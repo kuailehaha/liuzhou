@@ -18,7 +18,7 @@ def generate_legal_moves_phase1(state: GameState) -> List[Tuple[int, int]]:
 
     return legal_moves
 
-def apply_move_phase1(state: GameState, move: Tuple[int, int]) -> GameState:
+def apply_move_phase1(state: GameState, move: Tuple[int, int], mark_positions: List[Tuple[int, int]] = None) -> GameState:
     """
     在第一阶段执行一手落子:
     1. 在空位落子
@@ -27,37 +27,65 @@ def apply_move_phase1(state: GameState, move: Tuple[int, int]) -> GameState:
     """
     r, c = move
     new_state = state.copy()
+    current_player = new_state.current_player  # 获取当前玩家
 
-    if new_state.board[r][c] != 0 or new_state.phase != Phase.PLACEMENT:
-        # 非法情况，直接返回原state(也可抛异常)
-        return new_state
+    # 检查是否在空位落子
+    if new_state.board[r][c] != 0:
+        raise ValueError(f"位置 ({r}, {c}) 已有棋子")
+    
+    # 检查是否在被标记的位置落子
+    if current_player == Player.BLACK:
+        if (r, c) in new_state.marked_white:
+            raise ValueError(f"位置 ({r}, {c}) 已被标记，不能落子")
+    else:
+        if (r, c) in new_state.marked_black:
+            raise ValueError(f"位置 ({r}, {c}) 已被标记，不能落子")
 
-    current_player = new_state.current_player
+    if new_state.phase != Phase.PLACEMENT:
+        raise ValueError("当前不是落子阶段")
+
     # 下子
     new_state.board[r][c] = current_player.value
 
     # ---【关键】判断：该子是否已经被对手标记过？---
-    # 如果是黑方下子，则( r, c )是否在 marked_black？
-    # 如果是白方下子，则( r, c )是否在 marked_white？
-    # 若已标记 => 不能再触发新标记
     if current_player == Player.BLACK:
-        # 检查我方新下的子是否在 black标记集中(其实黑方自己不会标记黑子；这里要看规则的含义)
-        # 根据规则：“如果某颗棋子已经被对手标记，则不能再触发新的标记”；
-        #   => 即黑方落子的 (r, c) 是否在 state.marked_black 里。
-        #   但是 'marked_black' 的含义是“被标记的黑方棋子”，所以要检查 (r,c) in new_state.marked_black
         already_marked = (r, c) in new_state.marked_black
+        opponent_marked = new_state.marked_white
     else:
         already_marked = (r, c) in new_state.marked_white
+        opponent_marked = new_state.marked_black
 
     # 若没有被标记过，就进行形状检测
     if not already_marked:
-        shape = detect_shape_formed(new_state.board, r, c, current_player.value)
+        shape = detect_shape_formed(
+            new_state.board, r, c, current_player.value,
+            new_state.marked_black if current_player == Player.BLACK else new_state.marked_white
+        )
         if shape == "line":
-            # 标记对手2颗棋子
-            mark_opponent_pieces(new_state, count=2)
+            # 形成洲，标记对方2颗棋子
+            if mark_positions is None or len(mark_positions) != 2:
+                raise ValueError("形成洲后必须指定标记对方2颗棋子")
+            for mr, mc in mark_positions:
+                if new_state.board[mr][mc] != current_player.opponent().value or (mr, mc) in opponent_marked or is_piece_in_shape(new_state.board, mr, mc, current_player.opponent().value, opponent_marked):
+                    raise ValueError(f"标记位置 ({mr}, {mc}) 不合法")
+                if current_player == Player.BLACK:
+                    new_state.marked_white.add((mr, mc))
+                else:
+                    new_state.marked_black.add((mr, mc))
         elif shape == "square":
-            # 标记对手1颗棋子
-            mark_opponent_pieces(new_state, count=1)
+            # 形成方，标记对方1颗棋子
+            if mark_positions is None or len(mark_positions) != 1:
+                raise ValueError("形成方后必须指定标记对方1颗棋子")
+            mr, mc = mark_positions[0]
+            if new_state.board[mr][mc] != current_player.opponent().value or (mr, mc) in opponent_marked or is_piece_in_shape(new_state.board, mr, mc, current_player.opponent().value, opponent_marked):
+                raise ValueError(f"标记位置 ({mr}, {mc}) 不合法")
+            if current_player == Player.BLACK:
+                new_state.marked_white.add((mr, mc))
+            else:
+                new_state.marked_black.add((mr, mc))
+        elif mark_positions is not None:
+            # 如果没有形成方或洲，但传入了mark_positions参数，报错
+            raise ValueError("未形成方或洲时不能标记对方棋子")
         # else: "none" 不做任何事
 
     # 若棋盘已经满，进入Phase 2；否则切换玩家
@@ -71,119 +99,514 @@ def apply_move_phase1(state: GameState, move: Tuple[int, int]) -> GameState:
 
 
 
-def check_squares(board: List[List[int]], r: int, c: int, player_value: int) -> bool:
+def check_squares(board: List[List[int]], r: int, c: int, player_value: int, marked_set: set) -> bool:
     """
-    判断以 (r, c) 这步新落子为中心，是否形成了至少一个2x2的方块(同色).
+    判断以 (r, c) 这步新落子为中心，是否形成了至少一个2x2的方块(同色且未被标记).
     只要找到一个即可返回True，否则False。
     """
-    # 棋盘大小
     size = len(board)
-    # 可能形成2x2方块的左上角坐标范围
-    # (r,c)有可能是方块的四个角之一，因此要检查与(r,c)相邻的区域
     for dr in [0, -1]:
         for dc in [0, -1]:
             rr = r + dr
             cc = c + dc
-            # 确保 2x2 方块在棋盘范围内
             if 0 <= rr < size-1 and 0 <= cc < size-1:
-                if (board[rr][cc] == player_value and
-                    board[rr][cc+1] == player_value and
-                    board[rr+1][cc] == player_value and
-                    board[rr+1][cc+1] == player_value):
+                cells = [(rr, cc), (rr, cc+1), (rr+1, cc), (rr+1, cc+1)]
+                if all(board[x][y] == player_value and (x, y) not in marked_set for x, y in cells):
                     return True
     return False
 
-def check_lines(board: List[List[int]], r: int, c: int, player_value: int) -> bool:
+def check_lines(board: List[List[int]], r: int, c: int, player_value: int, marked_set: set) -> bool:
     """
-    检查是否形成“6连线”（洲），仅考虑水平或垂直连续6子，不考虑斜线。
-    只要找到一条满足条件的就返回 True，否则 False。
+    检查是否形成"6连线"（洲），仅考虑水平或垂直连续6子，不考虑斜线。
+    连线中的棋子不能被标记。
     """
     size = len(board)
-
-    # 行、列
     row = r
     col = c
-
-    # ===== 检查所在行是否有连续6枚 player_value =====
-    # 为了便于处理，我们先找到该行所有同色棋子的最大连续段。
-    # 具体做法：以 (row,col) 为中心，向左/向右扩展统计。
-    count_in_row = 1  # (row, col) 本身算1
-    # 向左扩展
+    # 行
+    count_in_row = 1 if (row, col) not in marked_set else 0
     cc = col - 1
-    while cc >= 0 and board[row][cc] == player_value:
+    while cc >= 0 and board[row][cc] == player_value and (row, cc) not in marked_set:
         count_in_row += 1
         cc -= 1
-    # 向右扩展
     cc = col + 1
-    while cc < size and board[row][cc] == player_value:
+    while cc < size and board[row][cc] == player_value and (row, cc) not in marked_set:
         count_in_row += 1
         cc += 1
     if count_in_row >= 6:
         return True
-
-    # ===== 检查所在列是否有连续6枚 player_value =====
-    count_in_col = 1  # (row, col) 本身算1
-    # 向上扩展
+    # 列
+    count_in_col = 1 if (row, col) not in marked_set else 0
     rr = row - 1
-    while rr >= 0 and board[rr][col] == player_value:
+    while rr >= 0 and board[rr][col] == player_value and (rr, col) not in marked_set:
         count_in_col += 1
         rr -= 1
-    # 向下扩展
     rr = row + 1
-    while rr < size and board[rr][col] == player_value:
+    while rr < size and board[rr][col] == player_value and (rr, col) not in marked_set:
         count_in_col += 1
         rr += 1
     if count_in_col >= 6:
         return True
-
     return False
 
-def detect_shape_formed(board: List[List[int]], r: int, c: int, player_value: int) -> str:
+def detect_shape_formed(board: List[List[int]], r: int, c: int, player_value: int, marked_set: set) -> str:
     """
     综合检测本次落子后是否至少形成一个"洲"或"方"。
     优先返回 'line' 表示洲，其次 'square' 表示方，若都无则返回 'none'。
+    检测时，已被标记的棋子不参与判断。
     """
-    # 先判定是否形成洲(6连线)
-    if check_lines(board, r, c, player_value):
-        return "line"
-
-    # 再判定是否形成方(2x2)
-    if check_squares(board, r, c, player_value):
+    # 检查是否形成洲
+    size = len(board)
+    # 横向检查
+    for start_c in range(max(0, c-5), min(c+1, size-5)):
+        if all(board[r][start_c+i] == player_value and (r, start_c+i) not in marked_set for i in range(6)):
+            return "line"
+    # 纵向检查
+    for start_r in range(max(0, r-5), min(r+1, size-5)):
+        if all(board[start_r+i][c] == player_value and (start_r+i, c) not in marked_set for i in range(6)):
+            return "line"
+    
+    # 检查是否形成方
+    if check_squares(board, r, c, player_value, marked_set):
         return "square"
-
+    
     return "none"
 
 def mark_opponent_pieces(state: GameState, count: int):
     """
-    简单示例：自动从左上往右下寻找对手棋子，挑count颗未被标记的来标记。
-    若不足count颗，则尽量标记全部可标记的。
+    标记对方棋子时，不能标记正处于"方"或"洲"结构中的棋子。
     """
     current_player = state.current_player
     opponent_value = current_player.opponent().value
 
-    # 我方若是 BLACK=1，则要标记对方(WHITE=-1)的子 => state.marked_white
-    # 反之亦然
     if current_player == Player.BLACK:
         marked_set = state.marked_white
     else:
         marked_set = state.marked_black
 
-    # 扫描棋盘，找到对方棋子
     marked = 0
     for r in range(state.BOARD_SIZE):
         for c in range(state.BOARD_SIZE):
             if marked >= count:
                 break
             if state.board[r][c] == opponent_value:
-                # 还未被标记则标记
+                # 还未被标记且不在特殊结构中才可标记
                 if current_player == Player.BLACK:
-                    if (r, c) not in state.marked_white:
+                    if (r, c) not in state.marked_white and not is_piece_in_shape(state.board, r, c, opponent_value, state.marked_white):
                         marked_set.add((r, c))
                         marked += 1
                 else:
-                    if (r, c) not in state.marked_black:
+                    if (r, c) not in state.marked_black and not is_piece_in_shape(state.board, r, c, opponent_value, state.marked_black):
                         marked_set.add((r, c))
                         marked += 1
-
         if marked >= count:
             break
+
+def is_piece_in_shape(board, r, c, player_value, marked_set):
+    """
+    判断棋子(r, c)是否正处于某个"方"或"洲"结构中。
+    注意：被标记的棋子不能作为"方"或"洲"结构的一部分。
+    """
+    size = len(board)
+    # 检查是否在2x2方块中
+    for dr in [0, -1]:
+        for dc in [0, -1]:
+            rr = r + dr
+            cc = c + dc
+            if 0 <= rr < size-1 and 0 <= cc < size-1:
+                cells = [(rr, cc), (rr, cc+1), (rr+1, cc), (rr+1, cc+1)]
+                # 构成方的所有棋子都必须是player_value且未被标记
+                if all(board[x][y] == player_value and (x,y) not in marked_set for x, y in cells):
+                    # 检查(r,c)是否是这个方的一部分
+                    if (r,c) in cells:
+                        return True
+                        
+    # 检查是否在6连线（洲）中
+    # 横向
+    for start_c in range(max(0, c-5), min(size-5, c+1)):
+        # 构成洲的所有棋子都必须是player_value且未被标记
+        if all(board[r][start_c+i] == player_value and (r, start_c+i) not in marked_set for i in range(6)):
+            # 检查(r,c)是否是这个洲的一部分
+            if start_c <= c < start_c + 6:
+                return True
+    # 纵向
+    for start_r in range(max(0, r-5), min(size-5, r+1)):
+        # 构成洲的所有棋子都必须是player_value且未被标记
+        if all(board[start_r+i][c] == player_value and (start_r+i, c) not in marked_set for i in range(6)):
+            # 检查(r,c)是否是这个洲的一部分
+            if start_r <= r < start_r + 6:
+                return True
+    return False
+
+def process_phase2_removals(state: GameState) -> GameState:
+    """
+    处理第二阶段的棋子移除逻辑：
+    1. 如果双方都没有标记棋子，则进入强制互相移除阶段，由白方先行指定移除对方棋子。
+    2. 如果有一方或双方标记了棋子，则移除所有被标记的棋子。
+    3. 清空标记集合。
+    4. 如果进行了标记棋子的移除，则进入第三阶段，由白方先行。
+    """
+    new_state = state.copy()
+
+    if not new_state.marked_black and not new_state.marked_white:
+        # 情况1：没有棋子被标记，进入强制移除阶段
+        new_state.phase = Phase.FORCED_REMOVAL
+        new_state.current_player = Player.WHITE # 白方先指定要移除的对方棋子
+        new_state.forced_removals_done = 0 # 确保计数器从0开始
+    else:
+        # 情况2：有棋子被标记，移除它们
+        removed_count = 0
+        for r_idx, row in enumerate(new_state.board):
+            for c_idx, _ in enumerate(row):
+                if (r_idx, c_idx) in new_state.marked_black:
+                    new_state.board[r_idx][c_idx] = 0 # 移除黑棋
+                    removed_count += 1
+                elif (r_idx, c_idx) in new_state.marked_white:
+                    new_state.board[r_idx][c_idx] = 0 # 移除白棋
+                    removed_count += 1
+        
+        new_state.marked_black.clear()
+        new_state.marked_white.clear()
+        
+        # 只有在真正移除了标记棋子后才进入MOVEMENT阶段
+        if removed_count > 0:
+            new_state.phase = Phase.MOVEMENT
+            new_state.current_player = Player.WHITE # 第三阶段由白方先行
+        # 如果 marked_black 和 marked_white 存在，但里面的坐标在棋盘上已经变空（不太可能，除非外部逻辑错误）
+        # 这种情况下，我们依然清空标记，但阶段维持不变或按原逻辑（如果棋盘满了去REMOVAL）
+        # 但根据当前函数被调用的前提（棋盘满，从PLACEMENT到REMOVAL），这里应该总是进入MOVEMENT或FORCED_REMOVAL
+
+    return new_state
+
+def apply_forced_removal(state: GameState, piece_to_remove: Tuple[int, int]) -> GameState:
+    """
+    处理强制移除阶段的单步移除操作：
+    当前玩家指定移除对方的一个棋子。
+    1. 检查是否为 FORCED_REMOVAL 阶段。
+    2. 根据 forced_removals_done 决定是哪一方在操作以及要移除哪一方的棋子。
+       - forced_removals_done == 0: 白方操作，移除黑子。
+       - forced_removals_done == 1: 黑方操作，移除白子。
+    3. 检查指定位置的棋子是否属于对方。
+    4. 检查该棋子是否不构成"方"或"洲"的一部分。
+    5. 从棋盘上移除该棋子，增加 forced_removals_done 计数。
+    6. 如果 forced_removals_done == 1，切换到黑方操作。
+    7. 如果 forced_removals_done == 2，进入 MOVEMENT 阶段，轮到白方。
+    """
+    new_state = state.copy()
+    r, c = piece_to_remove
+
+    if new_state.phase != Phase.FORCED_REMOVAL:
+        raise ValueError("当前不是强制移除阶段")
+
+    if new_state.forced_removals_done == 0: # 白方移除黑子
+        if new_state.current_player != Player.WHITE:
+            raise ValueError("强制移除顺序错误：应为白方先移除黑子")
+        if new_state.board[r][c] != Player.BLACK.value:
+            raise ValueError(f"位置 ({r}, {c}) 不是对方 (黑方) 的棋子")
+        
+        opponent_player_value = Player.BLACK.value
+        # 检查棋子是否在方或洲中 (被移除的是黑子，所以用黑子的视角检查)
+        if is_piece_in_shape(new_state.board, r, c, opponent_player_value, set()): 
+            raise ValueError(f"黑棋子 ({r}, {c}) 构成方或洲，不能被强制移除")
+
+        new_state.board[r][c] = 0
+        new_state.forced_removals_done = 1
+        new_state.current_player = Player.BLACK # 轮到黑方移除白子
+
+    elif new_state.forced_removals_done == 1: # 黑方移除白子
+        if new_state.current_player != Player.BLACK:
+            raise ValueError("强制移除顺序错误：应为黑方移除白子")
+        if new_state.board[r][c] != Player.WHITE.value:
+            raise ValueError(f"位置 ({r}, {c}) 不是对方 (白方) 的棋子")
+
+        opponent_player_value = Player.WHITE.value
+        # 检查棋子是否在方或洲中 (被移除的是白子，所以用白子的视角检查)
+        if is_piece_in_shape(new_state.board, r, c, opponent_player_value, set()): 
+            raise ValueError(f"白棋子 ({r}, {c}) 构成方或洲，不能被强制移除")
+
+        new_state.board[r][c] = 0
+        new_state.forced_removals_done = 2
+        new_state.phase = Phase.MOVEMENT
+        new_state.current_player = Player.WHITE # 第三阶段由白方开始
+    else:
+        # forced_removals_done 应该是0或1进入此函数
+        raise RuntimeError(f"强制移除状态错误 (forced_removals_done={new_state.forced_removals_done})！")
+
+    return new_state
+
+def generate_legal_moves_phase3(state: GameState) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """
+    生成第三阶段（走子阶段）所有合法的走子操作。
+    一个走子操作由 (起始坐标, 目标坐标) 表示。
+    """
+    legal_moves = []
+    if state.phase != Phase.MOVEMENT:
+        return legal_moves
+
+    player_value = state.current_player.value
+    player_pieces = state.get_player_pieces(state.current_player)
+
+    for r_from, c_from in player_pieces:
+        # 定义四个可能的移动方向：上, 下, 左, 右
+        possible_deltas = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        for dr, dc in possible_deltas:
+            r_to, c_to = r_from + dr, c_from + dc
+
+            # 检查目标位置是否在棋盘内
+            if 0 <= r_to < GameState.BOARD_SIZE and 0 <= c_to < GameState.BOARD_SIZE:
+                # 检查目标位置是否为空
+                if state.board[r_to][c_to] == 0:
+                    legal_moves.append(((r_from, c_from), (r_to, c_to)))
+    
+    return legal_moves
+
+def apply_move_phase3(
+    state: GameState, 
+    move: Tuple[Tuple[int, int], Tuple[int, int]], 
+    capture_positions: List[Tuple[int, int]] = None,
+    quiet: bool = False
+) -> GameState:
+    """
+    在第三阶段执行一手走子和可能的提吃:
+    1. 验证阶段和移动的有效性。
+    2. 移动棋子。
+    3. 检测移动后是否形成"方"或"洲"。
+    4. 如果形成，根据 capture_positions 提吃对方棋子。
+       - 提吃优先提吃对方不在"方"或"洲"中的普通棋子。
+       - 若对方普通棋子不足时，可以提吃方或洲中的棋子。
+    5. 检查是否有一方棋子被吃光，判定胜负。
+    6. 如果游戏未结束，切换玩家。
+    """
+    new_state = state.copy()
+    (r_from, c_from), (r_to, c_to) = move
+
+    if new_state.phase != Phase.MOVEMENT:
+        raise ValueError("当前不是走子阶段")
+
+    current_player_value = new_state.current_player.value
+    opponent_player_value = new_state.current_player.opponent().value
+
+    # 验证移动是否合法
+    if not (0 <= r_from < GameState.BOARD_SIZE and 0 <= c_from < GameState.BOARD_SIZE and \
+            0 <= r_to < GameState.BOARD_SIZE and 0 <= c_to < GameState.BOARD_SIZE):
+        raise ValueError("移动坐标超出棋盘范围")
+
+    if new_state.board[r_from][c_from] != current_player_value:
+        raise ValueError(f"起始位置 ({r_from}, {c_from}) 不是当前玩家的棋子")
+    
+    if new_state.board[r_to][c_to] != 0:
+        raise ValueError(f"目标位置 ({r_to}, {c_to}) 非空，不能移动")
+
+    # 校验是否为单步水平或垂直移动
+    if not ((abs(r_from - r_to) == 1 and c_from == c_to) or \
+            (abs(c_from - c_to) == 1 and r_from == r_to)):
+        raise ValueError("棋子只能水平或垂直移动一格")
+
+    # 执行移动
+    new_state.board[r_to][c_to] = current_player_value
+    new_state.board[r_from][c_from] = 0
+
+    # 检测移动后的棋子 (r_to, c_to) 是否形成了方或洲
+    # 在第三阶段，没有"标记棋子"的概念，所以 is_piece_in_shape 和 detect_shape_formed 的 marked_set 参数都传空 set
+    shape_formed = detect_shape_formed(new_state.board, r_to, c_to, current_player_value, set())
+
+    expected_captures = 0
+    if shape_formed == "line":
+        expected_captures = 2
+    elif shape_formed == "square":
+        expected_captures = 1
+
+    if expected_captures > 0:
+        if capture_positions is None or len(capture_positions) != expected_captures:
+            raise ValueError(f"形成 {shape_formed} 后应指定提吃 {expected_captures} 颗对方棋子，但指定了 {len(capture_positions) if capture_positions else 0} 颗")
+        
+        # 获取对方所有普通棋子（不在方或洲中的棋子）
+        opponent_normal_pieces = []
+        for r in range(GameState.BOARD_SIZE):
+            for c in range(GameState.BOARD_SIZE):
+                if new_state.board[r][c] == opponent_player_value:
+                    if not is_piece_in_shape(new_state.board, r, c, opponent_player_value, set()):
+                        opponent_normal_pieces.append((r, c))
+        
+        # 检查每个提吃位置的合法性
+        for cap_r, cap_c in capture_positions:
+            if not (0 <= cap_r < GameState.BOARD_SIZE and 0 <= cap_c < GameState.BOARD_SIZE):
+                raise ValueError(f"提吃位置 ({cap_r}, {cap_c}) 超出棋盘范围")
+            if new_state.board[cap_r][cap_c] != opponent_player_value:
+                raise ValueError(f"提吃位置 ({cap_r}, {cap_c}) 不是对方棋子")
+            
+            # 规则补丁：
+            # 1. 如果对方有足够的普通棋子，则必须提吃普通棋子
+            # 2. 如果对方普通棋子不足，可以提吃方/洲中的棋子
+            is_in_shape = is_piece_in_shape(new_state.board, cap_r, cap_c, opponent_player_value, set())
+            
+            # 针对形成方（提吃1颗）和形成洲（提吃2颗）的规则调整
+            if is_in_shape:
+                if shape_formed == "square": # 形成方，提吃1颗
+                    # 如果对方有普通棋子，则不能提吃方或洲中的棋子
+                    if len(opponent_normal_pieces) > 0:
+                        raise ValueError(f"当对方有普通棋子时，不能提吃对方在 ({cap_r}, {cap_c}) 处构成方或洲的棋子")
+                elif shape_formed == "line": # 形成洲，提吃2颗
+                    # 检查当前已处理的提吃位置数量
+                    processed_captures = capture_positions.index((cap_r, cap_c))
+                    
+                    # 如果对方普通棋子数量为0，可以提吃2颗方/洲中的棋子
+                    if len(opponent_normal_pieces) == 0:
+                        pass # 允许提吃
+                    # 如果对方普通棋子数量为1，且已经提吃了这1颗普通棋子，可以提吃1颗方/洲中的棋子
+                    elif len(opponent_normal_pieces) == 1 and processed_captures > 0:
+                        # 检查前一个提吃的是否为普通棋子
+                        prev_cap_r, prev_cap_c = capture_positions[processed_captures - 1]
+                        if not (prev_cap_r, prev_cap_c) in opponent_normal_pieces:
+                            raise ValueError(f"当对方有1颗普通棋子时，必须先提吃这颗普通棋子，再提吃对方在 ({cap_r}, {cap_c}) 处构成方或洲的棋子")
+                    # 如果对方普通棋子数量大于等于2，则必须全部提吃普通棋子
+                    else:
+                        raise ValueError(f"当对方有足够的普通棋子时，不能提吃对方在 ({cap_r}, {cap_c}) 处构成方或洲的棋子")
+            
+            # 执行提吃
+            new_state.board[cap_r][cap_c] = 0
+            
+            # 更新普通棋子列表，防止重复提吃同一个普通棋子
+            if (cap_r, cap_c) in opponent_normal_pieces:
+                opponent_normal_pieces.remove((cap_r, cap_c))
+                
+    elif capture_positions is not None and len(capture_positions) > 0:
+        raise ValueError("未形成方或洲，不能提吃棋子")
+
+    # 检查胜负条件：对方棋子是否被吃光
+    if new_state.count_player_pieces(new_state.current_player.opponent()) == 0:
+        if not quiet:
+            print(f"游戏结束！玩家 {new_state.current_player.name} 获胜！")
+        # 可以在这里将 phase 改为 GAME_OVER 或类似状态，或者由调用方处理
+        # 为了简单起见，我们先只打印信息。实际游戏中可能需要更完善的结束处理。
+        return new_state # 游戏结束，不再切换玩家
+
+    # 切换玩家
+    new_state.switch_player()
+
+    return new_state
+
+def has_legal_moves_phase3(state: GameState) -> bool:
+    """
+    判断当前玩家在第三阶段是否有合法移动
+    """
+    if state.phase != Phase.MOVEMENT:
+        raise ValueError("当前不是走子阶段")
+    
+    return len(generate_legal_moves_phase3(state)) > 0
+
+def handle_no_moves_phase3(
+    state: GameState, 
+    stucked_player_removes: Tuple[int, int],
+    quiet: bool = False
+) -> GameState:
+    """
+    处理第三阶段无子可动的情况：
+    1. 验证当前玩家是否真的无子可动。
+    2. 当前玩家（无子可动方）移除对方一枚棋子。
+       - 优先移除对方不在"方"或"洲"中的普通棋子。
+       - 若对方没有普通棋子，可以移除方或洲中的棋子。
+    3. 对方移除当前玩家一枚棋子（由 apply_counter_removal_phase3 完成）。
+    4. 返回到当前玩家的回合（保持当前玩家不变）。
+    """
+    new_state = state.copy()
+    
+    if new_state.phase != Phase.MOVEMENT:
+        raise ValueError("当前不是走子阶段")
+    
+    if has_legal_moves_phase3(new_state):
+        raise ValueError("当前玩家有合法移动，不能触发强制移除")
+    
+    r, c = stucked_player_removes
+    current_player = new_state.current_player
+    opponent_player = current_player.opponent()
+    
+    # 验证要移除的是对方棋子
+    if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
+        raise ValueError(f"移除位置 ({r}, {c}) 超出棋盘范围")
+    
+    if new_state.board[r][c] != opponent_player.value:
+        raise ValueError(f"位置 ({r}, {c}) 不是对方棋子")
+    
+    # 获取对方所有普通棋子（不在方或洲中的棋子）
+    opponent_normal_pieces = []
+    for i in range(GameState.BOARD_SIZE):
+        for j in range(GameState.BOARD_SIZE):
+            if new_state.board[i][j] == opponent_player.value:
+                if not is_piece_in_shape(new_state.board, i, j, opponent_player.value, set()):
+                    opponent_normal_pieces.append((i, j))
+    
+    # 验证：如果对方有普通棋子，不能移除对方"方"或"洲"中的棋子
+    is_in_shape = is_piece_in_shape(new_state.board, r, c, opponent_player.value, set())
+    if is_in_shape and len(opponent_normal_pieces) > 0:
+        raise ValueError(f"当对方有普通棋子时，不能移除对方在 ({r}, {c}) 处构成方或洲的棋子")
+    
+    # 执行移除
+    new_state.board[r][c] = 0
+    
+    # 检查是否获胜
+    if new_state.count_player_pieces(opponent_player) == 0:
+        if not quiet:
+            print(f"游戏结束！玩家 {current_player.name} 获胜！")
+        return new_state # 游戏结束
+    
+    # 创建一个临时状态，设置当前玩家为对方（用于第二次移除）
+    temp_state = new_state.copy()
+    temp_state.current_player = opponent_player
+    
+    # 返回修改后的状态，当前玩家不变（仍是无子可动的一方）
+    return new_state
+
+def apply_counter_removal_phase3(
+    state: GameState, 
+    opponent_removes: Tuple[int, int],
+    quiet: bool = False
+) -> GameState:
+    """
+    处理第三阶段无子可动后，对方对当前玩家的反制移除：
+    1. 验证移除的是当前玩家的棋子。
+    2. 执行移除。
+       - 优先移除不在"方"或"洲"中的普通棋子。
+       - 若没有普通棋子，可以移除方或洲中的棋子。
+    3. 检查胜负。
+    4. 保持当前玩家不变，返回到当前玩家的回合。
+    """
+    new_state = state.copy()
+    
+    if new_state.phase != Phase.MOVEMENT:
+        raise ValueError("当前不是走子阶段")
+    
+    r, c = opponent_removes
+    current_player = new_state.current_player  # 此时是无法移动的玩家
+    opponent_player = current_player.opponent()
+    
+    # 验证要移除的是当前玩家的棋子
+    if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
+        raise ValueError(f"移除位置 ({r}, {c}) 超出棋盘范围")
+    
+    if new_state.board[r][c] != current_player.value:
+        raise ValueError(f"位置 ({r}, {c}) 不是要反制移除的玩家棋子")
+    
+    # 获取当前玩家所有普通棋子（不在方或洲中的棋子）
+    current_player_normal_pieces = []
+    for i in range(GameState.BOARD_SIZE):
+        for j in range(GameState.BOARD_SIZE):
+            if new_state.board[i][j] == current_player.value:
+                if not is_piece_in_shape(new_state.board, i, j, current_player.value, set()):
+                    current_player_normal_pieces.append((i, j))
+    
+    # 验证：如果当前玩家有普通棋子，不能移除"方"或"洲"中的棋子
+    is_in_shape = is_piece_in_shape(new_state.board, r, c, current_player.value, set())
+    if is_in_shape and len(current_player_normal_pieces) > 0:
+        raise ValueError(f"当玩家有普通棋子时，不能移除玩家在 ({r}, {c}) 处构成方或洲的棋子")
+    
+    # 执行移除
+    new_state.board[r][c] = 0
+    
+    # 检查胜负
+    if new_state.count_player_pieces(current_player) == 0:
+        if not quiet:
+            print(f"游戏结束！玩家 {opponent_player.name} 获胜！")
+        return new_state  # 游戏结束
+    
+    return new_state

@@ -1,0 +1,21 @@
+
+
+
+test_*.txt
+*.log
+####################
+# 模型检查点 / 临时 #
+####################
+checkpoints*/        # checkpoints/ checkpoints_eval_run/ 等一律忽略
+*.pt
+*.pth
+*.ckpt
+*.npz
+
+####################
+# Python byte-code #
+####################
+**/__pycache__/      # 任意深度的 __pycache__ 目录
+**/*.py[cod]         # *.pyc / *.pyo / *.pyd
+__pycache__/
+*.py[cod]
