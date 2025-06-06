@@ -135,18 +135,24 @@ class MCTS:
     蒙特卡洛树搜索算法。
     """
     def __init__(
-        self, 
-        model: ChessNet, 
+        self,
+        model: ChessNet,
         num_simulations: int = 800,
         exploration_weight: float = 1.0,
         temperature: float = 1.0,
-        device: str = 'cpu'
+        device: str = 'cpu',
+        add_dirichlet_noise: bool = False,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_epsilon: float = 0.25,
     ):
         self.model = model
         self.num_simulations = num_simulations
         self.exploration_weight = exploration_weight
         self.temperature = temperature
         self.device = device
+        self.add_dirichlet_noise = add_dirichlet_noise
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
         self.model.to(device)
         self.model.eval()  # 设置为评估模式
 
@@ -224,6 +230,15 @@ class MCTS:
             move_probs, _ = get_move_probabilities( # _ placeholder for raw_log_probs as we don't need it here now
                 log_p1, log_p2, log_pmc, legal_moves, node.state.BOARD_SIZE, self.device
             )
+
+        # 如果是根节点且启用了Dirichlet噪声，混合探索噪声
+        if self.add_dirichlet_noise and node.parent is None:
+            noise = np.random.dirichlet([self.dirichlet_alpha] * len(move_probs))
+            move_probs = (
+                (1 - self.dirichlet_epsilon) * np.array(move_probs) +
+                self.dirichlet_epsilon * noise
+            )
+            move_probs = (move_probs / move_probs.sum()).tolist()
         
         # 扩展节点
         node.expand(legal_moves, move_probs)
@@ -259,7 +274,8 @@ def self_play(
             model=model,
             num_simulations=mcts_simulations,
             exploration_weight=exploration_weight,
-            device=device
+            device=device,
+            add_dirichlet_noise=True
         )
         
         # 初始化游戏状态
