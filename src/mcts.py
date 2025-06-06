@@ -164,11 +164,15 @@ class MCTS:
             
             # 如果叶节点不是终局节点，则扩展并评估
             if not leaf.is_terminal():
-                # 扩展叶节点
-                self._expand_and_evaluate(leaf)
-                
-                # 从叶节点开始反向传播
-                leaf.backpropagate(leaf.value())
+                # 扩展叶节点并获取评估值
+                value_estimate = self._expand_and_evaluate(leaf)
+
+                # 如果扩展后成为终局节点，使用终局价值
+                if leaf.is_terminal():
+                    leaf.backpropagate(leaf.terminal_value)
+                else:
+                    # 反向传播神经网络的评估值
+                    leaf.backpropagate(value_estimate)
             else:
                 # 如果是终局节点，则直接反向传播终局价值
                 leaf.backpropagate(leaf.terminal_value)
@@ -191,7 +195,7 @@ class MCTS:
             node = node.get_best_child(self.exploration_weight)
         return node
 
-    def _expand_and_evaluate(self, node: MCTSNode) -> None:
+    def _expand_and_evaluate(self, node: MCTSNode) -> float:
         """
         扩展节点并使用神经网络评估其价值。
         """
@@ -201,8 +205,8 @@ class MCTS:
         # 如果没有合法动作，则是终局节点
         if not legal_moves:
             # 如果当前玩家无法行动，则当前玩家输了
-            node.set_terminal(-1.0)  # 从当前玩家的角度看，价值为-1
-            return
+            node.set_terminal(-1.0)  # 从当前玩家的角度看，价值为 -1
+            return -1.0
         
         # 使用神经网络评估当前状态
         with torch.no_grad():
@@ -223,11 +227,10 @@ class MCTS:
         
         # 扩展节点
         node.expand(legal_moves, move_probs)
-        
-        # 设置节点的价值
-        # 注意：value 是从当前玩家的角度看的价值，范围是 [-1, 1]
-        node.value_sum = value.item()
-        node.visit_count = 1
+
+        # 返回神经网络评估值，但保持 visit_count 和 value_sum 为 0，
+        # 让 backpropagate 负责第一次更新
+        return value.item()
 
 def self_play(
     model: ChessNet, 
