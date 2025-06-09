@@ -6,6 +6,16 @@ from src.game_state import GameState, Player, Phase
 from src.move_generator import generate_all_legal_moves, apply_move, MoveType
 from src.neural_network import ChessNet, state_to_tensor, get_move_probabilities
 
+# 保证所有地方都能用到move_to_key
+
+def move_to_key(move):
+    if isinstance(move, dict):
+        return tuple(sorted((k, move_to_key(v)) for k, v in move.items()))
+    elif isinstance(move, list):
+        return tuple(move_to_key(x) for x in move)
+    else:
+        return move
+
 class MCTSNode:
     """
     表示蒙特卡洛树搜索中的一个节点。
@@ -163,34 +173,73 @@ class MCTS:
         # 创建根节点
         root = MCTSNode(state)
         
+        # 初始化统计字典：{move: {"black": 0, "white": 0, "draw": 0}}
+        move_result_stats = {}
+        # 先扩展根节点，获得所有第一步着法
+        if not root.is_fully_expanded():
+            self._expand_and_evaluate(root)
+        for child in root.children:
+            move_key = move_to_key(child.move)
+            move_result_stats[move_key] = {"black": 0, "white": 0, "draw": 0}
+        
         # 执行指定次数的模拟
         for _ in range(self.num_simulations):
-            # 选择叶节点
-            leaf = self._select(root)
-            
+            path = [root]
+            node = root
+            # 选择叶节点并记录路径
+            while node.is_fully_expanded() and not node.is_terminal():
+                node = node.get_best_child(self.exploration_weight)
+                path.append(node)
+            leaf = node
             # 如果叶节点不是终局节点，则扩展并评估
             if not leaf.is_terminal():
-                # 扩展叶节点并获取评估值
                 value_estimate = self._expand_and_evaluate(leaf)
-
-                # 如果扩展后成为终局节点，使用终局价值
                 if leaf.is_terminal():
-                    leaf.backpropagate(leaf.terminal_value)
+                    terminal_value = leaf.terminal_value
                 else:
-                    # 反向传播神经网络的评估值
-                    leaf.backpropagate(value_estimate)
+                    terminal_value = value_estimate
             else:
-                # 如果是终局节点，则直接反向传播终局价值
+                terminal_value = leaf.terminal_value
+            # 反向传播
+            if not leaf.is_terminal():
+                leaf.backpropagate(value_estimate)
+            else:
                 leaf.backpropagate(leaf.terminal_value)
-        
+            # 统计：只统计第一步着法
+            if len(path) > 1:
+                first_child = path[1]
+                move_key = move_to_key(first_child.move)
+                # 终局值：1.0=黑胜，-1.0=白胜，0.0=平局
+                if terminal_value == 1.0:
+                    move_result_stats[move_key]["black"] += 1
+                elif terminal_value == -1.0:
+                    move_result_stats[move_key]["white"] += 1
+                else:
+                    move_result_stats[move_key]["draw"] += 1
         # 根据访问次数生成策略
         moves, policy = root.get_visit_count_policy()
-        
         # 应用温度
         if self.temperature != 1.0:
             policy = np.power(policy, 1.0 / self.temperature)
             policy /= np.sum(policy)  # 重新归一化
-        
+        # 打印统计结果
+        print("\n===== MCTS模拟统计结果（每个着法） =====")
+        best_black = (None, 0)
+        best_white = (None, 0)
+        for move in moves:
+            move_key = move_to_key(move)
+            stats = move_result_stats.get(move_key, {"black": 0, "white": 0, "draw": 0})
+            total = stats["black"] + stats["white"] + stats["draw"]
+            black_rate = stats["black"] / total if total > 0 else 0
+            white_rate = stats["white"] / total if total > 0 else 0
+            print(f"着法: {move}, 黑胜: {stats['black']}, 白胜: {stats['white']}, 平局: {stats['draw']}, 黑胜率: {black_rate:.3f}, 白胜率: {white_rate:.3f}")
+            if black_rate > best_black[1]:
+                best_black = (move, black_rate)
+            if white_rate > best_white[1]:
+                best_white = (move, white_rate)
+        print(f"\n黑胜率最高着法: {best_black[0]}, 胜率: {best_black[1]:.3f}")
+        print(f"白胜率最高着法: {best_white[0]}, 胜率: {best_white[1]:.3f}")
+        print("====================================\n")
         return moves, policy
 
     def _select(self, node: MCTSNode) -> MCTSNode:
