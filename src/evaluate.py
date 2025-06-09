@@ -82,17 +82,9 @@ def play_single_game(agent_black, agent_white, initial_state: GameState = None, 
         state = apply_move(state, selected_move)
         move_count += 1
 
-        # 检查基于棋子数量的游戏结束条件 (与self_play一致)
-        black_pieces = state.count_player_pieces(Player.BLACK)
-        white_pieces = state.count_player_pieces(Player.WHITE)
-
-        if black_pieces <= 2 or white_pieces <= 2:
-            if black_pieces > white_pieces:
-                return 1.0  # 黑方胜
-            elif white_pieces > black_pieces:
-                return -1.0  # 白方胜
-            else:
-                return 0.0  # 平局
+        winner = state.get_winner()
+        if winner is not None:
+            return 1.0 if winner == Player.BLACK else -1.0 if winner == Player.WHITE else 0.0
     
     # print(f"Game ended: Reached max moves ({max_moves}).")
     return 0.0 # 达到最大步数，平局

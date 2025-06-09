@@ -3,11 +3,13 @@
 from enum import Enum
 from typing import List, Optional, Tuple
 
+
 class Phase(Enum):
-    PLACEMENT = 1   # 第一阶段：落子
-    REMOVAL = 2     # 第二阶段：标记/强制移除
-    MOVEMENT = 3    # 第三阶段：走子与提吃
-    FORCED_REMOVAL = 4 # 新增：强制移除阶段
+    PLACEMENT = 1  # 第一阶段：落子
+    REMOVAL = 2  # 第二阶段：标记/强制移除
+    MOVEMENT = 3  # 第三阶段：走子与提吃
+    FORCED_REMOVAL = 4  # 新增：强制移除阶段
+
 
 class Player(Enum):
     BLACK = 1
@@ -15,6 +17,7 @@ class Player(Enum):
 
     def opponent(self) -> "Player":
         return Player.WHITE if self == Player.BLACK else Player.BLACK
+
 
 class GameState:
     BOARD_SIZE = 6
@@ -25,11 +28,12 @@ class GameState:
         phase: Phase = Phase.PLACEMENT,
         current_player: Player = Player.BLACK,
         marked_black: Optional[set] = None,  # 存储被标记的黑棋子坐标
-        marked_white: Optional[set] = None,   # 存储被标记的白棋子坐标
-        forced_removals_done: int = 0 # 新增：记录强制移除阶段完成的次数
+        marked_white: Optional[set] = None,  # 存储被标记的白棋子坐标
+        forced_removals_done: int = 0,  # 新增：记录强制移除阶段完成的次数
+        move_count: int = 0,
     ):
         if board is None:
-            board = [[0]*self.BOARD_SIZE for _ in range(self.BOARD_SIZE)]
+            board = [[0] * self.BOARD_SIZE for _ in range(self.BOARD_SIZE)]
 
         self.board = board
         self.phase = phase
@@ -37,7 +41,8 @@ class GameState:
 
         self.marked_black = marked_black if marked_black is not None else set()
         self.marked_white = marked_white if marked_white is not None else set()
-        self.forced_removals_done = forced_removals_done # 初始化新属性
+        self.forced_removals_done = forced_removals_done  # 初始化新属性
+        self.move_count = move_count
 
     def copy(self) -> "GameState":
         new_board = [row[:] for row in self.board]
@@ -47,7 +52,8 @@ class GameState:
             current_player=self.current_player,
             marked_black=self.marked_black.copy(),
             marked_white=self.marked_white.copy(),
-            forced_removals_done=self.forced_removals_done # 复制新属性
+            forced_removals_done=self.forced_removals_done,  # 复制新属性
+            move_count=self.move_count,
         )
         return new_state
 
@@ -109,5 +115,28 @@ class GameState:
             "\n".join(rows)
             + f"\nPhase: {self.phase}, Current Player: {self.current_player}\n"
             + f"Marked Black: {self.marked_black}\nMarked White: {self.marked_white}\n"
-            + f"Forced Removals Done: {self.forced_removals_done}"  # 在打印信息中加入
+            + f"Forced Removals Done: {self.forced_removals_done}\n"
+            + f"Move Count: {self.move_count}"
         )
+
+    # 新增：判断游戏是否结束及获胜方
+    def get_winner(self) -> Optional[Player]:
+        """若有一方棋子被吃光，返回获胜方，否则返回 None"""
+        black = self.count_player_pieces(Player.BLACK)
+        white = self.count_player_pieces(Player.WHITE)
+        if black == 0 and white > 0:
+            return Player.WHITE
+        if white == 0 and black > 0:
+            return Player.BLACK
+
+        if self.move_count >= 36:
+            if black < 4 or white < 4:
+                if black > white:
+                    return Player.BLACK
+                if white > black:
+                    return Player.WHITE
+        return None
+
+    def is_game_over(self) -> bool:
+        """检查游戏是否已经结束"""
+        return self.get_winner() is not None
