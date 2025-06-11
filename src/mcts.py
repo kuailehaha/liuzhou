@@ -8,6 +8,7 @@ from src.neural_network import ChessNet, state_to_tensor, get_move_probabilities
 
 # 保证所有地方都能用到move_to_key
 
+
 def move_to_key(move):
     if isinstance(move, dict):
         return tuple(sorted((k, move_to_key(v)) for k, v in move.items()))
@@ -16,26 +17,30 @@ def move_to_key(move):
     else:
         return move
 
+
 class MCTSNode:
     """
     表示蒙特卡洛树搜索中的一个节点。
     """
+
     def __init__(
-        self, 
-        state: GameState, 
-        parent=None, 
-        move: Optional[MoveType] = None, 
+        self,
+        state: GameState,
+        parent=None,
+        move: Optional[MoveType] = None,
         prior: float = 0.0,
-        player_to_act: Optional[Player] = None
+        player_to_act: Optional[Player] = None,
     ):
         self.state = state
         self.parent = parent
         self.move = move  # 从父节点到这个节点的动作
         self.prior = prior  # 从策略网络得到的先验概率
-        
+
         # 如果没有指定 player_to_act，则使用 state.current_player
-        self.player_to_act = player_to_act if player_to_act is not None else state.current_player
-        
+        self.player_to_act = (
+            player_to_act if player_to_act is not None else state.current_player
+        )
+
         self.children: List[MCTSNode] = []
         self.visit_count = 0
         self.value_sum = 0.0  # 累积价值
@@ -56,7 +61,7 @@ class MCTSNode:
         使用给定的合法动作和概率扩展节点。
         """
         self.expanded = True
-        
+
         for move, prob in zip(legal_moves, move_probs):
             # 创建新状态
             new_state = apply_move(self.state.copy(), move)
@@ -66,7 +71,7 @@ class MCTSNode:
                 parent=self,
                 move=move,
                 prior=prob,
-                player_to_act=new_state.current_player
+                player_to_act=new_state.current_player,
             )
             self.children.append(child)
 
@@ -96,13 +101,13 @@ class MCTSNode:
         # 更新当前节点
         self.visit_count += 1
         self.value_sum += value
-        
+
         # 递归更新父节点
         if self.parent:
             # 从父节点的角度来看，价值需要取反
             self.parent.backpropagate(-value)
 
-    def get_best_child(self, exploration_weight: float = 1.0) -> 'MCTSNode':
+    def get_best_child(self, exploration_weight: float = 1.0) -> "MCTSNode":
         """
         使用 PUCT 公式选择最佳子节点。
         PUCT = Q(s,a) + U(s,a)
@@ -110,18 +115,23 @@ class MCTSNode:
         """
         if not self.children:
             raise ValueError("Node has no children")
-        
+
         # 计算所有子节点的 PUCT 值
         puct_values = []
         for child in self.children:
             # 计算探索项
             # U(s,a) = c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
             # 其中 c_puct 是探索权重，P(s,a) 是先验概率，N(s) 是父节点的访问次数，N(s,a) 是子节点的访问次数
-            exploration = exploration_weight * child.prior * math.sqrt(self.visit_count) / (1 + child.visit_count)
+            exploration = (
+                exploration_weight
+                * child.prior
+                * math.sqrt(self.visit_count)
+                / (1 + child.visit_count)
+            )
             # PUCT = Q(s,a) + U(s,a)
             puct = child.value() + exploration
             puct_values.append(puct)
-        
+
         # 返回 PUCT 值最大的子节点
         return self.children[np.argmax(puct_values)]
 
@@ -131,26 +141,28 @@ class MCTSNode:
         """
         if not self.children:
             raise ValueError("Node has no children")
-        
+
         moves = [child.move for child in self.children]
         visit_counts = np.array([child.visit_count for child in self.children])
-        
+
         # 将访问次数归一化为概率分布
         policy = visit_counts / np.sum(visit_counts)
-        
+
         return moves, policy
+
 
 class MCTS:
     """
     蒙特卡洛树搜索算法。
     """
+
     def __init__(
         self,
         model: ChessNet,
         num_simulations: int = 800,
         exploration_weight: float = 1.0,
         temperature: float = 1.0,
-        device: str = 'cpu',
+        device: str = "cpu",
         add_dirichlet_noise: bool = False,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
@@ -172,7 +184,7 @@ class MCTS:
         """
         # 创建根节点
         root = MCTSNode(state)
-        
+
         # 初始化统计字典：{move: {"black": 0, "white": 0, "draw": 0}}
         move_result_stats = {}
         # 先扩展根节点，获得所有第一步着法
@@ -181,7 +193,7 @@ class MCTS:
         for child in root.children:
             move_key = move_to_key(child.move)
             move_result_stats[move_key] = {"black": 0, "white": 0, "draw": 0}
-        
+
         # 执行指定次数的模拟
         for _ in range(self.num_simulations):
             path = [root]
@@ -232,7 +244,9 @@ class MCTS:
             total = stats["black"] + stats["white"] + stats["draw"]
             black_rate = stats["black"] / total if total > 0 else 0
             white_rate = stats["white"] / total if total > 0 else 0
-            print(f"着法: {move}, 黑胜: {stats['black']}, 白胜: {stats['white']}, 平局: {stats['draw']}, 黑胜率: {black_rate:.3f}, 白胜率: {white_rate:.3f}")
+            print(
+                f"着法: {move}, 黑胜: {stats['black']}, 白胜: {stats['white']}, 平局: {stats['draw']}, 黑胜率: {black_rate:.3f}, 白胜率: {white_rate:.3f}"
+            )
             if black_rate > best_black[1]:
                 best_black = (move, black_rate)
             if white_rate > best_white[1]:
@@ -255,40 +269,54 @@ class MCTS:
         扩展节点并使用神经网络评估其价值。
         """
         # 获取当前状态的所有合法动作
+        # 检查是否游戏已结束
+        if node.state.is_game_over():
+            winner = node.state.get_winner()
+            value = 1.0 if winner == node.player_to_act else -1.0
+            node.set_terminal(value)
+            return value
+
         legal_moves = generate_all_legal_moves(node.state)
-        
-        # 如果没有合法动作，则是终局节点
+
+        # 如果没有合法动作，则从规则上视为当前玩家失败
         if not legal_moves:
-            # 如果当前玩家无法行动，则当前玩家输了
-            node.set_terminal(-1.0)  # 从当前玩家的角度看，价值为 -1
+            node.set_terminal(-1.0)
             return -1.0
-        
+
         # 使用神经网络评估当前状态
         with torch.no_grad():
             # 将状态转换为张量
-            input_tensor = state_to_tensor(node.state, node.player_to_act).to(self.device)
+            input_tensor = state_to_tensor(node.state, node.player_to_act).to(
+                self.device
+            )
             # 获取神经网络的输出
             log_p1, log_p2, log_pmc, value = self.model(input_tensor)
             # 将对数概率转换为概率
             log_p1 = log_p1.squeeze(0)
             log_p2 = log_p2.squeeze(0)
             log_pmc = log_pmc.squeeze(0)
-            
+
             # 获取每个合法动作的概率
             # move_probs 是 softmax 后的概率， raw_log_probs 是 softmax 前的原始分数
-            move_probs, _ = get_move_probabilities( # _ placeholder for raw_log_probs as we don't need it here now
-                log_p1, log_p2, log_pmc, legal_moves, node.state.BOARD_SIZE, self.device
+            move_probs, _ = (
+                get_move_probabilities(  # _ placeholder for raw_log_probs as we don't need it here now
+                    log_p1,
+                    log_p2,
+                    log_pmc,
+                    legal_moves,
+                    node.state.BOARD_SIZE,
+                    self.device,
+                )
             )
 
         # 如果是根节点且启用了Dirichlet噪声，混合探索噪声
         if self.add_dirichlet_noise and node.parent is None:
             noise = np.random.dirichlet([self.dirichlet_alpha] * len(move_probs))
-            move_probs = (
-                (1 - self.dirichlet_epsilon) * np.array(move_probs) +
-                self.dirichlet_epsilon * noise
-            )
+            move_probs = (1 - self.dirichlet_epsilon) * np.array(
+                move_probs
+            ) + self.dirichlet_epsilon * noise
             move_probs = (move_probs / move_probs.sum()).tolist()
-        
+
         # 扩展节点
         node.expand(legal_moves, move_probs)
 
@@ -296,47 +324,48 @@ class MCTS:
         # 让 backpropagate 负责第一次更新
         return value.item()
 
+
 def self_play(
-    model: ChessNet, 
+    model: ChessNet,
     num_games: int = 1,
     mcts_simulations: int = 800,
     temperature_init: float = 1.0,
     temperature_final: float = 0.1,
     temperature_threshold: int = 10,
     exploration_weight: float = 1.0,
-    device: str = 'cpu'
+    device: str = "cpu",
 ) -> List[Tuple[List[GameState], List[np.ndarray], float]]:
     """
     执行自我对弈，生成训练数据。
-    
+
     返回值是一个列表，每个元素是一个元组 (states, policies, value)，
     其中 states 是游戏中的所有状态，policies 是 MCTS 生成的策略，
     value 是游戏结果 (1 表示黑方胜，-1 表示白方胜)。
     """
     training_data = []
-    
+
     for game_idx in range(num_games):
         print(f"Starting self-play game {game_idx + 1}/{num_games}")
-        
+
         # 创建 MCTS
         mcts = MCTS(
             model=model,
             num_simulations=mcts_simulations,
             exploration_weight=exploration_weight,
             device=device,
-            add_dirichlet_noise=True
+            add_dirichlet_noise=True,
         )
-        
+
         # 初始化游戏状态
         state = GameState()
-        
+
         # 记录游戏中的所有状态和策略
         game_states = []
         game_policies = []
-        
+
         # 记录每一步的动作
         move_count = 0
-        
+
         # 游戏循环
         while True:
             # 确定当前温度
@@ -344,99 +373,99 @@ def self_play(
                 temperature = temperature_init
             else:
                 temperature = temperature_final
-            
+
             mcts.temperature = temperature
-            
+
             # 执行 MCTS 搜索
             moves, policy = mcts.search(state)
-            
+
             # ---- 调试打印：当前局面所有合法走法及MCTS最终策略 ----
-            print(f"\n--- Self-Play Move {move_count+1} for Player {state.current_player} (Game {game_idx+1}) ---")
-            
-            print(f"MCTS found {len(moves)} legal moves with the following policy distribution (temperature: {mcts.temperature:.2f}):")
+            print(
+                f"\n--- Self-Play Move {move_count+1} for Player {state.current_player} (Game {game_idx+1}) ---"
+            )
+
+            print(
+                f"MCTS found {len(moves)} legal moves with the following policy distribution (temperature: {mcts.temperature:.2f}):"
+            )
             if not moves:
                 print("  No legal moves found by MCTS from this state.")
             else:
                 # 为了更好的可读性，可以排序或只显示概率较高的部分
-                sorted_moves_indices = np.argsort(policy)[::-1] # Sort by policy descending
+                sorted_moves_indices = np.argsort(policy)[
+                    ::-1
+                ]  # Sort by policy descending
                 for i in range(len(sorted_moves_indices)):
                     idx = sorted_moves_indices[i]
-                    print(f"  {i+1}. Move: {moves[idx]}, Policy Prob: {policy[idx]:.4f}")
-                    
+                    print(
+                        f"  {i+1}. Move: {moves[idx]}, Policy Prob: {policy[idx]:.4f}"
+                    )
+
             # ---- 结束调试打印 ----
-            
+
             # 记录当前状态和策略
             game_states.append(state.copy())
             game_policies.append(policy)
-            
+
             # 根据策略选择动作
             move_idx = np.random.choice(len(moves), p=policy)
             move = moves[move_idx]
-            
+
             # 应用动作
             state = apply_move(state, move)
-            
+
             move_count += 1
-            
-            # 获取棋子数量用于判断
-            black_pieces = state.count_player_pieces(Player.BLACK)
-            white_pieces = state.count_player_pieces(Player.WHITE)
+
             print(state)
-            if move_count >= 36:
-                if black_pieces <= 2 or white_pieces <= 2:
-                    # 游戏结束
-                    if black_pieces > white_pieces:
-                        result = 1.0  # 黑方胜
-                    elif white_pieces > black_pieces:
-                        result = -1.0  # 白方胜
-                    else:
-                        result = 0.0  # 平局
-                    
-                    # 将结果添加到训练数据中
-                    training_data.append((game_states, game_policies, result))
-                    break
-            
+            winner = state.get_winner()
+            if winner is not None:
+                result = 1.0 if winner == Player.BLACK else -1.0 if winner == Player.WHITE else 0.0
+                training_data.append((game_states, game_policies, result))
+                break
+
             # 如果游戏进行了太多步，也结束游戏
             if move_count > 500:
-                print(f"Game {game_idx + 1} reached move limit ({move_count} moves), ending as a draw.")
+                print(
+                    f"Game {game_idx + 1} reached move limit ({move_count} moves), ending as a draw."
+                )
                 print("Final state before ending due to move limit:")
                 print(state)
                 training_data.append((game_states, game_policies, 0.0))
                 break
-    
+
     return training_data
+
 
 if __name__ == "__main__":
     # 测试 MCTS
     from src.neural_network import ChessNet
-    
+
     # 创建模型
     board_size = GameState.BOARD_SIZE
     model = ChessNet(board_size=board_size)
-    
+
     # 创建 MCTS
     mcts = MCTS(model=model, num_simulations=10)  # 为了快速测试，只使用10次模拟
-    
+
     # 创建初始状态
     state = GameState()
-    
+
     # 执行 MCTS 搜索
     moves, policy = mcts.search(state)
-    
+
     print("Initial state:")
     print(state)
     print("\nMCTS policy:")
     for move, prob in zip(moves, policy):
         print(f"Move: {move}, Probability: {prob:.4f}")
-    
+
     # 选择概率最高的动作
     best_move_idx = np.argmax(policy)
     best_move = moves[best_move_idx]
-    
+
     print(f"\nBest move: {best_move}")
-    
+
     # 应用最佳动作
     new_state = apply_move(state, best_move)
-    
+
     print("\nState after best move:")
-    print(new_state) 
+    print(new_state)
