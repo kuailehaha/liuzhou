@@ -1,15 +1,19 @@
-# file: src/game_state.py
+"""
+Core game state representation and helpers.
+"""
 
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 
 class Phase(Enum):
-    PLACEMENT = 1  # 第一阶段：落子
-    REMOVAL = 2  # 第二阶段：标记/强制移除
-    MOVEMENT = 3  # 第三阶段：走子与提吃
-    FORCED_REMOVAL = 4  # 新增：强制移除阶段
-    COUNTER_REMOVAL = 5 # 新增：无子可动后的反制移除阶段
+    PLACEMENT = 1  # 落子
+    MARK_SELECTION = 2  # 逐个选择要标记的对方棋子
+    REMOVAL = 3  # 已标记棋子的实际移除
+    MOVEMENT = 4  # 行棋阶段，仅移动棋子
+    CAPTURE_SELECTION = 5  # 逐个选择要提掉的对方棋子
+    FORCED_REMOVAL = 6  # 强制移除阶段
+    COUNTER_REMOVAL = 7  # 无子可动后的反制移除阶段
 
 
 class Player(Enum):
@@ -28,10 +32,14 @@ class GameState:
         board: Optional[List[List[int]]] = None,
         phase: Phase = Phase.PLACEMENT,
         current_player: Player = Player.BLACK,
-        marked_black: Optional[set] = None,  # 存储被标记的黑棋子坐标
-        marked_white: Optional[set] = None,  # 存储被标记的白棋子坐标
-        forced_removals_done: int = 0,  # 新增：记录强制移除阶段完成的次数
+        marked_black: Optional[Set[Tuple[int, int]]] = None,
+        marked_white: Optional[Set[Tuple[int, int]]] = None,
+        forced_removals_done: int = 0,
         move_count: int = 0,
+        pending_marks_required: int = 0,
+        pending_marks_remaining: int = 0,
+        pending_captures_required: int = 0,
+        pending_captures_remaining: int = 0,
     ):
         if board is None:
             board = [[0] * self.BOARD_SIZE for _ in range(self.BOARD_SIZE)]
@@ -42,54 +50,66 @@ class GameState:
 
         self.marked_black = marked_black if marked_black is not None else set()
         self.marked_white = marked_white if marked_white is not None else set()
-        self.forced_removals_done = forced_removals_done  # 初始化新属性
+        self.forced_removals_done = forced_removals_done
         self.move_count = move_count
+
+        # Pending tasks created when某一步形成方/洲或触发提子。
+        self.pending_marks_required = pending_marks_required
+        self.pending_marks_remaining = pending_marks_remaining
+        self.pending_captures_required = pending_captures_required
+        self.pending_captures_remaining = pending_captures_remaining
 
     def copy(self) -> "GameState":
         new_board = [row[:] for row in self.board]
-        new_state = GameState(
+        return GameState(
             board=new_board,
             phase=self.phase,
             current_player=self.current_player,
             marked_black=self.marked_black.copy(),
             marked_white=self.marked_white.copy(),
-            forced_removals_done=self.forced_removals_done,  # 复制新属性
+            forced_removals_done=self.forced_removals_done,
             move_count=self.move_count,
+            pending_marks_required=self.pending_marks_required,
+            pending_marks_remaining=self.pending_marks_remaining,
+            pending_captures_required=self.pending_captures_required,
+            pending_captures_remaining=self.pending_captures_remaining,
         )
-        return new_state
 
     def switch_player(self):
         self.current_player = self.current_player.opponent()
 
     def is_board_full(self) -> bool:
-        for row in self.board:
-            for cell in row:
-                if cell == 0:
-                    return False
-        return True
+        return all(cell != 0 for row in self.board for cell in row)
 
     def get_player_pieces(self, player: Player) -> List[Tuple[int, int]]:
-        """获取指定玩家在棋盘上所有棋子的坐标列表"""
-        pieces = []
+        """获取指定玩家在棋盘上所有棋子的坐标列表。"""
         player_value = player.value
-        for r in range(self.BOARD_SIZE):
-            for c in range(self.BOARD_SIZE):
-                if self.board[r][c] == player_value:
-                    pieces.append((r, c))
-        return pieces
+        return [
+            (r, c)
+            for r in range(self.BOARD_SIZE)
+            for c in range(self.BOARD_SIZE)
+            if self.board[r][c] == player_value
+        ]
 
     def count_player_pieces(self, player: Player) -> int:
-        """获取指定玩家在棋盘上的棋子总数"""
-        count = 0
+        """统计指定玩家棋子数量。"""
         player_value = player.value
-        for r in range(self.BOARD_SIZE):
-            for c in range(self.BOARD_SIZE):
-                if self.board[r][c] == player_value:
-                    count += 1
-        return count
+        return sum(
+            1
+            for r in range(self.BOARD_SIZE)
+            for c in range(self.BOARD_SIZE)
+            if self.board[r][c] == player_value
+        )
+
+    def clear_pending_marks(self):
+        self.pending_marks_required = 0
+        self.pending_marks_remaining = 0
+
+    def clear_pending_captures(self):
+        self.pending_captures_required = 0
+        self.pending_captures_remaining = 0
 
     def __str__(self):
-        # 构建棋盘字符串，带坐标和边框，被标记的棋子特殊显示
         header = "    " + " ".join(str(c) for c in range(self.BOARD_SIZE))
         border = "   +" + "-" * (2 * self.BOARD_SIZE - 1) + "+"
         rows = [header, border]
@@ -97,34 +117,37 @@ class GameState:
             row_str = f" {r} |"
             for c in range(self.BOARD_SIZE):
                 if (r, c) in self.marked_black:
-                    cell = "◎"  # 被标记黑棋
+                    cell = "B"  # 黑方被标记
                 elif (r, c) in self.marked_white:
-                    cell = "◉"  # 被标记白棋
+                    cell = "W"  # 白方被标记
                 else:
                     val = self.board[r][c]
-                    if val == 1:
-                        cell = "○"  # 黑棋
-                    elif val == -1:
-                        cell = "●"  # 白棋
+                    if val == Player.BLACK.value:
+                        cell = "●"
+                    elif val == Player.WHITE.value:
+                        cell = "○"
                     else:
-                        cell = "·"  # 空位
+                        cell = "·"
                 row_str += cell + " "
-            row_str = row_str.rstrip() + "|"
-            rows.append(row_str)
+            rows.append(row_str.rstrip() + "|")
         rows.append(border)
-        return (
-            "\n".join(rows)
-            + f"\nPhase: {self.phase}, Current Player: {self.current_player}\n"
-            + f"Marked Black: {self.marked_black}\nMarked White: {self.marked_white}\n"
-            + f"Forced Removals Done: {self.forced_removals_done}\n"
-            + f"Move Count: {self.move_count}"
+        rows.append(f"Phase: {self.phase}, Current Player: {self.current_player}")
+        rows.append(f"Marked Black: {self.marked_black}")
+        rows.append(f"Marked White: {self.marked_white}")
+        rows.append(f"Forced Removals Done: {self.forced_removals_done}")
+        rows.append(
+            f"Pending Marks: {self.pending_marks_remaining}/{self.pending_marks_required}"
         )
+        rows.append(
+            f"Pending Captures: {self.pending_captures_remaining}/{self.pending_captures_required}"
+        )
+        rows.append(f"Move Count: {self.move_count}")
+        return "\n".join(rows)
 
-    # 新增：判断游戏是否结束及获胜方
     def get_winner(self) -> Optional[Player]:
-        """若有一方棋子被吃光，返回获胜方，否则返回 None"""
-        # The game should only be evaluated for a winner after the placement phase is complete.
+        """若有一方棋子被提光，返回获胜方，否则返回 None。"""
         if self.phase == Phase.PLACEMENT:
+            # 落子阶段不判胜负
             return None
 
         black_pieces = self.count_player_pieces(Player.BLACK)
@@ -134,9 +157,7 @@ class GameState:
             return Player.WHITE
         if white_pieces == 0:
             return Player.BLACK
-        
         return None
 
     def is_game_over(self) -> bool:
-        """检查游戏是否已经结束"""
         return self.get_winner() is not None

@@ -194,6 +194,9 @@ class MCTS:
             move_key = move_to_key(child.move)
             move_result_stats[move_key] = {"black": 0, "white": 0, "draw": 0}
 
+        root_player = root.state.current_player
+        opponent_player = root_player.opponent()
+
         # 执行指定次数的模拟
         for _ in range(self.num_simulations):
             path = [root]
@@ -221,11 +224,19 @@ class MCTS:
             if len(path) > 1:
                 first_child = path[1]
                 move_key = move_to_key(first_child.move)
-                # 终局值：1.0=黑胜，-1.0=白胜，0.0=平局
-                if terminal_value == 1.0:
-                    move_result_stats[move_key]["black"] += 1
-                elif terminal_value == -1.0:
-                    move_result_stats[move_key]["white"] += 1
+
+                depth = len(path) - 1  # number of moves simulated
+                sign = -1 if depth % 2 == 1 else 1
+                root_value = terminal_value * sign
+
+                if root_value > 0:
+                    winner = root_player
+                    key = "black" if winner == Player.BLACK else "white"
+                    move_result_stats[move_key][key] += 1
+                elif root_value < 0:
+                    winner = opponent_player
+                    key = "black" if winner == Player.BLACK else "white"
+                    move_result_stats[move_key][key] += 1
                 else:
                     move_result_stats[move_key]["draw"] += 1
         # 根据访问次数生成策略
@@ -235,17 +246,21 @@ class MCTS:
             policy = np.power(policy, 1.0 / self.temperature)
             policy /= np.sum(policy)  # 重新归一化
         # 打印统计结果
-        print("\n===== MCTS模拟统计结果（每个着法） =====")
+        print(
+            f"\n===== MCTS模拟统计（根节点执手: {root_player.name}, 候选动作 {len(moves)} 个） ====="
+        )
         best_black = (None, 0)
         best_white = (None, 0)
-        for move in moves:
+        for idx, move in enumerate(moves, start=1):
             move_key = move_to_key(move)
             stats = move_result_stats.get(move_key, {"black": 0, "white": 0, "draw": 0})
             total = stats["black"] + stats["white"] + stats["draw"]
             black_rate = stats["black"] / total if total > 0 else 0
             white_rate = stats["white"] / total if total > 0 else 0
             print(
-                f"着法: {move}, 黑胜: {stats['black']}, 白胜: {stats['white']}, 平局: {stats['draw']}, 黑胜率: {black_rate:.3f}, 白胜率: {white_rate:.3f}"
+                f"[候选 {idx}] 着法: {move}\n"
+                f"  黑方胜: {stats['black']}, 白方胜: {stats['white']}, 平局: {stats['draw']} "
+                f"(黑胜率: {black_rate:.3f}, 白胜率: {white_rate:.3f})"
             )
             if black_rate > best_black[1]:
                 best_black = (move, black_rate)

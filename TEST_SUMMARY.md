@@ -88,7 +88,6 @@
 可通过执行以下命令复现我们的测试：
 
 ```bash
-# 运行10000局增强测试
 python -m src.train --iterations 5
  --self_play_games 20 --mcts_simulations 3000 --epochs 1 --batch_size 128 --eval_games_vs_random 
 20 --eval_games_vs_best 20 --mcts_sims_eval 10 --checkpoint_dir ./checkpoints_eval_run > test_300
@@ -96,3 +95,8 @@ python -m src.train --iterations 5
 ```
 
 完整的测试工具使用说明请参阅 `README_TESTS.md`。
+
+```bash
+# 运行30局增强测试
+python -m src.train --iterations 5 --self_play_games 2 --mcts_simulations 30 --epochs 1 --batch_size 128 --eval_games_vs_random 20 --eval_games_vs_best 20 --mcts_sims_eval 10 --checkpoint_dir ./checkpoints_eval_run > 300simu_1.txt
+```

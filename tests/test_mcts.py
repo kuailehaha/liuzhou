@@ -28,7 +28,7 @@ def dummy_generate_no_moves(state):
     return []
 
 def dummy_generate_one_move(state):
-    return [{'phase': Phase.PLACEMENT, 'action_type': 'place', 'position': (0,0), 'mark_positions': None}]
+    return [{'phase': Phase.PLACEMENT, 'action_type': 'place', 'position': (0,0)}]
 
 def dummy_apply_move(state, move):
     new_state = state.copy()
