@@ -60,6 +60,13 @@ def generate_all_legal_moves(state: GameState) -> List[MoveType]:
         'action_type': 'no_moves_remove',
         'position': (r, c),  # 要移除的对方棋子位置
     }
+    
+    反制移除阶段(COUNTER_REMOVAL):
+    {
+        'phase': Phase.COUNTER_REMOVAL,
+        'action_type': 'counter_remove',
+        'position': (r, c), # 要移除的被困住方的棋子位置
+    }
 
     注：对于标记和提吃位置，如果有多种可能的组合，会生成多个不同的走法
     """
@@ -79,6 +86,8 @@ def generate_all_legal_moves(state: GameState) -> List[MoveType]:
             return _generate_moves_phase3(state)
         else:
             return _generate_moves_no_moves(state)
+    elif state.phase == Phase.COUNTER_REMOVAL:
+        return _generate_moves_counter_removal(state)
     else:
         return []
 
@@ -150,17 +159,36 @@ def _generate_moves_phase1(state: GameState) -> List[MoveType]:
 
             # 根据形成的形状，生成所有可能的标记组合
             if shape == "square":  # 标记1颗
-                for piece in opponent_pieces:
+                if not opponent_pieces: # 如果没有可标记的棋子
+                     legal_moves.append(
+                        {
+                            "phase": Phase.PLACEMENT,
+                            "action_type": "place",
+                            "position": position,
+                            "mark_positions": None,
+                        }
+                    )
+                else:
+                    for piece in opponent_pieces:
+                        legal_moves.append(
+                            {
+                                "phase": Phase.PLACEMENT,
+                                "action_type": "place",
+                                "position": position,
+                                "mark_positions": [piece],
+                            }
+                        )
+            elif shape == "line":  # 标记2颗
+                if len(opponent_pieces) < 2: # 如果没有足够可标记的棋子
                     legal_moves.append(
                         {
                             "phase": Phase.PLACEMENT,
                             "action_type": "place",
                             "position": position,
-                            "mark_positions": [piece],
+                            "mark_positions": None,
                         }
                     )
-            elif shape == "line":  # 标记2颗
-                if len(opponent_pieces) >= 2:
+                else:
                     for i in range(len(opponent_pieces)):
                         for j in range(i + 1, len(opponent_pieces)):
                             legal_moves.append(
@@ -212,25 +240,16 @@ def _generate_moves_forced_removal(state: GameState) -> List[MoveType]:
                     opponent_normal_pieces.append((r, c))
 
     # 优先移除不在方或洲中的普通棋子
-    if opponent_normal_pieces:
-        for piece in opponent_normal_pieces:
-            legal_moves.append(
-                {
-                    "phase": Phase.FORCED_REMOVAL,
-                    "action_type": "remove",
-                    "position": piece,
-                }
-            )
-    else:
-        # 如果没有普通棋子，可以移除在方或洲中的棋子
-        for piece in opponent_pieces:
-            legal_moves.append(
-                {
-                    "phase": Phase.FORCED_REMOVAL,
-                    "action_type": "remove",
-                    "position": piece,
-                }
-            )
+    target_pieces = opponent_normal_pieces if opponent_normal_pieces else opponent_pieces
+    
+    for piece in target_pieces:
+        legal_moves.append(
+            {
+                "phase": Phase.FORCED_REMOVAL,
+                "action_type": "remove",
+                "position": piece,
+            }
+        )
 
     return legal_moves
 
@@ -268,27 +287,25 @@ def _generate_moves_phase3(state: GameState) -> List[MoveType]:
             # 形成了方或洲，需要提吃对方棋子
             opponent_value = temp_state.current_player.opponent().value
             opponent_pieces = []
-            opponent_normal_pieces = []
-            opponent_shape_pieces = []
+            for r in range(GameState.BOARD_SIZE):
+                for c in range(GameState.BOARD_SIZE):
+                    if temp_state.board[r][c] == opponent_value:
+                        opponent_pieces.append((r, c))
 
-            # 收集所有可提吃的对方棋子
-            for row in range(GameState.BOARD_SIZE):
-                for col in range(GameState.BOARD_SIZE):
-                    if temp_state.board[row][col] == opponent_value:
-                        opponent_pieces.append((row, col))
-                        # 检查是否在方或洲中
-                        if is_piece_in_shape(
-                            temp_state.board, row, col, opponent_value, set()
-                        ):
-                            opponent_shape_pieces.append((row, col))
-                        else:
-                            opponent_normal_pieces.append((row, col))
-
-            # 根据形状和对方棋子情况，生成所有可能的提吃组合
+            # 根据形成的形状，生成所有可能的提吃组合
             if shape == "square":  # 提吃1颗
-                if opponent_normal_pieces:
-                    # 有普通棋子，只能提吃普通棋子
-                    for piece in opponent_normal_pieces:
+                if not opponent_pieces: # 如果没有可提吃的棋子
+                    legal_moves.append(
+                        {
+                            "phase": Phase.MOVEMENT,
+                            "action_type": "move",
+                            "from_position": (r_from, c_from),
+                            "to_position": (r_to, c_to),
+                            "capture_positions": None,
+                        }
+                    )
+                else:
+                    for piece in opponent_pieces:
                         legal_moves.append(
                             {
                                 "phase": Phase.MOVEMENT,
@@ -298,24 +315,20 @@ def _generate_moves_phase3(state: GameState) -> List[MoveType]:
                                 "capture_positions": [piece],
                             }
                         )
-                elif opponent_shape_pieces:
-                    # 没有普通棋子，可以提吃方/洲中的棋子
-                    for piece in opponent_shape_pieces:
-                        legal_moves.append(
-                            {
-                                "phase": Phase.MOVEMENT,
-                                "action_type": "move",
-                                "from_position": (r_from, c_from),
-                                "to_position": (r_to, c_to),
-                                "capture_positions": [piece],
-                            }
-                        )
-
             elif shape == "line":  # 提吃2颗
-                if len(opponent_normal_pieces) >= 2:
-                    # 有足够的普通棋子，只能提吃普通棋子
-                    for i in range(len(opponent_normal_pieces)):
-                        for j in range(i + 1, len(opponent_normal_pieces)):
+                if len(opponent_pieces) < 2: # 如果没有足够可提吃的棋子
+                    legal_moves.append(
+                        {
+                            "phase": Phase.MOVEMENT,
+                            "action_type": "move",
+                            "from_position": (r_from, c_from),
+                            "to_position": (r_to, c_to),
+                            "capture_positions": None,
+                        }
+                    )
+                else:
+                    for i in range(len(opponent_pieces)):
+                        for j in range(i + 1, len(opponent_pieces)):
                             legal_moves.append(
                                 {
                                     "phase": Phase.MOVEMENT,
@@ -323,41 +336,8 @@ def _generate_moves_phase3(state: GameState) -> List[MoveType]:
                                     "from_position": (r_from, c_from),
                                     "to_position": (r_to, c_to),
                                     "capture_positions": [
-                                        opponent_normal_pieces[i],
-                                        opponent_normal_pieces[j],
-                                    ],
-                                }
-                            )
-
-                elif len(opponent_normal_pieces) == 1 and opponent_shape_pieces:
-                    # 有1颗普通棋子，需要提吃这颗普通棋子和1颗方/洲中的棋子
-                    normal_piece = opponent_normal_pieces[0]
-                    for shape_piece in opponent_shape_pieces:
-                        legal_moves.append(
-                            {
-                                "phase": Phase.MOVEMENT,
-                                "action_type": "move",
-                                "from_position": (r_from, c_from),
-                                "to_position": (r_to, c_to),
-                                "capture_positions": [normal_piece, shape_piece],
-                            }
-                        )
-
-                elif (
-                    len(opponent_normal_pieces) == 0 and len(opponent_shape_pieces) >= 2
-                ):
-                    # 没有普通棋子，可以提吃2颗方/洲中的棋子
-                    for i in range(len(opponent_shape_pieces)):
-                        for j in range(i + 1, len(opponent_shape_pieces)):
-                            legal_moves.append(
-                                {
-                                    "phase": Phase.MOVEMENT,
-                                    "action_type": "move",
-                                    "from_position": (r_from, c_from),
-                                    "to_position": (r_to, c_to),
-                                    "capture_positions": [
-                                        opponent_shape_pieces[i],
-                                        opponent_shape_pieces[j],
+                                        opponent_pieces[i],
+                                        opponent_pieces[j],
                                     ],
                                 }
                             )
@@ -388,26 +368,52 @@ def _generate_moves_no_moves(state: GameState) -> List[MoveType]:
                     opponent_normal_pieces.append((r, c))
 
     # 优先移除不在方或洲中的普通棋子
-    if opponent_normal_pieces:
-        for piece in opponent_normal_pieces:
-            legal_moves.append(
-                {
-                    "phase": Phase.MOVEMENT,
-                    "action_type": "no_moves_remove",
-                    "position": piece,
-                }
-            )
-    else:
-        # 如果没有普通棋子，可以移除在方或洲中的棋子
-        for piece in opponent_pieces:
-            legal_moves.append(
-                {
-                    "phase": Phase.MOVEMENT,
-                    "action_type": "no_moves_remove",
-                    "position": piece,
-                }
-            )
+    target_pieces = opponent_normal_pieces if opponent_normal_pieces else opponent_pieces
+    
+    for piece in target_pieces:
+        legal_moves.append(
+            {
+                "phase": Phase.MOVEMENT,
+                "action_type": "no_moves_remove",
+                "position": piece,
+            }
+        )
 
+    return legal_moves
+
+def _generate_moves_counter_removal(state: GameState) -> List[MoveType]:
+    """反制移除阶段合法走法生成"""
+    legal_moves = []
+
+    # 当前玩家是反制方 (remover)
+    # 对方是被困住方 (stuck_player)
+    remover_player = state.current_player
+    stuck_player = remover_player.opponent()
+    stuck_player_value = stuck_player.value
+
+    # 收集被困住方的所有棋子
+    stuck_player_pieces = []
+    stuck_player_normal_pieces = []
+
+    for r in range(GameState.BOARD_SIZE):
+        for c in range(GameState.BOARD_SIZE):
+            if state.board[r][c] == stuck_player_value:
+                stuck_player_pieces.append((r, c))
+                # 检查是否在方或洲中
+                if not is_piece_in_shape(state.board, r, c, stuck_player_value, set()):
+                    stuck_player_normal_pieces.append((r, c))
+
+    # 优先移除不在方或洲中的普通棋子
+    target_pieces = stuck_player_normal_pieces if stuck_player_normal_pieces else stuck_player_pieces
+
+    for piece in target_pieces:
+        legal_moves.append(
+            {
+                "phase": Phase.COUNTER_REMOVAL,
+                "action_type": "counter_remove",
+                "position": piece,
+            }
+        )
     return legal_moves
 
 
@@ -460,6 +466,16 @@ def apply_move(state: GameState, move: MoveType, quiet: bool = False) -> GameSta
         new_state = apply_forced_removal(state, move["position"])
         new_state.move_count = state.move_count + 1
         return new_state
+    
+    elif state.phase == Phase.COUNTER_REMOVAL:
+        # 反制移除阶段
+        if move["action_type"] != "counter_remove":
+            raise ValueError(
+                f"在反制移除阶段只能执行 'counter_remove' 操作，而不是 {move['action_type']}"
+            )
+        new_state = apply_counter_removal_phase3(state, move["position"], quiet=quiet)
+        new_state.move_count = state.move_count + 1
+        return new_state
 
     elif state.phase == Phase.MOVEMENT:
         # 第三阶段：走子或处理无子可动
@@ -474,47 +490,12 @@ def apply_move(state: GameState, move: MoveType, quiet: bool = False) -> GameSta
             return new_state
         elif move["action_type"] == "no_moves_remove":
             # 无子可动时的移除
-            state_after_remove = handle_no_moves_phase3(
+            new_state = handle_no_moves_phase3(
                 state, move["position"], quiet=quiet
             )
-
-            # 模拟对方的反制移除
-            # 这里我们需要知道对方会选择移除哪个棋子
-            # 在真实游戏中，这应该由对方玩家决定
-            # 在自动模拟中，我们可以选择一个合法的反制移除
-            opponent_player = state.current_player.opponent()
-
-            # 为了简化，我们选择第一个合法的反制移除
-            current_player_pieces = []
-            current_player_normal_pieces = []
-            current_player_value = state.current_player.value
-
-            for r in range(GameState.BOARD_SIZE):
-                for c in range(GameState.BOARD_SIZE):
-                    if state_after_remove.board[r][c] == current_player_value:
-                        current_player_pieces.append((r, c))
-                        if not is_piece_in_shape(
-                            state_after_remove.board, r, c, current_player_value, set()
-                        ):
-                            current_player_normal_pieces.append((r, c))
-
-            # 选择要反制移除的棋子
-            counter_remove_position = None
-            if current_player_normal_pieces:
-                counter_remove_position = current_player_normal_pieces[0]
-            elif current_player_pieces:
-                counter_remove_position = current_player_pieces[0]
-
-            if counter_remove_position:
-                new_state = apply_counter_removal_phase3(
-                    state_after_remove, counter_remove_position, quiet=quiet
-                )
-                new_state.move_count = state.move_count + 1
-                return new_state
-            else:
-                # 没有棋子可以反制移除，对方胜利
-                state_after_remove.move_count = state.move_count + 1
-                return state_after_remove
+            # The state is now COUNTER_REMOVAL, turn switched.
+            new_state.move_count = state.move_count + 1
+            return new_state
         else:
             raise ValueError(f"在第三阶段不支持操作 {move['action_type']}")
 

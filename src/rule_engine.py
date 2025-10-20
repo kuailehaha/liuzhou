@@ -420,55 +420,15 @@ def apply_move_phase3(
         if capture_positions is None or len(capture_positions) != expected_captures:
             raise ValueError(f"形成 {shape_formed} 后应指定提吃 {expected_captures} 颗对方棋子，但指定了 {len(capture_positions) if capture_positions else 0} 颗")
         
-        # 获取对方所有普通棋子（不在方或洲中的棋子）
-        opponent_normal_pieces = []
-        for r in range(GameState.BOARD_SIZE):
-            for c in range(GameState.BOARD_SIZE):
-                if new_state.board[r][c] == opponent_player_value:
-                    if not is_piece_in_shape(new_state.board, r, c, opponent_player_value, set()):
-                        opponent_normal_pieces.append((r, c))
-        
         # 检查每个提吃位置的合法性
         for cap_r, cap_c in capture_positions:
             if not (0 <= cap_r < GameState.BOARD_SIZE and 0 <= cap_c < GameState.BOARD_SIZE):
                 raise ValueError(f"提吃位置 ({cap_r}, {cap_c}) 超出棋盘范围")
             if new_state.board[cap_r][cap_c] != opponent_player_value:
                 raise ValueError(f"提吃位置 ({cap_r}, {cap_c}) 不是对方棋子")
-            
-            # 规则补丁：
-            # 1. 如果对方有足够的普通棋子，则必须提吃普通棋子
-            # 2. 如果对方普通棋子不足，可以提吃方/洲中的棋子
-            is_in_shape = is_piece_in_shape(new_state.board, cap_r, cap_c, opponent_player_value, set())
-            
-            # 针对形成方（提吃1颗）和形成洲（提吃2颗）的规则调整
-            if is_in_shape:
-                if shape_formed == "square": # 形成方，提吃1颗
-                    # 如果对方有普通棋子，则不能提吃方或洲中的棋子
-                    if len(opponent_normal_pieces) > 0:
-                        raise ValueError(f"当对方有普通棋子时，不能提吃对方在 ({cap_r}, {cap_c}) 处构成方或洲的棋子")
-                elif shape_formed == "line": # 形成洲，提吃2颗
-                    # 检查当前已处理的提吃位置数量
-                    processed_captures = capture_positions.index((cap_r, cap_c))
-                    
-                    # 如果对方普通棋子数量为0，可以提吃2颗方/洲中的棋子
-                    if len(opponent_normal_pieces) == 0:
-                        pass # 允许提吃
-                    # 如果对方普通棋子数量为1，且已经提吃了这1颗普通棋子，可以提吃1颗方/洲中的棋子
-                    elif len(opponent_normal_pieces) == 1 and processed_captures > 0:
-                        # 检查前一个提吃的是否为普通棋子
-                        prev_cap_r, prev_cap_c = capture_positions[processed_captures - 1]
-                        if not (prev_cap_r, prev_cap_c) in opponent_normal_pieces:
-                            raise ValueError(f"当对方有1颗普通棋子时，必须先提吃这颗普通棋子，再提吃对方在 ({cap_r}, {cap_c}) 处构成方或洲的棋子")
-                    # 如果对方普通棋子数量大于等于2，则必须全部提吃普通棋子
-                    else:
-                        raise ValueError(f"当对方有足够的普通棋子时，不能提吃对方在 ({cap_r}, {cap_c}) 处构成方或洲的棋子")
-            
+
             # 执行提吃
             new_state.board[cap_r][cap_c] = 0
-            
-            # 更新普通棋子列表，防止重复提吃同一个普通棋子
-            if (cap_r, cap_c) in opponent_normal_pieces:
-                opponent_normal_pieces.remove((cap_r, cap_c))
                 
     elif capture_positions is not None and len(capture_positions) > 0:
         raise ValueError("未形成方或洲，不能提吃棋子")
@@ -496,38 +456,34 @@ def has_legal_moves_phase3(state: GameState) -> bool:
     return len(generate_legal_moves_phase3(state)) > 0
 
 def handle_no_moves_phase3(
-    state: GameState, 
+    state: GameState,
     stucked_player_removes: Tuple[int, int],
     quiet: bool = False
 ) -> GameState:
     """
     处理第三阶段无子可动的情况：
-    1. 验证当前玩家是否真的无子可动。
-    2. 当前玩家（无子可动方）移除对方一枚棋子。
+    1. 当前玩家（无子可动方）移除对方一枚棋子。
        - 优先移除对方不在"方"或"洲"中的普通棋子。
        - 若对方没有普通棋子，可以移除方或洲中的棋子。
-    3. 对方移除当前玩家一枚棋子（由 apply_counter_removal_phase3 完成）。
-    4. 返回到当前玩家的回合（保持当前玩家不变）。
+    2. 进入 COUNTER_REMOVAL 阶段，让对方反制移除。
     """
     new_state = state.copy()
-    
-    if new_state.phase != Phase.MOVEMENT:
-        raise ValueError("当前不是走子阶段")
-    
-    if has_legal_moves_phase3(new_state):
-        raise ValueError("当前玩家有合法移动，不能触发强制移除")
-    
+
+    # 调用者（如 move_generator）应确保此时玩家确实无子可动
+    # if has_legal_moves_phase3(new_state):
+    #     raise ValueError("当前玩家有合法移动，不能触发此函数")
+
     r, c = stucked_player_removes
     current_player = new_state.current_player
     opponent_player = current_player.opponent()
-    
+
     # 验证要移除的是对方棋子
     if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
         raise ValueError(f"移除位置 ({r}, {c}) 超出棋盘范围")
-    
+
     if new_state.board[r][c] != opponent_player.value:
         raise ValueError(f"位置 ({r}, {c}) 不是对方棋子")
-    
+
     # 获取对方所有普通棋子（不在方或洲中的棋子）
     opponent_normal_pieces = []
     for i in range(GameState.BOARD_SIZE):
@@ -535,78 +491,84 @@ def handle_no_moves_phase3(
             if new_state.board[i][j] == opponent_player.value:
                 if not is_piece_in_shape(new_state.board, i, j, opponent_player.value, set()):
                     opponent_normal_pieces.append((i, j))
-    
+
     # 验证：如果对方有普通棋子，不能移除对方"方"或"洲"中的棋子
     is_in_shape = is_piece_in_shape(new_state.board, r, c, opponent_player.value, set())
     if is_in_shape and len(opponent_normal_pieces) > 0:
         raise ValueError(f"当对方有普通棋子时，不能移除对方在 ({r}, {c}) 处构成方或洲的棋子")
-    
+
     # 执行移除
     new_state.board[r][c] = 0
-    
+
     # 检查是否获胜
     if new_state.count_player_pieces(opponent_player) == 0:
         if not quiet:
             print(f"游戏结束！玩家 {current_player.name} 获胜！")
         return new_state # 游戏结束
-    
-    # 创建一个临时状态，设置当前玩家为对方（用于第二次移除）
-    temp_state = new_state.copy()
-    temp_state.current_player = opponent_player
-    
-    # 返回修改后的状态，当前玩家不变（仍是无子可动的一方）
+
+    # 进入反制移除阶段，并切换玩家
+    new_state.phase = Phase.COUNTER_REMOVAL
+    new_state.switch_player()
+
     return new_state
 
+
 def apply_counter_removal_phase3(
-    state: GameState, 
+    state: GameState,
     opponent_removes: Tuple[int, int],
     quiet: bool = False
 ) -> GameState:
     """
-    处理第三阶段无子可动后，对方对当前玩家的反制移除：
-    1. 验证移除的是当前玩家的棋子。
-    2. 执行移除。
-       - 优先移除不在"方"或"洲"中的普通棋子。
-       - 若没有普通棋子，可以移除方或洲中的棋子。
-    3. 检查胜负。
-    4. 保持当前玩家不变，返回到当前玩家的回合。
+    处理 COUNTER_REMOVAL 阶段：
+    1. 验证当前是 COUNTER_REMOVAL 阶段。
+    2. 当前玩家(remover)移除对方(stuck_player)的一枚棋子。
+    3. 验证移除的合法性（是对方棋子，优先普通子等）。
+    4. 执行移除。
+    5. 检查胜负。
+    6. 将阶段切换回 MOVEMENT。
+    7. 将回合交还给对方(stuck_player)。
     """
     new_state = state.copy()
-    
-    if new_state.phase != Phase.MOVEMENT:
-        raise ValueError("当前不是走子阶段")
-    
     r, c = opponent_removes
-    current_player = new_state.current_player  # 此时是无法移动的玩家
-    opponent_player = current_player.opponent()
-    
-    # 验证要移除的是当前玩家的棋子
+
+    if new_state.phase != Phase.COUNTER_REMOVAL:
+        raise ValueError("当前不是反制移除阶段")
+
+    remover_player = new_state.current_player
+    stuck_player = remover_player.opponent()
+
+    # 验证要移除的是对方（被困住方）的棋子
     if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
         raise ValueError(f"移除位置 ({r}, {c}) 超出棋盘范围")
-    
-    if new_state.board[r][c] != current_player.value:
-        raise ValueError(f"位置 ({r}, {c}) 不是要反制移除的玩家棋子")
-    
-    # 获取当前玩家所有普通棋子（不在方或洲中的棋子）
-    current_player_normal_pieces = []
+
+    if new_state.board[r][c] != stuck_player.value:
+        raise ValueError(f"位置 ({r}, {c}) 不是被困住玩家 ({stuck_player.name}) 的棋子")
+
+    # 获取被困住方的所有普通棋子
+    stuck_player_normal_pieces = []
     for i in range(GameState.BOARD_SIZE):
         for j in range(GameState.BOARD_SIZE):
-            if new_state.board[i][j] == current_player.value:
-                if not is_piece_in_shape(new_state.board, i, j, current_player.value, set()):
-                    current_player_normal_pieces.append((i, j))
-    
-    # 验证：如果当前玩家有普通棋子，不能移除"方"或"洲"中的棋子
-    is_in_shape = is_piece_in_shape(new_state.board, r, c, current_player.value, set())
-    if is_in_shape and len(current_player_normal_pieces) > 0:
-        raise ValueError(f"当玩家有普通棋子时，不能移除玩家在 ({r}, {c}) 处构成方或洲的棋子")
-    
+            if new_state.board[i][j] == stuck_player.value:
+                if not is_piece_in_shape(new_state.board, i, j, stuck_player.value, set()):
+                    stuck_player_normal_pieces.append((i, j))
+
+    # 验证：如果对方有普通棋子，不能移除对方"方"或"洲"中的棋子
+    is_in_shape = is_piece_in_shape(new_state.board, r, c, stuck_player.value, set())
+    if is_in_shape and len(stuck_player_normal_pieces) > 0:
+        raise ValueError(f"当被困住的玩家有普通棋子时，不能移除其在 ({r}, {c}) 处构成方或洲的棋子")
+
     # 执行移除
     new_state.board[r][c] = 0
-    
+
     # 检查胜负
-    if new_state.count_player_pieces(current_player) == 0:
+    if new_state.count_player_pieces(stuck_player) == 0:
         if not quiet:
-            print(f"游戏结束！玩家 {opponent_player.name} 获胜！")
+            print(f"游戏结束！玩家 {remover_player.name} 获胜！")
         return new_state  # 游戏结束
-    
+
+    # 切换回走子阶段
+    new_state.phase = Phase.MOVEMENT
+    # 将回合交还给被困住方
+    new_state.switch_player()
+
     return new_state

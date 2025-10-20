@@ -5,7 +5,7 @@ from src.game_state import GameState, Player, Phase # 导入 Player 和 Phase
 from src.move_generator import generate_all_legal_moves, MoveType # 导入走法生成器和类型
 
 # 增加输入通道数量
-NUM_INPUT_CHANNELS = 8 # 1.己方棋子, 2.对方棋子, 3.己方被标记, 4.对方被标记, 5-8.Phase(one-hot)
+NUM_INPUT_CHANNELS = 9 # 1.己方棋子, 2.对方棋子, 3.己方被标记, 4.对方被标记, 5-9.Phase(one-hot)
 
 def state_to_tensor(state: GameState, player_to_act: Player) -> torch.Tensor:
     """
@@ -55,6 +55,8 @@ def state_to_tensor(state: GameState, player_to_act: Player) -> torch.Tensor:
         tensor[6, :, :] = 1
     elif state.phase == Phase.FORCED_REMOVAL:
         tensor[7, :, :] = 1
+    elif state.phase == Phase.COUNTER_REMOVAL:
+        tensor[8, :, :] = 1
         
     return tensor.unsqueeze(0) # 增加 batch 维度
 
@@ -245,6 +247,11 @@ def get_move_probabilities(
             # Using mark_capture head as it's a removal action not part of a standard move sequence.
             no_moves_remove_log_prob = log_policy_mark_capture[flatten_index(r, c)].item()
             current_log_prob += no_moves_remove_log_prob
+        
+        elif phase == Phase.COUNTER_REMOVAL and action_type == 'counter_remove':
+            r, c = move['position']
+            # Counter removals mirror forced removals: use the primary position head
+            current_log_prob += log_policy_pos1[flatten_index(r, c)].item()
         
         else:
             # Should not happen with current move generator if all cases are covered

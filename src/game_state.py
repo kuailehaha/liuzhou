@@ -9,6 +9,7 @@ class Phase(Enum):
     REMOVAL = 2  # 第二阶段：标记/强制移除
     MOVEMENT = 3  # 第三阶段：走子与提吃
     FORCED_REMOVAL = 4  # 新增：强制移除阶段
+    COUNTER_REMOVAL = 5 # 新增：无子可动后的反制移除阶段
 
 
 class Player(Enum):
@@ -122,19 +123,18 @@ class GameState:
     # 新增：判断游戏是否结束及获胜方
     def get_winner(self) -> Optional[Player]:
         """若有一方棋子被吃光，返回获胜方，否则返回 None"""
-        black = self.count_player_pieces(Player.BLACK)
-        white = self.count_player_pieces(Player.WHITE)
-        if black == 0 and white > 0:
-            return Player.WHITE
-        if white == 0 and black > 0:
-            return Player.BLACK
+        # The game should only be evaluated for a winner after the placement phase is complete.
+        if self.phase == Phase.PLACEMENT:
+            return None
 
-        if self.move_count >= 36:
-            if black < 4 or white < 4:
-                if black > white:
-                    return Player.BLACK
-                if white > black:
-                    return Player.WHITE
+        black_pieces = self.count_player_pieces(Player.BLACK)
+        white_pieces = self.count_player_pieces(Player.WHITE)
+
+        if black_pieces == 0:
+            return Player.WHITE
+        if white_pieces == 0:
+            return Player.BLACK
+        
         return None
 
     def is_game_over(self) -> bool:

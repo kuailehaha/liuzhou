@@ -272,7 +272,10 @@ class MCTS:
         # 检查是否游戏已结束
         if node.state.is_game_over():
             winner = node.state.get_winner()
-            value = 1.0 if winner == node.player_to_act else -1.0
+            if winner is None:
+                value = 0.0
+            else:
+                value = 1.0 if winner == node.player_to_act else -1.0
             node.set_terminal(value)
             return value
 
