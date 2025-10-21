@@ -136,139 +136,76 @@ def get_move_probabilities(
     device: str = 'cpu'
 ) -> tuple[list[float], torch.Tensor]:
     """
-    Calculates a probability distribution over legal moves.
-
-    Args:
-        log_policy_pos1: Log probabilities for the first key position. Shape (board_size*board_size,).
-        log_policy_pos2: Log probabilities for the second key position. Shape (board_size*board_size,).
-        log_policy_mark_capture: Log probabilities for mark/capture positions. Shape (board_size*board_size,).
-        legal_moves: A list of legal move dictionaries from generate_all_legal_moves.
-        board_size: The size of the board.
-        device: The device to perform tensor operations on ('cpu' or 'cuda').
+    Calculate per-move scores and probabilities, keeping gradients intact.
 
     Returns:
-        A tuple containing:
-        - A list of probabilities for each legal move, normalized via softmax.
-        - A tensor of the raw combined log-probabilities for each legal move.
+        probabilities (list[float]): Softmax over legal moves (detached for logging/sampling).
+        combined_log_probs (torch.Tensor): Raw combined log-scores for legal moves, shape (N,).
     """
     if not legal_moves:
         return [], torch.empty(0, device=device)
 
-    # Ensure policy tensors are 1D
-    log_policy_pos1 = log_policy_pos1.view(-1)
-    log_policy_pos2 = log_policy_pos2.view(-1)
-    log_policy_mark_capture = log_policy_mark_capture.view(-1)
+    log_policy_pos1 = log_policy_pos1.view(-1).to(device)
+    log_policy_pos2 = log_policy_pos2.view(-1).to(device)
+    log_policy_mark_capture = log_policy_mark_capture.view(-1).to(device)
 
-    combined_log_probs = []
-    
-    # ?    
-    move_types = []  # /
-
-    def flatten_index(r, c):
+    def flatten_index(r: int, c: int) -> int:
         return r * board_size + c
 
-    for move in legal_moves:
-        current_log_prob = 0.0
-        has_mark_capture = False  # /
+    scores: list[torch.Tensor] = []
+    zero = log_policy_pos1.new_zeros(())
+    neginf = log_policy_pos1.new_full((), float('-inf'))
 
+    for move in legal_moves:
         phase = move['phase']
         action_type = move['action_type']
+        score = neginf
 
         if phase == Phase.PLACEMENT and action_type == 'place':
             r, c = move['position']
-            current_log_prob += log_policy_pos1[flatten_index(r, c)].item()
-        
-        elif phase == Phase.MARK_SELECTION and action_type == 'mark':
-            has_mark_capture = True
-            r, c = move['position']
-            current_log_prob += log_policy_mark_capture[flatten_index(r, c)].item()
+            score = log_policy_pos1[flatten_index(r, c)]
 
         elif phase == Phase.MOVEMENT and action_type == 'move':
             r_from, c_from = move['from_position']
             r_to, c_to = move['to_position']
-            # 
-            current_log_prob += log_policy_pos1[flatten_index(r_from, c_from)].item()
-            current_log_prob += log_policy_pos2[flatten_index(r_to, c_to)].item()
+            score = log_policy_pos1[flatten_index(r_from, c_from)] + log_policy_pos2[flatten_index(r_to, c_to)]
+
+        elif phase == Phase.MARK_SELECTION and action_type == 'mark':
+            r, c = move['position']
+            score = log_policy_mark_capture[flatten_index(r, c)]
+
+        elif phase == Phase.CAPTURE_SELECTION and action_type == 'capture':
+            r, c = move['position']
+            score = log_policy_mark_capture[flatten_index(r, c)]
+
+        elif phase == Phase.MOVEMENT and action_type == 'no_moves_remove':
+            r, c = move['position']
+            score = log_policy_mark_capture[flatten_index(r, c)]
 
         elif phase == Phase.FORCED_REMOVAL and action_type == 'remove':
             r, c = move['position']
-            # Use pos1 for forced removal as it's a primary action at a location
-            current_log_prob += log_policy_pos1[flatten_index(r, c)].item()
-        
-        elif phase == Phase.REMOVAL and action_type == 'process_removal':
-            # This is typically the only move in this phase.
-            # Assign a neutral log probability (0.0) or a sum of all pos1 (needs thought).
-            # For now, if it's the only move, its probability will be 1.0 after softmax.
-            # If multiple moves were possible here, this would need refinement.
-            # Let's give it a base score; if other moves existed, they'd compete.
-            # A simple approach: sum of all log_policy_pos1, implies "any action is fine".
-            # This is a placeholder; often for such deterministic single moves, policy isn't strictly needed.
-            current_log_prob += 0.0 # Effectively neutral, relies on softmax for normalization if other moves existed.
-
-        elif phase == Phase.MOVEMENT and action_type == 'no_moves_remove':
-            has_mark_capture = True
-            r, c = move['position'] # Position of opponent's piece to remove
-            # Using mark_capture head as it's a removal action not part of a standard move sequence.
-            no_moves_remove_log_prob = log_policy_mark_capture[flatten_index(r, c)].item()
-            current_log_prob += no_moves_remove_log_prob
-        
-        elif phase == Phase.CAPTURE_SELECTION and action_type == 'capture':
-            has_mark_capture = True
-            r, c = move['position']
-            current_log_prob += log_policy_mark_capture[flatten_index(r, c)].item()
+            score = log_policy_mark_capture[flatten_index(r, c)]
 
         elif phase == Phase.COUNTER_REMOVAL and action_type == 'counter_remove':
             r, c = move['position']
-            # Counter removals mirror forced removals: use the primary position head
-            current_log_prob += log_policy_pos1[flatten_index(r, c)].item()
-        
-        else:
-            # Should not happen with current move generator if all cases are covered
-            print(f"Warning: Unhandled move type: Phase {phase}, Action {action_type}")
-            current_log_prob += -float('inf') # Penalize heavily
+            score = log_policy_mark_capture[flatten_index(r, c)]
 
-        combined_log_probs.append(current_log_prob)
-        move_types.append(has_mark_capture)
+        elif phase == Phase.REMOVAL and action_type == 'process_removal':
+            score = zero
 
-    if not combined_log_probs:  # Should be redundant due to earlier check
-        return [], torch.empty(0, device=device)
-    
-    # Convert to tensor for downstream processing
-    combined_log_probs_tensor = torch.tensor(combined_log_probs, dtype=torch.float32, device=device)
-    
-    # If there is only one legal move, its probability is 1.0
-    if len(legal_moves) == 1:
-        return [1.0], combined_log_probs_tensor
-    
-    # Optional adjustment: prevent all mark/capture moves from collapsing to near-zero probability
-    has_mark_capture_moves = any(move_types)
-    if has_mark_capture_moves:
-        orig_probs = torch.softmax(combined_log_probs_tensor, dim=0)
-        mark_capture_probs = [prob.item() for prob, has_mc in zip(orig_probs, move_types) if has_mc]
+        scores.append(score)
 
-        if mark_capture_probs and max(mark_capture_probs) < 0.001:
-            max_log_prob_no_mc = max(
-                [lp for lp, has_mc in zip(combined_log_probs, move_types) if not has_mc],
-                default=-float("inf"),
-            )
-            max_log_prob_mc = max(
-                [lp for lp, has_mc in zip(combined_log_probs, move_types) if has_mc],
-                default=-float("inf"),
-            )
-            adjustment = max(0.0, max_log_prob_no_mc - max_log_prob_mc - 1.0)
+    combined_log_probs = torch.stack(scores, dim=0)
 
-            adjusted_log_probs = [
-                lp + adjustment if has_mc else lp
-                for lp, has_mc in zip(combined_log_probs, move_types)
-            ]
-            combined_log_probs_tensor = torch.tensor(
-                adjusted_log_probs, dtype=torch.float32, device=device
-            )
+    if not torch.isfinite(combined_log_probs).any():
+        combined_log_probs = combined_log_probs.clone()
+        combined_log_probs[:] = 0.0
 
-    # Final normalized probabilities
-    probabilities = torch.softmax(combined_log_probs_tensor, dim=0).tolist()
-    
-    return probabilities, combined_log_probs_tensor
+    if combined_log_probs.numel() == 1:
+        return [1.0], combined_log_probs
+
+    probs = torch.softmax(combined_log_probs, dim=0)
+    return probs.detach().cpu().tolist(), combined_log_probs
 
 if __name__ == '__main__':
     board_size = GameState.BOARD_SIZE

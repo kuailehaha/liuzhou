@@ -9,6 +9,7 @@ from typing import List, Tuple, Dict, Any
 import random
 import argparse
 import shutil
+import json
 
 from src.game_state import GameState, Player, Phase
 from src.neural_network import ChessNet, state_to_tensor, NUM_INPUT_CHANNELS, get_move_probabilities
@@ -88,7 +89,7 @@ def train_network(
     weight_decay: float = 1e-4,
     device: str = 'cpu',
     board_size: int = GameState.BOARD_SIZE
-) -> ChessNet:
+) -> Tuple[ChessNet, Dict[str, Any]]:
     """
     使用生成的训练数据训练神经网络。
     
@@ -103,7 +104,7 @@ def train_network(
         board_size: 棋盘大小。
         
     Returns:
-        训练后的模型。
+        Tuple containing the trained model and a metrics dictionary with per-epoch loss statistics.
     """
     model.to(device)
     model.train()
@@ -120,11 +121,14 @@ def train_network(
     policy_loss_fn = nn.KLDivLoss(reduction='sum')
     
     # 训练循环
+    epoch_stats: List[Dict[str, Any]] = []
+
     for epoch in range(epochs):
-        total_loss_epoch = 0
-        policy_loss_epoch = 0
-        value_loss_epoch = 0
+        total_loss_epoch = 0.0
+        policy_loss_epoch = 0.0
+        value_loss_epoch = 0.0
         num_samples_processed = 0
+        total_valid_policy_samples = 0
         
         for batch_idx, (states_tensor_batch, batch_legal_moves, batch_target_policies, target_values_batch) in enumerate(dataloader):
             states_tensor_batch = states_tensor_batch.to(device)
@@ -203,25 +207,34 @@ def train_network(
             policy_loss_epoch += averaged_batch_policy_loss.item() * valid_policy_samples_in_batch
             value_loss_epoch += current_batch_value_loss.item() * states_tensor_batch.size(0) # MSE is already mean
             num_samples_processed += states_tensor_batch.size(0)
+            total_valid_policy_samples += valid_policy_samples_in_batch
         
         # 打印每个 epoch 的损失
         if num_samples_processed > 0 :
             avg_loss = total_loss_epoch / num_samples_processed
-            # For policy loss, average over samples where it was actually computed.
-            # The denominator for policy_loss_epoch accumulation was valid_policy_samples_in_batch.
-            # To get true average policy loss per sample in dataset:
-            # Need total sum of policy losses / total number of valid policy examples in epoch
-            # The current policy_loss_epoch is sum( (sum_kl_div_sample / num_valid_in_batch_i) * num_valid_in_batch_i ) = sum(sum_kl_div_sample)
-            # So, we need to count total_valid_policy_samples_in_epoch
-            total_valid_policy_samples_in_epoch_accumulator = 0 # This needs to be summed across batches
-            # Re-think epoch loss accumulation for proper average, for now, this is an approximation:
-            avg_policy_loss = policy_loss_epoch / num_samples_processed # Approximation if not all samples had policy loss
+            avg_policy_loss = policy_loss_epoch / total_valid_policy_samples if total_valid_policy_samples > 0 else 0.0
             avg_value_loss = value_loss_epoch / num_samples_processed
             print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}, Avg Policy Loss: {avg_policy_loss:.4f}, Avg Value Loss: {avg_value_loss:.4f}")
+            epoch_stats.append({
+                "epoch": epoch + 1,
+                "avg_loss": float(avg_loss),
+                "avg_policy_loss": float(avg_policy_loss),
+                "avg_value_loss": float(avg_value_loss),
+                "samples": int(num_samples_processed),
+                "valid_policy_samples": int(total_valid_policy_samples)
+            })
         else:
             print(f"Epoch {epoch+1}/{epochs}, No samples processed.")
+            epoch_stats.append({
+                "epoch": epoch + 1,
+                "avg_loss": None,
+                "avg_policy_loss": None,
+                "avg_value_loss": None,
+                "samples": 0,
+                "valid_policy_samples": 0
+            })
             
-    return model
+    return model, {"epoch_stats": epoch_stats}
 
 def train_pipeline(
     iterations: int = 10,
@@ -239,48 +252,39 @@ def train_pipeline(
     eval_games_vs_best: int = 20,
     win_rate_threshold: float = 0.55,
     mcts_sims_eval: int = 100,
-    checkpoint_dir: str = './checkpoints',
-    device: str = 'cpu'
+    checkpoint_dir: str = "./checkpoints",
+    device: str = "cpu"
 ) -> None:
     """
-    完整的训练流程。
-    
-    Args:
-        iterations: 训练迭代次数。
-        num_self_play_games: 每次迭代中自我对弈的游戏数量。
-        num_mcts_simulations: 每步 MCTS 的模拟次数。
-        batch_size: 训练批处理大小。
-        epochs: 每次迭代的训练轮数。
-        lr: 学习率。
-        weight_decay: 权重衰减。
-        temperature_init: 初始温度。
-        temperature_final: 最终温度。
-        temperature_threshold: 温度阈值。
-        exploration_weight: MCTS 探索权重。
-        eval_games_vs_random: 评估次数 vs RandomAgent。
-        eval_games_vs_best: 评估次数 vs BestModel。
-        win_rate_threshold: 获胜率阈值。
-        mcts_sims_eval: MCTS 模拟次数用于评估。
-        checkpoint_dir: 模型检查点保存目录。
-        device: 训练设备。
+    Complete training pipeline.
     """
-    # 创建检查点目录
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # 创建或加载模型
+
+    metrics: List[Dict[str, Any]] = []
+    metrics_path = os.path.join(checkpoint_dir, "training_metrics.json")
+
     board_size = GameState.BOARD_SIZE
     current_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
     current_model.to(device)
 
     best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
-    
-    # 训练迭代
+
     for iteration in range(iterations):
         print(f"\n{'='*20} Iteration {iteration+1}/{iterations} {'='*20}")
-        
-        # 1. 自我对弈生成训练数据
+
+        iter_start_time = time.perf_counter()
+        iteration_metrics: Dict[str, Any] = {
+            "iteration": iteration + 1,
+            "self_play_games_requested": num_self_play_games,
+            "mcts_simulations": num_mcts_simulations,
+            "epochs_requested": epochs,
+            "batch_size": batch_size,
+            "timestamp_start": time.time(),
+        }
+
         print(f"Self-play phase: generating {num_self_play_games} games using current model...")
-        current_model.eval() 
+        current_model.eval()
+        sp_start_time = time.perf_counter()
         training_data = self_play(
             model=current_model,
             num_games=num_self_play_games,
@@ -291,24 +295,30 @@ def train_pipeline(
             exploration_weight=exploration_weight,
             device=device
         )
-        
-        # 2. 准备训练数据
-        examples = []
+        self_play_time = time.perf_counter() - sp_start_time
+        training_data = training_data or []
+        num_games_generated = len(training_data)
+        iteration_metrics["self_play_time_sec"] = self_play_time
+        iteration_metrics["self_play_games_played"] = num_games_generated
+
+        examples: List[Tuple[GameState, np.ndarray, float]] = []
+        total_positions = 0
+        train_time = 0.0
+        train_metrics_data: Dict[str, Any] = {"epoch_stats": []}
+
         if not training_data:
             print("No training data generated from self-play. Skipping training for this iteration.")
         else:
             for game_states, game_policies, result in training_data:
                 for i, state in enumerate(game_states):
-                    if state.current_player == Player.WHITE:
-                        value = -result
-                    else:
-                        value = result
+                    value = -result if state.current_player == Player.WHITE else result
                     examples.append((state, game_policies[i], value))
-            
-            # 3. 训练神经网络
+                    total_positions += 1
+
             print(f"Training phase: {len(examples)} examples, {epochs} epochs...")
             current_model.train()
-            current_model = train_network(
+            train_start_time = time.perf_counter()
+            current_model, train_metrics_data = train_network(
                 model=current_model,
                 examples=examples,
                 batch_size=batch_size,
@@ -318,20 +328,36 @@ def train_pipeline(
                 device=device,
                 board_size=board_size
             )
+            train_time = time.perf_counter() - train_start_time
 
-        # 4. 保存当前迭代的模型
+        iteration_metrics["self_play_positions"] = total_positions
+        iteration_metrics["train_time_sec"] = train_time
+        iteration_metrics["train_examples"] = len(examples)
+        epoch_stats = list(train_metrics_data.get("epoch_stats", []))
+        iteration_metrics["train_epoch_stats"] = epoch_stats
+        if epoch_stats:
+            last_epoch_stats = epoch_stats[-1]
+            iteration_metrics["train_last_avg_loss"] = last_epoch_stats.get("avg_loss")
+            iteration_metrics["train_last_avg_policy_loss"] = last_epoch_stats.get("avg_policy_loss")
+            iteration_metrics["train_last_avg_value_loss"] = last_epoch_stats.get("avg_value_loss")
+        else:
+            iteration_metrics["train_last_avg_loss"] = None
+            iteration_metrics["train_last_avg_policy_loss"] = None
+            iteration_metrics["train_last_avg_value_loss"] = None
+
         iter_model_path = os.path.join(checkpoint_dir, f"model_iter_{iteration+1}.pt")
         torch.save({
-            'iteration': iteration + 1,
-            'model_state_dict': current_model.state_dict(),
-            'board_size': board_size,
-            'num_input_channels': NUM_INPUT_CHANNELS
+            "iteration": iteration + 1,
+            "model_state_dict": current_model.state_dict(),
+            "board_size": board_size,
+            "num_input_channels": NUM_INPUT_CHANNELS
         }, iter_model_path)
         print(f"Model for iteration {iteration+1} saved to {iter_model_path}")
+        iteration_metrics["checkpoint_path"] = iter_model_path
 
-        # 5. 评估当前模型
         print("\nEvaluation phase...")
         current_model.eval()
+        eval_start_time = time.perf_counter()
         challenger_agent = MCTSAgent(current_model, mcts_simulations=mcts_sims_eval, device=device)
         random_opponent = RandomAgent()
 
@@ -341,17 +367,21 @@ def train_pipeline(
         )
         print(f"Challenger win rate vs RandomAgent: {win_rate_vs_rnd:.2%}")
 
+        win_rate_vs_best_model = None
+        best_model_updated = False
+
         if win_rate_vs_rnd > win_rate_threshold:
             print(f"Challenger passed RandomAgent threshold ({win_rate_threshold:.0%}). Comparing to best model...")
             if not os.path.exists(best_model_path):
-                print(f"No existing best_model.pt. Current model becomes the best.")
+                print("No existing best_model.pt. Current model becomes the best.")
                 shutil.copy(iter_model_path, best_model_path)
                 print(f"Best model updated: {best_model_path}")
+                best_model_updated = True
             else:
-                print(f"Loading best_model.pt for comparison...")
+                print("Loading best_model.pt for comparison...")
                 best_model_checkpoint = torch.load(best_model_path, map_location=device)
                 best_model_eval = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
-                best_model_eval.load_state_dict(best_model_checkpoint['model_state_dict'])
+                best_model_eval.load_state_dict(best_model_checkpoint["model_state_dict"])
                 best_model_eval.to(device)
                 best_model_eval.eval()
                 
@@ -364,13 +394,33 @@ def train_pipeline(
                 print(f"Challenger win rate vs BestModel: {win_rate_vs_best_model:.2%}")
 
                 if win_rate_vs_best_model > win_rate_threshold:
-                    print(f"Challenger passed BestModel threshold. Updating best_model.pt.")
+                    print("Challenger passed BestModel threshold. Updating best_model.pt.")
                     shutil.copy(iter_model_path, best_model_path)
                     print(f"Best model updated: {best_model_path}")
+                    best_model_updated = True
                 else:
-                    print(f"Challenger did not surpass BestModel.")
+                    print("Challenger did not surpass BestModel.")
         else:
-            print(f"Challenger did not pass RandomAgent threshold.")
+            print("Challenger did not pass RandomAgent threshold.")
+
+        eval_time = time.perf_counter() - eval_start_time
+        iteration_metrics["eval_time_sec"] = eval_time
+        iteration_metrics["win_rate_vs_random"] = win_rate_vs_rnd
+        iteration_metrics["win_rate_vs_best"] = win_rate_vs_best_model
+        iteration_metrics["best_model_updated"] = best_model_updated
+        iteration_metrics["win_rate_threshold"] = win_rate_threshold
+
+        total_iter_time = time.perf_counter() - iter_start_time
+        iteration_metrics["iteration_time_sec"] = total_iter_time
+        iteration_metrics["timestamp_end"] = time.time()
+        metrics.append(iteration_metrics)
+
+        print(f"[Iteration {iteration+1}] Timing summary -> total={total_iter_time:.2f}s | self_play={self_play_time:.2f}s | train={train_time:.2f}s | eval={eval_time:.2f}s")
+        print(f"[Iteration {iteration+1}] Generated {num_games_generated} games with {total_positions} positions; training examples={len(examples)}.")
+
+    with open(metrics_path, "w", encoding="utf-8") as metrics_file:
+        json.dump(metrics, metrics_file, indent=2, ensure_ascii=False)
+    print(f"Iteration metrics written to {metrics_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a chess AI using AlphaZero-style self-play.")
