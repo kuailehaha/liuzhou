@@ -10,6 +10,7 @@ import random
 import argparse
 import shutil
 import json
+from datetime import datetime, timedelta
 
 from src.game_state import GameState, Player, Phase
 from src.neural_network import ChessNet, state_to_tensor, NUM_INPUT_CHANNELS, get_move_probabilities
@@ -17,6 +18,51 @@ from src.mcts import self_play
 from src.evaluate import MCTSAgent, RandomAgent, evaluate_against_agent
 from src.random_agent import RandomAgent
 from src.move_generator import MoveType, generate_all_legal_moves
+
+
+def _format_eta(seconds: float) -> str:
+    """
+    Convert seconds to a HH:MM:SS string; fallback to 'unknown' when no data.
+    """
+    if seconds is None or seconds <= 0:
+        return "unknown"
+    seconds = int(max(0, seconds))
+    return str(timedelta(seconds=seconds))
+
+
+def _stage_banner(
+    stage_key: str,
+    label: str,
+    iteration: int,
+    total_iterations: int,
+    history: Dict[str, List[float]]
+) -> None:
+    """
+    Print a timestamped banner indicating the stage has started and its ETA.
+    """
+    now_text = datetime.now().strftime("%H:%M:%S")
+    past = history.get(stage_key) or []
+    eta_text = "collecting data..."
+    if past:
+        avg_duration = sum(past) / len(past)
+        eta_text = _format_eta(avg_duration)
+    print(f"[{now_text}] Iteration {iteration+1}/{total_iterations} - {label} started (ETA ~ {eta_text})")
+
+
+def _stage_finish(
+    stage_key: str,
+    label: str,
+    start_time: float,
+    history: Dict[str, List[float]]
+) -> float:
+    """
+    Record the duration of a stage, update its history, and print the result.
+    """
+    duration = time.perf_counter() - start_time
+    history.setdefault(stage_key, []).append(duration)
+    now_text = datetime.now().strftime("%H:%M:%S")
+    print(f"[{now_text}] {label} finished in {_format_eta(duration)}")
+    return duration
 
 class ChessDataset(Dataset):
     """
@@ -262,6 +308,11 @@ def train_pipeline(
 
     metrics: List[Dict[str, Any]] = []
     metrics_path = os.path.join(checkpoint_dir, "training_metrics.json")
+    stage_history: Dict[str, List[float]] = {
+        "self_play": [],
+        "train": [],
+        "eval": [],
+    }
 
     board_size = GameState.BOARD_SIZE
     current_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
@@ -282,7 +333,9 @@ def train_pipeline(
             "timestamp_start": time.time(),
         }
 
-        print(f"Self-play phase: generating {num_self_play_games} games using current model...")
+        self_play_label = "Self-play phase"
+        _stage_banner("self_play", self_play_label, iteration, iterations, stage_history)
+        print(f"{self_play_label}: generating {num_self_play_games} games using current model...")
         current_model.eval()
         sp_start_time = time.perf_counter()
         training_data = self_play(
@@ -295,19 +348,23 @@ def train_pipeline(
             exploration_weight=exploration_weight,
             device=device
         )
-        self_play_time = time.perf_counter() - sp_start_time
         training_data = training_data or []
         num_games_generated = len(training_data)
+        self_play_time = _stage_finish("self_play", self_play_label, sp_start_time, stage_history)
         iteration_metrics["self_play_time_sec"] = self_play_time
         iteration_metrics["self_play_games_played"] = num_games_generated
 
         examples: List[Tuple[GameState, np.ndarray, float]] = []
         total_positions = 0
-        train_time = 0.0
         train_metrics_data: Dict[str, Any] = {"epoch_stats": []}
+
+        train_label = "Training phase"
+        _stage_banner("train", train_label, iteration, iterations, stage_history)
+        train_start_time = time.perf_counter()
 
         if not training_data:
             print("No training data generated from self-play. Skipping training for this iteration.")
+            train_time = _stage_finish("train", train_label, train_start_time, stage_history)
         else:
             for game_states, game_policies, result in training_data:
                 for i, state in enumerate(game_states):
@@ -315,9 +372,8 @@ def train_pipeline(
                     examples.append((state, game_policies[i], value))
                     total_positions += 1
 
-            print(f"Training phase: {len(examples)} examples, {epochs} epochs...")
+            print(f"{train_label}: {len(examples)} examples, {epochs} epochs...")
             current_model.train()
-            train_start_time = time.perf_counter()
             current_model, train_metrics_data = train_network(
                 model=current_model,
                 examples=examples,
@@ -328,7 +384,7 @@ def train_pipeline(
                 device=device,
                 board_size=board_size
             )
-            train_time = time.perf_counter() - train_start_time
+            train_time = _stage_finish("train", train_label, train_start_time, stage_history)
 
         iteration_metrics["self_play_positions"] = total_positions
         iteration_metrics["train_time_sec"] = train_time
@@ -356,6 +412,8 @@ def train_pipeline(
         iteration_metrics["checkpoint_path"] = iter_model_path
 
         print("\nEvaluation phase...")
+        eval_label = "Evaluation phase"
+        _stage_banner("eval", eval_label, iteration, iterations, stage_history)
         current_model.eval()
         eval_start_time = time.perf_counter()
         challenger_agent = MCTSAgent(current_model, mcts_simulations=mcts_sims_eval, device=device)
@@ -403,7 +461,7 @@ def train_pipeline(
         else:
             print("Challenger did not pass RandomAgent threshold.")
 
-        eval_time = time.perf_counter() - eval_start_time
+        eval_time = _stage_finish("eval", eval_label, eval_start_time, stage_history)
         iteration_metrics["eval_time_sec"] = eval_time
         iteration_metrics["win_rate_vs_random"] = win_rate_vs_rnd
         iteration_metrics["win_rate_vs_best"] = win_rate_vs_best_model
