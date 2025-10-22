@@ -109,31 +109,32 @@ class MCTSNode:
 
     def get_best_child(self, exploration_weight: float = 1.0) -> "MCTSNode":
         """
-        使用 PUCT 公式选择最佳子节点。
-        PUCT = Q(s,a) + U(s,a)
-        其中 Q(s,a) 是节点的平均价值，U(s,a) 是探索项。
+        使用 PUCT 公式选择最佳子节点：
+          PUCT = Q(s,a) + c_puct * P(s,a) * sqrt(N_parent) / (1 + N(s,a))
+        其中：
+          - Q(s,a) = child.value() = value_sum / visit_count（根执手视角）
+          - P(s,a) = child.prior（先验概率，根处可能含Dirichlet）
+          - N_parent = max(1, self.visit_count)  # 防止首轮 sqrt(0)
+          - N(s,a) = child.visit_count
         """
         if not self.children:
             raise ValueError("Node has no children")
 
-        # 计算所有子节点的 PUCT 值
-        puct_values = []
-        for child in self.children:
-            # 计算探索项
-            # U(s,a) = c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
-            # 其中 c_puct 是探索权重，P(s,a) 是先验概率，N(s) 是父节点的访问次数，N(s,a) 是子节点的访问次数
-            exploration = (
-                exploration_weight
-                * child.prior
-                * math.sqrt(self.visit_count)
-                / (1 + child.visit_count)
-            )
-            # PUCT = Q(s,a) + U(s,a)
-            puct = child.value() + exploration
-            puct_values.append(puct)
+        parent_N = max(1, self.visit_count)
 
-        # 返回 PUCT 值最大的子节点
-        return self.children[np.argmax(puct_values)]
+        best_child = None
+        best_score = -float("inf")
+
+        for child in self.children:
+            Q = child.value()                 # 平均价值（根执手视角）
+            P = child.prior                   # 先验
+            U = exploration_weight * P * math.sqrt(parent_N) / (1 + child.visit_count)
+            puct = Q + U
+            if puct > best_score:
+                best_score = puct
+                best_child = child
+
+        return best_child
 
     def get_visit_count_policy(self) -> Tuple[List[MoveType], np.ndarray]:
         """
@@ -180,104 +181,78 @@ class MCTS:
 
     def search(self, state: GameState) -> Tuple[List[MoveType], np.ndarray]:
         """
-        执行蒙特卡洛树搜索，返回基于访问次数的策略。
+        执行 AlphaZero 式 MCTS，返回基于访问次数的策略（根执手视角）。
         """
-        # 创建根节点
+        # 1) 建根并先扩展/评估一次（拿到先验与价值）
         root = MCTSNode(state)
-
-        # 初始化统计字典：{move: {"black": 0, "white": 0, "draw": 0}}
-        move_result_stats = {}
-        # 先扩展根节点，获得所有第一步着法
         if not root.is_fully_expanded():
             self._expand_and_evaluate(root)
-        for child in root.children:
-            move_key = move_to_key(child.move)
-            move_result_stats[move_key] = {"black": 0, "white": 0, "draw": 0}
+
+        # 若已是终局（或无合法着法在 _expand_and_evaluate 中被判终局），直接返回空
+        if root.is_terminal() or not root.children:
+            return [], np.array([], dtype=float)
 
         root_player = root.state.current_player
-        opponent_player = root_player.opponent()
 
-        # 执行指定次数的模拟
+        # 2) 进行指定次数的模拟
         for _ in range(self.num_simulations):
             path = [root]
             node = root
-            # 选择叶节点并记录路径
+
+            # selection：按 PUCT 向下走到叶子
             while node.is_fully_expanded() and not node.is_terminal():
                 node = node.get_best_child(self.exploration_weight)
                 path.append(node)
+
             leaf = node
-            # 如果叶节点不是终局节点，则扩展并评估
+
+            # expansion + evaluation：扩展并用网络估值（非终局）
             if not leaf.is_terminal():
                 value_estimate = self._expand_and_evaluate(leaf)
-                if leaf.is_terminal():
-                    terminal_value = leaf.terminal_value
-                else:
-                    terminal_value = value_estimate
+                # 回传（leaf 可能在扩展时判成了终局，但 backpropagate 一样成立）
+                leaf.backpropagate(value_estimate if not leaf.is_terminal() else leaf.terminal_value)
             else:
-                terminal_value = leaf.terminal_value
-            # 反向传播
-            if not leaf.is_terminal():
-                leaf.backpropagate(value_estimate)
-            else:
+                # 已是终局，直接回传终局值
                 leaf.backpropagate(leaf.terminal_value)
-            # 统计：只统计第一步着法
-            if len(path) > 1:
-                first_child = path[1]
-                move_key = move_to_key(first_child.move)
 
-                depth = len(path) - 1  # number of moves simulated
-                sign = -1 if depth % 2 == 1 else 1
-                root_value = terminal_value * sign
+        # 3) 基于访问次数得到根策略（分母保护）
+        moves = [child.move for child in root.children]
+        visit_counts = np.array([child.visit_count for child in root.children], dtype=float)
+        total = visit_counts.sum()
+        if total <= 0:
+            policy = np.ones_like(visit_counts) / len(visit_counts)
+        else:
+            policy = visit_counts / total
 
-                if root_value > 0:
-                    winner = root_player
-                    key = "black" if winner == Player.BLACK else "white"
-                    move_result_stats[move_key][key] += 1
-                elif root_value < 0:
-                    winner = opponent_player
-                    key = "black" if winner == Player.BLACK else "white"
-                    move_result_stats[move_key][key] += 1
-                else:
-                    move_result_stats[move_key]["draw"] += 1
-        # 根据访问次数生成策略
-        moves, policy = root.get_visit_count_policy()
-        # 应用温度
+        # 4) 温度（需要时）
         if self.temperature != 1.0:
             policy = np.power(policy, 1.0 / self.temperature)
-            policy /= np.sum(policy)  # 重新归一化
-        # 打印统计结果
-        print(
-            f"\n===== MCTS模拟统计（根节点执手: {root_player.name}, 候选动作 {len(moves)} 个） ====="
-        )
-        best_black = (None, 0)
-        best_white = (None, 0)
-        for idx, move in enumerate(moves, start=1):
-            move_key = move_to_key(move)
-            stats = move_result_stats.get(move_key, {"black": 0, "white": 0, "draw": 0})
-            total = stats["black"] + stats["white"] + stats["draw"]
-            black_rate = stats["black"] / total if total > 0 else 0
-            white_rate = stats["white"] / total if total > 0 else 0
-            print(
-                f"[候选 {idx}] 着法: {move}\n"
-                f"  黑方胜: {stats['black']}, 白方胜: {stats['white']}, 平局: {stats['draw']} "
-                f"(黑胜率: {black_rate:.3f}, 白胜率: {white_rate:.3f})"
-            )
-            if black_rate > best_black[1]:
-                best_black = (move, black_rate)
-            if white_rate > best_white[1]:
-                best_white = (move, white_rate)
-        print(f"\n黑胜率最高着法: {best_black[0]}, 胜率: {best_black[1]:.3f}")
-        print(f"白胜率最高着法: {best_white[0]}, 胜率: {best_white[1]:.3f}")
-        print("====================================\n")
-        return moves, policy
+            policy /= policy.sum()
 
-    def _select(self, node: MCTSNode) -> MCTSNode:
-        """
-        从根节点开始，根据 PUCT 公式选择子节点，直到达到叶节点。
-        """
-        while node.is_fully_expanded() and not node.is_terminal():
-            node = node.get_best_child(self.exploration_weight)
-        return node
+        # 5) 诊断打印：Q/N/P/U/PUCT + policy 排名
+        print(f"\n===== MCTS 诊断（根执手: {root_player.name}, 候选 {len(root.children)} 个） =====")
+        parent_N = max(1, root.visit_count)  # 与选择时保持一致
+        rows = []
+        for idx, child in enumerate(root.children, start=1):
+            Q = child.value()
+            N = child.visit_count
+            P = child.prior
+            U = self.exploration_weight * P * math.sqrt(parent_N) / (1 + N)
+            puct = Q + U
+            rows.append((idx, child.move, N, Q, P, U, puct))
+        rows.sort(key=lambda r: r[2], reverse=True)
+        for idx, mv, N, Q, P, U, puct in rows:
+            print(f"[{idx:02d}] N={N:4d} | Q={Q:+.3f} | P={P:.3f} | U={U:.3f} | Q+U={puct:+.3f} | move={mv}")
+
+        print("\nPolicy (from visit counts):")
+        sorted_idx = np.argsort(policy)[::-1]
+        topk = min(10, len(sorted_idx))
+        for rank in range(topk):
+            i = sorted_idx[rank]
+            print(f"  #{rank+1:02d} π={policy[i]:.3f}  move={moves[i]}")
+        print("====================================\n")
+
+        return moves, policy
 
     def _expand_and_evaluate(self, node: MCTSNode) -> float:
         """

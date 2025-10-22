@@ -1,0 +1,102 @@
+[
+  {
+    "iteration": 1,
+    "self_play_games_requested": 1,
+    "mcts_simulations": 300,
+    "epochs_requested": 3,
+    "batch_size": 128,
+    "timestamp_start": 1761112213.6203501,
+    "self_play_time_sec": 721.2294905000017,
+    "self_play_games_played": 1,
+    "self_play_positions": 501,
+    "train_time_sec": 17.389190300018527,
+    "train_examples": 501,
+    "train_epoch_stats": [
+      {
+        "epoch": 1,
+        "avg_loss": 1.4778106281619348,
+        "avg_policy_loss": 1.4616807175729565,
+        "avg_value_loss": 0.016129935129606972,
+        "samples": 501,
+        "valid_policy_samples": 501
+      },
+      {
+        "epoch": 2,
+        "avg_loss": 1.21610850369383,
+        "avg_policy_loss": 1.2149140342266973,
+        "avg_value_loss": 0.0011944426525711358,
+        "samples": 501,
+        "valid_policy_samples": 501
+      },
+      {
+        "epoch": 3,
+        "avg_loss": 1.1110979994376025,
+        "avg_policy_loss": 1.1104430931057045,
+        "avg_value_loss": 0.000654936926994759,
+        "samples": 501,
+        "valid_policy_samples": 501
+      }
+    ],
+    "train_last_avg_loss": 1.1110979994376025,
+    "train_last_avg_policy_loss": 1.1104430931057045,
+    "train_last_avg_value_loss": 0.000654936926994759,
+    "checkpoint_path": "./checkpoints_eval_run\\model_iter_1.pt",
+    "eval_time_sec": 147.25114189999294,
+    "win_rate_vs_random": 0.25,
+    "win_rate_vs_best": null,
+    "best_model_updated": false,
+    "win_rate_threshold": 0.55,
+    "iteration_time_sec": 885.9322004999849,
+    "timestamp_end": 1761113099.5525568
+  },
+  {
+    "iteration": 2,
+    "self_play_games_requested": 1,
+    "mcts_simulations": 300,
+    "epochs_requested": 3,
+    "batch_size": 128,
+    "timestamp_start": 1761113099.5525854,
+    "self_play_time_sec": 818.3057341999956,
+    "self_play_games_played": 1,
+    "self_play_positions": 481,
+    "train_time_sec": 7.14028990000952,
+    "train_examples": 481,
+    "train_epoch_stats": [
+      {
+        "epoch": 1,
+        "avg_loss": 2.8793006562889243,
+        "avg_policy_loss": 2.0088892007815864,
+        "avg_value_loss": 0.8704114593488015,
+        "samples": 481,
+        "valid_policy_samples": 481
+      },
+      {
+        "epoch": 2,
+        "avg_loss": 2.182365669777884,
+        "avg_policy_loss": 1.81936041951923,
+        "avg_value_loss": 0.36300523523357453,
+        "samples": 481,
+        "valid_policy_samples": 481
+      },
+      {
+        "epoch": 3,
+        "avg_loss": 1.8115850570543888,
+        "avg_policy_loss": 1.6926054989225898,
+        "avg_value_loss": 0.11897954118598772,
+        "samples": 481,
+        "valid_policy_samples": 481
+      }
+    ],
+    "train_last_avg_loss": 1.8115850570543888,
+    "train_last_avg_policy_loss": 1.6926054989225898,
+    "train_last_avg_value_loss": 0.11897954118598772,
+    "checkpoint_path": "./checkpoints_eval_run\\model_iter_2.pt",
+    "eval_time_sec": 104.08859309999389,
+    "win_rate_vs_random": 0.35,
+    "win_rate_vs_best": null,
+    "best_model_updated": false,
+    "win_rate_threshold": 0.55,
+    "iteration_time_sec": 929.5563720999926,
+    "timestamp_end": 1761114029.1089585
+  }
+]
