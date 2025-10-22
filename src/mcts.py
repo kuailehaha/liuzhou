@@ -185,101 +185,6 @@ class MCTS:
         self.verbose = verbose
         self.root: Optional[MCTSNode] = None
         self.last_profile: Dict[str, Any] = {}
-        self._reset_profile_counters()
-
-    def _reset_profile_counters(self) -> None:
-        self._profile_forward_batches = 0
-        self._profile_forward_samples = 0
-        self._profile_forward_time = 0.0
-
-    # def search(self, state: GameState) -> Tuple[List[MoveType], np.ndarray]:
-    #     """
-    #     执行 AlphaZero 式 MCTS，返回基于访问次数的策略（根执手视角）。
-    #     支持 root 复用（若 self.root 与 state 匹配则复用）与 verbose 诊断打印。
-    #     """
-    #     # ========== 1) 建立或复用根节点 ==========
-    #     if getattr(self, "root", None) is None or not self._same_state(self.root.state, state):
-    #         root = MCTSNode(state)
-    #         if not root.is_fully_expanded():
-    #             self._expand_and_evaluate(root)
-    #         self.root = root
-    #     else:
-    #         root = self.root
-
-    #     if not root.is_fully_expanded():
-    #         self._expand_and_evaluate(root)
-
-    #     # 若已是终局（或无合法着法在 _expand_and_evaluate 中被判终局），直接返回空
-    #     if root.is_terminal() or not root.children:
-    #         return [], np.array([], dtype=float)
-
-    #     root_player = root.state.current_player
-
-    #     # ========== 2) 进行指定次数的模拟 ==========
-    #     for sim in range(self.num_simulations):
-    #         path = [root]
-    #         node = root
-
-    #         # selection：按 PUCT 向下走到叶子
-    #         while node.is_fully_expanded() and not node.is_terminal():
-    #             node = node.get_best_child(self.exploration_weight)
-    #             path.append(node)
-
-    #         leaf = node
-
-    #         # expansion + evaluation：扩展并用网络估值（非终局）
-    #         if not leaf.is_terminal():
-    #             value_estimate = self._expand_and_evaluate(leaf)
-    #             # 回传（leaf 可能在扩展时判成了终局，但 backpropagate 一样成立）
-    #             leaf.backpropagate(value_estimate if not leaf.is_terminal() else leaf.terminal_value)
-    #         else:
-    #             # 已是终局，直接回传终局值
-    #             leaf.backpropagate(leaf.terminal_value)
-
-    #     # ========== 3) 基于访问次数得到根策略（分母保护） ==========
-    #     moves = [child.move for child in root.children]
-    #     visit_counts = np.array([child.visit_count for child in root.children], dtype=float)
-    #     total = visit_counts.sum()
-    #     if total <= 0:
-    #         policy = np.ones_like(visit_counts) / len(visit_counts)
-    #     else:
-    #         policy = visit_counts / total
-
-    #     # ========== 4) 温度（需要时） ==========
-    #     if self.temperature != 1.0:
-    #         policy = np.power(policy, 1.0 / self.temperature)
-    #         policy /= policy.sum()
-
-    #     # ========== 5) verbose 模式：打印诊断信息 ==========
-    #     if self.verbose:
-    #         print(f"\n===== MCTS 诊断（根执手: {root_player.name}, 候选 {len(root.children)} 个） =====")
-    #         parent_N = max(1, root.visit_count)  # 与选择时保持一致
-
-    #         rows = []
-    #         for idx, child in enumerate(root.children, start=1):
-    #             Q = child.value()
-    #             N = child.visit_count
-    #             P = child.prior
-    #             U = self.exploration_weight * P * math.sqrt(parent_N) / (1 + N)
-    #             puct = Q + U
-    #             rows.append((idx, child.move, N, Q, P, U, puct))
-
-    #         # 按访问次数排序，方便观察主要分支
-    #         rows.sort(key=lambda r: r[2], reverse=True)
-
-    #         for idx, mv, N, Q, P, U, puct in rows:
-    #             print(f"[{idx:02d}] N={N:4d} | Q={Q:+.3f} | P={P:.3f} | U={U:.3f} | Q+U={puct:+.3f} | move={mv}")
-
-    #         print("\nPolicy (from visit counts):")
-    #         sorted_idx = np.argsort(policy)[::-1]
-    #         topk = min(10, len(sorted_idx))
-    #         for rank in range(topk):
-    #             i = sorted_idx[rank]
-    #             print(f"  #{rank+1:02d} π={policy[i]:.3f}  move={moves[i]}")
-    #         print("====================================\n")
-
-    #     # ========== 6) 返回结果 ==========
-    #     return moves, policy
 
     def search(self, state: GameState) -> Tuple[List[MoveType], np.ndarray]:
         """
@@ -303,7 +208,6 @@ class MCTS:
         if root.is_terminal() or not root.children:
             return [], np.array([], dtype=float)
 
-        self._reset_profile_counters()
 
         root_player = root.state.current_player
         sims_done = 0
@@ -476,68 +380,7 @@ class MCTS:
         self.root = None
 
 
-    # def _expand_and_evaluate(self, node: MCTSNode) -> float:
-    #     """
-    #     扩展节点并使用神经网络评估其价值。
-    #     """
-    #     # 获取当前状态的所有合法动作
-    #     # 检查是否游戏已结束
-    #     if node.state.is_game_over():
-    #         winner = node.state.get_winner()
-    #         if winner is None:
-    #             value = 0.0
-    #         else:
-    #             value = 1.0 if winner == node.player_to_act else -1.0
-    #         node.set_terminal(value)
-    #         return value
-
-    #     legal_moves = generate_all_legal_moves(node.state)
-
-    #     # 如果没有合法动作，则从规则上视为当前玩家失败
-    #     if not legal_moves:
-    #         node.set_terminal(-1.0)
-    #         return -1.0
-
-    #     # 使用神经网络评估当前状态
-    #     with torch.no_grad():
-    #         # 将状态转换为张量
-    #         input_tensor = state_to_tensor(node.state, node.player_to_act).to(
-    #             self.device
-    #         )
-    #         # 获取神经网络的输出
-    #         log_p1, log_p2, log_pmc, value = self.model(input_tensor)
-    #         # 将对数概率转换为概率
-    #         log_p1 = log_p1.squeeze(0)
-    #         log_p2 = log_p2.squeeze(0)
-    #         log_pmc = log_pmc.squeeze(0)
-
-    #         # 获取每个合法动作的概率
-    #         # move_probs 是 softmax 后的概率， raw_log_probs 是 softmax 前的原始分数
-    #         move_probs, _ = (
-    #             get_move_probabilities(  # _ placeholder for raw_log_probs as we don't need it here now
-    #                 log_p1,
-    #                 log_p2,
-    #                 log_pmc,
-    #                 legal_moves,
-    #                 node.state.BOARD_SIZE,
-    #                 self.device,
-    #             )
-    #         )
-
-    #     # 如果是根节点且启用了Dirichlet噪声，混合探索噪声
-    #     if self.add_dirichlet_noise and node.parent is None:
-    #         noise = np.random.dirichlet([self.dirichlet_alpha] * len(move_probs))
-    #         move_probs = (1 - self.dirichlet_epsilon) * np.array(
-    #             move_probs
-    #         ) + self.dirichlet_epsilon * noise
-    #         move_probs = (move_probs / move_probs.sum()).tolist()
-
-    #     # 扩展节点
-    #     node.expand(legal_moves, move_probs)
-
-    #     # 返回神经网络评估值，但保持 visit_count 和 value_sum 为 0，
-    #     # 让 backpropagate 负责第一次更新
-    #     return value.item()
+    
     def _expand_and_evaluate(self, node: MCTSNode) -> float:
         """
         单节点扩展 + 评估：

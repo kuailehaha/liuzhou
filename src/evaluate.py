@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from src.game_state import GameState, Player, Phase
 from src.move_generator import generate_all_legal_moves, apply_move, MoveType
@@ -9,19 +9,34 @@ from src.mcts import MCTS
 from src.random_agent import RandomAgent
 
 class MCTSAgent:
-    """使用 MCTS 和神经网络模型选择动作的智能体。"""
-    def __init__(self, model: ChessNet, mcts_simulations: int, temperature: float = 0.1, device: str = 'cpu'):
+    """?? MCTS ????????????????"""
+
+    def __init__(
+        self,
+        model: ChessNet,
+        mcts_simulations: int,
+        temperature: float = 0.05,
+        device: str = "cpu",
+        add_dirichlet_noise: bool = False,
+        verbose: bool = False,
+        mcts_verbose: Optional[bool] = None,
+    ):
         self.model = model
-        self.model.eval() # 确保模型处于评估模式
+        self.model.eval()  # ??????????
         self.mcts_simulations = mcts_simulations
-        self.temperature = temperature # 评估时通常使用较低的温度以选择最佳动作
+        self.temperature = temperature  # ???????????????????
         self.device = device
+        self.verbose = verbose
+        if mcts_verbose is None:
+            mcts_verbose = verbose
         self.mcts = MCTS(
             model=self.model,
             num_simulations=self.mcts_simulations,
-            exploration_weight=1.0, # MCTS中的标准探索权重
-            temperature=self.temperature, # MCTS内部也使用温度，这里保持一致
-            device=self.device
+            exploration_weight=1.0,  # MCTS????????
+            temperature=self.temperature,
+            device=self.device,
+            add_dirichlet_noise=add_dirichlet_noise,
+            verbose=mcts_verbose,
         )
 
     def select_move(self, state: GameState) -> MoveType:
@@ -37,23 +52,21 @@ class MCTSAgent:
         
         # 在评估时，通常选择概率最高的动作
         move_idx = np.argmax(policy)
-        return moves[move_idx]
+        chosen_move = moves[move_idx]
+        self.mcts.advance_root(chosen_move)
+        return chosen_move
 
-def play_single_game(agent_black, agent_white, initial_state: GameState = None, max_moves: int = 200) -> float:
-    """
-    在两个智能体之间进行单局游戏。
-
-    Args:
-        agent_black: 控制黑方的智能体。
-        agent_white: 控制白方的智能体。
-        initial_state: 初始游戏状态，如果为None，则从默认状态开始。
-        max_moves: 游戏最大步数，防止无限循环。
-
-    Returns:
-        1.0 如果黑方胜，-1.0 如果白方胜，0.0 如果平局。
-    """
+def play_single_game(
+    agent_black,
+    agent_white,
+    initial_state: GameState = None,
+    max_moves: int = 200,
+    verbose: bool = False,
+) -> float:
+    """???????????????"""
     state = initial_state if initial_state else GameState()
     move_count = 0
+    log = print if verbose else (lambda *args, **kwargs: None)
 
     while move_count < max_moves:
         current_player = state.current_player
@@ -61,23 +74,14 @@ def play_single_game(agent_black, agent_white, initial_state: GameState = None, 
 
         legal_moves = generate_all_legal_moves(state)
         if not legal_moves:
-            # 当前玩家没有合法走法，判负
-            print(f"Game ended: Player {current_player} has no legal moves.")
+            log(f"Game ended: Player {current_player} has no legal moves.")
             return -1.0 if current_player == Player.BLACK else 1.0
 
         try:
             selected_move = active_agent.select_move(state)
-        except ValueError: # 如果智能体内部无法选择动作（例如 RandomAgent 在无棋可走时）
-            print(f"Game ended: Agent for {current_player} could not select a move.")
+        except ValueError:
+            log(f"Game ended: Agent for {current_player} could not select a move.")
             return -1.0 if current_player == Player.BLACK else 1.0
-        
-        # （可选）验证所选动作是否合法 - 通常智能体应该只选择合法动作
-        # is_move_in_legal_list = any(selected_move == lm for lm in legal_moves)
-        # if not is_move_in_legal_list:
-        #     print(f"Error: Agent for {current_player} selected an ILLEGAL move!")
-        #     print(f"Selected: {selected_move}")
-        #     print(f"Legal moves: {legal_moves}")
-        #     return -1.0 if current_player == Player.BLACK else 1.0 # 判非法操作方负
 
         state = apply_move(state, selected_move)
         move_count += 1
@@ -85,55 +89,43 @@ def play_single_game(agent_black, agent_white, initial_state: GameState = None, 
         winner = state.get_winner()
         if winner is not None:
             return 1.0 if winner == Player.BLACK else -1.0 if winner == Player.WHITE else 0.0
-    
-    # print(f"Game ended: Reached max moves ({max_moves}).")
-    return 0.0 # 达到最大步数，平局
+
+    return 0.0
 
 def evaluate_against_agent(
-    challenger_agent, # 通常是新训练的模型 MCTS Agent
-    opponent_agent,   # RandomAgent 或 BestModel MCTS Agent
+    challenger_agent,
+    opponent_agent,
     num_games: int,
-    device: str # challenger_agent 可能需要device
+    device: str,
+    verbose: bool = False,
+    game_verbose: Optional[bool] = None,
 ) -> float:
-    """
-    评估 challenger_agent 相对于 opponent_agent 的胜率。
-    双方轮流执黑。
-
-    Args:
-        challenger_agent: 挑战者智能体。
-        opponent_agent: 对手智能体。
-        num_games: 对弈的总局数 (必须是偶数，以保证双方执黑次数相同)。
-        device: challenger_agent 可能需要的设备。
-
-    Returns:
-        challenger_agent 的胜率。
-    """
+    """?? challenger_agent ??? opponent_agent ????"""
+    log = print if verbose else (lambda *args, **kwargs: None)
     if num_games % 2 != 0:
-        print("Warning: num_games for evaluation should be even for fair comparison. Adjusting...")
-        num_games_original = num_games  # 保存原始值
-        num_games = max(2, (num_games // 2) * 2) # 确保至少是2局偶数
-        if num_games == 0 and num_games_original > 0 : num_games = 2 # Handle original 1 game case
+        adjusted = max(2, (num_games // 2) * 2)
+        if adjusted == 0 and num_games > 0:
+            adjusted = 2
+        log("Warning: num_games for evaluation should be even for fair comparison. Adjusting...")
+        num_games = adjusted
+
+    if game_verbose is None:
+        game_verbose = verbose
 
     challenger_wins = 0.0
 
     for i in range(num_games):
-        print(f"  Playing evaluation game {i + 1}/{num_games}...")
+        log(f"  Playing evaluation game {i + 1}/{num_games}...")
         if i < num_games / 2:
-            # Challenger is Black
-            # print(f"    Challenger (Black) vs Opponent (White)")
-            result = play_single_game(challenger_agent, opponent_agent)
-            if result == 1.0: # Challenger (Black) won
+            result = play_single_game(challenger_agent, opponent_agent, verbose=game_verbose)
+            if result == 1.0:
                 challenger_wins += 1
         else:
-            # Challenger is White
-            # print(f"    Opponent (Black) vs Challenger (White)")
-            result = play_single_game(opponent_agent, challenger_agent)
-            if result == -1.0: # Challenger (White) won
+            result = play_single_game(opponent_agent, challenger_agent, verbose=game_verbose)
+            if result == -1.0:
                 challenger_wins += 1
-        # print(f"    Game {i+1} result for challenger: {result if i < num_games / 2 else -result}")
-            
-    if num_games == 0: return 0.0
-    return challenger_wins / num_games
+
+    return 0.0 if num_games == 0 else challenger_wins / num_games
 
 if __name__ == '__main__':
     # 简单测试评估流程

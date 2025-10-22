@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 import random
 import argparse
 import shutil
@@ -299,7 +299,8 @@ def train_pipeline(
     win_rate_threshold: float = 0.55,
     mcts_sims_eval: int = 100,
     checkpoint_dir: str = "./checkpoints",
-    device: str = "cpu"
+    device: str = "cpu",
+    runtime_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Complete training pipeline.
@@ -313,6 +314,25 @@ def train_pipeline(
         "train": [],
         "eval": [],
     }
+
+    runtime_config = runtime_config or {}
+    verbosity_cfg = runtime_config.get("verbosity", {})
+    self_play_verbose = bool(verbosity_cfg.get("self_play", False))
+    self_play_mcts_verbose = bool(verbosity_cfg.get("self_play_mcts", False))
+    eval_verbose = bool(verbosity_cfg.get("eval", False))
+    eval_game_verbose = bool(verbosity_cfg.get("eval_game", False))
+    eval_mcts_verbose = bool(verbosity_cfg.get("eval_mcts", False))
+
+    self_play_cfg = runtime_config.get("self_play", {})
+    self_play_add_dirichlet = self_play_cfg.get("add_dirichlet_noise", True)
+
+    evaluation_cfg = runtime_config.get("evaluation", {})
+    eval_temperature = evaluation_cfg.get("temperature", 0.05)
+    eval_add_dirichlet = evaluation_cfg.get("add_dirichlet_noise", False)
+    if "mcts_simulations" in evaluation_cfg:
+        mcts_sims_eval = evaluation_cfg["mcts_simulations"]
+    eval_games_vs_random = evaluation_cfg.get("games_vs_random", eval_games_vs_random)
+    eval_games_vs_best = evaluation_cfg.get("games_vs_best", eval_games_vs_best)
 
     board_size = GameState.BOARD_SIZE
     current_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
@@ -346,7 +366,10 @@ def train_pipeline(
             temperature_final=temperature_final,
             temperature_threshold=temperature_threshold,
             exploration_weight=exploration_weight,
-            device=device
+            device=device,
+            add_dirichlet_noise=self_play_add_dirichlet,
+            mcts_verbose=self_play_mcts_verbose,
+            verbose=self_play_verbose,
         )
         training_data = training_data or []
         num_games_generated = len(training_data)
@@ -416,12 +439,25 @@ def train_pipeline(
         _stage_banner("eval", eval_label, iteration, iterations, stage_history)
         current_model.eval()
         eval_start_time = time.perf_counter()
-        challenger_agent = MCTSAgent(current_model, mcts_simulations=mcts_sims_eval, device=device)
+        challenger_agent = MCTSAgent(
+            current_model,
+            mcts_simulations=mcts_sims_eval,
+            temperature=eval_temperature,
+            device=device,
+            add_dirichlet_noise=eval_add_dirichlet,
+            verbose=eval_verbose,
+            mcts_verbose=eval_mcts_verbose,
+        )
         random_opponent = RandomAgent()
 
         print(f"Evaluating challenger against RandomAgent ({eval_games_vs_random} games)...")
         win_rate_vs_rnd = evaluate_against_agent(
-            challenger_agent, random_opponent, eval_games_vs_random, device
+            challenger_agent,
+            random_opponent,
+            eval_games_vs_random,
+            device,
+            verbose=eval_verbose,
+            game_verbose=eval_game_verbose,
         )
         print(f"Challenger win rate vs RandomAgent: {win_rate_vs_rnd:.2%}")
 
@@ -443,11 +479,24 @@ def train_pipeline(
                 best_model_eval.to(device)
                 best_model_eval.eval()
                 
-                best_agent_opponent = MCTSAgent(best_model_eval, mcts_simulations=mcts_sims_eval, device=device)
-                
+                best_agent_opponent = MCTSAgent(
+                    best_model_eval,
+                    mcts_simulations=mcts_sims_eval,
+                    temperature=eval_temperature,
+                    device=device,
+                    add_dirichlet_noise=eval_add_dirichlet,
+                    verbose=eval_verbose,
+                    mcts_verbose=eval_mcts_verbose,
+                )
+
                 print(f"Evaluating challenger against BestModel ({eval_games_vs_best} games)...")
                 win_rate_vs_best_model = evaluate_against_agent(
-                    challenger_agent, best_agent_opponent, eval_games_vs_best, device
+                    challenger_agent,
+                    best_agent_opponent,
+                    eval_games_vs_best,
+                    device,
+                    verbose=eval_verbose,
+                    game_verbose=eval_game_verbose,
                 )
                 print(f"Challenger win rate vs BestModel: {win_rate_vs_best_model:.2%}")
 
@@ -495,6 +544,12 @@ if __name__ == "__main__":
     parser.add_argument("--eval_games_vs_best", type=int, default=4, help="Games vs BestModel.")
     parser.add_argument("--win_rate_threshold", type=float, default=0.55, help="Win rate to beat opponent.")
     parser.add_argument("--mcts_sims_eval", type=int, default=20, help="MCTS sims for evaluation agent.")
+    parser.add_argument(
+        "--runtime_config",
+        type=str,
+        default=None,
+        help="JSON string or file path specifying runtime options (verbosity, evaluation, etc.).",
+    )
 
     args = parser.parse_args()
     
@@ -502,6 +557,18 @@ if __name__ == "__main__":
     print(f"Training configuration: {args}")
     
     # 运行训练流程
+    runtime_config: Optional[Dict[str, Any]] = None
+    if args.runtime_config:
+        config_source = args.runtime_config
+        try:
+            if os.path.isfile(config_source):
+                with open(config_source, "r", encoding="utf-8") as cfg_file:
+                    runtime_config = json.load(cfg_file)
+            else:
+                runtime_config = json.loads(config_source)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"Failed to load runtime configuration from {config_source}: {exc}") from exc
+
     train_pipeline(
         iterations=args.iterations,
         num_self_play_games=args.self_play_games,
@@ -515,5 +582,6 @@ if __name__ == "__main__":
         win_rate_threshold=args.win_rate_threshold,
         mcts_sims_eval=args.mcts_sims_eval,
         checkpoint_dir=args.checkpoint_dir,
-        device=args.device
-    ) 
+        device=args.device,
+        runtime_config=runtime_config,
+    )

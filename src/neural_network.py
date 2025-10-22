@@ -7,52 +7,60 @@ from src.move_generator import generate_all_legal_moves, MoveType
 # Number of input channels: player pieces, opponent pieces, mark indicators, and phase planes
 NUM_INPUT_CHANNELS = 11
 
+
+
+@torch.no_grad()
 def state_to_tensor(state: GameState, player_to_act: Player) -> torch.Tensor:
-    """Convert a GameState into the neural network input tensor."""
+    """
+    Vectorized: (C,H,W) -> add batch -> (1,C,H,W)
+    """
     board_size = state.BOARD_SIZE
-    tensor = torch.zeros(NUM_INPUT_CHANNELS, board_size, board_size)
+    device = torch.device("cpu")  # 仍返回CPU张量，调用处再 .to(device)
 
-    player_val = player_to_act.value
-    opponent_val = player_to_act.opponent().value
+    x = torch.zeros((NUM_INPUT_CHANNELS, board_size, board_size), device=device)
 
-    # Channel 0: current player's pieces
-    # Channel 1: opponent pieces
-    for r in range(board_size):
-        for c in range(board_size):
-            if state.board[r][c] == player_val:
-                tensor[0, r, c] = 1
-            elif state.board[r][c] == opponent_val:
-                tensor[1, r, c] = 1
+    # board -> tensor
+    # 假设 state.board 是 HxW 的 Python 列表/列表；若是 np.ndarray 亦可 torch.from_numpy
+    board = torch.as_tensor(state.board, device=device)
 
-    # Channel 2: current player's marked pieces
-    # Channel 3: opponent's marked pieces
+    self_val = player_to_act.value
+    opp_val  = player_to_act.opponent().value
+
+    x[0] = (board == self_val).to(x.dtype)     # 自己棋子
+    x[1] = (board == opp_val ).to(x.dtype)     # 对手棋子
+
+    # marks：把坐标列表拆成行列索引
+    def fill_marks(channel_idx: int, positions):
+        if not positions:
+            return
+        rc = torch.tensor(list(positions), device=device, dtype=torch.long)
+        r, c = rc[:, 0], rc[:, 1]
+        # 过滤越界（以防万一）
+        mask = (r >= 0) & (r < board_size) & (c >= 0) & (c < board_size)
+        r, c = r[mask], c[mask]
+        x[channel_idx, r, c] = 1.0
+
     marked_self = state.marked_black if player_to_act == Player.BLACK else state.marked_white
-    marked_opponent = state.marked_white if player_to_act == Player.BLACK else state.marked_black
+    marked_opp  = state.marked_white if player_to_act == Player.BLACK else state.marked_black
 
-    for r, c in marked_self:
-        if 0 <= r < board_size and 0 <= c < board_size:
-            tensor[2, r, c] = 1
+    fill_marks(2, marked_self)
+    fill_marks(3, marked_opp)
 
-    for r, c in marked_opponent:
-        if 0 <= r < board_size and 0 <= c < board_size:
-            tensor[3, r, c] = 1
+    # phase one-hot
+    phase2ch = {
+        Phase.PLACEMENT:         4,
+        Phase.MARK_SELECTION:    5,
+        Phase.REMOVAL:           6,
+        Phase.MOVEMENT:          7,
+        Phase.CAPTURE_SELECTION: 8,
+        Phase.FORCED_REMOVAL:    9,
+        Phase.COUNTER_REMOVAL:   10,
+    }
+    ch = phase2ch.get(state.phase, None)
+    if ch is not None:
+        x[ch].fill_(1.0)
 
-    # Phase one-hot channels
-    if state.phase == Phase.PLACEMENT:
-        tensor[4, :, :] = 1
-    elif state.phase == Phase.MARK_SELECTION:
-        tensor[5, :, :] = 1
-    elif state.phase == Phase.REMOVAL:
-        tensor[6, :, :] = 1
-    elif state.phase == Phase.MOVEMENT:
-        tensor[7, :, :] = 1
-    elif state.phase == Phase.CAPTURE_SELECTION:
-        tensor[8, :, :] = 1
-    elif state.phase == Phase.FORCED_REMOVAL:
-        tensor[9, :, :] = 1
-    elif state.phase == Phase.COUNTER_REMOVAL:
-        tensor[10, :, :] = 1
-    return tensor.unsqueeze(0)  # add batch dimension
+    return x.unsqueeze(0)  # (1,C,H,W)
 
 class ChessNet(nn.Module):
     def __init__(self, board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS, hidden_conv_channels=64):
