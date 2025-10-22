@@ -98,3 +98,64 @@ This rule set matches the current code paths in `rule_engine.py`, `move_generato
 - [ ] **Model improvements** – experiment with deeper/wider networks, residual blocks, or mixed-precision; tune hyperparameters (learning rate schedules, batch size, Dirichlet noise) to stabilise training.
 - [ ] **Value regularisation** – investigate adding step-based penalties/rewards (e.g., encourage faster wins or discourage slow losses) once baseline training is stable.
 - [ ] **Potential C++/Rust rewrite** – evaluate portability/performance needs; if Python becomes the bottleneck, sketch an interop-friendly core for move generation and search.
+
+
+
+## Q & A
+
+
+### ❓Q: If the first self-play iteration ends in a draw, how can the model still learn anything?
+
+> There seems to be no value signal (`z = 0`), so doesn’t that mean the network receives zero gradient and no useful update?
+
+---
+
+### 💡A: Even when the game result is a draw, the network *still learns* from the policy head.
+
+In AlphaZero-style training, the neural network is optimized with two losses:
+
+[
+L = (v - z)^2 - \pi^T \log p
+]
+
+where
+
+* **`v`** = predicted value of the current position,
+* **`z`** = final game result (+1 = win, 0 = draw, -1 = loss),
+* **`π`** = improved move distribution from MCTS (visit count–based),
+* **`p`** = policy head output distribution.
+
+---
+
+#### 1️⃣ When the result is a draw (`z = 0`)
+
+The **value loss** term `(v - z)^2` produces little or no gradient.
+However, the **policy loss** term `-πᵀ log p` is still active — it forces the policy head to *imitate* the search distribution produced by MCTS.
+
+MCTS acts as a *teacher*:
+even though the final outcome is neutral, the search procedure prefers some actions over others based on simulated rollouts and the value network’s internal evaluations.
+Thus, the generated π distribution implicitly carries “which moves look promising” information.
+
+---
+
+#### 2️⃣ What actually happens
+
+* The policy head is penalized for assigning low probability to moves favored by MCTS.
+* The value head is repeatedly used during search, indirectly shaping which states are explored next.
+* As a result, even with `z = 0`, the policy head gradually shifts from random to meaningful move patterns.
+
+In short:
+
+> The model still learns because MCTS itself encodes value-guided preferences into the visit-count distribution π, and the policy head is trained to match π.
+> This indirectly penalizes suboptimal actions — effectively acting as a “soft advantage” signal, even without explicit wins or losses.
+
+---
+
+#### ✅ Summary
+
+| Component       | Source of learning                                           | Works even if draw?             |
+| --------------- | ------------------------------------------------------------ | ------------------------------- |
+| Value head      | Supervised by final result *(z)*                             | ❌ No                            |
+| Policy head     | Cross-entropy imitation of MCTS π                            | ✅ Yes                           |
+| Combined effect | Policy improves → better search → better data → better value | 🌀 Iterative self-bootstrapping |
+
