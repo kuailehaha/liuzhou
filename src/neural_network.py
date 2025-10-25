@@ -81,12 +81,12 @@ class ChessNet(nn.Module):
         self.policy_common_conv = nn.Conv2d(hidden_conv_channels * 4, hidden_conv_channels, kernel_size=1)
         self.policy_common_bn = nn.BatchNorm2d(hidden_conv_channels)
 
-        # Policy Head 1: primary position logits (placement, move source, removals)
+        # Policy Head 1: primary position logits (placement, move destination, removals)
         self.policy_pos1_conv = nn.Conv2d(hidden_conv_channels, 2, kernel_size=1)
         self.policy_pos1_bn = nn.BatchNorm2d(2)
         self.policy_pos1_fc = nn.Linear(2 * board_size * board_size, board_size * board_size)
 
-        # Policy Head 2: secondary position logits (move destination)
+        # Policy Head 2: secondary position logits (move source)
         self.policy_pos2_conv = nn.Conv2d(hidden_conv_channels, 2, kernel_size=1)
         self.policy_pos2_bn = nn.BatchNorm2d(2)
         self.policy_pos2_fc = nn.Linear(2 * board_size * board_size, board_size * board_size)
@@ -176,7 +176,8 @@ def get_move_probabilities(
         elif phase == Phase.MOVEMENT and action_type == 'move':
             r_from, c_from = move['from_position']
             r_to, c_to = move['to_position']
-            score = log_policy_pos1[flatten_index(r_from, c_from)] + log_policy_pos2[flatten_index(r_to, c_to)]
+            #score = log_policy_pos1[flatten_index(r_from, c_from)] + log_policy_pos2[flatten_index(r_to, c_to)]
+            score = log_policy_pos2[flatten_index(r_from, c_from)] + log_policy_pos1[flatten_index(r_to, c_to)]
 
         elif phase == Phase.MARK_SELECTION and action_type == 'mark':
             r, c = move['position']

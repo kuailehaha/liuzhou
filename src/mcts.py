@@ -263,23 +263,6 @@ class MCTS:
 
             # ---- 1.1 收集最多 K 个叶子（每个叶子一条 path）----
             to_collect = min(K, self.num_simulations - sims_done)
-            # seen: Set[int] = set()
-            # for _ in range(to_collect):
-            #     node = root
-            #     path = [root]
-            #     while node.is_fully_expanded() and not node.is_terminal():
-            #         node = node.get_best_child(self.exploration_weight)
-            #         path.append(node)
-
-            #     nid = id(node)
-            #     if nid in seen:
-            #         prof["dup_skipped"] += 1
-            #         # 已经收过，跳过这一位（本批次可能凑不满 K，是合理的）
-            #         continue
-            #     seen.add(nid)
-            #     leaves.append(node)
-            #     paths.append(path)
-            #     sims_done += 1
 
             reserved_leaf_ids: Set[int] = set()  # ★ 本波已“预订”的叶子
             collected = 0
@@ -464,15 +447,13 @@ class MCTS:
             for rank in range(topk):
                 i = sorted_idx[rank]
                 print(f"  #{rank+1:02d} π={policy[i]:.3f}  move={moves[i]}")
+            print("moves:", len(moves), "policy:", len(policy))
+            print(f"[MCTS] waves={prof['waves']} | nn_calls={prof['nn_calls']} | "
+              f"unique_leaves={prof['unique_leaves']} | dup_skipped={prof['dup_skipped']} | "
+              f"avg_batch≈{prof['avg_B']:.2f} (K={prof['batch_K']})")
             print("====================================\n")
+        assert len(moves) == len(policy), "not same length at search()."
 
-        #assert len(moves) == len(policy), "not same length at search()."
-        print(len(moves), len(policy))
-        print(f"[MCTS] waves={prof['waves']} | nn_calls={prof['nn_calls']} | "
-          f"unique_leaves={prof['unique_leaves']} | dup_skipped={prof['dup_skipped']} | "
-          f"avg_batch≈{prof['avg_B']:.2f} (K={prof['batch_K']})")
-        print()
-        
         return moves, policy
     
 
