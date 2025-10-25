@@ -51,7 +51,7 @@ Every turn the game state is in exactly one of the phases listed below.  Phases 
 ## End-of-Game Conditions
 
 * **Capture victory**: as soon as a player’s capture (including counter removal) removes the opponent’s final stone, that player wins immediately.
-* **Move limit draw**: self-play and training scripts enforce a hard cap of 500 moves.  Reaching the cap without a capture victory results in a draw (zero value for both players).  This limit is intended to prevent endless loops in self-play; adjust it if different behaviour is desired.
+* **Move limit draw**: self-play and training scripts enforce a hard cap of 200 moves.  Reaching the cap without a capture victory results in a draw (zero value for both players).  This limit is intended to prevent endless loops in self-play; adjust it if different behaviour is desired.
 * **No legal actions**: if `generate_all_legal_moves` returns an empty list for the side to move, that player loses (this case usually aligns with having no pieces left or no possible placement during early phases).
 
 ## Additional Notes

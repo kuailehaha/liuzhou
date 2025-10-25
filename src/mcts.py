@@ -61,6 +61,10 @@ class MCTSNode:
         """
         使用给定的合法动作和概率扩展节点。
         """
+        if self.expanded:
+        # ★ 已扩展过则直接返回，防止重复追加 children
+            return
+
         self.expanded = True
 
         for move, prob in zip(legal_moves, move_probs):
@@ -137,6 +141,27 @@ class MCTSNode:
 
         return best_child
 
+    def get_best_child_excluding(self, exploration_weight: float = 1.0,
+                                 banned_child_ids: Optional[Set[int]] = None) -> Optional["MCTSNode"]:
+        """在 children 中选择 PUCT 最高的子节点，但排除 banned_child_ids 里的孩子。"""
+        if not self.children:
+            return None
+        banned_child_ids = banned_child_ids or set()
+
+        parent_N = max(1, self.visit_count)
+        best_child, best_score = None, -float("inf")
+        for child in self.children:
+            if id(child) in banned_child_ids:
+                continue
+            Q = child.value()
+            P = child.prior
+            U = exploration_weight * P * math.sqrt(parent_N) / (1 + child.visit_count)
+            puct = Q + U
+            if puct > best_score:
+                best_score, best_child = puct, child
+        return best_child
+
+
     def get_visit_count_policy(self) -> Tuple[List[MoveType], np.ndarray]:
         """
         返回基于访问次数的策略。
@@ -203,10 +228,28 @@ class MCTS:
             self.root = root
         else:
             root = self.root
+            # ★ 关键补丁：复用到的根如果还没扩展，先做一次单样本扩展
+            if not root.is_fully_expanded() and not root.is_terminal():
+                self._expand_and_evaluate(root)
 
         # 若已是终局（或无合法着法在 _expand_and_evaluate 中被判终局），直接返回空
         if root.is_terminal() or not root.children:
             return [], np.array([], dtype=float)
+
+        
+        # --- 批量统计信息埋点 ---
+        prof = {
+            "batch_K": self.batch_K,
+            "waves": 0,             # 批量前向的“波次”数量（一次前向=一波）
+            "nn_calls": 0,          # 实际前向调用次数
+            "total_B": 0,           # 所有波的 batch 大小之和
+            "avg_B": 0.0,           # 平均 batch 大小 = total_B / nn_calls
+            "dup_skipped": 0,       # 本轮因去重跳过的叶子个数
+            "terminals_fastpath": 0,# 在前向前被判终局/无着法而直接回传的叶子数
+            "unique_leaves": 0,     # 实际送入 NN 的“唯一叶子”总数
+            "sims_budget": self.num_simulations
+        }
+
 
 
         root_player = root.state.current_player
@@ -220,15 +263,90 @@ class MCTS:
 
             # ---- 1.1 收集最多 K 个叶子（每个叶子一条 path）----
             to_collect = min(K, self.num_simulations - sims_done)
-            for _ in range(to_collect):
+            # seen: Set[int] = set()
+            # for _ in range(to_collect):
+            #     node = root
+            #     path = [root]
+            #     while node.is_fully_expanded() and not node.is_terminal():
+            #         node = node.get_best_child(self.exploration_weight)
+            #         path.append(node)
+
+            #     nid = id(node)
+            #     if nid in seen:
+            #         prof["dup_skipped"] += 1
+            #         # 已经收过，跳过这一位（本批次可能凑不满 K，是合理的）
+            #         continue
+            #     seen.add(nid)
+            #     leaves.append(node)
+            #     paths.append(path)
+            #     sims_done += 1
+
+            reserved_leaf_ids: Set[int] = set()  # ★ 本波已“预订”的叶子
+            collected = 0
+
+            # 为了在遇到已预订叶子时能“回退并换兄弟”，我们在一次选择内维护“每个父节点的禁选子集”
+            while collected < to_collect:
                 node = root
                 path = [root]
-                while node.is_fully_expanded() and not node.is_terminal():
-                    node = node.get_best_child(self.exploration_weight)
+                # 对于本次“下探”，维护一个“父节点 -> 禁选子id集合”的临时映射
+                banned_at_parent: Dict[int, Set[int]] = {}
+
+                while True:
+                    # 终局或未扩展 -> 候选叶子
+                    if not node.is_fully_expanded() or node.is_terminal():
+                        # 如果这个候选叶子已被本波预订，则回退到父节点，禁掉它，然后换下一个
+                        if id(node) in reserved_leaf_ids:
+                            if node.parent is None:
+                                # 根就被预订了（极端情况），这波收集不到更多叶子，提前结束本波
+                                break
+                            parent = node.parent
+                            banned_set = banned_at_parent.setdefault(id(parent), set())
+                            banned_set.add(id(node))
+                            # 从父节点重新选择（排除被禁的孩子）
+                            alt = parent.get_best_child_excluding(self.exploration_weight, banned_set)
+                            if alt is None:
+                                # 这个父节点没有可替代的孩子，继续往上回退
+                                node = parent
+                                path.pop()
+                                # 如果一路回退到根也不行，就结束这次尝试
+                                if node.parent is None and parent.get_best_child_excluding(self.exploration_weight, banned_at_parent.get(id(node), set())) is None:
+                                    break
+                                continue
+                            # 有替代子：改走它，并继续向下
+                            node = alt
+                            path.append(node)
+                            # 继续 while True 循环，直到落到一个未预订叶子
+                            continue
+
+                        # 命中了一个“不冲突”的新叶子
+                        leaves.append(node)
+                        paths.append(path)
+                        reserved_leaf_ids.add(id(node))
+                        collected += 1
+                        sims_done += 1
+                        break  # 本次下探完成，开始收集下一个
+
+                    # 已扩展且非终局 -> 继续向下，挑选当前最优子节点（考虑父节点的禁选）
+                    banned_set = banned_at_parent.get(id(node), set())
+                    child = node.get_best_child_excluding(self.exploration_weight, banned_set)
+                    if child is None:
+                        # 当前节点下所有孩子都被禁了：回退
+                        if node.parent is None:
+                            # 回到根也无路可走，提前结束本波
+                            break
+                        # 把当前节点也加入父节点的禁选，换父节点的另一个孩子
+                        parent = node.parent
+                        banned_at_parent.setdefault(id(parent), set()).add(id(node))
+                        node = parent
+                        path.pop()
+                        continue
+
+                    node = child
                     path.append(node)
-                leaves.append(node)
-                paths.append(path)
-                sims_done += 1
+
+                # 如果这波完全走不动了（例如分支不足），就退出收集循环
+                if collected == 0:
+                    break
 
             # ---- 1.2 终局快速处理 + 准备批量前向的张量 ----
             tensors = []
@@ -238,6 +356,7 @@ class MCTS:
             for i, leaf in enumerate(leaves):
                 if leaf.is_terminal():
                     leaf.backpropagate(leaf.terminal_value)
+                    prof["terminals_fastpath"] += 1
                     continue
 
                 # 规则终局检查
@@ -246,6 +365,7 @@ class MCTS:
                     v = 0.0 if winner is None else (1.0 if winner == leaf.player_to_act else -1.0)
                     leaf.set_terminal(v)
                     leaf.backpropagate(v)
+                    prof["terminals_fastpath"] += 1
                     continue
 
                 legal_moves = generate_all_legal_moves(leaf.state)
@@ -265,6 +385,12 @@ class MCTS:
                 continue
 
             batch = torch.cat(tensors, dim=0).to(self.device)  # (B,C,H,W)
+
+            # --- 批量统计记账 ---
+            prof["waves"] += 1
+            prof["nn_calls"] += 1
+            prof["total_B"] += int(batch.size(0))
+            prof["unique_leaves"] += int(batch.size(0))
 
             # ---- 1.3 批量前向 ----
             with torch.inference_mode():
@@ -297,6 +423,12 @@ class MCTS:
                 # （可选）数值裁剪，避免初始化早期的尖峰
                 # v = max(-1.0, min(1.0, v))
                 leaf.backpropagate(v)
+
+            # --- 结束时补全统计并缓存 ---
+        if prof["nn_calls"] > 0:
+            prof["avg_B"] = prof["total_B"] / prof["nn_calls"]
+        self.last_profile = prof
+
 
         # ========== 2) 基于访问次数得到根策略 ==========
         moves = [child.move for child in root.children]
@@ -334,7 +466,15 @@ class MCTS:
                 print(f"  #{rank+1:02d} π={policy[i]:.3f}  move={moves[i]}")
             print("====================================\n")
 
+        #assert len(moves) == len(policy), "not same length at search()."
+        print(len(moves), len(policy))
+        print(f"[MCTS] waves={prof['waves']} | nn_calls={prof['nn_calls']} | "
+          f"unique_leaves={prof['unique_leaves']} | dup_skipped={prof['dup_skipped']} | "
+          f"avg_batch≈{prof['avg_B']:.2f} (K={prof['batch_K']})")
+        print()
+        
         return moves, policy
+    
 
 
     def _same_state(self, a: GameState, b: GameState) -> bool:
@@ -434,7 +574,8 @@ class MCTS:
         # 可选：早期训练可进行轻微裁剪防爆
         # v = max(-1.0, min(1.0, v))
         return v
-
+    
+    
 
 
 def self_play(
@@ -538,7 +679,7 @@ def self_play(
                 break
 
             # 如果游戏进行了太多步，也结束游戏
-            if move_count > 500:
+            if move_count > 200:
                 if verbose:
                     log(f"Game {game_idx + 1} reached move limit ({move_count} moves), ending as a draw.")
                     log("Final state before ending due to move limit:")
