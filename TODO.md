@@ -7,7 +7,8 @@
 - [x] 修复 no_legal_moves 的异常
 - [x] 实现 RandomAgent 的对局，并获取胜率数据
 - [ ] 张量化实现自博弈过程
-- [ ] 合并参数：self_play_games、self_play_games_per_worker
+- [x] 合并参数：self_play_games、self_play_games_per_worker
 - [ ] 并行化DDP训练或实现“自对弈集群+训练服务器”模式
 - [ ] 确认代码实现逻辑
-
+- [ ] 模型结构和超参调优
+- [ ] 对场上棋子实现reward并检查效果

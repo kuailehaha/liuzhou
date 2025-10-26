@@ -284,7 +284,6 @@ def train_network(
 
 def train_pipeline(
     iterations: int = 10,
-    num_self_play_games: int = 100,
     num_mcts_simulations: int = 800,
     batch_size: int = 32,
     epochs: int = 10,
@@ -343,8 +342,12 @@ def train_pipeline(
         sp_games_per_worker = int(sp_gpw_cfg) if sp_gpw_cfg is not None else None
     except (TypeError, ValueError):
         sp_games_per_worker = None
-    if sp_games_per_worker is not None and sp_games_per_worker <= 0:
-        sp_games_per_worker = None
+
+    if sp_games_per_worker is None:
+        raise ValueError("self_play_games_per_worker must be provided and greater than zero.")
+    if sp_games_per_worker <= 0:
+        raise ValueError("self_play_games_per_worker must be greater than zero.")
+    total_self_play_games = sp_games_per_worker * sp_workers
 
     sp_seed_cfg = parallel_cfg.get("base_seed", self_play_base_seed)
     try:
@@ -380,7 +383,7 @@ def train_pipeline(
         iter_start_time = time.perf_counter()
         iteration_metrics: Dict[str, Any] = {
             "iteration": iteration + 1,
-            "self_play_games_requested": num_self_play_games,
+            "self_play_games_requested": total_self_play_games,
             "mcts_simulations": num_mcts_simulations,
             "epochs_requested": epochs,
             "batch_size": batch_size,
@@ -393,12 +396,12 @@ def train_pipeline(
 
         self_play_label = "Self-play phase"
         _stage_banner("self_play", self_play_label, iteration, iterations, stage_history)
-        print(f"{self_play_label}: generating {num_self_play_games} games using current model...")
+        print(f"{self_play_label}: generating {total_self_play_games} games using current model...")
         current_model.eval()
         sp_start_time = time.perf_counter()
         training_data = self_play(
             model=current_model,
-            num_games=num_self_play_games,
+            num_games=total_self_play_games,
             mcts_simulations=num_mcts_simulations,
             temperature_init=temperature_init,
             temperature_final=temperature_final,
@@ -574,7 +577,6 @@ def train_pipeline(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a chess AI using AlphaZero-style self-play.")
     parser.add_argument("--iterations", type=int, default=10, help="Number of training iterations.")
-    parser.add_argument("--self_play_games", type=int, default=2, help="Number of self-play games per iteration.")
     parser.add_argument("--mcts_simulations", type=int, default=20, help="Number of MCTS simulations per move for self-play.")
     parser.add_argument("--batch_size", type=int, default=16, help="Training batch size.")
     parser.add_argument("--epochs", type=int, default=2, help="Training epochs per iteration.")
@@ -583,7 +585,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_eval_test", help="Directory to save model checkpoints.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Training device.")
     parser.add_argument("--self_play_workers", type=int, default=1, help="Number of parallel workers for self-play (>=1).")
-    parser.add_argument("--self_play_games_per_worker", type=int, default=0, help="Games per worker (0 = auto split).")
+    parser.add_argument("--self_play_games_per_worker", type=int, default=2, help="Number of self-play games each worker should play per iteration.")
     parser.add_argument("--self_play_base_seed", type=int, default=0, help="Base RNG seed for parallel self-play (0 = auto).")
     parser.add_argument("--self_play_virtual_loss", type=float, default=0.0, help="Virtual loss weight passed to MCTS during self-play.")
     parser.add_argument("--eval_games_vs_random", type=int, default=4, help="Games vs RandomAgent.")
@@ -598,6 +600,9 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if args.self_play_games_per_worker <= 0:
+        raise ValueError("self_play_games_per_worker must be greater than zero.")
     
     print(f"Training on device: {args.device}")
     print(f"Training configuration: {args}")
@@ -617,14 +622,13 @@ if __name__ == "__main__":
 
     train_pipeline(
         iterations=args.iterations,
-        num_self_play_games=args.self_play_games,
         num_mcts_simulations=args.mcts_simulations,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
         self_play_workers=args.self_play_workers,
-        self_play_games_per_worker=(None if args.self_play_games_per_worker <= 0 else args.self_play_games_per_worker),
+        self_play_games_per_worker=args.self_play_games_per_worker,
         self_play_base_seed=(None if args.self_play_base_seed == 0 else args.self_play_base_seed),
         self_play_virtual_loss_weight=args.self_play_virtual_loss,
         eval_games_vs_random=args.eval_games_vs_random,

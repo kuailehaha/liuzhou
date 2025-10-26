@@ -88,15 +88,6 @@ This rule set matches the current code paths in `rule_engine.py`, `move_generato
 - **`checkpoints_eval_run/`** – Default directory where training checkpoints (best/latest model weights) are stored.
 - **`README_zh.md`** – Chinese version of the rules (in progress).  Keep both README files in sync when updating documentation.
 
-## TODO
-
-- [ ] **Validate rule engine correctness** – add targeted unit/behaviour tests for the new atomic phases (mark selection edge cases, forced removal sequences, counter-removal loops).
-- [ ] **Refine MCTS logging** – separate true terminal outcomes from network value estimates; optionally add mean/variance of predicted values to avoid confusion when no simulation reaches a terminal state.
-- [ ] **Training telemetry** – log/visualise policy loss, value loss, and total loss per iteration (TensorBoard or Matplotlib) and add progress indicators for self-play/training loops.
-- [ ] **Performance profiling** – measure CPU/GPU utilisation, optimise state copying/move generation, and explore batched or multi-process self-play to keep the GPU busy.
-- [ ] **Model improvements** – experiment with deeper/wider networks, residual blocks, or mixed-precision; tune hyperparameters (learning rate schedules, batch size, Dirichlet noise) to stabilise training.
-- [ ] **Value regularisation** – investigate adding step-based penalties/rewards (e.g., encourage faster wins or discourage slow losses) once baseline training is stable.
-- [ ] **Potential C++/Rust rewrite** – evaluate portability/performance needs; if Python becomes the bottleneck, sketch an interop-friendly core for move generation and search.
 
 
 
