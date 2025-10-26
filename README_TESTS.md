@@ -4,9 +4,8 @@
 
 ## 文件结构
 
-- `src/test_random_agent.py` - 基本测试脚本，检查移动合法性
-- `src/test_random_agent_enhanced.py` - 增强版测试脚本，收集详细游戏统计信息
-- `src/test_random_agent_debug.py` - 调试脚本，展示单局游戏的详细过程
+- `tests/random_agent/test_random_agent_enhanced.py` - 增强版测试脚本，收集详细游戏统计信息
+- `tests/random_agent/test_random_agent_debug.py` - 调试脚本，展示单局游戏的详细过程
 - `run_tests.py` - 主运行脚本，整合各种测试模式
 
 ## 使用方法

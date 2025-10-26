@@ -78,7 +78,7 @@ This rule set matches the current code paths in `rule_engine.py`, `move_generato
 
 ### Agents, Tests, Utilities
 - **`src/random_agent.py`** – Baseline agent that samples uniformly from legal moves (used in evaluation and debugging).
-- **`src/test_random_agent_debug.py` / `src/test_random_agent_enhanced.py`** – Lightweight smoke tests that ensure random games can be executed end-to-end without exceptions after the rule refactor.
+- **`tests/random_agent/test_random_agent_debug.py` / `tests/random_agent/test_random_agent_enhanced.py`** – Lightweight smoke tests that ensure random games can be executed end-to-end without exceptions after the rule refactor.
 - **`tests/test_mcts.py`** – Unit tests for MCTS expansion/backprop mechanics using dummy models/tensors.
 - **`run.py` / `run_tests.py`** – Entry points for running experiments or batched tests outside the training loop.
 - **`README_TESTS.md`** – Notes on the available automated tests and how to extend them.
@@ -148,4 +148,3 @@ In short:
 | Value head      | Supervised by final result *(z)*                             | ❌ No                            |
 | Policy head     | Cross-entropy imitation of MCTS π                            | ✅ Yes                           |
 | Combined effect | Policy improves → better search → better data → better value | 🌀 Iterative self-bootstrapping |
-

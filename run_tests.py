@@ -6,8 +6,9 @@
 import argparse
 import time
 import sys
-from src.test_random_agent_enhanced import run_enhanced_tests
-from src.test_random_agent_debug import test_single_game, test_multiple_games
+
+from tests.random_agent.test_random_agent_enhanced import run_enhanced_tests
+from tests.random_agent.test_random_agent_debug import test_single_game, test_multiple_games
 
 def parse_args():
     """解析命令行参数"""

@@ -161,7 +161,7 @@
 
 * **`src/random_agent.py`** —— 基线智能体，从当前合法动作中均匀采样，用于评估与调试。
 
-* **`src/test_random_agent_debug.py` / `src/test_random_agent_enhanced.py`** —— 轻量级冒烟测试，用于验证在规则重构后随机对局是否能无异常地运行完整流程。
+* **`tests/random_agent/test_random_agent_debug.py` / `tests/random_agent/test_random_agent_enhanced.py`** —— 轻量级冒烟测试，用于验证在规则重构后随机对局是否能无异常地运行完整流程。
 
 * **`tests/test_mcts.py`** —— 针对 MCTS 展开与回传机制的单元测试，使用虚拟模型与张量。
 
