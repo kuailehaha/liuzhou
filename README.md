@@ -86,7 +86,6 @@ This rule set matches the current code paths in `rule_engine.py`, `move_generato
 
 ### Project Layout (Top Level)
 - **`checkpoints_eval_run/`** – Default directory where training checkpoints (best/latest model weights) are stored.
-- **`3000simu_1.txt` / `test_300simu_1.txt`** – Example self-play logs (useful when inspecting MCTS behaviour or debugging training).
 - **`README_zh.md`** – Chinese version of the rules (in progress).  Keep both README files in sync when updating documentation.
 
 ## TODO

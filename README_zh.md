@@ -176,7 +176,6 @@
 ### 🗂️ 项目目录结构（Project Layout, Top Level）
 
 * **`checkpoints_eval_run/`** —— 默认存放训练检查点目录（最佳模型与最新模型权重）。
-* **`3000simu_1.txt` / `test_300simu_1.txt`** —— 示例自博弈日志，用于分析 MCTS 行为或调试训练。
 * **`README_zh.md`** —— 中文版规则文档（编写中）。更新文档时应保持中英文版同步。
 
 ---
