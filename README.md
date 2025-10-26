@@ -80,8 +80,8 @@ This rule set matches the current code paths in `rule_engine.py`, `move_generato
 - **`src/random_agent.py`** – Baseline agent that samples uniformly from legal moves (used in evaluation and debugging).
 - **`tests/random_agent/test_random_agent_debug.py` / `tests/random_agent/test_random_agent_enhanced.py`** – Lightweight smoke tests that ensure random games can be executed end-to-end without exceptions after the rule refactor.
 - **`tests/test_mcts.py`** – Unit tests for MCTS expansion/backprop mechanics using dummy models/tensors.
-- **`run.py` / `run_tests.py`** – Entry points for running experiments or batched tests outside the training loop.
-- **`README_TESTS.md`** – Notes on the available automated tests and how to extend them.
+- **`run.py` / `tests/random_agent/run_tests.py`** – Entry points for running experiments or batched tests outside the training loop.
+- **`tests/random_agent/README.md`** – Notes on the available automated tests and how to extend them.
 - **`AGENT.md.bak`, `dev`, `rewrite.md`** – Historical notes and scratchpad files kept for reference during the refactor.
 
 ### Project Layout (Top Level)

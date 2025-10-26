@@ -165,9 +165,9 @@
 
 * **`tests/test_mcts.py`** —— 针对 MCTS 展开与回传机制的单元测试，使用虚拟模型与张量。
 
-* **`run.py` / `run_tests.py`** —— 在训练循环之外运行实验或批量测试的入口文件。
+* **`run.py` / `tests/random_agent/run_tests.py`** —— 在训练循环之外运行实验或批量测试的入口文件。
 
-* **`README_TESTS.md`** —— 说明可用自动化测试及其扩展方式的文档。
+* **`tests/random_agent/README.md`** —— 说明可用自动化测试及其扩展方式的文档。
 
 * **`AGENT.md.bak`、`dev`、`rewrite.md`** —— 历史记录与重构过程中的草稿文件，仅作参考保留。
 

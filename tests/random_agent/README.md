@@ -6,7 +6,7 @@
 
 - `tests/random_agent/test_random_agent_enhanced.py` - 增强版测试脚本，收集详细游戏统计信息
 - `tests/random_agent/test_random_agent_debug.py` - 调试脚本，展示单局游戏的详细过程
-- `run_tests.py` - 主运行脚本，整合各种测试模式
+- `tests/random_agent/run_tests.py` - 主运行脚本，整合各种测试模式（推荐通过模块方式运行）
 
 ## 使用方法
 
@@ -15,7 +15,7 @@
 查看一局完整游戏的所有走法和状态变化：
 
 ```bash
-python run_tests.py single -s <随机种子>
+python -m tests.random_agent.run_tests single -s <随机种子>
 ```
 
 参数说明：
@@ -24,7 +24,7 @@ python run_tests.py single -s <随机种子>
 
 例如：
 ```bash
-python run_tests.py single -s 42 -t 100
+python -m tests.random_agent.run_tests single -s 42 -t 100
 ```
 
 ### 运行多局游戏简要测试
@@ -32,7 +32,7 @@ python run_tests.py single -s 42 -t 100
 运行多局游戏并显示简要结果：
 
 ```bash
-python run_tests.py multiple -n <游戏局数> -s <起始随机种子>
+python -m tests.random_agent.run_tests multiple -n <游戏局数> -s <起始随机种子>
 ```
 
 参数说明：
@@ -41,7 +41,7 @@ python run_tests.py multiple -n <游戏局数> -s <起始随机种子>
 
 例如：
 ```bash
-python run_tests.py multiple -n 20 -s 100
+python -m tests.random_agent.run_tests multiple -n 20 -s 100
 ```
 
 ### 运行基本大规模测试
@@ -49,7 +49,7 @@ python run_tests.py multiple -n 20 -s 100
 检查大量随机种子下移动生成器的正确性：
 
 ```bash
-python run_tests.py basic -n <测试局数> -s <起始随机种子>
+python -m tests.random_agent.run_tests basic -n <测试局数> -s <起始随机种子>
 ```
 
 参数说明：
@@ -58,7 +58,7 @@ python run_tests.py basic -n <测试局数> -s <起始随机种子>
 
 例如：
 ```bash
-python run_tests.py basic -n 10000 -s 0
+python -m tests.random_agent.run_tests basic -n 10000 -s 0
 ```
 
 ### 运行增强大规模测试
@@ -66,7 +66,7 @@ python run_tests.py basic -n 10000 -s 0
 收集详细游戏统计信息并分析随机智能体的表现：
 
 ```bash
-python run_tests.py enhanced -n <测试局数> -s <起始随机种子> [-q]
+python -m tests.random_agent.run_tests enhanced -n <测试局数> -s <起始随机种子> [-q]
 ```
 
 参数说明：
@@ -76,7 +76,7 @@ python run_tests.py enhanced -n <测试局数> -s <起始随机种子> [-q]
 
 例如：
 ```bash
-python run_tests.py enhanced -n 5000 -s 0 -q
+python -m tests.random_agent.run_tests enhanced -n 5000 -s 0 -q
 ```
 
 ## 统计信息解读
@@ -106,7 +106,7 @@ python run_tests.py enhanced -n 5000 -s 0 -q
 2. 使用安静模式（-q参数）减少输出，提高运行效率
 3. 如需长时间运行，可考虑将输出重定向到文件：
    ```bash
-   python run_tests.py enhanced -n 10000 -s 0 > results.txt
+   python -m tests.random_agent.run_tests enhanced -n 10000 -s 0 > results.txt
    ``` 
 
 ## 测试结果
