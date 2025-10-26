@@ -45,6 +45,7 @@ class MCTSNode:
         self.children: List[MCTSNode] = []
         self.visit_count = 0
         self.value_sum = 0.0  # 累积价值
+        self.virtual_loss = 0.0  # 并行选择时累积的临时虚损
         self.expanded = False  # 是否已经扩展
         self.terminal = False  # 是否是终局节点
         self.terminal_value = None  # 终局节点的价值
@@ -111,6 +112,29 @@ class MCTSNode:
         if self.parent:
             # 从父节点的角度来看，价值需要取反
             self.parent.backpropagate(-value)
+
+    def apply_virtual_loss(self, loss: float) -> None:
+        """
+        对节点施加临时虚损，用于并行选择时降低再次命中概率。
+        loss <= 0 时直接返回。
+        """
+        if loss <= 0:
+            return
+        self.virtual_loss += loss
+        self.visit_count += loss
+        self.value_sum -= loss
+
+    def revert_virtual_loss(self, loss: float) -> None:
+        """
+        撤销之前施加的虚损。
+        """
+        if loss <= 0:
+            return
+        self.virtual_loss = max(0.0, self.virtual_loss - loss)
+        self.visit_count -= loss
+        if self.visit_count < 0:
+            self.visit_count = 0.0
+        self.value_sum += loss
 
     def get_best_child(self, exploration_weight: float = 1.0) -> "MCTSNode":
         """
@@ -193,6 +217,7 @@ class MCTS:
         add_dirichlet_noise: bool = False,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
+        virtual_loss_weight: float = 0.0,
         batch_K: int = 16,
         verbose: bool = False,
     ):
@@ -206,10 +231,29 @@ class MCTS:
         self.dirichlet_epsilon = dirichlet_epsilon
         self.model.to(device)
         self.model.eval()  # 设置为评估模式
+        self.virtual_loss_weight = max(0.0, float(virtual_loss_weight))
         self.batch_K = max(1, batch_K)
         self.verbose = verbose
         self.root: Optional[MCTSNode] = None
         self.last_profile: Dict[str, Any] = {}
+
+    def _apply_virtual_loss(self, path: List[MCTSNode]) -> None:
+        """
+        沿着指定路径施加虚损（仅在 virtual_loss_weight > 0 时生效）。
+        """
+        if self.virtual_loss_weight <= 0:
+            return
+        for node in path:
+            node.apply_virtual_loss(self.virtual_loss_weight)
+
+    def _revert_virtual_loss(self, path: List[MCTSNode]) -> None:
+        """
+        撤销之前沿路径施加的虚损。
+        """
+        if self.virtual_loss_weight <= 0:
+            return
+        for node in reversed(path):
+            node.revert_virtual_loss(self.virtual_loss_weight)
 
     def search(self, state: GameState) -> Tuple[List[MoveType], np.ndarray]:
         """
@@ -261,74 +305,93 @@ class MCTS:
             leaves = []
             paths = []
 
-            # ---- 1.1 收集最多 K 个叶子（每个叶子一条 path）----
+            # ---- 1.1 收集最多 K 个叶子（本波内互不重复，带安全退出）----
             to_collect = min(K, self.num_simulations - sims_done)
-
-            reserved_leaf_ids: Set[int] = set()  # ★ 本波已“预订”的叶子
+            reserved_leaf_ids: Set[int] = set()   # 本波已“预订”的叶子
             collected = 0
 
-            # 为了在遇到已预订叶子时能“回退并换兄弟”，我们在一次选择内维护“每个父节点的禁选子集”
-            while collected < to_collect:
+            # 安全阈值：本波允许的“整体尝试次数”与“单次下探回退步数”
+            MAX_ATTEMPTS_PER_WAVE = max(8 * to_collect, 64)  # 本波最多尝试多少次“下探”
+            MAX_BACKTRACK_STEPS   = 128                      # 单次下探中允许回退的最大步数
+
+            attempts_this_wave = 0
+            wave_made_progress = False  # 记录这一波是否至少成功收集过一个叶子
+
+            while collected < to_collect and attempts_this_wave < MAX_ATTEMPTS_PER_WAVE:
+                attempts_this_wave += 1
+
                 node = root
                 path = [root]
-                # 对于本次“下探”，维护一个“父节点 -> 禁选子id集合”的临时映射
+
+                # “父节点 -> 禁选子”的临时映射（仅本次下探内有效）
                 banned_at_parent: Dict[int, Set[int]] = {}
+                backtrack_steps = 0
+                got_new_leaf = False
 
                 while True:
-                    # 终局或未扩展 -> 候选叶子
+                    # 命中候选叶子：未扩展或为终局
                     if not node.is_fully_expanded() or node.is_terminal():
-                        # 如果这个候选叶子已被本波预订，则回退到父节点，禁掉它，然后换下一个
+                        # 如果这片叶子已被本波预订，尝试回退并换兄弟
                         if id(node) in reserved_leaf_ids:
                             if node.parent is None:
-                                # 根就被预订了（极端情况），这波收集不到更多叶子，提前结束本波
+                                # 根也无可替代路径 -> 结束本次下探
                                 break
                             parent = node.parent
                             banned_set = banned_at_parent.setdefault(id(parent), set())
                             banned_set.add(id(node))
-                            # 从父节点重新选择（排除被禁的孩子）
                             alt = parent.get_best_child_excluding(self.exploration_weight, banned_set)
                             if alt is None:
-                                # 这个父节点没有可替代的孩子，继续往上回退
+                                # 父节点也没有可替代的子 -> 继续回退
                                 node = parent
                                 path.pop()
-                                # 如果一路回退到根也不行，就结束这次尝试
-                                if node.parent is None and parent.get_best_child_excluding(self.exploration_weight, banned_at_parent.get(id(node), set())) is None:
+                                backtrack_steps += 1
+                                if backtrack_steps > MAX_BACKTRACK_STEPS:
                                     break
                                 continue
-                            # 有替代子：改走它，并继续向下
+                            # 有替代子，改走它
                             node = alt
                             path.append(node)
-                            # 继续 while True 循环，直到落到一个未预订叶子
                             continue
 
-                        # 命中了一个“不冲突”的新叶子
+                        # 命中了一个“未预订”的新叶子
                         leaves.append(node)
                         paths.append(path)
                         reserved_leaf_ids.add(id(node))
+                        self._apply_virtual_loss(path)  # 打标签（若权重>0）
+                        got_new_leaf = True
+                        wave_made_progress = True
                         collected += 1
                         sims_done += 1
-                        break  # 本次下探完成，开始收集下一个
+                        break  # 本次下探完成
 
-                    # 已扩展且非终局 -> 继续向下，挑选当前最优子节点（考虑父节点的禁选）
+                    # 否则继续往下，带禁选地挑最优子
                     banned_set = banned_at_parent.get(id(node), set())
                     child = node.get_best_child_excluding(self.exploration_weight, banned_set)
                     if child is None:
-                        # 当前节点下所有孩子都被禁了：回退
+                        # 当前节点所有孩子都被禁 -> 回退
                         if node.parent is None:
-                            # 回到根也无路可走，提前结束本波
+                            # 回到根也没路可走，结束本次下探
                             break
-                        # 把当前节点也加入父节点的禁选，换父节点的另一个孩子
                         parent = node.parent
                         banned_at_parent.setdefault(id(parent), set()).add(id(node))
                         node = parent
                         path.pop()
+                        backtrack_steps += 1
+                        if backtrack_steps > MAX_BACKTRACK_STEPS:
+                            break
                         continue
 
                     node = child
                     path.append(node)
 
-                # 如果这波完全走不动了（例如分支不足），就退出收集循环
-                if collected == 0:
+                # 没拿到新叶子：确保本次下探未施加过虚损；如已施加，应在后面统一撤销
+                if not got_new_leaf and path:
+                    # 这里 path 只包含已走过的节点；理论上我们只在拿到叶子时才 _apply_virtual_loss，
+                    # 所以没有需要撤销的；留着注释说明
+                    pass
+
+                # 如果尝试很多次都没进展，提前结束本波，避免卡住
+                if not wave_made_progress and attempts_this_wave >= MAX_ATTEMPTS_PER_WAVE:
                     break
 
             # ---- 1.2 终局快速处理 + 准备批量前向的张量 ----
@@ -337,16 +400,19 @@ class MCTS:
             legal_moves_batch = [] # 与 work_idx 对齐
 
             for i, leaf in enumerate(leaves):
+                path = paths[i]
                 if leaf.is_terminal():
+                    self._revert_virtual_loss(path)
                     leaf.backpropagate(leaf.terminal_value)
                     prof["terminals_fastpath"] += 1
                     continue
 
-                # 规则终局检查
+                # 规则终局检测
                 if leaf.state.is_game_over():
                     winner = leaf.state.get_winner()
                     v = 0.0 if winner is None else (1.0 if winner == leaf.player_to_act else -1.0)
                     leaf.set_terminal(v)
+                    self._revert_virtual_loss(path)
                     leaf.backpropagate(v)
                     prof["terminals_fastpath"] += 1
                     continue
@@ -355,6 +421,7 @@ class MCTS:
                 if not legal_moves:
                     # 无合法走法 -> 当前执手视角失败
                     leaf.set_terminal(-1.0)
+                    self._revert_virtual_loss(path)
                     leaf.backpropagate(-1.0)
                     continue
 
@@ -384,6 +451,7 @@ class MCTS:
             for bi, i_leaf in enumerate(work_idx):
                 leaf = leaves[i_leaf]
                 legal_moves = legal_moves_batch[bi]
+                path = paths[i_leaf]
 
                 lp1 = log_p1[bi]   # (HW,)
                 lp2 = log_p2[bi]   # (HW,)
@@ -400,6 +468,7 @@ class MCTS:
                     move_probs = (1 - self.dirichlet_epsilon) * np.array(move_probs) + self.dirichlet_epsilon * noise
                     move_probs = (move_probs / move_probs.sum()).tolist()
 
+                self._revert_virtual_loss(path)
                 leaf.expand(legal_moves, move_probs)
 
                 v = float(values[bi].item())
@@ -447,13 +516,13 @@ class MCTS:
             for rank in range(topk):
                 i = sorted_idx[rank]
                 print(f"  #{rank+1:02d} π={policy[i]:.3f}  move={moves[i]}")
-            print("moves:", len(moves), "policy:", len(policy))
-            print(f"[MCTS] waves={prof['waves']} | nn_calls={prof['nn_calls']} | "
-              f"unique_leaves={prof['unique_leaves']} | dup_skipped={prof['dup_skipped']} | "
-              f"avg_batch≈{prof['avg_B']:.2f} (K={prof['batch_K']})")
+            
             print("====================================\n")
         assert len(moves) == len(policy), "not same length at search()."
-
+        print("moves:", len(moves), "policy:", len(policy))
+        print(f"[MCTS] waves={prof['waves']} | nn_calls={prof['nn_calls']} | "
+        f"unique_leaves={prof['unique_leaves']} | dup_skipped={prof['dup_skipped']} | "
+        f"avg_batch≈{prof['avg_B']:.2f} (K={prof['batch_K']})")
         return moves, policy
     
 
