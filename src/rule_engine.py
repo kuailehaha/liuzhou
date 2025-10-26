@@ -100,6 +100,9 @@ def generate_mark_targets(state: GameState) -> List[Tuple[int, int]]:
         if opponent_normal_pieces
         else [pos for pos in opponent_pieces if pos not in opponent_marked]
     )
+    if not pool:
+        # All normal pieces have been marked already; fall back to any remaining piece.
+        pool = [pos for pos in opponent_pieces if pos not in opponent_marked]
     return pool
 
 
@@ -130,7 +133,10 @@ def apply_mark_selection(state: GameState, position: Tuple[int, int]) -> GameSta
         if new_state.board[rr][cc] == opponent_value
         and not is_piece_in_shape(new_state.board, rr, cc, opponent_value, opponent_marked)
     ]
-    if opponent_normal_pieces and is_piece_in_shape(
+    opponent_normal_unmarked = [
+        pos for pos in opponent_normal_pieces if pos not in opponent_marked
+    ]
+    if opponent_normal_unmarked and is_piece_in_shape(
         new_state.board, r, c, opponent_value, opponent_marked
     ):
         raise ValueError("对方存在普通棋子时，不能标记其关键结构中的棋子")

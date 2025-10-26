@@ -1,6 +1,6 @@
 import random
 from typing import Dict, Union
-
+from tqdm import tqdm 
 from src.game_state import GameState, Player
 from src.move_generator import generate_all_legal_moves, apply_move
 from src.random_agent import RandomAgent
@@ -70,7 +70,7 @@ def run_enhanced_tests(
 
     progress_interval = max(1, num_games // 10)
 
-    for game_index in range(num_games):
+    for game_index in tqdm(range(num_games)):
         winner, turns_played, reason, error = _simulate_random_game(
             agent, seed + game_index, max_turns_per_game
         )
@@ -97,11 +97,11 @@ def run_enhanced_tests(
         elif reason == "no_legal_moves" and winner is None:
             stats["stalled_games"] += 1
 
-        if verbose and (
-            (game_index + 1) % progress_interval == 0
-            or game_index == num_games - 1
-        ):
-            print(f"  Completed {game_index + 1}/{num_games} games...")
+        # if verbose and (
+        #     (game_index + 1) % progress_interval == 0
+        #     or game_index == num_games - 1
+        # ):
+        #     print(f"  Completed {game_index + 1}/{num_games} games...")
 
     if stats["completed_games"]:
         stats["average_turns"] = stats["total_turns"] / stats["completed_games"]

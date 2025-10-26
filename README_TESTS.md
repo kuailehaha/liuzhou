@@ -110,4 +110,20 @@ python run_tests.py enhanced -n 5000 -s 0 -q
    python run_tests.py enhanced -n 10000 -s 0 > results.txt
    ``` 
 
-   
+## 测试结果
+
+==== 随机智能体测试 (enhanced模式) ====
+起始随机种子: 0
+增强大规模测试 (局数: 100000, 最大回合数: 200)
+100%|██████████████████████████████████████████████████████| 100000/100000 [34:00<00:00, 49.02it/s]
+
+---- Enhanced Random Agent Test Summary ----
+Games played: 100000/100000
+Black wins : 5369 (5.37%)
+White wins : 5373 (5.37%)
+Draws      : 89258 (89.26%)
+Games hitting the turn limit (200): 89258
+Average turns per game: 196.94
+Longest game length   : 200 turns
+
+测试完成！总运行时间: 2040.07 秒
