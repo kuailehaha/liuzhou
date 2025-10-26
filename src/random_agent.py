@@ -34,7 +34,7 @@ def simulate_game(max_turns=1000):
         
         # 应用走法
         try:
-            state = apply_move(state, move)
+            state = apply_move(state, move, quiet=True)
             history.append(state.copy())
             
             # 打印当前状态

@@ -83,7 +83,7 @@ def play_single_game(
             log(f"Game ended: Agent for {current_player} could not select a move.")
             return -1.0 if current_player == Player.BLACK else 1.0
 
-        state = apply_move(state, selected_move)
+        state = apply_move(state, selected_move, quiet=True)
         move_count += 1
 
         winner = state.get_winner()

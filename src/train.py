@@ -294,6 +294,10 @@ def train_pipeline(
     temperature_final: float = 0.1,
     temperature_threshold: int = 10,
     exploration_weight: float = 1.0,
+    self_play_workers: int = 1,
+    self_play_games_per_worker: Optional[int] = None,
+    self_play_base_seed: Optional[int] = None,
+    self_play_virtual_loss_weight: float = 0.0,
     eval_games_vs_random: int = 20,
     eval_games_vs_best: int = 20,
     win_rate_threshold: float = 0.55,
@@ -325,6 +329,36 @@ def train_pipeline(
 
     self_play_cfg = runtime_config.get("self_play", {})
     self_play_add_dirichlet = self_play_cfg.get("add_dirichlet_noise", True)
+    parallel_cfg = runtime_config.get("self_play_parallel", {})
+
+    sp_workers_cfg = parallel_cfg.get("workers", self_play_workers)
+    try:
+        sp_workers = int(sp_workers_cfg)
+    except (TypeError, ValueError):
+        sp_workers = self_play_workers
+    sp_workers = max(1, sp_workers)
+
+    sp_gpw_cfg = parallel_cfg.get("games_per_worker", self_play_games_per_worker)
+    try:
+        sp_games_per_worker = int(sp_gpw_cfg) if sp_gpw_cfg is not None else None
+    except (TypeError, ValueError):
+        sp_games_per_worker = None
+    if sp_games_per_worker is not None and sp_games_per_worker <= 0:
+        sp_games_per_worker = None
+
+    sp_seed_cfg = parallel_cfg.get("base_seed", self_play_base_seed)
+    try:
+        sp_base_seed = int(sp_seed_cfg) if sp_seed_cfg is not None else None
+    except (TypeError, ValueError):
+        sp_base_seed = None
+    if sp_base_seed == 0:
+        sp_base_seed = None
+
+    sp_virtual_loss_cfg = parallel_cfg.get("virtual_loss_weight", self_play_virtual_loss_weight)
+    try:
+        sp_virtual_loss = float(sp_virtual_loss_cfg)
+    except (TypeError, ValueError):
+        sp_virtual_loss = float(self_play_virtual_loss_weight)
 
     evaluation_cfg = runtime_config.get("evaluation", {})
     eval_temperature = evaluation_cfg.get("temperature", 0.05)
@@ -351,6 +385,10 @@ def train_pipeline(
             "epochs_requested": epochs,
             "batch_size": batch_size,
             "timestamp_start": time.time(),
+            "self_play_workers": sp_workers,
+            "self_play_games_per_worker": sp_games_per_worker,
+            "self_play_virtual_loss": sp_virtual_loss,
+            "self_play_base_seed": sp_base_seed,
         }
 
         self_play_label = "Self-play phase"
@@ -370,6 +408,10 @@ def train_pipeline(
             add_dirichlet_noise=self_play_add_dirichlet,
             mcts_verbose=self_play_mcts_verbose,
             verbose=self_play_verbose,
+            num_workers=sp_workers,
+            games_per_worker=sp_games_per_worker,
+            base_seed=sp_base_seed,
+            virtual_loss_weight=sp_virtual_loss,
         )
         training_data = training_data or []
         num_games_generated = len(training_data)
@@ -540,6 +582,10 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay.")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_eval_test", help="Directory to save model checkpoints.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Training device.")
+    parser.add_argument("--self_play_workers", type=int, default=1, help="Number of parallel workers for self-play (>=1).")
+    parser.add_argument("--self_play_games_per_worker", type=int, default=0, help="Games per worker (0 = auto split).")
+    parser.add_argument("--self_play_base_seed", type=int, default=0, help="Base RNG seed for parallel self-play (0 = auto).")
+    parser.add_argument("--self_play_virtual_loss", type=float, default=0.0, help="Virtual loss weight passed to MCTS during self-play.")
     parser.add_argument("--eval_games_vs_random", type=int, default=4, help="Games vs RandomAgent.")
     parser.add_argument("--eval_games_vs_best", type=int, default=4, help="Games vs BestModel.")
     parser.add_argument("--win_rate_threshold", type=float, default=0.55, help="Win rate to beat opponent.")
@@ -577,6 +623,10 @@ if __name__ == "__main__":
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        self_play_workers=args.self_play_workers,
+        self_play_games_per_worker=(None if args.self_play_games_per_worker <= 0 else args.self_play_games_per_worker),
+        self_play_base_seed=(None if args.self_play_base_seed == 0 else args.self_play_base_seed),
+        self_play_virtual_loss_weight=args.self_play_virtual_loss,
         eval_games_vs_random=args.eval_games_vs_random,
         eval_games_vs_best=args.eval_games_vs_best,
         win_rate_threshold=args.win_rate_threshold,

@@ -1,7 +1,11 @@
+import io
 import math
+import os
+import random
 import time
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from typing import List, Dict, Tuple, Optional, Set, Any, Union
 from src.game_state import GameState, Player, Phase
 from src.move_generator import generate_all_legal_moves, apply_move, MoveType
@@ -70,7 +74,7 @@ class MCTSNode:
 
         for move, prob in zip(legal_moves, move_probs):
             # 创建新状态
-            new_state = apply_move(self.state.copy(), move)
+            new_state = apply_move(self.state.copy(), move, quiet=True)
             # 创建子节点
             child = MCTSNode(
                 state=new_state,
@@ -516,13 +520,13 @@ class MCTS:
             for rank in range(topk):
                 i = sorted_idx[rank]
                 print(f"  #{rank+1:02d} π={policy[i]:.3f}  move={moves[i]}")
-            
+            print("moves:", len(moves), "policy:", len(policy))
+            print(f"[MCTS] waves={prof['waves']} | nn_calls={prof['nn_calls']} | "
+            f"unique_leaves={prof['unique_leaves']} | dup_skipped={prof['dup_skipped']} | "
+            f"avg_batch≈{prof['avg_B']:.2f} (K={prof['batch_K']})")
             print("====================================\n")
         assert len(moves) == len(policy), "not same length at search()."
-        print("moves:", len(moves), "policy:", len(policy))
-        print(f"[MCTS] waves={prof['waves']} | nn_calls={prof['nn_calls']} | "
-        f"unique_leaves={prof['unique_leaves']} | dup_skipped={prof['dup_skipped']} | "
-        f"avg_batch≈{prof['avg_B']:.2f} (K={prof['batch_K']})")
+        
         return moves, policy
     
 
@@ -627,6 +631,142 @@ class MCTS:
     
     
 
+def self_play_single_game(
+    model: ChessNet,
+    mcts_simulations: int,
+    temperature_init: float,
+    temperature_final: float,
+    temperature_threshold: int,
+    exploration_weight: float,
+    device: str,
+    add_dirichlet_noise: bool,
+    virtual_loss_weight: float = 0.0,
+    mcts_verbose: bool = False,
+    verbose: bool = False,
+) -> Tuple[List[GameState], List[np.ndarray], float]:
+    """
+    运行一整局自博弈，返回 (states, policies, result)。
+    """
+    log = print if verbose else (lambda *args, **kwargs: None)
+    mcts = MCTS(
+        model=model,
+        num_simulations=mcts_simulations,
+        exploration_weight=exploration_weight,
+        device=device,
+        add_dirichlet_noise=add_dirichlet_noise,
+        virtual_loss_weight=virtual_loss_weight,
+        verbose=mcts_verbose,
+    )
+
+    state = GameState()
+    game_states: List[GameState] = []
+    game_policies: List[np.ndarray] = []
+    move_count = 0
+
+    while True:
+        temperature = temperature_init if move_count < temperature_threshold else temperature_final
+        mcts.temperature = temperature
+
+        moves, policy = mcts.search(state)
+
+        if verbose:
+            log(
+                f"\n--- Self-Play Move {move_count + 1} for Player {state.current_player} ---"
+            )
+            log(
+                f"MCTS found {len(moves)} legal moves (temperature: {mcts.temperature:.2f}):"
+            )
+            if not moves:
+                log("  No legal moves found by MCTS from this state.")
+            else:
+                sorted_moves_indices = np.argsort(policy)[::-1]
+                for i in range(len(sorted_moves_indices)):
+                    idx = sorted_moves_indices[i]
+                    log(f"  {i + 1}. Move: {moves[idx]}, Policy Prob: {policy[idx]:.4f}")
+
+        game_states.append(state.copy())
+        game_policies.append(policy)
+
+        if len(moves) == 0:
+            winner = state.get_winner()
+            result = 0.0 if winner is None else (1.0 if winner == Player.BLACK else -1.0)
+            return game_states, game_policies, result
+
+        move_idx = np.random.choice(len(moves), p=policy)
+        move = moves[move_idx]
+
+        state = apply_move(state, move, quiet=True)
+        mcts.advance_root(move)
+        move_count += 1
+
+        if verbose:
+            log(state)
+
+        winner = state.get_winner()
+        if winner is not None:
+            result = 0.0 if winner is None else (1.0 if winner == Player.BLACK else -1.0)
+            return game_states, game_policies, result
+
+        if move_count > 200:
+            return game_states, game_policies, 0.0
+
+
+def _self_play_worker(
+    worker_id: int,
+    cfg: Dict[str, Any],
+    model_state_bytes: bytes,
+    return_queue: "mp.Queue",
+) -> None:
+    """
+    子进程入口：重建模型、执行若干局自博弈并返回结果。
+    """
+    try:
+        try:
+            cpu_total = os.cpu_count() or 1
+            per_worker = max(1, cpu_total // max(1, int(cfg.get("num_workers", 1))))
+            torch.set_num_threads(per_worker)
+        except Exception:
+            pass
+
+        base_seed = int(cfg.get("base_seed", 12345))
+        seed = base_seed + 100003 * worker_id
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        board_size = GameState.BOARD_SIZE
+        num_input_channels = cfg.get("num_input_channels")
+        if num_input_channels is None:
+            model = ChessNet(board_size=board_size)
+        else:
+            model = ChessNet(board_size=board_size, num_input_channels=num_input_channels)
+
+        buf = io.BytesIO(model_state_bytes)
+        state_dict = torch.load(buf, map_location=cfg["device"])
+        model.load_state_dict(state_dict)
+        model.to(cfg["device"])
+        model.eval()
+
+        games = []
+        for _ in range(cfg["games_per_worker"]):
+            gs, ps, r = self_play_single_game(
+                model=model,
+                mcts_simulations=cfg["mcts_simulations"],
+                temperature_init=cfg["temperature_init"],
+                temperature_final=cfg["temperature_final"],
+                temperature_threshold=cfg["temperature_threshold"],
+                exploration_weight=cfg["exploration_weight"],
+                device=cfg["device"],
+                add_dirichlet_noise=cfg["add_dirichlet_noise"],
+                virtual_loss_weight=cfg.get("virtual_loss_weight", 0.0),
+                mcts_verbose=cfg.get("mcts_verbose", False),
+                verbose=cfg.get("verbose", False),
+            )
+            games.append((gs, ps, r))
+
+        return_queue.put(("ok", worker_id, games))
+    except Exception as exc:
+        return_queue.put(("err", worker_id, repr(exc)))
 
 def self_play(
     model: ChessNet,
@@ -640,102 +780,111 @@ def self_play(
     add_dirichlet_noise: bool = True,
     mcts_verbose: Optional[bool] = None,
     verbose: bool = False,
+    num_workers: int = 1,
+    games_per_worker: Optional[int] = None,
+    base_seed: Optional[int] = None,
+    virtual_loss_weight: float = 0.0,
 ) -> List[Tuple[List[GameState], List[np.ndarray], float]]:
     """
     执行自我对弈，生成训练数据。
 
-    返回值是一个列表，每个元素是一个元组 (states, policies, value)，
+    返回值是一个列表，每个元素是一个元组(states, policies, value)。
     其中 states 是游戏中的所有状态，policies 是 MCTS 生成的策略，
-    value 是游戏结果 (1 表示黑方胜，-1 表示白方胜)。
+    value 是游戏结果(1 表示黑方胜，-1 表示白方胜)。
     """
     if mcts_verbose is None:
         mcts_verbose = verbose
-    log = print if verbose else (lambda *args, **kwargs: None)
-    training_data = []
 
-    for game_idx in range(num_games):
-        log(f"Starting self-play game {game_idx + 1}/{num_games}")
+    if num_workers <= 1:
+        log = print if verbose else (lambda *args, **kwargs: None)
+        training_data: List[Tuple[List[GameState], List[np.ndarray], float]] = []
+        for game_idx in range(num_games):
+            log(f"Starting self-play game {game_idx + 1}/{num_games}")
+            game_states, game_policies, result = self_play_single_game(
+                model=model,
+                mcts_simulations=mcts_simulations,
+                temperature_init=temperature_init,
+                temperature_final=temperature_final,
+                temperature_threshold=temperature_threshold,
+                exploration_weight=exploration_weight,
+                device=device,
+                add_dirichlet_noise=add_dirichlet_noise,
+                virtual_loss_weight=virtual_loss_weight,
+                mcts_verbose=mcts_verbose,
+                verbose=verbose,
+            )
+            training_data.append((game_states, game_policies, result))
+        return training_data
 
-        # 创建 MCTS
-        mcts = MCTS(
-            model=model,
-            num_simulations=mcts_simulations,
-            exploration_weight=exploration_weight,
-            device=device,
-            add_dirichlet_noise=add_dirichlet_noise,
-            verbose=mcts_verbose,
+    ctx = mp.get_context("spawn")
+    total_requested = num_games
+    if games_per_worker is None:
+        q, r = divmod(total_requested, num_workers)
+        per_worker = [q + (1 if i < r else 0) for i in range(num_workers)]
+    else:
+        per_worker = [int(games_per_worker)] * num_workers
+        total_requested = sum(per_worker)
+
+    work_specs = [(idx, games) for idx, games in enumerate(per_worker) if games > 0]
+    if not work_specs:
+        return []
+
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    model_state_bytes = buffer.getvalue()
+
+    if base_seed is None:
+        base_seed = int(torch.initial_seed() % (2**31 - 1))
+
+    num_input_channels = getattr(model, "num_input_channels", None)
+    return_queue = ctx.Queue()
+    processes: List[mp.Process] = []
+    for worker_id, games_for_worker in work_specs:
+        cfg = {
+            "num_workers": num_workers,
+            "games_per_worker": games_for_worker,
+            "mcts_simulations": mcts_simulations,
+            "temperature_init": temperature_init,
+            "temperature_final": temperature_final,
+            "temperature_threshold": temperature_threshold,
+            "exploration_weight": exploration_weight,
+            "device": device,
+            "add_dirichlet_noise": add_dirichlet_noise,
+            "virtual_loss_weight": virtual_loss_weight,
+            "mcts_verbose": mcts_verbose,
+            "verbose": verbose,
+            "base_seed": base_seed,
+            "num_input_channels": num_input_channels,
+        }
+        proc = ctx.Process(
+            target=_self_play_worker,
+            args=(worker_id, cfg, model_state_bytes, return_queue),
         )
+        proc.daemon = False
+        proc.start()
+        processes.append(proc)
 
-        # 初始化游戏状态
-        state = GameState()
-
-        # 记录游戏中的所有状态和策略
-        game_states = []
-        game_policies = []
-
-        # 记录每一步的动作
-        move_count = 0
-
-        # 游戏循环
-        while True:
-            # 确定当前温度
-            if move_count < temperature_threshold:
-                temperature = temperature_init
+    training_data: List[Tuple[List[GameState], List[np.ndarray], float]] = []
+    finished = 0
+    expected = len(work_specs)
+    try:
+        while finished < expected:
+            tag, worker_id, payload = return_queue.get()
+            if tag == "ok":
+                training_data.extend(payload)
+                finished += 1
             else:
-                temperature = temperature_final
-
-            mcts.temperature = temperature
-
-            # 执行 MCTS 搜索
-            moves, policy = mcts.search(state)
-
-            if verbose:
-                log(
-                    f"\n--- Self-Play Move {move_count + 1} for Player {state.current_player} (Game {game_idx + 1}) ---"
-                )
-                log(
-                    f"MCTS found {len(moves)} legal moves with the following policy distribution (temperature: {mcts.temperature:.2f}):"
-                )
-                if not moves:
-                    log("  No legal moves found by MCTS from this state.")
-                else:
-                    sorted_moves_indices = np.argsort(policy)[::-1]
-                    for i in range(len(sorted_moves_indices)):
-                        idx = sorted_moves_indices[i]
-                        log(f"  {i + 1}. Move: {moves[idx]}, Policy Prob: {policy[idx]:.4f}")
-
-
-
-            # 记录当前状态和策略
-            game_states.append(state.copy())
-            game_policies.append(policy)
-
-            # 根据策略选择动作
-            move_idx = np.random.choice(len(moves), p=policy)
-            move = moves[move_idx]
-
-            # 应用动作
-            state = apply_move(state, move)
-            mcts.advance_root(move)
-
-            move_count += 1
-
-            if verbose:
-                log(state)
-            winner = state.get_winner()
-            if winner is not None:
-                result = 1.0 if winner == Player.BLACK else -1.0 if winner == Player.WHITE else 0.0
-                training_data.append((game_states, game_policies, result))
-                break
-
-            # 如果游戏进行了太多步，也结束游戏
-            if move_count > 200:
-                if verbose:
-                    log(f"Game {game_idx + 1} reached move limit ({move_count} moves), ending as a draw.")
-                    log("Final state before ending due to move limit:")
-                    log(state)
-                training_data.append((game_states, game_policies, 0.0))
-                break
+                raise RuntimeError(f"self-play worker {worker_id} failed: {payload}")
+    except Exception:
+        for proc in processes:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in processes:
+            proc.join()
+        raise
+    else:
+        for proc in processes:
+            proc.join()
 
     return training_data
 
@@ -770,7 +919,7 @@ if __name__ == "__main__":
     print(f"\nBest move: {best_move}")
 
     # 应用最佳动作
-    new_state = apply_move(state, best_move)
+    new_state = apply_move(state, best_move, quiet=True)
 
     print("\nState after best move:")
     print(new_state)
