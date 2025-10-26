@@ -9,7 +9,7 @@ from src.mcts import MCTS
 from src.random_agent import RandomAgent
 
 class MCTSAgent:
-    """?? MCTS ????????????????"""
+    """Agent that selects moves via Monte Carlo Tree Search guided by a neural network."""
 
     def __init__(
         self,
@@ -22,9 +22,9 @@ class MCTSAgent:
         mcts_verbose: Optional[bool] = None,
     ):
         self.model = model
-        self.model.eval()  # ??????????
+        self.model.eval()  # Keep the model in inference mode during evaluation
         self.mcts_simulations = mcts_simulations
-        self.temperature = temperature  # ???????????????????
+        self.temperature = temperature  # Controls how deterministic the visit distribution is
         self.device = device
         self.verbose = verbose
         if mcts_verbose is None:
@@ -32,7 +32,7 @@ class MCTSAgent:
         self.mcts = MCTS(
             model=self.model,
             num_simulations=self.mcts_simulations,
-            exploration_weight=1.0,  # MCTS????????
+            exploration_weight=1.0,  # Exploration constant for UCT scoring
             temperature=self.temperature,
             device=self.device,
             add_dirichlet_noise=add_dirichlet_noise,
@@ -40,8 +40,8 @@ class MCTSAgent:
         )
 
     def select_move(self, state: GameState) -> MoveType:
-        """使用MCTS搜索选择一个动作。"""
-        if not generate_all_legal_moves(state): # 提前检查，以防万一
+        """Use MCTS to choose a move for the given state."""
+        if not generate_all_legal_moves(state):  # Fail fast if the state unexpectedly has no legal moves
             # print(f"MCTSAgent: No legal moves for state:\n{state}")
             raise ValueError("MCTSAgent: No legal moves available for the current state to select from.")
 
@@ -50,7 +50,7 @@ class MCTSAgent:
             # print(f"MCTSAgent: MCTS search returned no moves for state:\n{state}")
             raise ValueError("MCTSAgent: MCTS search returned no moves.")
         
-        # 在评估时，通常选择概率最高的动作
+        # In evaluation we simply pick the move with the highest visit probability
         move_idx = np.argmax(policy)
         chosen_move = moves[move_idx]
         self.mcts.advance_root(chosen_move)
@@ -63,7 +63,7 @@ def play_single_game(
     max_moves: int = 200,
     verbose: bool = False,
 ) -> float:
-    """???????????????"""
+    """Play a single game and return the outcome from Black's perspective."""
     state = initial_state if initial_state else GameState()
     move_count = 0
     log = print if verbose else (lambda *args, **kwargs: None)
@@ -100,7 +100,7 @@ def evaluate_against_agent(
     verbose: bool = False,
     game_verbose: Optional[bool] = None,
 ) -> float:
-    """?? challenger_agent ??? opponent_agent ????"""
+    """Pit the challenger against the opponent and return the challenger win rate."""
     log = print if verbose else (lambda *args, **kwargs: None)
     if num_games % 2 != 0:
         adjusted = max(2, (num_games // 2) * 2)
@@ -128,29 +128,29 @@ def evaluate_against_agent(
     return 0.0 if num_games == 0 else challenger_wins / num_games
 
 if __name__ == '__main__':
-    # 简单测试评估流程
+    # Basic smoke test for the evaluation utilities
     print("Testing evaluation module...")
     current_device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 创建一个虚拟的ChessNet模型 (未训练)
+    # Create an untrained ChessNet model as a lightweight placeholder
     from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
     from src.game_state import GameState
     board_size = GameState.BOARD_SIZE
     dummy_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS).to(current_device)
 
-    # 创建MCTS Agent
-    mcts_agent = MCTSAgent(dummy_model, mcts_simulations=20, device=current_device) # 低模拟次数用于测试
+    # Build the MCTS-based agent used for evaluation
+    mcts_agent = MCTSAgent(dummy_model, mcts_simulations=20, device=current_device)  # Low simulation count keeps this quick
     
-    # 创建Random Agent
+    # Random baseline agent for comparison
     random_agent = RandomAgent()
 
-    num_eval_games = 4 # 必须是偶数
+    num_eval_games = 4  # Even number so each agent gets both colors
     print(f"\nEvaluating MCTSAgent vs RandomAgent over {num_eval_games} games...")
     win_rate_vs_random = evaluate_against_agent(mcts_agent, random_agent, num_eval_games, current_device)
     print(f"MCTSAgent win rate against RandomAgent: {win_rate_vs_random:.2%}")
 
-    # 模拟评估两个MCTS Agent (例如，新模型 vs 旧的最佳模型)
-    # 创建另一个虚拟模型代表旧的最佳模型
+    # Example: evaluate two MCTS agents (e.g., new model vs. previous best)
+    # Create another placeholder model to stand in for the previous best
     # old_best_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS).to(current_device)
     # best_model_agent = MCTSAgent(old_best_model, mcts_simulations=20, device=current_device)
     

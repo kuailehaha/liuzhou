@@ -6,8 +6,7 @@
 import argparse
 import time
 import sys
-from src.test_random_agent import run_mass_tests as run_basic_tests
-from src.test_random_agent_enhanced import run_mass_tests as run_enhanced_tests
+from src.test_random_agent_enhanced import run_enhanced_tests
 from src.test_random_agent_debug import test_single_game, test_multiple_games
 
 def parse_args():
@@ -47,12 +46,7 @@ def main():
         
     elif args.mode == 'multiple':
         print(f"测试多局游戏 (局数: {args.num}, 最大回合数: {args.turns})")
-        test_multiple_games(args.num, args.seed)
-        
-    elif args.mode == 'basic':
-        num = 1000 if args.num == 10 else args.num  # 基本模式默认1000局
-        print(f"基本大规模测试 (局数: {num}, 最大回合数: {args.turns})")
-        run_basic_tests(num, args.seed)
+        test_multiple_games(args.num, args.seed, max_turns=args.turns)
         
     elif args.mode == 'enhanced':
         num = 1000 if args.num == 10 else args.num  # 增强模式默认1000局
