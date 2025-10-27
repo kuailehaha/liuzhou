@@ -26,6 +26,7 @@ class Player(Enum):
 
 class GameState:
     BOARD_SIZE = 6
+    MAX_MOVE_COUNT = 200
 
     def __init__(
         self,
@@ -77,6 +78,9 @@ class GameState:
 
     def switch_player(self):
         self.current_player = self.current_player.opponent()
+
+    def has_reached_move_limit(self) -> bool:
+        return self.move_count >= self.MAX_MOVE_COUNT
 
     def is_board_full(self) -> bool:
         return all(cell != 0 for row in self.board for cell in row)
@@ -160,4 +164,4 @@ class GameState:
         return None
 
     def is_game_over(self) -> bool:
-        return self.get_winner() is not None
+        return self.get_winner() is not None or self.has_reached_move_limit()

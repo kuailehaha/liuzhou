@@ -108,14 +108,21 @@ class MCTSNode:
         """
         将价值反向传播到根节点。
         """
-        # 更新当前节点
-        self.visit_count += 1
-        self.value_sum += value
+        node = self
+        current_value = value
+        visited: Set[int] = set()
 
-        # 递归更新父节点
-        if self.parent:
-            # 从父节点的角度来看，价值需要取反
-            self.parent.backpropagate(-value)
+        while node is not None:
+            node_id = id(node)
+            if node_id in visited:
+                raise RuntimeError("Detected cycle while backpropagating in MCTS tree")
+            visited.add(node_id)
+
+            node.visit_count += 1
+            node.value_sum += current_value
+
+            node = node.parent
+            current_value = -current_value
 
     def apply_virtual_loss(self, loss: float) -> None:
         """
@@ -707,7 +714,7 @@ def self_play_single_game(
             result = 0.0 if winner is None else (1.0 if winner == Player.BLACK else -1.0)
             return game_states, game_policies, result
 
-        if move_count > 200:
+        if state.has_reached_move_limit():
             return game_states, game_policies, 0.0
 
 
