@@ -19,3 +19,5 @@ checkpoints*/        # checkpoints/ checkpoints_eval_run/ 等一律忽略
 **/*.py[cod]         # *.pyc / *.pyo / *.pyd
 __pycache__/
 *.py[cod]
+
+models/

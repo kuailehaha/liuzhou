@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-store" />
+    <title>Liuzhou Web UI</title>
+    <link rel="stylesheet" href="styles.css?v=20251031" />
+  </head>
+  <body>
+    <header>
+      <h1>Liuzhou Human vs AI Playground</h1>
+    </header>
+
+    <main>
+      <section id="setup">
+        <h2>Launch a New Game</h2>
+        <form id="new-game-form">
+          <fieldset>
+            <legend>Human Side</legend>
+            <label>
+              <input type="radio" name="human_player" value="BLACK" checked />
+              Human plays BLACK (moves first)
+            </label>
+            <label>
+              <input type="radio" name="human_player" value="WHITE" />
+              Human plays WHITE
+            </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Model Options</legend>
+            <label>
+              Model checkpoint path (optional):
+              <input
+                type="text"
+                name="model_path"
+                value="D:\CODES\liuzhou\models\model_iter_3.pt"
+                placeholder="D:\CODES\liuzhou\models\model_iter_3.pt"
+                autocomplete="off"
+              />
+            </label>
+            <label>
+              MCTS simulations per move:
+              <input type="number" name="mcts_simulations" min="1" placeholder="160" />
+            </label>
+            <label>
+              Temperature:
+              <input type="number" name="temperature" step="0.01" min="0" placeholder="0.05" />
+            </label>
+          </fieldset>
+
+          <button type="button" id="start-game">Start Game</button>
+        </form>
+        <div id="setup-error" class="error"></div>
+      </section>
+
+      <section id="game" class="hidden">
+        <div class="left-column">
+          <h2>Board</h2>
+          <div id="board" class="board"></div>
+          <button id="process-removal" class="hidden">Process Removal Phase</button>
+        </div>
+        <div class="right-column">
+          <h2>Status</h2>
+          <div id="status"></div>
+          <div id="meta"></div>
+
+          <h2>Moves</h2>
+          <div id="human-hints" class="hint"></div>
+          <div id="move-log" class="log"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <small>
+        API endpoint: <code id="api-base">/api</code>. Open the dev console for network traces.
+      </small>
+    </footer>
+
+    <script src="app.js?v=20251031" type="module"></script>
+  </body>
+</html>
