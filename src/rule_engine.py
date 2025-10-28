@@ -465,10 +465,13 @@ def detect_shape_formed(
     player_value: int,
     marked_set: set,
 ) -> str:
-    if check_squares(board, r, c, player_value, marked_set):
-        return "square"
-    if check_lines(board, r, c, player_value, marked_set):
+    found_square = check_squares(board, r, c, player_value, marked_set)
+    found_line = check_lines(board, r, c, player_value, marked_set)
+
+    if found_line:
         return "line"
+    if found_square:
+        return "square"
     return "none"
 
 
