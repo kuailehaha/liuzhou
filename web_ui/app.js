@@ -199,10 +199,89 @@ function markCellState(cell, state, row, col) {
   }
 }
 
+// === 新增：读取 CSS 变量，得到像素数 ===
+function readCssPx(varName, from = document.documentElement) {
+  const v = getComputedStyle(from).getPropertyValue(varName).trim();
+  return Number(v.replace('px', ''));
+}
+
+// === 新增：用 SVG 画 6x6（或任意 NxN）网格线 ===
+// 规则：N 条竖线、N 条横线；每条线从第一格中心到最后一格中心。
+// 因为 .board 有半格 padding，所以边/角交点不会“延伸出棋盘”。
+function drawGridSvg(size) {
+  const svg = document.getElementById('grid-svg');
+  if (!svg) return;
+
+  // 清空旧线
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  // 读取尺寸/样式
+  const board = document.getElementById('board');
+  //const boardRect = board.getBoundingClientRect();
+  const cellSize = readCssPx('--cell-size');
+  const lineWidth = readCssPx('--line-width') || 2;
+
+  // 线颜色用你定义的 --line-color
+  const lineColor = getComputedStyle(document.documentElement)
+    .getPropertyValue('--line-color').trim() || 'rgba(65,45,22,0.8)';
+
+  // SVG 尺寸 = 棋盘盒子尺寸（含 padding）
+  const w = board.clientWidth;   // content + padding（不含 border）
+  const h = board.clientHeight;
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.setAttribute('width', w);
+  svg.setAttribute('height', h);
+
+  const pb = getComputedStyle(board);
+  const padding = parseFloat(pb.paddingLeft);
+  const pad = cellSize / 2 + padding ;               // 起止坐标的“内缩半格”
+  const last = pad + (size - 1) * cellSize;
+
+  // 画竖线（x 固定，y 从 pad 到 last）
+  for (let i = 0; i < size; i++) {
+    const x = pad + i * cellSize;
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', x);
+    line.setAttribute('y1', pad);
+    line.setAttribute('x2', x);
+    line.setAttribute('y2', last);
+    line.setAttribute('stroke', lineColor);
+    line.setAttribute('stroke-width', lineWidth);
+    line.setAttribute('shape-rendering', 'crispEdges');
+    svg.appendChild(line);
+  }
+
+  // 画横线（y 固定，x 从 pad 到 last）
+  for (let i = 0; i < size; i++) {
+    const y = pad + i * cellSize;
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', pad);
+    line.setAttribute('y1', y);
+    line.setAttribute('x2', last);
+    line.setAttribute('y2', y);
+    line.setAttribute('stroke', lineColor);
+    line.setAttribute('stroke-width', lineWidth);
+    line.setAttribute('shape-rendering', 'crispEdges');
+    svg.appendChild(line);
+  }
+
+
+}
+
+
+
 function renderBoard(state) {
   boardElement.innerHTML = "";
   const size = state.board.length;
   document.documentElement.style.setProperty("--board-size", size);
+
+  // 1) 先把 SVG 放回去（boardElement 清空会把 svg 也清掉）
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.id = 'grid-svg';
+  svg.classList.add('grid-svg');
+  boardElement.appendChild(svg);
+
+  // 2) 再铺格子（保持你原来的点击/选中逻辑）
   const humanTurn = isHumanTurn(state);
   for (let r = 0; r < size; r += 1) {
     for (let c = 0; c < size; c += 1) {
@@ -220,7 +299,11 @@ function renderBoard(state) {
       boardElement.appendChild(cell);
     }
   }
+
+  // 3) 画坐标网格线
+  drawGridSvg(size);
 }
+
 
 function findSimpleMove(position) {
   return currentLegalMoves.find(

@@ -1,6 +1,6 @@
 :root {
   --board-size: 6;
-  --cell-size: 72px;
+  --cell-size: 100px;
   --line-width: 2px;
   --board-wood: #d9b072;
   --board-wood-shadow: #b48a4a;
@@ -145,8 +145,8 @@ form button:hover {
 }
 
 .cell .stone {
-  width: 78%;
-  height: 78%;
+  width: 75%;
+  height: 75%;
   border-radius: 50%;
   position: relative;
   z-index: 2;
@@ -253,30 +253,31 @@ form button:hover {
   grid-template-columns: repeat(var(--board-size), var(--cell-size));
   grid-template-rows: repeat(var(--board-size), var(--cell-size));
   gap: 0;
+
+  /* 保持你原来的木纹、尺寸、圆角等 */
   padding: calc(var(--cell-size) / 2);
   width: calc(var(--board-size) * var(--cell-size) + var(--cell-size));
   height: calc(var(--board-size) * var(--cell-size) + var(--cell-size));
   background-color: var(--board-wood);
-  background-image:
-    linear-gradient(
-      90deg,
-      transparent calc(50% - var(--line-width) / 2),
-      var(--line-color) calc(50% - var(--line-width) / 2),
-      var(--line-color) calc(50% + var(--line-width) / 2),
-      transparent calc(50% + var(--line-width) / 2)
-    ),
-    linear-gradient(
-      0deg,
-      transparent calc(50% - var(--line-width) / 2),
-      var(--line-color) calc(50% - var(--line-width) / 2),
-      var(--line-color) calc(50% + var(--line-width) / 2),
-      transparent calc(50% + var(--line-width) / 2)
-    );
-  background-size: var(--cell-size) var(--cell-size), var(--cell-size) var(--cell-size);
-  background-position: calc(var(--cell-size) / 2) calc(var(--cell-size) / 2);
+
+  /* 关键：去掉渐变网格线，交给 SVG 画 */
+  /* background-image: ... (删除这两条 linear-gradient) */
+  background-image: none;
+
   border: 10px solid var(--board-wood-shadow);
   border-radius: 14px;
   box-shadow: 0 20px 40px rgba(43, 32, 15, 0.25);
   box-sizing: border-box;
 }
 
+/* SVG 覆盖在棋盘最上层，用来画线；不拦截鼠标事件 */
+.grid-svg {
+  position: absolute;
+  inset: 0;            /* 等价于 top/right/bottom/left: 0 */
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;          /* 线在格子下/上都行；如需让棋子压住线可设 0 */
+}
+
+/* 保持 .cell/.stone 等原样（无需改） */
