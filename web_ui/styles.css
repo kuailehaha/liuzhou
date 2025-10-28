@@ -2,6 +2,7 @@
   --board-size: 6;
   --cell-size: 100px;
   --line-width: 2px;
+  --board-border: 10px;
   --board-wood: #d9b072;
   --board-wood-shadow: #b48a4a;
   --line-color: rgba(65, 45, 22, 0.8);
@@ -256,8 +257,10 @@ form button:hover {
 
   /* 保持你原来的木纹、尺寸、圆角等 */
   padding: calc(var(--cell-size) / 2);
-  width: calc(var(--board-size) * var(--cell-size) + var(--cell-size));
-  height: calc(var(--board-size) * var(--cell-size) + var(--cell-size));
+  border: var(--board-border) solid var(--board-wood-shadow);
+  width: calc(var(--board-size) * var(--cell-size) + var(--cell-size) + 2 * var(--board-border));
+  height: calc(var(--board-size) * var(--cell-size) + var(--cell-size) + 2 * var(--board-border));
+
   background-color: var(--board-wood);
 
   /* 关键：去掉渐变网格线，交给 SVG 画 */
