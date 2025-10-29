@@ -209,63 +209,67 @@ function readCssPx(varName, from = document.documentElement) {
 // 规则：N 条竖线、N 条横线；每条线从第一格中心到最后一格中心。
 // 因为 .board 有半格 padding，所以边/角交点不会“延伸出棋盘”。
 function drawGridSvg(size) {
-  const svg = document.getElementById('grid-svg');
+  const svg = document.getElementById("grid-svg");
   if (!svg) return;
 
-  // 清空旧线
-  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  while (svg.firstChild) {
+    svg.removeChild(svg.firstChild);
+  }
 
-  // 读取尺寸/样式
-  const board = document.getElementById('board');
-  //const boardRect = board.getBoundingClientRect();
-  const cellSize = readCssPx('--cell-size');
-  const lineWidth = readCssPx('--line-width') || 2;
+  const board = document.getElementById("board");
+  if (!board) return;
 
-  // 线颜色用你定义的 --line-color
-  const lineColor = getComputedStyle(document.documentElement)
-    .getPropertyValue('--line-color').trim() || 'rgba(65,45,22,0.8)';
+  const cellSize = readCssPx("--cell-size") || 0;
+  const lineWidth = readCssPx("--line-width") || 2;
+  const boardBorder = readCssPx("--board-border") || 0;
+  const lineColor =
+    getComputedStyle(document.documentElement).getPropertyValue("--line-color").trim() ||
+    "rgba(65,45,22,0.8)";
 
-  // SVG 尺寸 = 棋盘盒子尺寸（含 padding）
-  const w = board.clientWidth;   // content + padding（不含 border）
-  const h = board.clientHeight;
-  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-  svg.setAttribute('width', w);
-  svg.setAttribute('height', h);
+  const targetExtent = size * cellSize + cellSize + 2 * boardBorder;
+  let width = board.clientWidth || targetExtent;
+  let height = board.clientHeight || targetExtent;
 
-  const pb = getComputedStyle(board);
-  const padding = parseFloat(pb.paddingLeft);
-  const pad = cellSize / 2 + padding ;               // 起止坐标的“内缩半格”
+  if ((!board.clientWidth || !board.clientHeight) && board.offsetParent === null) {
+    requestAnimationFrame(() => drawGridSvg(size));
+  }
+
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", width);
+  svg.setAttribute("height", height);
+
+  const boardStyle = getComputedStyle(board);
+  const paddingLeft = parseFloat(boardStyle.paddingLeft);
+  const effectivePadding =
+    Number.isFinite(paddingLeft) && paddingLeft > 0 ? paddingLeft : cellSize / 2;
+  const pad = cellSize / 2 + effectivePadding;
   const last = pad + (size - 1) * cellSize;
 
-  // 画竖线（x 固定，y 从 pad 到 last）
-  for (let i = 0; i < size; i++) {
+  for (let i = 0; i < size; i += 1) {
     const x = pad + i * cellSize;
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    line.setAttribute('x1', x);
-    line.setAttribute('y1', pad);
-    line.setAttribute('x2', x);
-    line.setAttribute('y2', last);
-    line.setAttribute('stroke', lineColor);
-    line.setAttribute('stroke-width', lineWidth);
-    line.setAttribute('shape-rendering', 'crispEdges');
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", x);
+    line.setAttribute("y1", pad);
+    line.setAttribute("x2", x);
+    line.setAttribute("y2", last);
+    line.setAttribute("stroke", lineColor);
+    line.setAttribute("stroke-width", lineWidth);
+    line.setAttribute("shape-rendering", "crispEdges");
     svg.appendChild(line);
   }
 
-  // 画横线（y 固定，x 从 pad 到 last）
-  for (let i = 0; i < size; i++) {
+  for (let i = 0; i < size; i += 1) {
     const y = pad + i * cellSize;
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    line.setAttribute('x1', pad);
-    line.setAttribute('y1', y);
-    line.setAttribute('x2', last);
-    line.setAttribute('y2', y);
-    line.setAttribute('stroke', lineColor);
-    line.setAttribute('stroke-width', lineWidth);
-    line.setAttribute('shape-rendering', 'crispEdges');
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", pad);
+    line.setAttribute("y1", y);
+    line.setAttribute("x2", last);
+    line.setAttribute("y2", y);
+    line.setAttribute("stroke", lineColor);
+    line.setAttribute("stroke-width", lineWidth);
+    line.setAttribute("shape-rendering", "crispEdges");
     svg.appendChild(line);
   }
-
-
 }
 
 
@@ -442,12 +446,16 @@ async function handleNewGame(event) {
       throw new Error("Malformed server response.");
     }
     moveLog.length = 0;
+    if (setupSection) {
+      setupSection.classList.add("hidden");
+    }
+    if (gameSection) {
+      gameSection.classList.remove("hidden");
+    }
     if (data.aiMoves) {
       data.aiMoves.forEach((move) => addLogEntry("ai", move));
     }
     updateGameState(data);
-    setupSection.classList.add("hidden");
-    gameSection.classList.remove("hidden");
     setupError.textContent = "";
   } catch (error) {
     setupError.textContent = error.message;
@@ -468,3 +476,4 @@ if (newGameForm) {
 if (processRemovalButton) {
   processRemovalButton.addEventListener("click", () => maybeSendProcessRemoval());
 }
+
