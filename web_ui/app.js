@@ -9,6 +9,7 @@ const gameSection = document.getElementById("game");
 const startGameButton = document.getElementById("start-game");
 const boardElement = document.getElementById("board");
 const statusElement = document.getElementById("status");
+const evaluationElement = document.getElementById("evaluation");
 const metaElement = document.getElementById("meta");
 const hintElement = document.getElementById("human-hints");
 const logElement = document.getElementById("move-log");
@@ -19,6 +20,7 @@ let currentState = null;
 let currentLegalMoves = [];
 let humanPlayer = null;
 let selectedSource = null;
+let currentEvaluation = null;
 const moveLog = [];
 
 function arraysEqual(a, b) {
@@ -128,9 +130,36 @@ function updateMeta(meta) {
   metaElement.textContent = parts.join(" | ");
 }
 
+function updateEvaluation(info) {
+  if (!evaluationElement) {
+    return;
+  }
+
+  currentEvaluation = info ?? null;
+  if (!currentEvaluation) {
+    evaluationElement.textContent = "Network evaluation: unavailable (no neural estimate).";
+    return;
+  }
+
+  const { value, winProbability, perspective, range } = currentEvaluation;
+  const [rangeMin, rangeMax] = Array.isArray(range) && range.length >= 2 ? range : [-1, 1];
+  const sideLabel = perspective ? `${perspective} to move` : "Current player";
+
+  if (!Number.isFinite(value)) {
+    evaluationElement.textContent = `Network evaluation (${sideLabel}, range ${rangeMin}..${rangeMax}): unavailable.`;
+    return;
+  }
+
+  const clampedValue = Math.max(rangeMin ?? -1, Math.min(rangeMax ?? 1, value));
+  const rawProb = Number.isFinite(winProbability) ? winProbability : (clampedValue + 1) / 2;
+  const clampedProb = Math.max(0, Math.min(1, rawProb));
+  const percentText = `${(clampedProb * 100).toFixed(1)}%`;
+  evaluationElement.textContent = `Network evaluation (${sideLabel}, range ${rangeMin}..${rangeMax}): value ${clampedValue.toFixed(3)}, win approx ${percentText}.`;
+}
+
 function updateHint(state) {
   if (!isHumanTurn(state)) {
-    hintElement.textContent = state.isGameOver ? "Replay the game or start a new match." : "Waiting for AI…";
+    hintElement.textContent = state.isGameOver ? "Replay the game or start a new match." : "Waiting for AI...";
     return;
   }
 
@@ -415,6 +444,7 @@ function updateGameState(data) {
   updateStatus(currentState);
   updateMeta(data.meta || {});
   updateHint(currentState);
+  updateEvaluation(data.evaluation || null);
 
   if (data.aiMoves) {
     data.aiMoves.forEach((move) => addLogEntry("ai", move));
@@ -477,3 +507,4 @@ if (processRemovalButton) {
   processRemovalButton.addEventListener("click", () => maybeSendProcessRemoval());
 }
 
+updateEvaluation(null);

@@ -5,12 +5,17 @@ import mimetypes
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
 from src.game_state import GameState, Player
 from src.move_generator import apply_move, generate_all_legal_moves
+from src.neural_network import state_to_tensor
 from src.random_agent import RandomAgent
 from src.evaluate import MCTSAgent
 
@@ -135,6 +140,40 @@ def _ensure_human_turn(session: GameSession) -> None:
         )
 
 
+def _evaluate_position(session: GameSession) -> Dict[str, Any] | None:
+    """
+    Run the value head of the AI model on the current state (when available).
+    Returns the estimate from the current player's perspective in the [-1, 1] range.
+    """
+    if torch is None:
+        return None
+    agent = getattr(session, "ai_agent", None)
+    model = getattr(agent, "model", None)
+    if model is None:
+        return None
+
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+
+    current_player = session.state.current_player
+    try:
+        inputs = state_to_tensor(session.state, current_player).to(device)
+        with torch.inference_mode():
+            _, _, _, value = model(inputs)
+        raw_value = float(value.squeeze().detach().to("cpu").item())
+    except Exception:
+        return None
+
+    return {
+        "value": raw_value,
+        "winProbability": (raw_value + 1.0) / 2.0,
+        "perspective": current_player.name,
+        "range": [-1.0, 1.0],
+    }
+
+
 def _prepare_payload(session: GameSession, ai_moves: List[Mapping[str, Any]] | None = None) -> Dict[str, Any]:
     legal_moves = generate_all_legal_moves(session.state) if not session.state.is_game_over() else []
     payload = build_game_payload(session.game_id, session.state, legal_moves, ai_moves)
@@ -145,6 +184,9 @@ def _prepare_payload(session: GameSession, ai_moves: List[Mapping[str, Any]] | N
     }
     if session.using_random_agent:
         payload["meta"]["note"] = "Falling back to RandomAgent because no model checkpoint was configured."
+    evaluation = _evaluate_position(session)
+    if evaluation is not None:
+        payload["evaluation"] = evaluation
     return payload
 
 

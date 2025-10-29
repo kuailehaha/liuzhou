@@ -219,6 +219,16 @@ form button:hover {
   font-weight: 600;
 }
 
+.info-block {
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  background: #f7f9fc;
+  border: 1px solid #d9e2ec;
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
 #meta {
   margin-bottom: 1.5rem;
   font-size: 0.9rem;
