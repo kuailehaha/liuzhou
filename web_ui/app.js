@@ -21,6 +21,7 @@ let currentLegalMoves = [];
 let humanPlayer = null;
 let selectedSource = null;
 let currentEvaluation = null;
+let lastOpponentHighlight = null;
 const moveLog = [];
 
 function arraysEqual(a, b) {
@@ -157,6 +158,49 @@ function updateEvaluation(info) {
   evaluationElement.textContent = `Network evaluation (${sideLabel}, range ${rangeMin}..${rangeMax}): value ${clampedValue.toFixed(3)}, win approx ${percentText}.`;
 }
 
+function getMoveLandingPosition(move) {
+  if (!move) {
+    return null;
+  }
+  const action = move.action_type;
+  if (action === "place" && Array.isArray(move.position)) {
+    return move.position.slice(0, 2);
+  }
+  if (action === "move" && Array.isArray(move.to_position)) {
+    return move.to_position.slice(0, 2);
+  }
+  return null;
+}
+
+function refreshOpponentHighlight(moves) {
+  if (!Array.isArray(moves) || moves.length === 0) {
+    return;
+  }
+  const board = currentState?.board;
+  for (let idx = moves.length - 1; idx >= 0; idx -= 1) {
+    const landing = getMoveLandingPosition(moves[idx]);
+    if (!landing) {
+      continue;
+    }
+    const [row, col] = landing;
+    if (!board || !Array.isArray(board[row]) || typeof board[row][col] === "undefined") {
+      lastOpponentHighlight = landing.slice(0, 2);
+      return;
+    }
+    const occupant = board[row][col];
+    const occupantColor = occupant === 1 ? "BLACK" : occupant === -1 ? "WHITE" : null;
+    if (!occupantColor) {
+      continue;
+    }
+    if (humanPlayer && occupantColor === humanPlayer) {
+      continue;
+    }
+    lastOpponentHighlight = landing.slice(0, 2);
+    return;
+  }
+  lastOpponentHighlight = null;
+}
+
 function updateHint(state) {
   if (!isHumanTurn(state)) {
     hintElement.textContent = state.isGameOver ? "Replay the game or start a new match." : "Waiting for AI...";
@@ -221,6 +265,16 @@ function markCellState(cell, state, row, col) {
   }
   if (markedWhite) {
     cell.classList.add("marked-white");
+  }
+
+  const highlightMatch = lastOpponentHighlight && arraysEqual(lastOpponentHighlight, [row, col]);
+  if (highlightMatch) {
+    const occupantColor = stone === 1 ? "BLACK" : stone === -1 ? "WHITE" : null;
+    if (occupantColor && (!humanPlayer || occupantColor !== humanPlayer)) {
+      const indicator = document.createElement("div");
+      indicator.className = `last-opponent-indicator ${occupantColor.toLowerCase()}`;
+      cell.appendChild(indicator);
+    }
   }
 
   if (selectedSource && arraysEqual(selectedSource, [row, col])) {
@@ -440,6 +494,7 @@ function updateGameState(data) {
   humanPlayer = data.meta?.humanPlayer || humanPlayer;
   selectedSource = null;
 
+  refreshOpponentHighlight(data.aiMoves || []);
   renderBoard(currentState);
   updateStatus(currentState);
   updateMeta(data.meta || {});
@@ -485,6 +540,7 @@ async function handleNewGame(event) {
     if (data.aiMoves) {
       data.aiMoves.forEach((move) => addLogEntry("ai", move));
     }
+    lastOpponentHighlight = null;
     updateGameState(data);
     setupError.textContent = "";
   } catch (error) {
