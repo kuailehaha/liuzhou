@@ -27,7 +27,8 @@ def test_self_play_generation_smoke():
     )
 
     assert len(training_data) == games_requested
-    for game_states, game_policies, result in training_data:
+    for game_states, game_policies, result, soft_value in training_data:
         assert game_states, "Expected at least one state per game"
         assert len(game_states) == len(game_policies)
         assert result in (-1, 0, 1)
+        assert -1.0 <= soft_value <= 1.0

@@ -650,7 +650,8 @@ def self_play_single_game(
     virtual_loss_weight: float = 0.0,
     mcts_verbose: bool = False,
     verbose: bool = False,
-) -> Tuple[List[GameState], List[np.ndarray], float]:
+    soft_value_k: float = 2.0,
+) -> Tuple[List[GameState], List[np.ndarray], float, float]:
     """
     运行一整局自博弈，返回 (states, policies, result)。
     """
@@ -666,6 +667,13 @@ def self_play_single_game(
     )
 
     state = GameState()
+    board_area = GameState.BOARD_SIZE * GameState.BOARD_SIZE
+
+    def compute_soft_value(final_state: GameState) -> float:
+        black_count = final_state.count_player_pieces(Player.BLACK)
+        white_count = final_state.count_player_pieces(Player.WHITE)
+        material_delta = (black_count - white_count) / float(board_area)
+        return math.tanh(soft_value_k * material_delta)
     game_states: List[GameState] = []
     game_policies: List[np.ndarray] = []
     move_count = 0
@@ -697,7 +705,8 @@ def self_play_single_game(
         if len(moves) == 0:
             winner = state.get_winner()
             result = 0.0 if winner is None else (1.0 if winner == Player.BLACK else -1.0)
-            return game_states, game_policies, result
+            soft_value = compute_soft_value(state)
+            return game_states, game_policies, result, soft_value
 
         move_idx = np.random.choice(len(moves), p=policy)
         move = moves[move_idx]
@@ -712,10 +721,12 @@ def self_play_single_game(
         winner = state.get_winner()
         if winner is not None:
             result = 0.0 if winner is None else (1.0 if winner == Player.BLACK else -1.0)
-            return game_states, game_policies, result
+            soft_value = compute_soft_value(state)
+            return game_states, game_policies, result, soft_value
 
         if state.has_reached_move_limit():
-            return game_states, game_policies, 0.0
+            soft_value = compute_soft_value(state)
+            return game_states, game_policies, 0.0, soft_value
 
 
 def _self_play_worker(
@@ -754,9 +765,15 @@ def _self_play_worker(
         model.to(cfg["device"])
         model.eval()
 
+        cfg_soft_value_k = cfg.get("soft_value_k", 2.0)
+        try:
+            soft_value_k = float(cfg_soft_value_k)
+        except (TypeError, ValueError):
+            soft_value_k = 2.0
+
         games = []
         for _ in range(cfg["games_per_worker"]):
-            gs, ps, r = self_play_single_game(
+            gs, ps, r, soft_v = self_play_single_game(
                 model=model,
                 mcts_simulations=cfg["mcts_simulations"],
                 temperature_init=cfg["temperature_init"],
@@ -768,8 +785,9 @@ def _self_play_worker(
                 virtual_loss_weight=cfg.get("virtual_loss_weight", 0.0),
                 mcts_verbose=cfg.get("mcts_verbose", False),
                 verbose=cfg.get("verbose", False),
+                soft_value_k=soft_value_k,
             )
-            games.append((gs, ps, r))
+            games.append((gs, ps, r, soft_v))
 
         return_queue.put(("ok", worker_id, games))
     except Exception as exc:
@@ -791,7 +809,8 @@ def self_play(
     games_per_worker: Optional[int] = None,
     base_seed: Optional[int] = None,
     virtual_loss_weight: float = 0.0,
-) -> List[Tuple[List[GameState], List[np.ndarray], float]]:
+    soft_value_k: float = 2.0,
+) -> List[Tuple[List[GameState], List[np.ndarray], float, float]]:
     """
     执行自我对弈，生成训练数据。
 
@@ -804,10 +823,10 @@ def self_play(
 
     if num_workers <= 1:
         log = print if verbose else (lambda *args, **kwargs: None)
-        training_data: List[Tuple[List[GameState], List[np.ndarray], float]] = []
+        training_data: List[Tuple[List[GameState], List[np.ndarray], float, float]] = []
         for game_idx in range(num_games):
             log(f"Starting self-play game {game_idx + 1}/{num_games}")
-            game_states, game_policies, result = self_play_single_game(
+            game_states, game_policies, result, soft_value = self_play_single_game(
                 model=model,
                 mcts_simulations=mcts_simulations,
                 temperature_init=temperature_init,
@@ -819,8 +838,9 @@ def self_play(
                 virtual_loss_weight=virtual_loss_weight,
                 mcts_verbose=mcts_verbose,
                 verbose=verbose,
+                soft_value_k=soft_value_k,
             )
-            training_data.append((game_states, game_policies, result))
+            training_data.append((game_states, game_policies, result, soft_value))
         return training_data
 
     ctx = mp.get_context("spawn")
@@ -858,6 +878,7 @@ def self_play(
             "device": device,
             "add_dirichlet_noise": add_dirichlet_noise,
             "virtual_loss_weight": virtual_loss_weight,
+            "soft_value_k": soft_value_k,
             "mcts_verbose": mcts_verbose,
             "verbose": verbose,
             "base_seed": base_seed,
@@ -871,7 +892,7 @@ def self_play(
         proc.start()
         processes.append(proc)
 
-    training_data: List[Tuple[List[GameState], List[np.ndarray], float]] = []
+    training_data: List[Tuple[List[GameState], List[np.ndarray], float, float]] = []
     finished = 0
     expected = len(work_specs)
     try:

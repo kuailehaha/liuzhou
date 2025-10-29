@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import torch
@@ -68,7 +69,7 @@ class ChessDataset(Dataset):
     """
     用于训练神经网络的数据集。
     """
-    def __init__(self, examples: List[Tuple[GameState, np.ndarray, float]]):
+    def __init__(self, examples: List[Tuple[GameState, np.ndarray, float, float]]):
         """
         初始化数据集。
         
@@ -81,8 +82,8 @@ class ChessDataset(Dataset):
     def __len__(self):
         return len(self.examples)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor]:
-        state_obj, mcts_policy, value = self.examples[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor, torch.Tensor]:
+        state_obj, mcts_policy, value, soft_value = self.examples[idx]
         
         # 将状态转换为张量
         state_tensor = state_to_tensor(state_obj, state_obj.current_player).squeeze(0)
@@ -92,6 +93,7 @@ class ChessDataset(Dataset):
         
         # 价值转换为张量
         value_tensor = torch.FloatTensor([value])
+        soft_tensor = torch.FloatTensor([soft_value])
         
         # 获取当前状态的合法走法，MCTS策略是针对这些走法的
         # 必须保证 generate_all_legal_moves 的顺序与 MCTS 生成策略时的顺序一致
@@ -112,10 +114,10 @@ class ChessDataset(Dataset):
                 print(f"Critical Warning: Mismatch len(legal_moves)={len(legal_moves)} vs len(mcts_policy)={len(mcts_policy_tensor)}")
 
 
-        return state_tensor, legal_moves, mcts_policy_tensor, value_tensor
+        return state_tensor, legal_moves, mcts_policy_tensor, value_tensor, soft_tensor
 
-def mcts_collate_fn(batch: List[Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor]]) \
-    -> Tuple[torch.Tensor, List[List[MoveType]], List[torch.Tensor], torch.Tensor]:
+def mcts_collate_fn(batch: List[Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor, torch.Tensor]]) \
+    -> Tuple[torch.Tensor, List[List[MoveType]], List[torch.Tensor], torch.Tensor, torch.Tensor]:
     """
     自定义的collate_fn，用于处理包含legal_moves列表的批次。
     """
@@ -123,16 +125,18 @@ def mcts_collate_fn(batch: List[Tuple[torch.Tensor, List[MoveType], torch.Tensor
     list_of_legal_moves = [item[1] for item in batch]  # list of lists of dicts
     target_policies_list = [item[2] for item in batch] # list of Tensors
     value_tensors = torch.stack([item[3] for item in batch])
-    
-    return state_tensors, list_of_legal_moves, target_policies_list, value_tensors
+    soft_tensors = torch.stack([item[4] for item in batch])
+
+    return state_tensors, list_of_legal_moves, target_policies_list, value_tensors, soft_tensors
 
 def train_network(
     model: ChessNet,
-    examples: List[Tuple[GameState, np.ndarray, float]],
+    examples: List[Tuple[GameState, np.ndarray, float, float]],
     batch_size: int = 32,
     epochs: int = 10,
     lr: float = 0.001,
     weight_decay: float = 1e-4,
+    soft_label_alpha: float = 0.0,
     device: str = 'cpu',
     board_size: int = GameState.BOARD_SIZE
 ) -> Tuple[ChessNet, Dict[str, Any]]:
@@ -175,10 +179,14 @@ def train_network(
         value_loss_epoch = 0.0
         num_samples_processed = 0
         total_valid_policy_samples = 0
+        soft_abs_epoch = 0.0
+        mix_abs_epoch = 0.0
+        soft_batches = 0
         
-        for batch_idx, (states_tensor_batch, batch_legal_moves, batch_target_policies, target_values_batch) in enumerate(dataloader):
+        for batch_idx, (states_tensor_batch, batch_legal_moves, batch_target_policies, target_values_batch, soft_values_batch) in enumerate(dataloader):
             states_tensor_batch = states_tensor_batch.to(device)
             target_values_batch = target_values_batch.to(device)
+            soft_values_batch = soft_values_batch.to(device)
             # batch_target_policies is a list of tensors, they will be moved to device inside the loop
 
             optimizer.zero_grad()
@@ -187,7 +195,11 @@ def train_network(
             log_p1_batch, log_p2_batch, log_pmc_batch, value_pred_batch = model(states_tensor_batch)
             
             current_batch_policy_loss = torch.tensor(0.0, device=device)
-            current_batch_value_loss = value_loss_fn(value_pred_batch, target_values_batch)
+            y_mix = (1.0 - soft_label_alpha) * target_values_batch + soft_label_alpha * soft_values_batch
+            current_batch_value_loss = value_loss_fn(value_pred_batch, y_mix)
+            soft_abs_epoch += soft_values_batch.abs().mean().item()
+            mix_abs_epoch += y_mix.abs().mean().item()
+            soft_batches += 1
             
             valid_policy_samples_in_batch = 0
 
@@ -255,6 +267,10 @@ def train_network(
             num_samples_processed += states_tensor_batch.size(0)
             total_valid_policy_samples += valid_policy_samples_in_batch
         
+        denom = max(1, soft_batches)
+        avg_soft_abs = soft_abs_epoch / denom
+        avg_mix_abs = mix_abs_epoch / denom
+        
         # 打印每个 epoch 的损失
         if num_samples_processed > 0 :
             avg_loss = total_loss_epoch / num_samples_processed
@@ -267,7 +283,10 @@ def train_network(
                 "avg_policy_loss": float(avg_policy_loss),
                 "avg_value_loss": float(avg_value_loss),
                 "samples": int(num_samples_processed),
-                "valid_policy_samples": int(total_valid_policy_samples)
+                "valid_policy_samples": int(total_valid_policy_samples),
+                "soft_alpha": float(soft_label_alpha),
+                "avg_soft_abs": float(avg_soft_abs),
+                "avg_mix_abs": float(avg_mix_abs),
             })
         else:
             print(f"Epoch {epoch+1}/{epochs}, No samples processed.")
@@ -277,7 +296,10 @@ def train_network(
                 "avg_policy_loss": None,
                 "avg_value_loss": None,
                 "samples": 0,
-                "valid_policy_samples": 0
+                "valid_policy_samples": 0,
+                "soft_alpha": float(soft_label_alpha),
+                "avg_soft_abs": None,
+                "avg_mix_abs": None,
             })
             
     return model, {"epoch_stats": epoch_stats}
@@ -371,6 +393,27 @@ def train_pipeline(
     eval_games_vs_random = evaluation_cfg.get("games_vs_random", eval_games_vs_random)
     eval_games_vs_best = evaluation_cfg.get("games_vs_best", eval_games_vs_best)
 
+    soft_value_cfg = runtime_config.get("soft_value_labels", {})
+    try:
+        soft_value_k = float(soft_value_cfg.get("k", 2.0))
+    except (TypeError, ValueError):
+        soft_value_k = 2.0
+    try:
+        soft_alpha_start = float(soft_value_cfg.get("alpha_start", 0.3))
+    except (TypeError, ValueError):
+        soft_alpha_start = 0.3
+    try:
+        soft_alpha_end = float(soft_value_cfg.get("alpha_end", 0.0))
+    except (TypeError, ValueError):
+        soft_alpha_end = 0.0
+    try:
+        soft_alpha_anneal_iters = int(soft_value_cfg.get("anneal_iterations", 20))
+    except (TypeError, ValueError):
+        soft_alpha_anneal_iters = 20
+    soft_alpha_start = max(0.0, min(1.0, soft_alpha_start))
+    soft_alpha_end = max(0.0, min(1.0, soft_alpha_end))
+    soft_alpha_anneal_iters = max(0, soft_alpha_anneal_iters)
+
     board_size = GameState.BOARD_SIZE
     current_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
     current_model.to(device)
@@ -394,6 +437,18 @@ def train_pipeline(
             "self_play_base_seed": sp_base_seed,
         }
 
+        if soft_alpha_anneal_iters <= 0:
+            current_alpha = soft_alpha_start
+        else:
+            progress = min(iteration / max(1, soft_alpha_anneal_iters), 1.0)
+            cosine_weight = 0.5 * (1.0 + math.cos(math.pi * progress))
+            current_alpha = soft_alpha_end + (soft_alpha_start - soft_alpha_end) * cosine_weight
+        current_alpha = max(0.0, min(1.0, current_alpha))
+        iteration_metrics["soft_label_alpha"] = current_alpha
+        iteration_metrics["soft_value_k"] = soft_value_k
+
+        print(f"Soft label alpha (value mix): {current_alpha:.3f}, soft_value_k={soft_value_k:.2f}")
+
         self_play_label = "Self-play phase"
         _stage_banner("self_play", self_play_label, iteration, iterations, stage_history)
         print(f"{self_play_label}: generating {total_self_play_games} games using current model...")
@@ -415,6 +470,7 @@ def train_pipeline(
             games_per_worker=sp_games_per_worker,
             base_seed=sp_base_seed,
             virtual_loss_weight=sp_virtual_loss,
+            soft_value_k=soft_value_k,
         )
         training_data = training_data or []
         num_games_generated = len(training_data)
@@ -422,7 +478,7 @@ def train_pipeline(
         iteration_metrics["self_play_time_sec"] = self_play_time
         iteration_metrics["self_play_games_played"] = num_games_generated
 
-        examples: List[Tuple[GameState, np.ndarray, float]] = []
+        examples: List[Tuple[GameState, np.ndarray, float, float]] = []
         total_positions = 0
         train_metrics_data: Dict[str, Any] = {"epoch_stats": []}
 
@@ -434,10 +490,12 @@ def train_pipeline(
             print("No training data generated from self-play. Skipping training for this iteration.")
             train_time = _stage_finish("train", train_label, train_start_time, stage_history)
         else:
-            for game_states, game_policies, result in training_data:
+            for game_states, game_policies, result, soft_value in training_data:
                 for i, state in enumerate(game_states):
-                    value = -result if state.current_player == Player.WHITE else result
-                    examples.append((state, game_policies[i], value))
+                    sign = 1.0 if state.current_player == Player.BLACK else -1.0
+                    value = sign * result
+                    soft_signed = sign * soft_value
+                    examples.append((state, game_policies[i], value, soft_signed))
                     total_positions += 1
 
             print(f"{train_label}: {len(examples)} examples, {epochs} epochs...")
@@ -449,6 +507,7 @@ def train_pipeline(
                 epochs=epochs,
                 lr=lr,
                 weight_decay=weight_decay,
+                soft_label_alpha=current_alpha,
                 device=device,
                 board_size=board_size
             )
@@ -464,10 +523,16 @@ def train_pipeline(
             iteration_metrics["train_last_avg_loss"] = last_epoch_stats.get("avg_loss")
             iteration_metrics["train_last_avg_policy_loss"] = last_epoch_stats.get("avg_policy_loss")
             iteration_metrics["train_last_avg_value_loss"] = last_epoch_stats.get("avg_value_loss")
+            iteration_metrics["train_last_soft_alpha"] = last_epoch_stats.get("soft_alpha")
+            iteration_metrics["train_last_avg_soft_abs"] = last_epoch_stats.get("avg_soft_abs")
+            iteration_metrics["train_last_avg_mix_abs"] = last_epoch_stats.get("avg_mix_abs")
         else:
             iteration_metrics["train_last_avg_loss"] = None
             iteration_metrics["train_last_avg_policy_loss"] = None
             iteration_metrics["train_last_avg_value_loss"] = None
+            iteration_metrics["train_last_soft_alpha"] = None
+            iteration_metrics["train_last_avg_soft_abs"] = None
+            iteration_metrics["train_last_avg_mix_abs"] = None
 
         iter_model_path = os.path.join(checkpoint_dir, f"model_iter_{iteration+1}.pt")
         torch.save({
