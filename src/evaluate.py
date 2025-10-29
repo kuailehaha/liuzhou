@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from src.game_state import GameState, Player, Phase
@@ -7,6 +8,29 @@ from src.move_generator import generate_all_legal_moves, apply_move, MoveType
 from src.neural_network import ChessNet # For type hinting
 from src.mcts import MCTS
 from src.random_agent import RandomAgent
+
+@dataclass
+class EvaluationStats:
+    """Aggregate win/draw/loss information for a head-to-head evaluation."""
+    wins: int
+    losses: int
+    draws: int
+    total_games: int
+
+    @property
+    def win_rate(self) -> float:
+        return self._safe_rate(self.wins)
+
+    @property
+    def loss_rate(self) -> float:
+        return self._safe_rate(self.losses)
+
+    @property
+    def draw_rate(self) -> float:
+        return self._safe_rate(self.draws)
+
+    def _safe_rate(self, value: int) -> float:
+        return 0.0 if self.total_games == 0 else value / self.total_games
 
 class MCTSAgent:
     """Agent that selects moves via Monte Carlo Tree Search guided by a neural network."""
@@ -99,8 +123,8 @@ def evaluate_against_agent(
     device: str,
     verbose: bool = False,
     game_verbose: Optional[bool] = None,
-) -> float:
-    """Pit the challenger against the opponent and return the challenger win rate."""
+) -> EvaluationStats:
+    """Pit the challenger against the opponent and return aggregated results."""
     log = print if verbose else (lambda *args, **kwargs: None)
     if num_games % 2 != 0:
         adjusted = max(2, (num_games // 2) * 2)
@@ -112,7 +136,9 @@ def evaluate_against_agent(
     if game_verbose is None:
         game_verbose = verbose
 
-    challenger_wins = 0.0
+    challenger_wins = 0
+    challenger_losses = 0
+    challenger_draws = 0
 
     for i in range(num_games):
         log(f"  Playing evaluation game {i + 1}/{num_games}...")
@@ -120,12 +146,25 @@ def evaluate_against_agent(
             result = play_single_game(challenger_agent, opponent_agent, verbose=game_verbose)
             if result == 1.0:
                 challenger_wins += 1
+            elif result == -1.0:
+                challenger_losses += 1
+            else:
+                challenger_draws += 1
         else:
             result = play_single_game(opponent_agent, challenger_agent, verbose=game_verbose)
             if result == -1.0:
                 challenger_wins += 1
+            elif result == 1.0:
+                challenger_losses += 1
+            else:
+                challenger_draws += 1
 
-    return 0.0 if num_games == 0 else challenger_wins / num_games
+    return EvaluationStats(
+        wins=challenger_wins,
+        losses=challenger_losses,
+        draws=challenger_draws,
+        total_games=num_games
+    )
 
 if __name__ == '__main__':
     # Basic smoke test for the evaluation utilities
@@ -146,8 +185,9 @@ if __name__ == '__main__':
 
     num_eval_games = 4  # Even number so each agent gets both colors
     print(f"\nEvaluating MCTSAgent vs RandomAgent over {num_eval_games} games...")
-    win_rate_vs_random = evaluate_against_agent(mcts_agent, random_agent, num_eval_games, current_device)
-    print(f"MCTSAgent win rate against RandomAgent: {win_rate_vs_random:.2%}")
+    stats_vs_random = evaluate_against_agent(mcts_agent, random_agent, num_eval_games, current_device)
+    print(f"MCTSAgent record against RandomAgent: {stats_vs_random.wins}-{stats_vs_random.losses}-{stats_vs_random.draws} "
+          f"(win {stats_vs_random.win_rate:.2%} / loss {stats_vs_random.loss_rate:.2%} / draw {stats_vs_random.draw_rate:.2%})")
 
     # Example: evaluate two MCTS agents (e.g., new model vs. previous best)
     # Create another placeholder model to stand in for the previous best

@@ -496,7 +496,7 @@ def train_pipeline(
         random_opponent = RandomAgent()
 
         print(f"Evaluating challenger against RandomAgent ({eval_games_vs_random} games)...")
-        win_rate_vs_rnd = evaluate_against_agent(
+        stats_vs_rnd = evaluate_against_agent(
             challenger_agent,
             random_opponent,
             eval_games_vs_random,
@@ -504,12 +504,18 @@ def train_pipeline(
             verbose=eval_verbose,
             game_verbose=eval_game_verbose,
         )
-        print(f"Challenger win rate vs RandomAgent: {win_rate_vs_rnd:.2%}")
+        print(f"Challenger win rate vs RandomAgent: {stats_vs_rnd.win_rate:.2%}")
+        print(
+            "Challenger record vs RandomAgent: "
+            f"{stats_vs_rnd.wins}-{stats_vs_rnd.losses}-{stats_vs_rnd.draws} "
+            f"(win {stats_vs_rnd.win_rate:.2%} / loss {stats_vs_rnd.loss_rate:.2%} / draw {stats_vs_rnd.draw_rate:.2%})"
+        )
 
         win_rate_vs_best_model = None
+        stats_vs_best_model = None
         best_model_updated = False
 
-        if win_rate_vs_rnd > win_rate_threshold:
+        if stats_vs_rnd.win_rate > win_rate_threshold:
             print(f"Challenger passed RandomAgent threshold ({win_rate_threshold:.0%}). Comparing to best model...")
             if not os.path.exists(best_model_path):
                 print("No existing best_model.pt. Current model becomes the best.")
@@ -535,7 +541,7 @@ def train_pipeline(
                 )
 
                 print(f"Evaluating challenger against BestModel ({eval_games_vs_best} games)...")
-                win_rate_vs_best_model = evaluate_against_agent(
+                stats_vs_best_model = evaluate_against_agent(
                     challenger_agent,
                     best_agent_opponent,
                     eval_games_vs_best,
@@ -543,7 +549,13 @@ def train_pipeline(
                     verbose=eval_verbose,
                     game_verbose=eval_game_verbose,
                 )
+                win_rate_vs_best_model = stats_vs_best_model.win_rate
                 print(f"Challenger win rate vs BestModel: {win_rate_vs_best_model:.2%}")
+                print(
+                    "Challenger record vs BestModel: "
+                    f"{stats_vs_best_model.wins}-{stats_vs_best_model.losses}-{stats_vs_best_model.draws} "
+                    f"(win {stats_vs_best_model.win_rate:.2%} / loss {stats_vs_best_model.loss_rate:.2%} / draw {stats_vs_best_model.draw_rate:.2%})"
+                )
 
                 if win_rate_vs_best_model > win_rate_threshold:
                     print("Challenger passed BestModel threshold. Updating best_model.pt.")
@@ -557,8 +569,13 @@ def train_pipeline(
 
         eval_time = _stage_finish("eval", eval_label, eval_start_time, stage_history)
         iteration_metrics["eval_time_sec"] = eval_time
-        iteration_metrics["win_rate_vs_random"] = win_rate_vs_rnd
+        iteration_metrics["win_rate_vs_random"] = stats_vs_rnd.win_rate
+        iteration_metrics["loss_rate_vs_random"] = stats_vs_rnd.loss_rate
+        iteration_metrics["draw_rate_vs_random"] = stats_vs_rnd.draw_rate
         iteration_metrics["win_rate_vs_best"] = win_rate_vs_best_model
+        if stats_vs_best_model is not None:
+            iteration_metrics["loss_rate_vs_best"] = stats_vs_best_model.loss_rate
+            iteration_metrics["draw_rate_vs_best"] = stats_vs_best_model.draw_rate
         iteration_metrics["best_model_updated"] = best_model_updated
         iteration_metrics["win_rate_threshold"] = win_rate_threshold
 
