@@ -93,6 +93,12 @@ class VectorizedMCTS:
                 continue
 
             mcts = self._trees.get(idx)
+            current_move_count = int(batch.move_count[idx].item())
+            if mcts is not None:
+                root = getattr(mcts, "root", None)
+                if root is not None and getattr(root.state, "move_count", current_move_count) > current_move_count:
+                    self._trees.pop(idx, None)
+                    mcts = None
             if mcts is None:
                 mcts = self._make_mcts()
                 self._trees[idx] = mcts

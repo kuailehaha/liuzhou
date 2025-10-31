@@ -81,6 +81,8 @@ def legacy_policy_map(
 ) -> Tuple[Dict[int, float], float]:
     _sync_if_needed(device)
     start = time.perf_counter()
+    # Always rebuild the tree so each sample starts from a clean root.
+    mcts.root = None
     moves, policy = mcts.search(state)
     _sync_if_needed(device)
     elapsed = time.perf_counter() - start
