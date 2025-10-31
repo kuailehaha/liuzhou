@@ -85,10 +85,10 @@ class VectorizedMCTS:
         self._trees = {idx: tree for idx, tree in self._trees.items() if idx < batch.batch_size}
 
         for idx, state in enumerate(states):
-            if batch.mask_alive is not None and not bool(batch.mask_alive[idx]):
+            if batch.mask_alive is not None and not batch.mask_alive[idx].item():
                 self._trees.pop(idx, None)
                 continue
-            if not legal_mask[idx].any():
+            if not legal_mask[idx].any().item():
                 self._trees.pop(idx, None)
                 continue
 
@@ -115,12 +115,12 @@ class VectorizedMCTS:
                 action_idx = action_to_index(move, board_size, spec)
                 if action_idx is None:
                     continue
-                if not mask_row[action_idx]:
+                if not mask_row[action_idx].item():
                     continue
                 row[action_idx] = float(prob)
 
             total = row[mask_row].sum()
-            if total > 0:
+            if total.item() > 0:
                 row[mask_row] /= total
             else:
                 legal_indices = mask_row.nonzero(as_tuple=False).flatten()

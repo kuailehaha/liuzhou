@@ -93,7 +93,7 @@ def run_self_play(
 
         # Handle players with no legal moves (loss condition -> game ends immediately)
         no_moves = (legal_mask.sum(dim=1) == 0) & active_mask_tensor
-        if no_moves.any():
+        if no_moves.any().item():
             indices = torch.nonzero(no_moves, as_tuple=False).squeeze(1).tolist()
             for idx in indices:
                 state = games[idx]
