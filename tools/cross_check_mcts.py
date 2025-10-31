@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from src.game_state import GameState
@@ -19,7 +21,12 @@ from src.mcts import MCTS
 from src.move_generator import apply_move, generate_all_legal_moves
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 
-from v1.game.move_encoder import ActionEncodingSpec, DEFAULT_ACTION_SPEC, action_to_index
+from v1.game.move_encoder import (
+    ActionEncodingSpec,
+    DEFAULT_ACTION_SPEC,
+    action_to_index,
+    decode_action_indices,
+)
 from v1.game.state_batch import from_game_states
 from v1.mcts.vectorized_mcts import VectorizedMCTS, VectorizedMCTSConfig
 
@@ -35,6 +42,15 @@ class CrossCheckConfig:
     seed: int = 0
     device: str = "cpu"
     action_spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC
+
+
+def _sync_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+DEBUG_L1_THRESHOLD = 1e-3
+MISMATCH_EPS = 1e-4
 
 
 def sample_states(config: CrossCheckConfig) -> List[GameState]:
@@ -61,8 +77,13 @@ def legacy_policy_map(
     state: GameState,
     mcts: MCTS,
     spec: ActionEncodingSpec,
-) -> Dict[int, float]:
+    device: torch.device,
+) -> Tuple[Dict[int, float], float]:
+    _sync_if_needed(device)
+    start = time.perf_counter()
     moves, policy = mcts.search(state)
+    _sync_if_needed(device)
+    elapsed = time.perf_counter() - start
     board_size = state.BOARD_SIZE
     result: Dict[int, float] = {}
 
@@ -71,7 +92,7 @@ def legacy_policy_map(
         if idx is None:
             continue
         result[idx] = float(prob)
-    return result
+    return result, elapsed
 
 
 def vectorized_policy_map(
@@ -79,9 +100,13 @@ def vectorized_policy_map(
     vmcts: VectorizedMCTS,
     spec: ActionEncodingSpec,
     device: torch.device,
-) -> List[Dict[int, float]]:
+) -> Tuple[List[Dict[int, float]], float]:
+    _sync_if_needed(device)
+    start = time.perf_counter()
     tensor_batch = from_game_states(states, device=device)
     policies, legal_mask = vmcts.search(tensor_batch)
+    _sync_if_needed(device)
+    elapsed = time.perf_counter() - start
     maps: List[Dict[int, float]] = []
 
     for idx in range(tensor_batch.batch_size):
@@ -90,7 +115,7 @@ def vectorized_policy_map(
         legal_indices = mask.nonzero(as_tuple=False).flatten()
         mapping = {int(i.item()): float(row[i].item()) for i in legal_indices}
         maps.append(mapping)
-    return maps
+    return maps, elapsed
 
 
 def compare_policies(
@@ -107,9 +132,76 @@ def compare_policies(
     return l1, max_diff
 
 
+def _decode_indices_for_state(
+    state: GameState,
+    indices: List[int],
+    spec: ActionEncodingSpec,
+    device: torch.device,
+):
+    if not indices:
+        return []
+    clones = [state.copy() for _ in indices]
+    batch = from_game_states(clones, device=device)
+    tensor = torch.tensor(indices, dtype=torch.long)
+    moves = decode_action_indices(tensor, batch, spec)
+    return moves
+
+
+def _print_debug_details(
+    state_idx: int,
+    state: GameState,
+    legacy_map: Dict[int, float],
+    tensor_map: Dict[int, float],
+    spec: ActionEncodingSpec,
+    device: torch.device,
+    l1: float,
+    max_diff: float,
+) -> None:
+    print(f"\n[Debug] State {state_idx}: phase={state.phase} player={state.current_player}")
+    missing_indices = sorted(set(legacy_map) - set(tensor_map))
+    extra_indices = sorted(set(tensor_map) - set(legacy_map))
+    common = set(legacy_map) & set(tensor_map)
+    mismatched = sorted(
+        (
+            (idx, legacy_map[idx], tensor_map[idx], abs(legacy_map[idx] - tensor_map[idx]))
+            for idx in common
+        ),
+        key=lambda item: item[3],
+        reverse=True,
+    )
+
+    def describe(label: str, indices: List[int]):
+        if not indices:
+            return
+        moves = _decode_indices_for_state(state, indices, spec, device)
+        print(f"  {label} ({len(indices)}):")
+        for idx_val, move in zip(indices, moves):
+            print(f"    idx {idx_val:4d}: {move}")
+
+    describe("Missing in tensorized", missing_indices[:10])
+    describe("Extra in tensorized", extra_indices[:10])
+
+    relevant_mismatches = [info for info in mismatched if info[3] > MISMATCH_EPS]
+    if relevant_mismatches:
+        print("  Mismatched probabilities:")
+        for idx_val, legacy_prob, tensor_prob, diff in relevant_mismatches[:10]:
+            move = _decode_indices_for_state(state, [idx_val], spec, device)[0]
+            print(
+                f"    idx {idx_val:4d}: legacy={legacy_prob:.6f} tensorized={tensor_prob:.6f} diff={diff:.6f} move={move}"
+            )
+    else:
+        print("  No mismatched probabilities above threshold.")
+
+    print("  GameState snapshot:")
+    print(state)
+
+
 def run_cross_check(cfg: CrossCheckConfig) -> None:
     torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
     random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
 
     device = torch.device(cfg.device)
     model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
@@ -126,6 +218,7 @@ def run_cross_check(cfg: CrossCheckConfig) -> None:
         device=str(device),
         add_dirichlet_noise=False,
         virtual_loss_weight=0.0,
+        batch_K=cfg.batch_leaves,
     )
 
     vmcts_config = VectorizedMCTSConfig(
@@ -138,19 +231,44 @@ def run_cross_check(cfg: CrossCheckConfig) -> None:
     )
     vectorized = VectorizedMCTS(model=model, config=vmcts_config, device=str(device))
 
-    tensor_policies = vectorized_policy_map(states, vectorized, cfg.action_spec, device)
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+
+    tensor_policies, vector_elapsed = vectorized_policy_map(states, vectorized, cfg.action_spec, device)
+    vectorized._trees.clear()
+
+    random.setstate(py_state)
+    np.random.set_state(np_state)
+    torch.set_rng_state(torch_state)
+    if cuda_state is not None:
+        torch.cuda.set_rng_state(cuda_state, device)
 
     l1_diffs: List[float] = []
     max_diffs: List[float] = []
+    legacy_durations: List[float] = []
 
     for idx, state in enumerate(states):
-        legacy_policy = legacy_policy_map(state, legacy_mcts, cfg.action_spec)
+        legacy_policy, elapsed = legacy_policy_map(state, legacy_mcts, cfg.action_spec, device)
+        legacy_durations.append(elapsed)
         tensor_policy = tensor_policies[idx]
         l1, max_diff = compare_policies(legacy_policy, tensor_policy)
         l1_diffs.append(l1)
         max_diffs.append(max_diff)
 
         print(f"[State {idx:02d}] L1={l1:.6f}  max|diff|={max_diff:.6f}  legal={len(legacy_policy)}")
+        if l1 > DEBUG_L1_THRESHOLD:
+            _print_debug_details(
+                state_idx=idx,
+                state=state,
+                legacy_map=legacy_policy,
+                tensor_map=tensor_policy,
+                spec=cfg.action_spec,
+                device=device,
+                l1=l1,
+                max_diff=max_diff,
+            )
 
     if l1_diffs:
         print("\nSummary:")
@@ -158,6 +276,14 @@ def run_cross_check(cfg: CrossCheckConfig) -> None:
         print(f"  Max L1:  {max(l1_diffs):.6f}")
         print(f"  Mean max|diff|: {sum(max_diffs) / len(max_diffs):.6f}")
         print(f"  Max max|diff|:  {max(max_diffs):.6f}")
+        if legacy_durations:
+            total_legacy = sum(legacy_durations)
+            mean_legacy = total_legacy / len(legacy_durations)
+            print(f"  Legacy search avg: {mean_legacy * 1_000:.3f} ms  (total {total_legacy:.3f}s)")
+        per_state_vector = vector_elapsed / max(len(states), 1)
+        print(f"  Vectorized search avg: {per_state_vector * 1_000:.3f} ms  (batch total {vector_elapsed:.3f}s)")
+        if legacy_durations and per_state_vector > 0:
+            print(f"  Speedup (legacy/vectorized): {mean_legacy / per_state_vector:.2f}x")
 
 
 def parse_args() -> CrossCheckConfig:
@@ -186,4 +312,3 @@ def parse_args() -> CrossCheckConfig:
 
 if __name__ == "__main__":
     run_cross_check(parse_args())
-
