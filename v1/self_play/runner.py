@@ -39,7 +39,9 @@ class SelfPlayConfig:
 class SelfPlayBatchResult:
     states: torch.Tensor  # (B, T, C, H, W)
     policies: torch.Tensor  # (B, T, A)
-    mask: torch.BoolTensor  # (B, T)
+    player_signs: torch.Tensor  # (B, T)
+    legal_masks: torch.BoolTensor  # (B, T, A)
+    mask: torch.BoolTensor  # (B, T) -> indicates valid timesteps
     results: torch.Tensor  # (B,)
     soft_values: torch.Tensor  # (B,)
     lengths: torch.LongTensor  # (B,)
@@ -66,6 +68,8 @@ def run_self_play(
 
     state_history: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
     policy_history: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+    legal_history: List[List[torch.BoolTensor]] = [[] for _ in range(batch_size)]
+    sign_history: List[List[float]] = [[] for _ in range(batch_size)]
 
     board_size = GameState.BOARD_SIZE
     action_dim = cfg.action_spec.total_dim
@@ -127,8 +131,12 @@ def run_self_play(
                 continue
             state_tensor = state_to_tensor(games[idx], games[idx].current_player).squeeze(0).cpu()
             policy_tensor = policies[idx].detach().cpu()
+            legal_tensor = legal_mask[idx].detach().cpu()
             state_history[idx].append(state_tensor)
             policy_history[idx].append(policy_tensor)
+            legal_history[idx].append(legal_tensor)
+            sign = 1.0 if games[idx].current_player == Player.BLACK else -1.0
+            sign_history[idx].append(sign)
 
         vmcts.advance_roots(tensor_batch, action_indices)
         moves = decode_action_indices(action_indices.to("cpu"), tensor_batch, cfg.action_spec)
@@ -176,18 +184,24 @@ def run_self_play(
             batch_size, 0, NUM_INPUT_CHANNELS, board_size, board_size, dtype=torch.float32
         )
         policies_tensor = torch.empty(batch_size, 0, action_dim, dtype=torch.float32)
-        mask_tensor = torch.zeros(batch_size, 0, dtype=torch.bool)
+        player_sign_tensor = torch.empty(batch_size, 0, dtype=torch.float32)
+        legal_tensor = torch.zeros(batch_size, 0, action_dim, dtype=torch.bool)
+        step_mask = torch.zeros(batch_size, 0, dtype=torch.bool)
     else:
         states_tensor = torch.zeros(
             batch_size, max_len, NUM_INPUT_CHANNELS, board_size, board_size, dtype=torch.float32
         )
         policies_tensor = torch.zeros(batch_size, max_len, action_dim, dtype=torch.float32)
-        mask_tensor = torch.zeros(batch_size, max_len, dtype=torch.bool)
+        legal_tensor = torch.zeros(batch_size, max_len, action_dim, dtype=torch.bool)
+        step_mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
+        player_sign_tensor = torch.zeros(batch_size, max_len, dtype=torch.float32)
         for idx in range(batch_size):
             for t, (state_tensor, policy_tensor) in enumerate(zip(state_history[idx], policy_history[idx])):
                 states_tensor[idx, t] = state_tensor
                 policies_tensor[idx, t] = policy_tensor
-                mask_tensor[idx, t] = True
+                legal_tensor[idx, t] = legal_history[idx][t]
+                step_mask[idx, t] = True
+                player_sign_tensor[idx, t] = sign_history[idx][t]
 
     results_tensor = torch.tensor(results, dtype=torch.float32)
     soft_tensor = torch.tensor(soft_values, dtype=torch.float32)
@@ -195,7 +209,9 @@ def run_self_play(
     return SelfPlayBatchResult(
         states=states_tensor,
         policies=policies_tensor,
-        mask=mask_tensor,
+        player_signs=player_sign_tensor,
+        legal_masks=legal_tensor,
+        mask=step_mask,
         results=results_tensor,
         soft_values=soft_tensor,
         lengths=lengths,

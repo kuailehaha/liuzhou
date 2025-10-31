@@ -36,3 +36,7 @@ stable for reference and regression comparison.
 Progress through these steps will be tracked in `TODO.md`.  The legacy pipeline
 remains untouched so we can A/B compare behaviours during the rollout.
 
+## Utilities
+
+- `tools/cross_check_mcts.py` – 对拍脚本，随机采样若干局面并比较传统 `src.mcts.MCTS` 与
+  `v1.mcts.vectorized_mcts.VectorizedMCTS` 的策略分布差异，便于在重构过程中快速验证行为一致性。

@@ -19,6 +19,7 @@ class RolloutTensorBatch:
     policies: torch.Tensor  # (N, A)
     values: torch.Tensor  # (N,)
     soft_values: torch.Tensor  # (N,)
+    legal_masks: torch.BoolTensor  # (N, A)
 
     def to(self, device: torch.device) -> "RolloutTensorBatch":
         return RolloutTensorBatch(
@@ -26,5 +27,5 @@ class RolloutTensorBatch:
             policies=self.policies.to(device),
             values=self.values.to(device),
             soft_values=self.soft_values.to(device),
+            legal_masks=self.legal_masks.to(device),
         )
-

@@ -56,5 +56,5 @@ TODO以产生时间为准。
 - [x] 完成 v1/game/move_encoder.py 动作编码与解码
 - [x] 写出 VectorizedMCTS 主流程并替换自博弈调度
 - [ ] 打通 v1/self_play -> v1/train 张量化训练闭环
-- [ ] 为 v1 分支新增测试与对照验证脚本
+- [x] 为 v1 分支新增测试与对照验证脚本
 

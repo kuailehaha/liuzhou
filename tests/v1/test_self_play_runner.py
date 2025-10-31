@@ -27,9 +27,13 @@ def test_run_self_play_shapes():
 
     assert result.states.shape[0] == 2
     assert result.policies.shape[0] == 2
+    assert result.player_signs.shape[:2] == result.mask.shape[:2]
+    assert result.legal_masks.shape[:2] == result.mask.shape[:2]
+    assert result.legal_masks.shape[2] == cfg.mcts.action_spec.total_dim
     assert result.mask.shape[0] == 2
     assert result.states.shape[1] == result.policies.shape[1] == result.mask.shape[1]
     assert result.policies.shape[2] == cfg.mcts.action_spec.total_dim
     assert result.results.shape == (2,)
     assert result.soft_values.shape == (2,)
     assert torch.all(result.lengths == result.mask.sum(dim=1))
+    assert torch.all(result.player_signs[result.mask] != 0)

@@ -23,10 +23,11 @@ class TensorRolloutDataset(Dataset):
     policies: torch.Tensor
     values: torch.Tensor
     soft_values: torch.Tensor
+    legal_masks: torch.BoolTensor
 
     @classmethod
     def from_batch(cls, batch: RolloutTensorBatch) -> "TensorRolloutDataset":
-        return cls(batch.states, batch.policies, batch.values, batch.soft_values)
+        return cls(batch.states, batch.policies, batch.values, batch.soft_values, batch.legal_masks)
 
     def __len__(self) -> int:
         return int(self.states.shape[0])
@@ -37,5 +38,5 @@ class TensorRolloutDataset(Dataset):
             self.policies[idx],
             self.values[idx],
             self.soft_values[idx],
+            self.legal_masks[idx],
         )
-
