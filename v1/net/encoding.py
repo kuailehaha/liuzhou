@@ -11,7 +11,7 @@ from typing import Tuple
 
 import torch
 
-from ..game.move_encoder import ActionEncodingSpec, DEFAULT_ACTION_SPEC
+from ..game.move_encoder import ActionEncodingSpec, DEFAULT_ACTION_SPEC, DIRECTIONS
 from ..game.state_batch import TensorStateBatch
 
 _PHASE_ORDER = (
@@ -89,7 +89,7 @@ def _phase_planes(
 
 
 def project_policy_logits(
-    logits: torch.Tensor,
+    logits: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     legal_mask: torch.BoolTensor,
     spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -98,4 +98,100 @@ def project_policy_logits(
 
     Returns tuple `(probs, masked_logits)` for downstream sampling/training.
     """
-    raise NotImplementedError("project_policy_logits requires action encoding support.")
+    if len(logits) != 3:
+        raise ValueError("project_policy_logits expects a tuple of (log_p1, log_p2, log_pmc).")
+
+    log_p1, log_p2, log_pmc = logits
+    if log_p1.shape != log_p2.shape or log_p1.shape != log_pmc.shape:
+        raise ValueError("All policy heads must share the same shape.")
+
+    batch_size, head_dim = log_p1.shape
+    device = log_p1.device
+    dtype = log_p1.dtype
+
+    placement_dim = spec.placement_dim
+    movement_dim = spec.movement_dim
+    selection_dim = spec.selection_dim
+    auxiliary_dim = spec.auxiliary_dim
+
+    board_size = int(round(placement_dim ** 0.5))
+    if board_size * board_size != placement_dim:
+        raise ValueError("placement_dim must be a perfect square representing the board area.")
+
+    if head_dim != placement_dim:
+        raise ValueError(
+            f"Policy head dimension mismatch: expected {placement_dim}, got {head_dim}."
+        )
+    total_dim = spec.total_dim
+    if legal_mask.shape != (batch_size, total_dim):
+        raise ValueError(
+            f"legal_mask expected shape ({batch_size}, {total_dim}), got {tuple(legal_mask.shape)}"
+        )
+
+    neginf = torch.tensor(float("-inf"), device=device, dtype=dtype)
+
+    placement_slice = slice(0, placement_dim)
+    movement_slice = slice(placement_slice.stop, placement_slice.stop + movement_dim)
+    selection_slice = slice(movement_slice.stop, movement_slice.stop + selection_dim)
+    auxiliary_slice = slice(selection_slice.stop, selection_slice.stop + auxiliary_dim)
+
+    combined = torch.empty((batch_size, total_dim), dtype=dtype, device=device)
+    combined[:, placement_slice] = log_p1
+    combined[:, selection_slice] = log_pmc
+
+    dirs = len(DIRECTIONS)
+    if movement_dim != placement_dim * dirs:
+        raise ValueError(
+            f"movement_dim mismatch: expected {placement_dim * dirs}, got {movement_dim}."
+        )
+
+    indices = torch.arange(placement_dim, device=device)
+    rows = indices // board_size
+    cols = indices % board_size
+
+    movement_logits = []
+    for dr, dc in DIRECTIONS:
+        dest_rows = rows + dr
+        dest_cols = cols + dc
+        valid = (
+            (dest_rows >= 0)
+            & (dest_rows < board_size)
+            & (dest_cols >= 0)
+            & (dest_cols < board_size)
+        )
+        dest_indices = dest_rows * board_size + dest_cols
+        dest_indices = dest_indices.to(torch.long)
+
+        dest_scores = torch.full((batch_size, placement_dim), neginf, dtype=dtype, device=device)
+        if valid.any():
+            gather_idx = dest_indices[valid].view(1, -1).expand(batch_size, -1)
+            gathered = log_p1.gather(1, gather_idx)
+            dest_scores[:, valid] = gathered
+
+        movement_logits.append(log_p2 + dest_scores)
+
+    movement_concat = torch.stack(movement_logits, dim=2).reshape(batch_size, movement_dim)
+    combined[:, movement_slice] = movement_concat
+
+    if auxiliary_dim > 0:
+        aux = torch.zeros((batch_size, auxiliary_dim), dtype=dtype, device=device)
+        combined[:, auxiliary_slice] = aux
+
+    masked_logits = torch.where(legal_mask, combined, neginf)
+    probs = torch.zeros_like(combined)
+
+    for idx in range(batch_size):
+        legal_indices = legal_mask[idx].nonzero(as_tuple=False).view(-1)
+        if legal_indices.numel() == 0:
+            continue
+        row_logits = masked_logits[idx, legal_indices]
+        if not torch.isfinite(row_logits).any():
+            row_logits = torch.zeros_like(row_logits)
+            masked_logits[idx, legal_indices] = row_logits
+        if legal_indices.numel() == 1:
+            probs[idx, legal_indices[0]] = 1.0
+        else:
+            row_probs = torch.softmax(row_logits, dim=0)
+            probs[idx, legal_indices] = row_probs
+
+    return probs, masked_logits

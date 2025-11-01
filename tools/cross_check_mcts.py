@@ -239,7 +239,7 @@ def run_cross_check(cfg: CrossCheckConfig) -> None:
     cuda_state = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
 
     tensor_policies, vector_elapsed = vectorized_policy_map(states, vectorized, cfg.action_spec, device)
-    vectorized._trees.clear()
+    vectorized._roots.clear()
 
     random.setstate(py_state)
     np.random.set_state(np_state)

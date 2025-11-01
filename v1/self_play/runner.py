@@ -16,17 +16,18 @@ import torch
 
 from src.game_state import GameState, Player
 from src.move_generator import apply_move
-from src.neural_network import state_to_tensor, NUM_INPUT_CHANNELS
+from src.neural_network import NUM_INPUT_CHANNELS
 
 from ..mcts.vectorized_mcts import VectorizedMCTS, VectorizedMCTSConfig
 from ..game.state_batch import from_game_states
 from ..game.move_encoder import ActionEncodingSpec, DEFAULT_ACTION_SPEC, decode_action_indices
 from ..net.policy_decoder import sample_actions
+from ..net.encoding import states_to_model_input
 
 
 @dataclass
 class SelfPlayConfig:
-    mcts: VectorizedMCTSConfig = field(default_factory=VectorizedMCTSConfig)
+    mcts: VectorizedMCTSConfig = field(default_factory=lambda: VectorizedMCTSConfig(add_dirichlet_noise=True))
     temperature_init: float = 1.0
     temperature_final: float = 0.2
     temperature_threshold: int = 30
@@ -102,7 +103,7 @@ def run_self_play(
                 results[idx] = -1.0 if loser == Player.BLACK else 1.0
                 soft_values[idx] = compute_soft_value(state)
                 active[idx] = False
-                vmcts._trees.pop(idx, None)
+                vmcts._roots.pop(idx, None)
             if not any(active):
                 break
             active_mask_tensor = torch.tensor(active, dtype=torch.bool, device=policies.device)
@@ -127,9 +128,10 @@ def run_self_play(
             if action_idx < 0:
                 # No legal move chosen (should not occur since handled above)
                 active[idx] = False
-                vmcts._trees.pop(idx, None)
+                vmcts._roots.pop(idx, None)
                 continue
-            state_tensor = state_to_tensor(games[idx], games[idx].current_player).squeeze(0).cpu()
+            single_batch = from_game_states([games[idx]])
+            state_tensor = states_to_model_input(single_batch).squeeze(0).cpu()
             policy_tensor = policies[idx].detach().cpu()
             legal_tensor = legal_mask[idx].detach().cpu()
             state_history[idx].append(state_tensor)
@@ -147,13 +149,13 @@ def run_self_play(
             action_idx = int(action_indices[idx].item())
             if action_idx < 0 or move is None:
                 active[idx] = False
-                vmcts._trees.pop(idx, None)
+                vmcts._roots.pop(idx, None)
                 continue
             try:
                 games[idx] = apply_move(games[idx], move, quiet=True)
             except ValueError:
                 active[idx] = False
-                vmcts._trees.pop(idx, None)
+                vmcts._roots.pop(idx, None)
                 results[idx] = 0.0
                 soft_values[idx] = compute_soft_value(games[idx])
                 continue
@@ -171,7 +173,7 @@ def run_self_play(
             if finished:
                 soft_values[idx] = compute_soft_value(games[idx])
                 active[idx] = False
-                vmcts._trees.pop(idx, None)
+                vmcts._roots.pop(idx, None)
 
         global_step += 1
 

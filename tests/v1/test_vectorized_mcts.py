@@ -38,20 +38,19 @@ def test_advance_roots_reuses_tree():
     batch0 = from_game_states([state0])
     policies, mask = vmcts.search(batch0)
 
-    tree_before = vmcts._trees[0]
-    root_before = tree_before.root
+    root_before = vmcts._roots[0]
 
     legal_indices = mask[0].nonzero(as_tuple=False).flatten()
     chosen_idx = int(legal_indices[0].item())
 
     vmcts.advance_roots(batch0, torch.tensor([chosen_idx], dtype=torch.long))
-    tree_after = vmcts._trees[0]
-    assert tree_after is tree_before
-    assert tree_after.root is not root_before
+    root_after = vmcts._roots[0]
+    assert root_after is not root_before
+    assert root_after.parent is None
 
     move = decode_action_indices(torch.tensor([chosen_idx]), batch0)[0]
     next_state = apply_move(state0, move, quiet=True)
     batch1 = from_game_states([next_state])
 
     vmcts.search(batch1)
-    assert vmcts._trees[0] is tree_before
+    assert vmcts._roots[0] is root_after

@@ -14,11 +14,8 @@ from torch.utils.data import DataLoader
 from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 
-from ..game.move_encoder import (
-    ActionEncodingSpec,
-    DIRECTIONS,
-    DEFAULT_ACTION_SPEC,
-)
+from ..game.move_encoder import ActionEncodingSpec, DEFAULT_ACTION_SPEC
+from ..net.encoding import project_policy_logits
 from ..self_play.runner import SelfPlayBatchResult, SelfPlayConfig, run_self_play
 from ..self_play.samples import RolloutTensorBatch
 from ..train.dataset import TensorRolloutDataset
@@ -123,51 +120,6 @@ def generate_training_data(
     return _flatten_self_play_result(result, config.self_play_config.action_spec)
 
 
-def _gather_action_log_scores(
-    log_p1_flat: torch.Tensor,
-    log_p2_flat: torch.Tensor,
-    log_pmc_flat: torch.Tensor,
-    indices: torch.Tensor,
-    spec: ActionEncodingSpec,
-    board_size: int,
-) -> torch.Tensor:
-    scores: List[torch.Tensor] = []
-    placement_dim = spec.placement_dim
-    movement_dim = spec.movement_dim
-    selection_dim = spec.selection_dim
-    total_dim = spec.total_dim
-    device = log_p1_flat.device
-
-    for idx in indices.tolist():
-        if idx < placement_dim:
-            scores.append(log_p1_flat[idx])
-        elif idx < placement_dim + movement_dim:
-            rel = idx - placement_dim
-            cell_idx, dir_idx = divmod(rel, len(DIRECTIONS))
-            src_r = cell_idx // board_size
-            src_c = cell_idx % board_size
-            dr, dc = DIRECTIONS[dir_idx]
-            dst_r = src_r + dr
-            dst_c = src_c + dc
-            if 0 <= dst_r < board_size and 0 <= dst_c < board_size:
-                dst_idx = dst_r * board_size + dst_c
-                scores.append(log_p2_flat[cell_idx] + log_p1_flat[dst_idx])
-            else:
-                scores.append(torch.full((), float("-inf"), device=device))
-        elif idx < placement_dim + movement_dim + selection_dim:
-            rel = idx - (placement_dim + movement_dim)
-            scores.append(log_pmc_flat[rel])
-        else:
-            aux_rel = idx - (placement_dim + movement_dim + selection_dim)
-            if aux_rel == 0:
-                scores.append(torch.zeros((), device=device))
-            else:
-                scores.append(torch.full((), float("-inf"), device=device))
-    if not scores:
-        return torch.empty(0, device=device)
-    return torch.stack(scores, dim=0)
-
-
 def _compute_policy_loss(
     log_p1_batch: torch.Tensor,
     log_p2_batch: torch.Tensor,
@@ -175,10 +127,14 @@ def _compute_policy_loss(
     target_policies: torch.Tensor,
     legal_masks: torch.BoolTensor,
     action_spec: ActionEncodingSpec,
-    board_size: int,
 ) -> Tuple[torch.Tensor, int]:
     losses: List[torch.Tensor] = []
     batch_size = log_p1_batch.size(0)
+    probs, masked_logits = project_policy_logits(
+        (log_p1_batch, log_p2_batch, log_pmc_batch),
+        legal_masks,
+        action_spec,
+    )
     for i in range(batch_size):
         indices = legal_masks[i].nonzero(as_tuple=False).flatten()
         if indices.numel() == 0:
@@ -188,17 +144,10 @@ def _compute_policy_loss(
         if total <= 0:
             continue
         targets = targets / total
-        log_scores = _gather_action_log_scores(
-            log_p1_batch[i].view(-1),
-            log_p2_batch[i].view(-1),
-            log_pmc_batch[i].view(-1),
-            indices,
-            action_spec,
-            board_size,
-        )
-        if log_scores.numel() == 0:
+        row_logits = masked_logits[i, indices]
+        if row_logits.numel() == 0:
             continue
-        log_probs = torch.log_softmax(log_scores, dim=0)
+        log_probs = torch.log_softmax(row_logits, dim=0)
         loss = -(targets * log_probs).sum()
         losses.append(loss)
     if not losses:
@@ -248,7 +197,6 @@ def train_one_iteration(
     sum_value_loss = 0.0
     sum_policy_loss = 0.0
 
-    board_size = model.board_size if hasattr(model, "board_size") else GameState.BOARD_SIZE
     action_spec = config.self_play_config.action_spec
 
     for _ in range(config.epochs):
@@ -274,7 +222,6 @@ def train_one_iteration(
                 policies,
                 legal_masks,
                 action_spec,
-                board_size,
             )
 
             loss = value_loss + policy_loss

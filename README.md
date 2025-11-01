@@ -91,6 +91,16 @@ This rule set matches the current code paths in `rule_engine.py`, `move_generato
 
 
 
+## Tensorized Pipeline (v1)
+
+- 1/net/encoding.states_to_model_input encodes batches of GameState objects into (B, C, H, W) tensors consumed by the neural network.
+- 1/mcts/vectorized_mcts.VectorizedMCTS performs batched search on those tensors, reusing cached roots while exposing temperature and Dirichlet parameters via VectorizedMCTSConfig.
+- Self-play and training both route logits through project_policy_logits, keeping probability masking and fallback rules identical.
+- Cross-check helpers (	ools/cross_check_policy_projection.py, 	ools/cross_check_mcts.py) validate the tensorised outputs against the legacy pipeline.
+
+With this setup the legacy state_to_tensor helper no longer appears in the v1 loop; reverting to the classic flow simply means running the original src/ modules.
+
+
 ## Q & A
 
 
