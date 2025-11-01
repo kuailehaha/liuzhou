@@ -61,3 +61,17 @@ TODO以产生时间为准。
 ### 2025.10.31
 
 - [ ] 对拍传统管线和新管线（MCTS部分）
+
+### 2025.11.1
+
+- [x] 梳理 legacy 流程关键函数并整理 inputs/outputs 对照表
+- [x] 设计并实现 states_to_model_input 及 _board_planes/_mark_planes/_phase_planes
+- [ ] 编写 B=1 对拍测试，确认新旧 state 编码逐通道一致
+- [ ] 复核 ActionEncodingSpec/encode/decode 索引约定并补齐批量掩码 helper
+- [ ] 在 project_policy_logits 中完成 logits 拆分、掩码与兜底归一化逻辑
+- [ ] 如有需要新增 batched gather/reshape 等张量工具函数
+- [ ] 编写 cross-check 脚本对比两套管线的输入张量与动作分布
+- [ ] 更新自博弈/MCTS/训练脚本调用路径切换至 v1 张量化实现
+- [ ] README/TODO 记录切换方式与验证状态
+- [ ] Future: unify policy heads (head1=place/move-to, head2=move-from, head3=mark+all removals) and drop phase one-hot channels when legacy parity is secured.
+
