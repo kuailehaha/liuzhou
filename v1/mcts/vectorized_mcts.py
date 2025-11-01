@@ -173,8 +173,10 @@ class _MCTSNode:
         best_child: Optional[_MCTSNode] = None
         sqrt_total = math.sqrt(self.visit_count + 1.0)
 
-        for child in self.children_by_index.values():
-            q = child.value()
+         # 遍历顺序稳定化：按 action_index 排序，避免同分随机抖动
+        for _, child in sorted(self.children_by_index.items()):
+            # 关键修正：child.value() 是以 child.player 视角存的，父节点需要取反
+            q = -child.value()
             u = exploration_weight * child.prior * sqrt_total / (1.0 + child.visit_count)
             score = q + u
             if score > best_score:
@@ -338,7 +340,14 @@ class VectorizedMCTS:
             row.zero_()
 
             if not root.children_by_index:
-                row[legal_indices] = 1.0 / legal_indices.numel()
+                 # 没有子节点时，不再用均匀分布；回退到“带 mask 的先验”更稳
+                with torch.no_grad():
+                    tb = from_game_states([root.state], device=self.device)
+                    inputs = states_to_model_input(tb)
+                    log_p1, log_p2, log_pmc, _ = self.model(inputs)
+                    eval_mask = encode_actions(tb, spec).to(self.device)
+                    probs_row, _ = project_policy_logits((log_p1, log_p2, log_pmc), eval_mask, spec)
+                    row.copy_(probs_row[0])
                 continue
 
             total_visits = sum(child.visit_count for child in root.children_by_index.values())

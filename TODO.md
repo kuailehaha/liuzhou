@@ -75,3 +75,6 @@ TODO以产生时间为准。
 - [ ] README/TODO 记录切换方式与验证状态
 - [ ] Future: unify policy heads (head1=place/move-to, head2=move-from, head3=mark+all removals) and drop phase one-hot channels when legacy parity is secured.
 
+### 2025.11.2
+
+- [ ] debug: python -m tools.cross_check_mcts --states 10 --max-random-moves 40 --num-simulations 64 --device cuda > check_log.txt  
