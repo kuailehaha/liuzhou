@@ -317,64 +317,18 @@ class VectorizedMCTS:
             # Optional: we could also backpropagate root value here, but we keep semantics consistent
             # with leaf-eval path (values used on actual descent paths).
 
-    def search(self, batch: TensorStateBatch):
-        """
-        Run batched simulations for the provided root states.
+    def _run_simulations_for_root(self, idx: int, root: _MCTSNode, spec: ActionEncodingSpec) -> None:
+        num_sims = int(self.config.num_simulations)
+        if num_sims <= 0:
+            return
 
-        Returns
-        -------
-        policy : torch.Tensor
-            Shape (B, action_dim) probability over encoded actions.
-        legal_mask : torch.BoolTensor
-            Same shape mask indicating legal actions for each sample.
-        """
-        spec = self.config.action_spec
-        legal_mask = encode_actions(batch, spec).to(self.device)
-        policies = torch.zeros(
-            (batch.batch_size, spec.total_dim), dtype=torch.float32, device=self.device
-        )
-
-        states = to_game_states(batch)
-
-        self._roots = {idx: root for idx, root in self._roots.items() if idx < batch.batch_size}
-
-        roots: List[Optional[_MCTSNode]] = []
-        for idx, state in enumerate(states):
-            if batch.mask_alive is not None and not bool(batch.mask_alive[idx]):
-                self._roots.pop(idx, None)
-                roots.append(None)
-                continue
-
-            sig = _state_signature(state)
-            root = self._roots.get(idx)
-            if root is None or root.state_signature != sig:
-                root = _MCTSNode(state)
-                self._roots[idx] = root
-            roots.append(root)
-
-        active_indices = [i for i, root in enumerate(roots) if root is not None and legal_mask[i].any().item()]
-        if not active_indices:
-            return policies, legal_mask
-
-        # ---------- NEW: Pre-expand not-yet-expanded, non-terminal roots ----------
-        pending_roots = [
-            roots[i]
-            for i in active_indices
-            if roots[i] is not None and not roots[i].is_terminal() and not roots[i].is_expanded()
-        ]
-        self._expand_nodes(pending_roots, spec)
-
-        num_sims = self.config.num_simulations
         batch_leaves = max(1, self.config.batch_leaves)
         sims_done = 0
-        active_count = len(active_indices)
-        root_cursor = 0
 
         while sims_done < num_sims:
             to_collect = min(batch_leaves, num_sims - sims_done)
             leaves: List[Tuple[int, _MCTSNode, List[_MCTSNode]]] = []
             reserved_leaf_ids: Set[int] = set()
-            # ---------- NEW: also reserve children per parent to avoid duplicate selection ----------
             reserved_children_by_parent: Dict[int, Set[int]] = {}
 
             MAX_ATTEMPTS_PER_WAVE = max(8 * to_collect, 64)
@@ -383,18 +337,11 @@ class VectorizedMCTS:
             wave_made_progress = False
 
             while len(leaves) < to_collect and attempts_this_wave < MAX_ATTEMPTS_PER_WAVE:
-                idx = active_indices[root_cursor]
-                root_cursor = (root_cursor + 1) % active_count
-                attempts_this_wave += 1
-
-                root = roots[idx]
-                if root is None:
-                    continue
-
                 node = root
                 path = [node]
                 banned_at_parent: Dict[int, Set[int]] = {}
                 backtrack_steps = 0
+                attempts_this_wave += 1
 
                 while True:
                     if not node.is_expanded() or node.is_terminal():
@@ -404,7 +351,6 @@ class VectorizedMCTS:
                             parent = node.parent
                             banned_set = banned_at_parent.setdefault(id(parent), set())
                             banned_set.add(id(node))
-                            # ---------- NEW: combine banned + reserved ----------
                             reserved_set = reserved_children_by_parent.get(id(parent), set())
                             combined = set(banned_set) | set(reserved_set)
                             alt = parent.get_best_child_excluding(self.config.exploration_weight, combined)
@@ -421,7 +367,6 @@ class VectorizedMCTS:
 
                         leaves.append((idx, node, path.copy()))
                         reserved_leaf_ids.add(id(node))
-                        # ---------- NEW: mark reservation at parent level too ----------
                         if node.parent is not None:
                             reserved_children_by_parent.setdefault(id(node.parent), set()).add(id(node))
                         self._apply_virtual_loss(path)
@@ -430,7 +375,6 @@ class VectorizedMCTS:
                         break
 
                     banned_set = banned_at_parent.get(id(node), set())
-                    # ---------- NEW: avoid choosing children already reserved in this wave ----------
                     reserved_set = reserved_children_by_parent.get(id(node), set())
                     combined = set(banned_set) | set(reserved_set)
                     child = node.get_best_child_excluding(self.config.exploration_weight, combined)
@@ -453,7 +397,7 @@ class VectorizedMCTS:
                     break
 
             if not leaves:
-                break
+                continue
 
             eval_states: List[GameState] = []
             eval_info: List[Tuple[int, _MCTSNode, List[_MCTSNode], List[dict]]] = []
@@ -503,6 +447,59 @@ class VectorizedMCTS:
                 )
                 value = float(values[bi].item())
                 _backpropagate(path, value)
+
+    def search(self, batch: TensorStateBatch):
+        """
+        Run batched simulations for the provided root states.
+
+        Returns
+        -------
+        policy : torch.Tensor
+            Shape (B, action_dim) probability over encoded actions.
+        legal_mask : torch.BoolTensor
+            Same shape mask indicating legal actions for each sample.
+        """
+        spec = self.config.action_spec
+        legal_mask = encode_actions(batch, spec).to(self.device)
+        policies = torch.zeros(
+            (batch.batch_size, spec.total_dim), dtype=torch.float32, device=self.device
+        )
+
+        states = to_game_states(batch)
+
+        self._roots = {idx: root for idx, root in self._roots.items() if idx < batch.batch_size}
+
+        roots: List[Optional[_MCTSNode]] = []
+        for idx, state in enumerate(states):
+            if batch.mask_alive is not None and not bool(batch.mask_alive[idx]):
+                self._roots.pop(idx, None)
+                roots.append(None)
+                continue
+
+            sig = _state_signature(state)
+            root = self._roots.get(idx)
+            if root is None or root.state_signature != sig:
+                root = _MCTSNode(state)
+                self._roots[idx] = root
+            roots.append(root)
+
+        active_indices = [i for i, root in enumerate(roots) if root is not None and legal_mask[i].any().item()]
+        if not active_indices:
+            return policies, legal_mask
+
+        # ---------- NEW: Pre-expand not-yet-expanded, non-terminal roots ----------
+        pending_roots = [
+            roots[i]
+            for i in active_indices
+            if roots[i] is not None and not roots[i].is_terminal() and not roots[i].is_expanded()
+        ]
+        self._expand_nodes(pending_roots, spec)
+
+        for idx in active_indices:
+            root = roots[idx]
+            if root is None:
+                continue
+            self._run_simulations_for_root(idx, root, spec)
 
         for idx in active_indices:
             root = roots[idx]
@@ -599,3 +596,44 @@ class VectorizedMCTS:
                 self._roots[idx] = child
 
         return None
+
+
+
+"""
+python -m tools.cross_check_mcts --states 1000 --max-random-moves 40 --num-simulations 64 --device cuda --batch-leaves 16 > check_log.txt
+
+
+[Debug] State 245: phase=Phase.MARK_SELECTION player=Player.BLACK
+  Mismatched probabilities:
+    idx  192: legacy=0.203125 tensorized=0.093750 diff=0.109375 move={'phase': <Phase.MARK_SELECTION: 2>, 'action_type': 'mark', 'position': (2, 0)}
+    idx  213: legacy=0.078125 tensorized=0.187500 diff=0.109375 move={'phase': <Phase.MARK_SELECTION: 2>, 'action_type': 'mark', 'position': (5, 3)}
+  GameState snapshot:
+    0 1 2 3 4 5
+   +-----------+
+ 0 |○ ○ ○ · ● ○|
+ 1 |○ ○ ○ ● · ○|
+ 2 |○ ● ● ● ● ●|
+ 3 |● ● ○ · ● ●|
+ 4 |B ○ ○ · ○ ○|
+ 5 |● · ● ○ ● ●|
+   +-----------+
+Phase: Phase.MARK_SELECTION, Current Player: Player.BLACK
+Marked Black: {(4, 0)}
+Marked White: set()
+Forced Removals Done: 0
+Pending Marks: 1/1
+Pending Captures: 0/0
+Move Count: 32
+
+
+Summary:
+  Mean L1: 0.000219
+  Max L1:  0.218750
+  Mean max|diff|: 0.000109
+  Max max|diff|:  0.109375
+  Legacy search avg: 146.448 ms  (total 146.448s)
+  Vectorized search avg: 223.240 ms  (batch total 223.240s)
+  Speedup (legacy/vectorized): 0.66x
+
+
+"""
