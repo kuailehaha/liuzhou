@@ -180,13 +180,13 @@ def _print_debug_details(
         for idx_val, move in zip(indices, moves):
             print(f"    idx {idx_val:4d}: {move}")
 
-    describe("Missing in tensorized", missing_indices[:10])
-    describe("Extra in tensorized", extra_indices[:10])
+    describe("Missing in tensorized", missing_indices)
+    describe("Extra in tensorized", extra_indices)
 
     relevant_mismatches = [info for info in mismatched if info[3] > MISMATCH_EPS]
     if relevant_mismatches:
         print("  Mismatched probabilities:")
-        for idx_val, legacy_prob, tensor_prob, diff in relevant_mismatches[:10]:
+        for idx_val, legacy_prob, tensor_prob, diff in relevant_mismatches:
             move = _decode_indices_for_state(state, [idx_val], spec, device)[0]
             print(
                 f"    idx {idx_val:4d}: legacy={legacy_prob:.6f} tensorized={tensor_prob:.6f} diff={diff:.6f} move={move}"

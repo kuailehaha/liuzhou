@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Set
 
 import torch
 from torch.distributions import Dirichlet
@@ -69,6 +69,7 @@ class _MCTSNode:
         "action_index",
         "terminal_value",
         "state_signature",
+        "virtual_loss",
     )
 
     def __init__(
@@ -91,6 +92,7 @@ class _MCTSNode:
         self.action_index = action_index
         self.terminal_value = self._evaluate_terminal()
         self.state_signature = _state_signature(state)
+        self.virtual_loss = 0.0
 
     def _evaluate_terminal(self) -> Optional[float]:
         if self.state.is_game_over():
@@ -173,10 +175,31 @@ class _MCTSNode:
         best_child: Optional[_MCTSNode] = None
         sqrt_total = math.sqrt(self.visit_count + 1.0)
 
-         # 遍历顺序稳定化：按 action_index 排序，避免同分随机抖动
+        for child in self.children_by_index.values():
+            q = child.value()
+            u = exploration_weight * child.prior * sqrt_total / (1.0 + child.visit_count)
+            score = q + u
+            if score > best_score:
+                best_score = score
+                best_child = child
+        return best_child
+
+    def get_best_child_excluding(
+        self,
+        exploration_weight: float,
+        banned_child_ids: Optional[Set[int]] = None,
+    ) -> Optional["_MCTSNode"]:
+        if not self.children_by_index:
+            return None
+        banned_child_ids = banned_child_ids or set()
+        best_score = -float("inf")
+        best_child: Optional[_MCTSNode] = None
+        sqrt_total = math.sqrt(self.visit_count + 1.0)
+
         for _, child in sorted(self.children_by_index.items()):
-            # 关键修正：child.value() 是以 child.player 视角存的，父节点需要取反
-            q = -child.value()
+            if id(child) in banned_child_ids:
+                continue
+            q = child.value()
             u = exploration_weight * child.prior * sqrt_total / (1.0 + child.visit_count)
             score = q + u
             if score > best_score:
@@ -222,6 +245,27 @@ class VectorizedMCTS:
         self.model.eval()
         self._roots: Dict[int, _MCTSNode] = {}
 
+    def _apply_virtual_loss(self, path: Sequence[_MCTSNode]) -> None:
+        loss = float(self.config.virtual_loss_weight)
+        if loss <= 0.0:
+            return
+        for node in path:
+            node.virtual_loss += loss
+            node.visit_count += loss
+            node.value_sum -= loss
+
+    def _revert_virtual_loss(self, path: Sequence[_MCTSNode]) -> None:
+        loss = float(self.config.virtual_loss_weight)
+        if loss <= 0.0:
+            return
+        for node in reversed(path):
+            if node.virtual_loss <= 0.0:
+                continue
+            delta = min(loss, node.virtual_loss)
+            node.virtual_loss -= delta
+            node.visit_count = max(0.0, node.visit_count - delta)
+            node.value_sum += delta
+
     def search(self, batch: TensorStateBatch):
         """
         Run batched simulations for the provided root states.
@@ -264,42 +308,105 @@ class VectorizedMCTS:
         num_sims = self.config.num_simulations
         batch_leaves = max(1, self.config.batch_leaves)
         sims_done = 0
-        while sims_done < num_sims:
-            leaves: List[Tuple[int, _MCTSNode, List[_MCTSNode], List[dict]]] = []
+        active_count = len(active_indices)
+        root_cursor = 0
 
-            for idx in active_indices:
+        while sims_done < num_sims:
+            to_collect = min(batch_leaves, num_sims - sims_done)
+            leaves: List[Tuple[int, _MCTSNode, List[_MCTSNode]]] = []
+            reserved_leaf_ids: Set[int] = set()
+
+            MAX_ATTEMPTS_PER_WAVE = max(8 * to_collect, 64)
+            MAX_BACKTRACK_STEPS = 128
+            attempts_this_wave = 0
+            wave_made_progress = False
+
+            while len(leaves) < to_collect and attempts_this_wave < MAX_ATTEMPTS_PER_WAVE:
+                idx = active_indices[root_cursor]
+                root_cursor = (root_cursor + 1) % active_count
+                attempts_this_wave += 1
+
                 root = roots[idx]
                 if root is None:
                     continue
 
                 node = root
                 path = [node]
+                banned_at_parent: Dict[int, Set[int]] = {}
+                backtrack_steps = 0
 
-                while node.is_expanded() and not node.is_terminal():
-                    child = node.select_child(self.config.exploration_weight)
-                    if child is None:
+                while True:
+                    if not node.is_expanded() or node.is_terminal():
+                        if id(node) in reserved_leaf_ids:
+                            if node.parent is None:
+                                break
+                            parent = node.parent
+                            banned_set = banned_at_parent.setdefault(id(parent), set())
+                            banned_set.add(id(node))
+                            alt = parent.get_best_child_excluding(self.config.exploration_weight, banned_set)
+                            if alt is None:
+                                node = parent
+                                path.pop()
+                                backtrack_steps += 1
+                                if backtrack_steps > MAX_BACKTRACK_STEPS:
+                                    break
+                                continue
+                            node = alt
+                            path.append(node)
+                            continue
+
+                        leaves.append((idx, node, path.copy()))
+                        reserved_leaf_ids.add(id(node))
+                        self._apply_virtual_loss(path)
+                        wave_made_progress = True
+                        sims_done += 1
                         break
+
+                    banned_set = banned_at_parent.get(id(node), set())
+                    child = node.get_best_child_excluding(self.config.exploration_weight, banned_set)
+                    if child is None:
+                        if node.parent is None:
+                            break
+                        parent = node.parent
+                        banned_at_parent.setdefault(id(parent), set()).add(id(node))
+                        node = parent
+                        path.pop()
+                        backtrack_steps += 1
+                        if backtrack_steps > MAX_BACKTRACK_STEPS:
+                            break
+                        continue
+
                     node = child
                     path.append(node)
 
+                if not wave_made_progress and attempts_this_wave >= MAX_ATTEMPTS_PER_WAVE:
+                    break
+
+            if not leaves:
+                break
+
+            eval_states: List[GameState] = []
+            eval_info: List[Tuple[int, _MCTSNode, List[_MCTSNode], List[dict]]] = []
+
+            for root_idx, node, path in leaves:
                 if node.is_terminal():
+                    self._revert_virtual_loss(path)
                     _backpropagate(path, node.terminal_value)
                     continue
 
                 legal_moves = generate_all_legal_moves(node.state)
                 if not legal_moves:
                     node.make_terminal(-1.0)
+                    self._revert_virtual_loss(path)
                     _backpropagate(path, -1.0)
                     continue
 
-                leaves.append((idx, node, path, legal_moves))
-                if len(leaves) >= batch_leaves:
-                    break
+                eval_states.append(node.state)
+                eval_info.append((root_idx, node, path, legal_moves))
 
-            if not leaves:
-                break
+            if not eval_info:
+                continue
 
-            eval_states = [leaf[1].state for leaf in leaves]
             tensor_batch = from_game_states(eval_states, device=self.device)
             inputs = states_to_model_input(tensor_batch)
             with torch.no_grad():
@@ -308,13 +415,14 @@ class VectorizedMCTS:
             legal_eval_mask = encode_actions(tensor_batch, spec)
             probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
 
-            for bi, (root_idx, node, path, legal_moves) in enumerate(leaves):
+            for bi, (root_idx, node, path, legal_moves) in enumerate(eval_info):
                 priors = []
                 probs_row = probs[bi]
                 for move in legal_moves:
                     action_idx = action_to_index(move, node.state.BOARD_SIZE, spec)
                     priors.append(float(probs_row[action_idx].item()) if action_idx is not None else 0.0)
 
+                self._revert_virtual_loss(path)
                 node.expand(
                     legal_moves,
                     priors,
@@ -325,8 +433,6 @@ class VectorizedMCTS:
                 )
                 value = float(values[bi].item())
                 _backpropagate(path, value)
-
-            sims_done += len(leaves)
 
         for idx in active_indices:
             root = roots[idx]
@@ -340,14 +446,7 @@ class VectorizedMCTS:
             row.zero_()
 
             if not root.children_by_index:
-                 # 没有子节点时，不再用均匀分布；回退到“带 mask 的先验”更稳
-                with torch.no_grad():
-                    tb = from_game_states([root.state], device=self.device)
-                    inputs = states_to_model_input(tb)
-                    log_p1, log_p2, log_pmc, _ = self.model(inputs)
-                    eval_mask = encode_actions(tb, spec).to(self.device)
-                    probs_row, _ = project_policy_logits((log_p1, log_p2, log_pmc), eval_mask, spec)
-                    row.copy_(probs_row[0])
+                row[legal_indices] = 1.0 / legal_indices.numel()
                 continue
 
             total_visits = sum(child.visit_count for child in root.children_by_index.values())
