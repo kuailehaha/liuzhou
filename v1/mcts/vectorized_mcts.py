@@ -266,6 +266,57 @@ class VectorizedMCTS:
             node.visit_count = max(0.0, node.visit_count - delta)
             node.value_sum += delta
 
+    # ---------- NEW: Batch expand helper ----------
+    def _expand_nodes(self, nodes: Sequence[_MCTSNode], spec: ActionEncodingSpec) -> None:
+        """
+        Expand a list of nodes in a single forward pass through the model.
+        """
+        if not nodes:
+            return
+
+        pending: List[Tuple[_MCTSNode, List[dict]]] = []
+        eval_states: List[GameState] = []
+
+        for node in nodes:
+            if node.is_terminal() or node.is_expanded():
+                continue
+            legal_moves = generate_all_legal_moves(node.state)
+            if not legal_moves:
+                node.make_terminal(-1.0)
+                continue
+            eval_states.append(node.state)
+            pending.append((node, legal_moves))
+
+        if not pending:
+            return
+
+        tensor_batch = from_game_states(eval_states, device=self.device)
+        inputs = states_to_model_input(tensor_batch)
+        with torch.no_grad():
+            log_p1, log_p2, log_pmc, values = self.model(inputs)
+        values = values.squeeze(1).clamp(-1.0, 1.0)
+
+        legal_eval_mask = encode_actions(tensor_batch, spec)
+        probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
+
+        for bi, (node, legal_moves) in enumerate(pending):
+            priors = []
+            probs_row = probs[bi]
+            for move in legal_moves:
+                action_idx = action_to_index(move, node.state.BOARD_SIZE, spec)
+                priors.append(float(probs_row[action_idx].item()) if action_idx is not None else 0.0)
+
+            node.expand(
+                legal_moves,
+                priors,
+                spec,
+                apply_dirichlet=node.parent is None and self.config.add_dirichlet_noise,
+                dirichlet_alpha=self.config.dirichlet_alpha,
+                dirichlet_epsilon=self.config.dirichlet_epsilon,
+            )
+            # Optional: we could also backpropagate root value here, but we keep semantics consistent
+            # with leaf-eval path (values used on actual descent paths).
+
     def search(self, batch: TensorStateBatch):
         """
         Run batched simulations for the provided root states.
@@ -305,6 +356,14 @@ class VectorizedMCTS:
         if not active_indices:
             return policies, legal_mask
 
+        # ---------- NEW: Pre-expand not-yet-expanded, non-terminal roots ----------
+        pending_roots = [
+            roots[i]
+            for i in active_indices
+            if roots[i] is not None and not roots[i].is_terminal() and not roots[i].is_expanded()
+        ]
+        self._expand_nodes(pending_roots, spec)
+
         num_sims = self.config.num_simulations
         batch_leaves = max(1, self.config.batch_leaves)
         sims_done = 0
@@ -315,6 +374,8 @@ class VectorizedMCTS:
             to_collect = min(batch_leaves, num_sims - sims_done)
             leaves: List[Tuple[int, _MCTSNode, List[_MCTSNode]]] = []
             reserved_leaf_ids: Set[int] = set()
+            # ---------- NEW: also reserve children per parent to avoid duplicate selection ----------
+            reserved_children_by_parent: Dict[int, Set[int]] = {}
 
             MAX_ATTEMPTS_PER_WAVE = max(8 * to_collect, 64)
             MAX_BACKTRACK_STEPS = 128
@@ -343,7 +404,10 @@ class VectorizedMCTS:
                             parent = node.parent
                             banned_set = banned_at_parent.setdefault(id(parent), set())
                             banned_set.add(id(node))
-                            alt = parent.get_best_child_excluding(self.config.exploration_weight, banned_set)
+                            # ---------- NEW: combine banned + reserved ----------
+                            reserved_set = reserved_children_by_parent.get(id(parent), set())
+                            combined = set(banned_set) | set(reserved_set)
+                            alt = parent.get_best_child_excluding(self.config.exploration_weight, combined)
                             if alt is None:
                                 node = parent
                                 path.pop()
@@ -357,13 +421,19 @@ class VectorizedMCTS:
 
                         leaves.append((idx, node, path.copy()))
                         reserved_leaf_ids.add(id(node))
+                        # ---------- NEW: mark reservation at parent level too ----------
+                        if node.parent is not None:
+                            reserved_children_by_parent.setdefault(id(node.parent), set()).add(id(node))
                         self._apply_virtual_loss(path)
                         wave_made_progress = True
                         sims_done += 1
                         break
 
                     banned_set = banned_at_parent.get(id(node), set())
-                    child = node.get_best_child_excluding(self.config.exploration_weight, banned_set)
+                    # ---------- NEW: avoid choosing children already reserved in this wave ----------
+                    reserved_set = reserved_children_by_parent.get(id(node), set())
+                    combined = set(banned_set) | set(reserved_set)
+                    child = node.get_best_child_excluding(self.config.exploration_weight, combined)
                     if child is None:
                         if node.parent is None:
                             break
