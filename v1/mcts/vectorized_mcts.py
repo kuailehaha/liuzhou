@@ -173,9 +173,10 @@ class _MCTSNode:
             return None
         best_score = -float("inf")
         best_child: Optional[_MCTSNode] = None
-        sqrt_total = math.sqrt(self.visit_count + 1.0)
-
-        for child in self.children_by_index.values():
+        # match legacy: sqrt(max(1, N_parent))
+        sqrt_total = math.sqrt(max(1.0, self.visit_count))
+        # deterministic tie-break by action index
+        for _, child in sorted(self.children_by_index.items()):
             q = child.value()
             u = exploration_weight * child.prior * sqrt_total / (1.0 + child.visit_count)
             score = q + u
@@ -194,7 +195,8 @@ class _MCTSNode:
         banned_child_ids = banned_child_ids or set()
         best_score = -float("inf")
         best_child: Optional[_MCTSNode] = None
-        sqrt_total = math.sqrt(self.visit_count + 1.0)
+        # keep consistent with select_child()/legacy
+        sqrt_total = math.sqrt(max(1.0, self.visit_count))
 
         for _, child in sorted(self.children_by_index.items()):
             if id(child) in banned_child_ids:
