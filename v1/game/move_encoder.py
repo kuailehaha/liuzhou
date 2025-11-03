@@ -22,6 +22,7 @@ from .rules_tensor import (
     generate_selection_mask,
 )
 from .state_batch import TensorStateBatch
+from .fast_legal_mask import encode_actions_fast as _encode_actions_fast
 
 
 @dataclass(frozen=True)
@@ -59,9 +60,12 @@ DEFAULT_ACTION_SPEC = ActionEncodingSpec(
 )
 
 
-def encode_actions(batch: TensorStateBatch, spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC) -> torch.BoolTensor:
+def encode_actions_python(
+    batch: TensorStateBatch,
+    spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC,
+) -> torch.BoolTensor:
     """
-    Produce a legal-action mask of shape (B, spec.total_dim).
+    Pure-Python/tensor implementation of the legal-action mask.
     """
     device = batch.board.device
     B = batch.batch_size
@@ -95,6 +99,23 @@ def encode_actions(batch: TensorStateBatch, spec: ActionEncodingSpec = DEFAULT_A
     mask[:, auxiliary_slice.start : auxiliary_slice.start + 1] = process_mask
 
     return mask
+
+
+def encode_actions(
+    batch: TensorStateBatch,
+    spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC,
+    *,
+    use_fast: bool = True,
+) -> torch.BoolTensor:
+    """
+    Produce a legal-action mask of shape (B, spec.total_dim).
+    """
+    if use_fast and batch.board.device.type == "cpu":
+        fast_mask = _encode_actions_fast(batch, spec)
+        if fast_mask is not None:
+            return fast_mask.to(batch.board.device)
+
+    return encode_actions_python(batch, spec)
 
 
 DIRECTIONS: Tuple[Tuple[int, int], ...] = ((-1, 0), (1, 0), (0, -1), (0, 1))

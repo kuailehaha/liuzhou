@@ -10,8 +10,10 @@ from v1.game.move_encoder import (
     action_to_index,
     decode_action_indices,
     encode_actions,
+    encode_actions_python,
 )
 from v1.game.state_batch import from_game_states
+from v1.game.fast_legal_mask import encode_actions_fast
 
 
 def _state_placement() -> GameState:
@@ -149,3 +151,15 @@ def test_action_to_index_movement_direction_consistency():
     }
     expected = {m["to_position"] for m in legal_moves}
     assert to_positions == expected
+
+
+def test_fast_encoder_matches_python_when_available():
+    states = [builder() for _, builder in SCENARIOS]
+    batch = from_game_states(states)
+
+    fast_mask = encode_actions_fast(batch, DEFAULT_ACTION_SPEC)
+    if fast_mask is None:
+        pytest.skip("C++ fast encoder unavailable on this platform.")
+
+    python_mask = encode_actions_python(batch, DEFAULT_ACTION_SPEC)
+    assert torch.equal(fast_mask, python_mask.cpu())
