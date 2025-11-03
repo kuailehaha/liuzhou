@@ -189,3 +189,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# python -m tools.benchmark_legal_mask --states 1000 --batch-size 128 --device cuda --runs 3 --verify  

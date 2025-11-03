@@ -110,10 +110,16 @@ def encode_actions(
     """
     Produce a legal-action mask of shape (B, spec.total_dim).
     """
-    if use_fast and batch.board.device.type == "cpu":
-        fast_mask = _encode_actions_fast(batch, spec)
+    device = batch.board.device
+
+    if use_fast:
+        if device.type == "cpu":
+            fast_mask = _encode_actions_fast(batch, spec)
+        else:
+            cpu_batch = batch.to(torch.device("cpu"))
+            fast_mask = _encode_actions_fast(cpu_batch, spec)
         if fast_mask is not None:
-            return fast_mask.to(batch.board.device)
+            return fast_mask.to(device)
 
     return encode_actions_python(batch, spec)
 

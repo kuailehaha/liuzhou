@@ -315,3 +315,6 @@ def parse_args() -> CrossCheckConfig:
 
 if __name__ == "__main__":
     run_cross_check(parse_args())
+
+
+# python -m tools.cross_check_mcts --states 200 --max-random-moves 40 --num-simulations 64 --device cuda --batch-leaves 16 > check_log.txt      
