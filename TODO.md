@@ -85,3 +85,4 @@ TODO以产生时间为准。
 - [ ] 优化 project_policy_logits 的实现，仅对合法动作做 softmax，并预先整理 movement 的索引映射
 - [ ] 在节点缓存 legal action indices 和 child state，避免重复调用 action_to_index/apply_move
 - [ ] 预热并复用 TensorStateBatch / states_to_model_input 的工作缓冲降低 encode 成本
+- [ ] 通过 pybind11、cffi、cython 等把棋规核心搬到 native。优点是保留命令式风格，同时获得编译语言的常数加速，还能在内部做更细的缓存/并行。

@@ -72,6 +72,8 @@ class _MCTSNode:
         "terminal_value",
         "state_signature",
         "virtual_loss",
+        "cached_legal_indices",   # torch.Tensor | None  (shape: [L], dtype: long)
+        "cached_children",        # Dict[int, Tuple[GameState, dict]] | None
     )
 
     def __init__(
@@ -95,6 +97,8 @@ class _MCTSNode:
         self.terminal_value = self._evaluate_terminal()
         self.state_signature = _state_signature(state)
         self.virtual_loss = 0.0
+        self.cached_legal_indices = None
+        self.cached_children = None
 
     def _evaluate_terminal(self) -> Optional[float]:
         if self.state.is_game_over():
@@ -335,13 +339,15 @@ class VectorizedMCTS:
         if not pending:
             return 0, 0
 
-        encode_start = time.perf_counter() if self.profile and profile_acc is not None else None
+        profiling = self.profile and profile_acc is not None
+
+        encode_start = time.perf_counter() if profiling else None
         tensor_batch = from_game_states(eval_states, device=self.device)
         inputs = states_to_model_input(tensor_batch)
         if encode_start is not None:
             profile_acc["encode"] += time.perf_counter() - encode_start
 
-        fwd_start = time.perf_counter() if self.profile and profile_acc is not None else None
+        fwd_start = time.perf_counter() if profiling else None
         inference_ctx = torch.inference_mode()
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.float16) if self.device.type == "cuda" else nullcontext()
@@ -352,19 +358,42 @@ class VectorizedMCTS:
         if fwd_start is not None:
             profile_acc["fwd"] += time.perf_counter() - fwd_start
         values = values.squeeze(1).clamp(-1.0, 1.0)
-        pri_start = time.perf_counter() if self.profile and profile_acc is not None else None
-        legal_eval_mask = encode_actions(tensor_batch, spec)
-        probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
-        if pri_start is not None:
-            profile_acc["pri"] += time.perf_counter() - pri_start
 
-        apply_start = time.perf_counter() if self.profile and profile_acc is not None else None
+        pri_mask_start = time.perf_counter() if profiling else None
+        legal_eval_mask = torch.zeros(
+            (len(pending), spec.total_dim), dtype=torch.bool, device=log_p1.device
+        )
+        legal_indices_list: List[torch.Tensor] = []
         for bi, (node, legal_moves) in enumerate(pending):
-            priors = []
-            probs_row = probs[bi]
-            for move in legal_moves:
-                action_idx = action_to_index(move, node.state.BOARD_SIZE, spec)
-                priors.append(float(probs_row[action_idx].item()) if action_idx is not None else 0.0)
+            legal_indices = node.cached_legal_indices
+            if legal_indices is None:
+                idxs = []
+                for mv in legal_moves:
+                    idx = action_to_index(mv, node.state.BOARD_SIZE, spec)
+                    if idx is None:
+                        continue
+                    idxs.append(idx)
+                legal_indices = torch.tensor(idxs, dtype=torch.long, device=log_p1.device)
+                node.cached_legal_indices = legal_indices
+            elif legal_indices.device != log_p1.device:
+                legal_indices = legal_indices.to(log_p1.device)
+                node.cached_legal_indices = legal_indices
+            legal_indices_list.append(legal_indices)
+            if legal_indices.numel() > 0:
+                legal_eval_mask[bi, legal_indices] = True
+        if pri_mask_start is not None:
+            profile_acc["pri_encode_actions"] += time.perf_counter() - pri_mask_start
+
+        pri_project_start = time.perf_counter() if profiling else None
+        probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
+        if pri_project_start is not None:
+            profile_acc["pri_project_policy_logits"] += time.perf_counter() - pri_project_start
+
+        apply_start = time.perf_counter() if profiling else None
+        for bi, (node, legal_moves) in enumerate(pending):
+            legal_indices = legal_indices_list[bi]
+            priors_t = probs[bi, legal_indices]
+            priors = priors_t.to("cpu").tolist()
 
             node.expand(
                 legal_moves,
@@ -374,10 +403,9 @@ class VectorizedMCTS:
                 dirichlet_alpha=self.config.dirichlet_alpha,
                 dirichlet_epsilon=self.config.dirichlet_epsilon,
             )
-            # Optional: we could also backpropagate root value here, but we keep semantics consistent
-            # with leaf-eval path (values used on actual descent paths).
         if apply_start is not None:
             profile_acc["apply"] += time.perf_counter() - apply_start
+
         return 1, len(eval_states)
 
     def _run_simulations_multi_root(
@@ -464,21 +492,44 @@ class VectorizedMCTS:
                 if fwd_start is not None:
                     profile_acc["fwd"] += time.perf_counter() - fwd_start
                 values = values.squeeze(1).clamp(-1.0, 1.0)
-                pri_start = time.perf_counter() if profiling else None
-                legal_eval_mask = encode_actions(tensor_batch, spec)
-                probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
-                if pri_start is not None:
-                    profile_acc["pri"] += time.perf_counter() - pri_start
                 nn_calls += 1
                 total_b += len(eval_info)
 
+                pri_mask_start = time.perf_counter() if profiling else None
+                legal_eval_mask = torch.zeros(
+                    (len(eval_info), spec.total_dim), dtype=torch.bool, device=log_p1.device
+                )
+                legal_indices_list: List[torch.Tensor] = []
+                for bi, (ridx, leaf, path, legal_moves) in enumerate(eval_info):
+                    legal_indices = leaf.cached_legal_indices
+                    if legal_indices is None:
+                        idxs = []
+                        for mv in legal_moves:
+                            idx = action_to_index(mv, leaf.state.BOARD_SIZE, spec)
+                            if idx is None:
+                                continue
+                            idxs.append(idx)
+                        legal_indices = torch.tensor(idxs, dtype=torch.long, device=log_p1.device)
+                        leaf.cached_legal_indices = legal_indices
+                    elif legal_indices.device != log_p1.device:
+                        legal_indices = legal_indices.to(log_p1.device)
+                        leaf.cached_legal_indices = legal_indices
+                    legal_indices_list.append(legal_indices)
+                    if legal_indices.numel() > 0:
+                        legal_eval_mask[bi, legal_indices] = True
+                if pri_mask_start is not None:
+                    profile_acc["pri_encode_actions"] += time.perf_counter() - pri_mask_start
+
+                pri_project_start = time.perf_counter() if profiling else None
+                probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
+                if pri_project_start is not None:
+                    profile_acc["pri_project_policy_logits"] += time.perf_counter() - pri_project_start
+
                 apply_start = time.perf_counter() if profiling else None
                 for bi, (ridx, leaf, path, legal_moves) in enumerate(eval_info):
-                    priors = []
-                    probs_row = probs[bi]
-                    for move in legal_moves:
-                        action_idx = action_to_index(move, leaf.state.BOARD_SIZE, spec)
-                        priors.append(float(probs_row[action_idx].item()) if action_idx is not None else 0.0)
+                    legal_indices = legal_indices_list[bi]
+                    priors_t = probs[bi, legal_indices]
+                    priors = priors_t.to("cpu").tolist()
 
                     self._revert_virtual_loss(path)
                     leaf.expand(
@@ -493,6 +544,7 @@ class VectorizedMCTS:
                     _backpropagate(path, value)
                 if apply_start is not None:
                     profile_acc["apply"] += time.perf_counter() - apply_start
+
                 if profiling:
                     waves += 1
             elif not progress:
@@ -556,7 +608,15 @@ class VectorizedMCTS:
         nn_calls = 0
         total_b = 0
         profile_acc = (
-            {"sel": 0.0, "moves": 0.0, "encode": 0.0, "fwd": 0.0, "pri": 0.0, "apply": 0.0}
+            {
+                "sel": 0.0,
+                "moves": 0.0,
+                "encode": 0.0,
+                "fwd": 0.0,
+                "pri_encode_actions": 0.0,
+                "pri_project_policy_logits": 0.0,
+                "apply": 0.0,
+            }
             if self.profile
             else None
         )
@@ -651,7 +711,8 @@ class VectorizedMCTS:
                     f"moves={profile_acc['moves']/total_time:.2%} "
                     f"encode={profile_acc['encode']/total_time:.2%} "
                     f"fwd={profile_acc['fwd']/total_time:.2%} "
-                    f"pri={profile_acc['pri']/total_time:.2%} "
+                    f"pri:encode_actions={profile_acc['pri_encode_actions']/total_time:.2%} "
+                    f"pri:project_policy_logits={profile_acc['pri_project_policy_logits']/total_time:.2%} "
                     f"apply={profile_acc['apply']/total_time:.2%}"
                 )
 
