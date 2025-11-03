@@ -230,6 +230,7 @@ def run_cross_check(cfg: CrossCheckConfig) -> None:
         batch_leaves=cfg.batch_leaves,
         virtual_loss_weight=0.0,
         action_spec=cfg.action_spec,
+        log_stats=True,
     )
     vectorized = VectorizedMCTS(model=model, config=vmcts_config, device=str(device))
 
@@ -260,17 +261,17 @@ def run_cross_check(cfg: CrossCheckConfig) -> None:
         max_diffs.append(max_diff)
 
         print(f"[State {idx:02d}] L1={l1:.6f}  max|diff|={max_diff:.6f}  legal={len(legacy_policy)}")
-        if l1 > DEBUG_L1_THRESHOLD:
-            _print_debug_details(
-                state_idx=idx,
-                state=state,
-                legacy_map=legacy_policy,
-                tensor_map=tensor_policy,
-                spec=cfg.action_spec,
-                device=device,
-                l1=l1,
-                max_diff=max_diff,
-            )
+        # if l1 > DEBUG_L1_THRESHOLD:
+        #     _print_debug_details(
+        #         state_idx=idx,
+        #         state=state,
+        #         legacy_map=legacy_policy,
+        #         tensor_map=tensor_policy,
+        #         spec=cfg.action_spec,
+        #         device=device,
+        #         l1=l1,
+        #         max_diff=max_diff,
+        #     )
 
     if l1_diffs:
         print("\nSummary:")

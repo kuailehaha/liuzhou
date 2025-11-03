@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple, Set
+import time
+from contextlib import nullcontext
 
 import torch
 from torch.distributions import Dirichlet
@@ -232,6 +234,7 @@ class VectorizedMCTSConfig:
     add_dirichlet_noise: bool = False
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
+    log_stats: bool = False
 
 
 class VectorizedMCTS:
@@ -246,6 +249,7 @@ class VectorizedMCTS:
         self.model.to(self.device)
         self.model.eval()
         self._roots: Dict[int, _MCTSNode] = {}
+        self.profile = bool(getattr(self.config, "log_stats", False))
 
     def _apply_virtual_loss(self, path: Sequence[_MCTSNode]) -> None:
         loss = float(self.config.virtual_loss_weight)
@@ -268,13 +272,52 @@ class VectorizedMCTS:
             node.visit_count = max(0.0, node.visit_count - delta)
             node.value_sum += delta
 
+    def _select_one_leaf_serial(
+        self,
+        root: Optional[_MCTSNode],
+        exploration_weight: float,
+    ) -> Tuple[Optional[_MCTSNode], List[_MCTSNode]]:
+        """
+        Descend a single root to select exactly one leaf while keeping the
+        selection path strictly serial.
+        """
+        if root is None:
+            return None, []
+        node = root
+        path: List[_MCTSNode] = [node]
+        backtrack_steps = 0
+        MAX_BACKTRACK_STEPS = 128
+
+        while True:
+            if not node.is_expanded() or node.is_terminal():
+                return node, path
+
+            child = node.select_child(exploration_weight)
+            if child is None:
+                if node.parent is None or not path:
+                    return node, path
+                path.pop()
+                node = node.parent
+                backtrack_steps += 1
+                if backtrack_steps > MAX_BACKTRACK_STEPS:
+                    return node, path
+                continue
+
+            node = child
+            path.append(node)
+
     # ---------- NEW: Batch expand helper ----------
-    def _expand_nodes(self, nodes: Sequence[_MCTSNode], spec: ActionEncodingSpec) -> None:
+    def _expand_nodes(
+        self,
+        nodes: Sequence[_MCTSNode],
+        spec: ActionEncodingSpec,
+        profile_acc: Optional[Dict[str, float]] = None,
+    ) -> Tuple[int, int]:
         """
         Expand a list of nodes in a single forward pass through the model.
         """
         if not nodes:
-            return
+            return 0, 0
 
         pending: List[Tuple[_MCTSNode, List[dict]]] = []
         eval_states: List[GameState] = []
@@ -290,17 +333,32 @@ class VectorizedMCTS:
             pending.append((node, legal_moves))
 
         if not pending:
-            return
+            return 0, 0
 
+        encode_start = time.perf_counter() if self.profile and profile_acc is not None else None
         tensor_batch = from_game_states(eval_states, device=self.device)
         inputs = states_to_model_input(tensor_batch)
-        with torch.no_grad():
-            log_p1, log_p2, log_pmc, values = self.model(inputs)
-        values = values.squeeze(1).clamp(-1.0, 1.0)
+        if encode_start is not None:
+            profile_acc["encode"] += time.perf_counter() - encode_start
 
+        fwd_start = time.perf_counter() if self.profile and profile_acc is not None else None
+        inference_ctx = torch.inference_mode()
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16) if self.device.type == "cuda" else nullcontext()
+        )
+        with inference_ctx:
+            with autocast_ctx:
+                log_p1, log_p2, log_pmc, values = self.model(inputs)
+        if fwd_start is not None:
+            profile_acc["fwd"] += time.perf_counter() - fwd_start
+        values = values.squeeze(1).clamp(-1.0, 1.0)
+        pri_start = time.perf_counter() if self.profile and profile_acc is not None else None
         legal_eval_mask = encode_actions(tensor_batch, spec)
         probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
+        if pri_start is not None:
+            profile_acc["pri"] += time.perf_counter() - pri_start
 
+        apply_start = time.perf_counter() if self.profile and profile_acc is not None else None
         for bi, (node, legal_moves) in enumerate(pending):
             priors = []
             probs_row = probs[bi]
@@ -318,137 +376,141 @@ class VectorizedMCTS:
             )
             # Optional: we could also backpropagate root value here, but we keep semantics consistent
             # with leaf-eval path (values used on actual descent paths).
+        if apply_start is not None:
+            profile_acc["apply"] += time.perf_counter() - apply_start
+        return 1, len(eval_states)
 
-    def _run_simulations_for_root(self, idx: int, root: _MCTSNode, spec: ActionEncodingSpec) -> None:
+    def _run_simulations_multi_root(
+        self,
+        roots: Sequence[Tuple[int, _MCTSNode]],
+        spec: ActionEncodingSpec,
+        profile_acc: Optional[Dict[str, float]] = None,
+    ) -> Tuple[int, int, int]:
+        """
+        Run simulations for multiple roots while keeping each individual root
+        strictly serial (one leaf per simulation).
+        """
         num_sims = int(self.config.num_simulations)
-        if num_sims <= 0:
-            return
+        if num_sims <= 0 or not roots:
+            return 0, 0, 0
 
-        batch_leaves = max(1, self.config.batch_leaves)
-        sims_done = 0
+        sims_done = [0] * len(roots)
+        exploration_weight = float(self.config.exploration_weight)
+        nn_calls = 0
+        total_b = 0
+        waves = 0
+        profiling = self.profile and profile_acc is not None
 
-        while sims_done < num_sims:
-            to_collect = min(batch_leaves, num_sims - sims_done)
-            leaves: List[Tuple[int, _MCTSNode, List[_MCTSNode]]] = []
-            reserved_leaf_ids: Set[int] = set()
-            reserved_children_by_parent: Dict[int, Set[int]] = {}
-
-            MAX_ATTEMPTS_PER_WAVE = max(8 * to_collect, 64)
-            MAX_BACKTRACK_STEPS = 128
-            attempts_this_wave = 0
-            wave_made_progress = False
-
-            while len(leaves) < to_collect and attempts_this_wave < MAX_ATTEMPTS_PER_WAVE:
-                node = root
-                path = [node]
-                banned_at_parent: Dict[int, Set[int]] = {}
-                backtrack_steps = 0
-                attempts_this_wave += 1
-
-                while True:
-                    if not node.is_expanded() or node.is_terminal():
-                        if id(node) in reserved_leaf_ids:
-                            if node.parent is None:
-                                break
-                            parent = node.parent
-                            banned_set = banned_at_parent.setdefault(id(parent), set())
-                            banned_set.add(id(node))
-                            reserved_set = reserved_children_by_parent.get(id(parent), set())
-                            combined = set(banned_set) | set(reserved_set)
-                            alt = parent.get_best_child_excluding(self.config.exploration_weight, combined)
-                            if alt is None:
-                                node = parent
-                                path.pop()
-                                backtrack_steps += 1
-                                if backtrack_steps > MAX_BACKTRACK_STEPS:
-                                    break
-                                continue
-                            node = alt
-                            path.append(node)
-                            continue
-
-                        leaves.append((idx, node, path.copy()))
-                        reserved_leaf_ids.add(id(node))
-                        if node.parent is not None:
-                            reserved_children_by_parent.setdefault(id(node.parent), set()).add(id(node))
-                        self._apply_virtual_loss(path)
-                        wave_made_progress = True
-                        sims_done += 1
-                        break
-
-                    banned_set = banned_at_parent.get(id(node), set())
-                    reserved_set = reserved_children_by_parent.get(id(node), set())
-                    combined = set(banned_set) | set(reserved_set)
-                    child = node.get_best_child_excluding(self.config.exploration_weight, combined)
-                    if child is None:
-                        if node.parent is None:
-                            break
-                        parent = node.parent
-                        banned_at_parent.setdefault(id(parent), set()).add(id(node))
-                        node = parent
-                        path.pop()
-                        backtrack_steps += 1
-                        if backtrack_steps > MAX_BACKTRACK_STEPS:
-                            break
-                        continue
-
-                    node = child
-                    path.append(node)
-
-                if not wave_made_progress and attempts_this_wave >= MAX_ATTEMPTS_PER_WAVE:
-                    break
-
-            if not leaves:
-                continue
-
+        while True:
             eval_states: List[GameState] = []
             eval_info: List[Tuple[int, _MCTSNode, List[_MCTSNode], List[dict]]] = []
+            progress = False
 
-            for root_idx, node, path in leaves:
-                if node.is_terminal():
-                    self._revert_virtual_loss(path)
-                    _backpropagate(path, node.terminal_value)
+            for ridx, (_, root_node) in enumerate(roots):
+                if sims_done[ridx] >= num_sims:
                     continue
 
-                legal_moves = generate_all_legal_moves(node.state)
+                sel_start = time.perf_counter() if profiling else None
+                leaf, path = self._select_one_leaf_serial(root_node, exploration_weight)
+                if sel_start is not None:
+                    profile_acc["sel"] += time.perf_counter() - sel_start
+                if leaf is None:
+                    sims_done[ridx] = num_sims
+                    continue
+
+                self._apply_virtual_loss(path)
+
+                if leaf.is_terminal():
+                    self._revert_virtual_loss(path)
+                    _backpropagate(path, leaf.terminal_value)
+                    sims_done[ridx] += 1
+                    progress = True
+                    continue
+
+                moves_start = time.perf_counter() if profiling else None
+                legal_moves = generate_all_legal_moves(leaf.state)
+                if moves_start is not None:
+                    profile_acc["moves"] += time.perf_counter() - moves_start
                 if not legal_moves:
-                    node.make_terminal(-1.0)
+                    leaf.make_terminal(-1.0)
                     self._revert_virtual_loss(path)
                     _backpropagate(path, -1.0)
+                    sims_done[ridx] += 1
+                    progress = True
                     continue
 
-                eval_states.append(node.state)
-                eval_info.append((root_idx, node, path, legal_moves))
+                eval_states.append(leaf.state)
+                eval_info.append((ridx, leaf, path, legal_moves))
+                sims_done[ridx] += 1
+                progress = True
 
-            if not eval_info:
-                continue
+            if eval_info:
+                encode_start = time.perf_counter() if profiling else None
+                tensor_batch = from_game_states(eval_states, device=self.device)
+                inputs = states_to_model_input(tensor_batch)
+                if encode_start is not None:
+                    profile_acc["encode"] += time.perf_counter() - encode_start
 
-            tensor_batch = from_game_states(eval_states, device=self.device)
-            inputs = states_to_model_input(tensor_batch)
-            with torch.no_grad():
-                log_p1, log_p2, log_pmc, values = self.model(inputs)
-            values = values.squeeze(1).clamp(-1.0, 1.0)
-            legal_eval_mask = encode_actions(tensor_batch, spec)
-            probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
-
-            for bi, (root_idx, node, path, legal_moves) in enumerate(eval_info):
-                priors = []
-                probs_row = probs[bi]
-                for move in legal_moves:
-                    action_idx = action_to_index(move, node.state.BOARD_SIZE, spec)
-                    priors.append(float(probs_row[action_idx].item()) if action_idx is not None else 0.0)
-
-                self._revert_virtual_loss(path)
-                node.expand(
-                    legal_moves,
-                    priors,
-                    spec,
-                    apply_dirichlet=node.parent is None and self.config.add_dirichlet_noise,
-                    dirichlet_alpha=self.config.dirichlet_alpha,
-                    dirichlet_epsilon=self.config.dirichlet_epsilon,
+                fwd_start = time.perf_counter() if profiling else None
+                inference_ctx = torch.inference_mode()
+                autocast_ctx = (
+                    torch.autocast(device_type="cuda", dtype=torch.float16)
+                    if self.device.type == "cuda"
+                    else nullcontext()
                 )
-                value = float(values[bi].item())
-                _backpropagate(path, value)
+                with inference_ctx:
+                    with autocast_ctx:
+                        log_p1, log_p2, log_pmc, values = self.model(inputs)
+                if fwd_start is not None:
+                    profile_acc["fwd"] += time.perf_counter() - fwd_start
+                values = values.squeeze(1).clamp(-1.0, 1.0)
+                pri_start = time.perf_counter() if profiling else None
+                legal_eval_mask = encode_actions(tensor_batch, spec)
+                probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
+                if pri_start is not None:
+                    profile_acc["pri"] += time.perf_counter() - pri_start
+                nn_calls += 1
+                total_b += len(eval_info)
+
+                apply_start = time.perf_counter() if profiling else None
+                for bi, (ridx, leaf, path, legal_moves) in enumerate(eval_info):
+                    priors = []
+                    probs_row = probs[bi]
+                    for move in legal_moves:
+                        action_idx = action_to_index(move, leaf.state.BOARD_SIZE, spec)
+                        priors.append(float(probs_row[action_idx].item()) if action_idx is not None else 0.0)
+
+                    self._revert_virtual_loss(path)
+                    leaf.expand(
+                        legal_moves,
+                        priors,
+                        spec,
+                        apply_dirichlet=leaf.parent is None and self.config.add_dirichlet_noise,
+                        dirichlet_alpha=self.config.dirichlet_alpha,
+                        dirichlet_epsilon=self.config.dirichlet_epsilon,
+                    )
+                    value = float(values[bi].item())
+                    _backpropagate(path, value)
+                if apply_start is not None:
+                    profile_acc["apply"] += time.perf_counter() - apply_start
+                if profiling:
+                    waves += 1
+            elif not progress:
+                break
+
+            if all(done >= num_sims for done in sims_done):
+                break
+
+        return nn_calls, total_b, waves
+
+    def _run_simulations_for_root(self, idx: int, root: _MCTSNode, spec: ActionEncodingSpec) -> None:
+        """
+        Legacy helper kept for compatibility. Delegates to the multi-root scheduler
+        with a single entry.
+        """
+        if root is None:
+            return
+        self._run_simulations_multi_root([(idx, root)], spec)
 
     def search(self, batch: TensorStateBatch):
         """
@@ -487,7 +549,18 @@ class VectorizedMCTS:
 
         active_indices = [i for i, root in enumerate(roots) if root is not None and legal_mask[i].any().item()]
         if not active_indices:
+            if self.config.log_stats:
+                print("[VectorizedMCTS] nn_calls=0 total_B=0 avg_B=0.00")
             return policies, legal_mask
+
+        nn_calls = 0
+        total_b = 0
+        profile_acc = (
+            {"sel": 0.0, "moves": 0.0, "encode": 0.0, "fwd": 0.0, "pri": 0.0, "apply": 0.0}
+            if self.profile
+            else None
+        )
+        profile_waves = 0
 
         # ---------- NEW: Pre-expand not-yet-expanded, non-terminal roots ----------
         pending_roots = [
@@ -495,13 +568,16 @@ class VectorizedMCTS:
             for i in active_indices
             if roots[i] is not None and not roots[i].is_terminal() and not roots[i].is_expanded()
         ]
-        self._expand_nodes(pending_roots, spec)
+        expand_calls, expand_b = self._expand_nodes(pending_roots, spec, profile_acc)
+        nn_calls += expand_calls
+        total_b += expand_b
 
-        for idx in active_indices:
-            root = roots[idx]
-            if root is None:
-                continue
-            self._run_simulations_for_root(idx, root, spec)
+        multi_roots = [(idx, roots[idx]) for idx in active_indices if roots[idx] is not None]
+        if multi_roots:
+            sim_calls, sim_b, sim_waves = self._run_simulations_multi_root(multi_roots, spec, profile_acc)
+            nn_calls += sim_calls
+            total_b += sim_b
+            profile_waves += sim_waves
 
         for idx in active_indices:
             root = roots[idx]
@@ -558,6 +634,26 @@ class VectorizedMCTS:
 
             if row.sum().item() <= 0:
                 row[legal_indices] = 1.0 / legal_indices.numel()
+
+        if self.config.log_stats:
+            avg_b = (total_b / nn_calls) if nn_calls else 0.0
+            print(f"[VectorizedMCTS] nn_calls={nn_calls} total_B={total_b} avg_B={avg_b:.2f}")
+
+        if self.profile and profile_acc is not None:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            total_time = sum(profile_acc.values())
+            if total_time > 0.0:
+                print(
+                    "[VMCTS-profile] "
+                    f"waves={profile_waves} "
+                    f"sel={profile_acc['sel']/total_time:.2%} "
+                    f"moves={profile_acc['moves']/total_time:.2%} "
+                    f"encode={profile_acc['encode']/total_time:.2%} "
+                    f"fwd={profile_acc['fwd']/total_time:.2%} "
+                    f"pri={profile_acc['pri']/total_time:.2%} "
+                    f"apply={profile_acc['apply']/total_time:.2%}"
+                )
 
         return policies, legal_mask
 
