@@ -16,8 +16,8 @@ from contextlib import nullcontext
 import torch
 from torch.distributions import Dirichlet
 
-from src.game_state import GameState
-from src.move_generator import apply_move, generate_all_legal_moves
+from src.game_state import GameState, Phase
+from src.move_generator import apply_move
 
 from ..game.move_encoder import (
     ActionEncodingSpec,
@@ -25,6 +25,7 @@ from ..game.move_encoder import (
     action_to_index,
     decode_action_indices,
     encode_actions,
+    DIRECTIONS,
 )
 from ..game.state_batch import TensorStateBatch, from_game_states, to_game_states
 from ..net.encoding import project_policy_logits, states_to_model_input
@@ -57,6 +58,96 @@ def _state_signature(state: GameState) -> Tuple:
     )
 
 
+def _indices_to_moves(
+    indices: torch.Tensor,
+    state: GameState,
+    spec: ActionEncodingSpec,
+) -> List[dict]:
+    """
+    Convert flat action indices into structured move dictionaries for a single state.
+    """
+    moves: List[dict] = []
+    if indices.numel() == 0:
+        return moves
+
+    cpu_indices = indices.detach().to("cpu")
+
+    board_size = state.BOARD_SIZE
+    placement_dim = spec.placement_dim
+    movement_dim = spec.movement_dim
+    selection_dim = spec.selection_dim
+
+    placement_end = placement_dim
+    movement_end = placement_end + movement_dim
+    selection_end = movement_end + selection_dim
+    phase = state.phase
+
+    dirs = len(DIRECTIONS)
+
+    for raw in cpu_indices.tolist():
+        action = int(raw)
+        if action < placement_end:
+            cell = action
+            r = cell // board_size
+            c = cell % board_size
+            move = {
+                "phase": Phase.PLACEMENT,
+                "action_type": "place",
+                "position": (r, c),
+            }
+        elif action < movement_end:
+            rel = action - placement_end
+            cell_idx, dir_idx = divmod(rel, dirs)
+            r_from = cell_idx // board_size
+            c_from = cell_idx % board_size
+            dr, dc = DIRECTIONS[dir_idx]
+            move = {
+                "phase": Phase.MOVEMENT,
+                "action_type": "move",
+                "from_position": (r_from, c_from),
+                "to_position": (r_from + dr, c_from + dc),
+            }
+        elif action < selection_end:
+            rel = action - movement_end
+            r = rel // board_size
+            c = rel % board_size
+            if phase == Phase.MARK_SELECTION:
+                action_type = "mark"
+                target_phase = Phase.MARK_SELECTION
+            elif phase == Phase.CAPTURE_SELECTION:
+                action_type = "capture"
+                target_phase = Phase.CAPTURE_SELECTION
+            elif phase == Phase.FORCED_REMOVAL:
+                action_type = "remove"
+                target_phase = Phase.FORCED_REMOVAL
+            elif phase == Phase.COUNTER_REMOVAL:
+                action_type = "counter_remove"
+                target_phase = Phase.COUNTER_REMOVAL
+            elif phase == Phase.MOVEMENT:
+                action_type = "no_moves_remove"
+                target_phase = Phase.MOVEMENT
+            else:
+                action_type = "select"
+                target_phase = phase
+            move = {
+                "phase": target_phase,
+                "action_type": action_type,
+                "position": (r, c),
+            }
+        else:
+            aux_index = action - selection_end
+            if aux_index == 0:
+                move = {
+                    "phase": Phase.REMOVAL,
+                    "action_type": "process_removal",
+                }
+            else:
+                continue
+        moves.append(move)
+
+    return moves
+
+
 class _MCTSNode:
     __slots__ = (
         "state",
@@ -73,6 +164,7 @@ class _MCTSNode:
         "state_signature",
         "virtual_loss",
         "cached_legal_indices",   # torch.Tensor | None  (shape: [L], dtype: long)
+        "cached_legal_moves",     # List[dict] | None
         "cached_children",        # Dict[int, Tuple[GameState, dict]] | None
     )
 
@@ -98,6 +190,7 @@ class _MCTSNode:
         self.state_signature = _state_signature(state)
         self.virtual_loss = 0.0
         self.cached_legal_indices = None
+        self.cached_legal_moves = None
         self.cached_children = None
 
     def _evaluate_terminal(self) -> Optional[float]:
@@ -323,20 +416,16 @@ class VectorizedMCTS:
         if not nodes:
             return 0, 0
 
-        pending: List[Tuple[_MCTSNode, List[dict]]] = []
+        pending_nodes: List[_MCTSNode] = []
         eval_states: List[GameState] = []
 
         for node in nodes:
             if node.is_terminal() or node.is_expanded():
                 continue
-            legal_moves = generate_all_legal_moves(node.state)
-            if not legal_moves:
-                node.make_terminal(-1.0)
-                continue
             eval_states.append(node.state)
-            pending.append((node, legal_moves))
+            pending_nodes.append(node)
 
-        if not pending:
+        if not pending_nodes:
             return 0, 0
 
         profiling = self.profile and profile_acc is not None
@@ -360,27 +449,7 @@ class VectorizedMCTS:
         values = values.squeeze(1).clamp(-1.0, 1.0)
 
         pri_mask_start = time.perf_counter() if profiling else None
-        legal_eval_mask = torch.zeros(
-            (len(pending), spec.total_dim), dtype=torch.bool, device=log_p1.device
-        )
-        legal_indices_list: List[torch.Tensor] = []
-        for bi, (node, legal_moves) in enumerate(pending):
-            legal_indices = node.cached_legal_indices
-            if legal_indices is None:
-                idxs = []
-                for mv in legal_moves:
-                    idx = action_to_index(mv, node.state.BOARD_SIZE, spec)
-                    if idx is None:
-                        continue
-                    idxs.append(idx)
-                legal_indices = torch.tensor(idxs, dtype=torch.long, device=log_p1.device)
-                node.cached_legal_indices = legal_indices
-            elif legal_indices.device != log_p1.device:
-                legal_indices = legal_indices.to(log_p1.device)
-                node.cached_legal_indices = legal_indices
-            legal_indices_list.append(legal_indices)
-            if legal_indices.numel() > 0:
-                legal_eval_mask[bi, legal_indices] = True
+        legal_eval_mask = encode_actions(tensor_batch, spec)
         if pri_mask_start is not None:
             profile_acc["pri_encode_actions"] += time.perf_counter() - pri_mask_start
 
@@ -390,8 +459,22 @@ class VectorizedMCTS:
             profile_acc["pri_project_policy_logits"] += time.perf_counter() - pri_project_start
 
         apply_start = time.perf_counter() if profiling else None
-        for bi, (node, legal_moves) in enumerate(pending):
-            legal_indices = legal_indices_list[bi]
+        for bi, node in enumerate(pending_nodes):
+            mask_row = legal_eval_mask[bi]
+            legal_indices = mask_row.nonzero(as_tuple=False).view(-1)
+            if legal_indices.numel() == 0:
+                node.cached_legal_indices = torch.empty(0, dtype=torch.long, device=log_p1.device)
+                node.cached_legal_moves = []
+                node.make_terminal(-1.0)
+                continue
+
+            if legal_indices.device != log_p1.device:
+                legal_indices = legal_indices.to(log_p1.device)
+
+            legal_moves = _indices_to_moves(legal_indices, eval_states[bi], spec)
+            node.cached_legal_indices = legal_indices
+            node.cached_legal_moves = legal_moves
+
             priors_t = probs[bi, legal_indices]
             priors = priors_t.to("cpu").tolist()
 
@@ -431,7 +514,7 @@ class VectorizedMCTS:
 
         while True:
             eval_states: List[GameState] = []
-            eval_info: List[Tuple[int, _MCTSNode, List[_MCTSNode], List[dict]]] = []
+            eval_info: List[Tuple[int, _MCTSNode, List[_MCTSNode]]] = []
             progress = False
 
             for ridx, (_, root_node) in enumerate(roots):
@@ -455,20 +538,8 @@ class VectorizedMCTS:
                     progress = True
                     continue
 
-                moves_start = time.perf_counter() if profiling else None
-                legal_moves = generate_all_legal_moves(leaf.state)
-                if moves_start is not None:
-                    profile_acc["moves"] += time.perf_counter() - moves_start
-                if not legal_moves:
-                    leaf.make_terminal(-1.0)
-                    self._revert_virtual_loss(path)
-                    _backpropagate(path, -1.0)
-                    sims_done[ridx] += 1
-                    progress = True
-                    continue
-
                 eval_states.append(leaf.state)
-                eval_info.append((ridx, leaf, path, legal_moves))
+                eval_info.append((ridx, leaf, path))
                 sims_done[ridx] += 1
                 progress = True
 
@@ -496,27 +567,7 @@ class VectorizedMCTS:
                 total_b += len(eval_info)
 
                 pri_mask_start = time.perf_counter() if profiling else None
-                legal_eval_mask = torch.zeros(
-                    (len(eval_info), spec.total_dim), dtype=torch.bool, device=log_p1.device
-                )
-                legal_indices_list: List[torch.Tensor] = []
-                for bi, (ridx, leaf, path, legal_moves) in enumerate(eval_info):
-                    legal_indices = leaf.cached_legal_indices
-                    if legal_indices is None:
-                        idxs = []
-                        for mv in legal_moves:
-                            idx = action_to_index(mv, leaf.state.BOARD_SIZE, spec)
-                            if idx is None:
-                                continue
-                            idxs.append(idx)
-                        legal_indices = torch.tensor(idxs, dtype=torch.long, device=log_p1.device)
-                        leaf.cached_legal_indices = legal_indices
-                    elif legal_indices.device != log_p1.device:
-                        legal_indices = legal_indices.to(log_p1.device)
-                        leaf.cached_legal_indices = legal_indices
-                    legal_indices_list.append(legal_indices)
-                    if legal_indices.numel() > 0:
-                        legal_eval_mask[bi, legal_indices] = True
+                legal_eval_mask = encode_actions(tensor_batch, spec)
                 if pri_mask_start is not None:
                     profile_acc["pri_encode_actions"] += time.perf_counter() - pri_mask_start
 
@@ -526,8 +577,26 @@ class VectorizedMCTS:
                     profile_acc["pri_project_policy_logits"] += time.perf_counter() - pri_project_start
 
                 apply_start = time.perf_counter() if profiling else None
-                for bi, (ridx, leaf, path, legal_moves) in enumerate(eval_info):
-                    legal_indices = legal_indices_list[bi]
+                for bi, (ridx, leaf, path) in enumerate(eval_info):
+                    mask_row = legal_eval_mask[bi]
+                    legal_indices = mask_row.nonzero(as_tuple=False).view(-1)
+                    if legal_indices.numel() == 0:
+                        leaf.cached_legal_indices = torch.empty(
+                            0, dtype=torch.long, device=log_p1.device
+                        )
+                        leaf.cached_legal_moves = []
+                        self._revert_virtual_loss(path)
+                        leaf.make_terminal(-1.0)
+                        _backpropagate(path, -1.0)
+                        continue
+
+                    if legal_indices.device != log_p1.device:
+                        legal_indices = legal_indices.to(log_p1.device)
+
+                    legal_moves = _indices_to_moves(legal_indices, eval_states[bi], spec)
+                    leaf.cached_legal_indices = legal_indices
+                    leaf.cached_legal_moves = legal_moves
+
                     priors_t = probs[bi, legal_indices]
                     priors = priors_t.to("cpu").tolist()
 
