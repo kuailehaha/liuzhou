@@ -78,3 +78,10 @@ TODO以产生时间为准。
 ### 2025.11.2
 
 - [ ] debug: python -m tools.cross_check_mcts --states 10 --max-random-moves 40 --num-simulations 64 --device cuda > check_log.txt  
+
+### 2025.11.3
+
+- [ ] 对encode、pri、apply阶段做优化：[VMCTS-profile] waves=64 sel=0.67% moves=0.78% encode=11.96% fwd=3.09% pri=35.44% apply=48.05%
+- [ ] 优化 project_policy_logits 的实现，仅对合法动作做 softmax，并预先整理 movement 的索引映射
+- [ ] 在节点缓存 legal action indices 和 child state，避免重复调用 action_to_index/apply_move
+- [ ] 预热并复用 TensorStateBatch / states_to_model_input 的工作缓冲降低 encode 成本

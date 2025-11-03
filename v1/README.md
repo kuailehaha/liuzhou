@@ -40,3 +40,38 @@ remains untouched so we can A/B compare behaviours during the rollout.
 
 - `tools/cross_check_mcts.py` – 对拍脚本，随机采样若干局面并比较传统 `src.mcts.MCTS` 与
   `v1.mcts.vectorized_mcts.VectorizedMCTS` 的策略分布差异，便于在重构过程中快速验证行为一致性。
+
+(torchenv) PS D:\CODES\liuzhou> tree /f /a ./v1 | findstr /v "\.pyc __pycache__ \__init__.py" 
+
+|   README.md
+|   
++---common
+|   |   tensor_utils.py
+|   |
+|
++---game
+|   |   move_encoder.py
+|   |   rules_tensor.py
+|   |   state_batch.py
+|   |
+|
++---mcts
+|   |   node_storage.py
+|   |   vectorized_mcts.py
+|   |
+|
++---net
+|   |   encoding.py
+|   |   policy_decoder.py
+|   |
+|
++---self_play
+|   |   runner.py
+|   |   samples.py
+|   |
+|
++---train
+|   |   dataset.py
+|   |   pipeline.py
+|   |
+|
