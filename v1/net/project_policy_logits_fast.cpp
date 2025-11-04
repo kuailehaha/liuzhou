@@ -121,7 +121,7 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
         movement_chunks.push_back(movement_dir);
     }
 
-    auto movement_concat = torch::cat(movement_chunks, 1);
+    auto movement_concat = torch::stack(movement_chunks, 2).reshape({batch_size, movement_dim});
     combined.narrow(1, placement_dim, movement_dim).copy_(movement_concat);
     combined.narrow(1, placement_dim + movement_dim, selection_dim).copy_(log_pmc);
 
@@ -138,7 +138,6 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
         auto legal_row = legal_mask[b];
         const int64_t legal_count = legal_row.sum().item<int64_t>();
         if (legal_count == 0) {
-            masked_logits.index_put_({b, Slice()}, 0);
             continue;
         }
 
@@ -168,4 +167,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &project_policy_logits_fast,
         "Fused policy projection with masked softmax");
 }
-
