@@ -134,27 +134,22 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
 
     using torch::indexing::Slice;
 
-    for (int64_t b = 0; b < batch_size; ++b) {
-        auto legal_row = legal_mask[b];
-        const int64_t legal_count = legal_row.sum().item<int64_t>();
-        if (legal_count == 0) {
-            continue;
+    auto has_legal = legal_mask.any(1);
+    if (has_legal.any().item<bool>()) {
+        auto legal_indices = has_legal.nonzero().squeeze(1).to(torch::kLong).contiguous();
+        auto legal_logits = masked_logits.index_select(0, legal_indices);
+        auto legal_has_finite = legal_logits.isfinite().any(1);
+        if (!legal_has_finite.all().item<bool>()) {
+            auto invalid_positions = legal_has_finite.logical_not().nonzero().squeeze(1).to(torch::kLong).contiguous();
+            auto invalid_batch_indices = legal_indices.index_select(0, invalid_positions);
+            masked_logits.index_put_({invalid_batch_indices, Slice()}, 0);
+            masked_logits.masked_fill_(legal_mask.logical_not(), neginf);
+            legal_logits = masked_logits.index_select(0, legal_indices);
         }
-
-        // auto legal_indices = legal_row.nonzero().squeeze(1)
-        auto legal_indices = legal_row.nonzero().squeeze(1).to(torch::kLong).contiguous();
-        auto row_logits = masked_logits.index({b, legal_indices});
-
-        const bool any_finite = row_logits.isfinite().any().item<bool>();
-        if (!any_finite) {
-            auto zeros = torch::zeros_like(row_logits);
-            masked_logits.index_put_({b, legal_indices}, zeros);
-            row_logits = zeros;
-        }
-
-        auto row_probs = torch::softmax(row_logits, 0);
-        probs.index_put_({b, legal_indices}, row_probs);
+        auto legal_probs = torch::softmax(legal_logits, 1);
+        probs.index_put_({legal_indices, Slice()}, legal_probs);
     }
+    probs.masked_fill_(legal_mask.logical_not(), 0);
 
     return {probs, masked_logits};
 }
