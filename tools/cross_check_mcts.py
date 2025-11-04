@@ -29,6 +29,7 @@ from v1.game.move_encoder import (
 )
 from v1.game.state_batch import from_game_states
 from v1.mcts.vectorized_mcts import VectorizedMCTS, VectorizedMCTSConfig
+from v1.net.project_policy_logits_fast import ensure_project_policy_logits_fast
 
 
 @dataclass
@@ -206,6 +207,11 @@ def run_cross_check(cfg: CrossCheckConfig) -> None:
     np.random.seed(cfg.seed)
 
     device = torch.device(cfg.device)
+    fast_ready = ensure_project_policy_logits_fast(cfg.action_spec, device)
+    if fast_ready:
+        print(f"[CrossCheck] project_policy_logits_fast extension active on {device}.")
+    else:
+        print("[CrossCheck] project_policy_logits_fast extension unavailable; falling back to Python path.")
     model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
     model.to(device)
     model.eval()

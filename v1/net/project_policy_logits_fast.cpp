@@ -129,7 +129,8 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
         combined.narrow(1, placement_dim + movement_dim + selection_dim, auxiliary_dim).zero_();
     }
 
-    auto masked_logits = combined.masked_fill(legal_mask.logical_not(), neginf);
+    auto illegal_mask = legal_mask.logical_not();
+    auto masked_logits = combined.masked_fill(illegal_mask, neginf);
     auto probs = torch::zeros_like(combined);
 
     using torch::indexing::Slice;
@@ -139,17 +140,25 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
         auto legal_indices = has_legal.nonzero().squeeze(1).to(torch::kLong).contiguous();
         auto legal_logits = masked_logits.index_select(0, legal_indices);
         auto legal_has_finite = legal_logits.isfinite().any(1);
-        if (!legal_has_finite.all().item<bool>()) {
-            auto invalid_positions = legal_has_finite.logical_not().nonzero().squeeze(1).to(torch::kLong).contiguous();
-            auto invalid_batch_indices = legal_indices.index_select(0, invalid_positions);
-            masked_logits.index_put_({invalid_batch_indices, Slice()}, 0);
-            masked_logits.masked_fill_(legal_mask.logical_not(), neginf);
-            legal_logits = masked_logits.index_select(0, legal_indices);
+
+        auto valid_positions = legal_has_finite.nonzero().squeeze(1).to(torch::kLong).contiguous();
+        if (valid_positions.numel() > 0) {
+            auto valid_batch_indices = legal_indices.index_select(0, valid_positions);
+            auto valid_logits = legal_logits.index_select(0, valid_positions);
+            auto legal_probs = torch::softmax(valid_logits, 1);
+            probs.index_put_({valid_batch_indices, Slice()}, legal_probs);
         }
-        auto legal_probs = torch::softmax(legal_logits, 1);
-        probs.index_put_({legal_indices, Slice()}, legal_probs);
+
+        auto invalid_positions =
+            legal_has_finite.logical_not().nonzero().squeeze(1).to(torch::kLong).contiguous();
+        if (invalid_positions.numel() > 0) {
+            auto invalid_batch_indices = legal_indices.index_select(0, invalid_positions);
+            auto invalid_rows = masked_logits.index_select(0, invalid_batch_indices);
+            auto invalid_legal_mask = legal_mask.index_select(0, invalid_batch_indices);
+            invalid_rows.masked_fill_(invalid_legal_mask, 0);
+            masked_logits.index_put_({invalid_batch_indices, Slice()}, invalid_rows);
+        }
     }
-    probs.masked_fill_(legal_mask.logical_not(), 0);
 
     return {probs, masked_logits};
 }

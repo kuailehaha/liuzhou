@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.utils.cpp_extension as cpp
@@ -83,3 +83,43 @@ def project_policy_logits_fast(
         spec.selection_dim,
         spec.auxiliary_dim,
     )
+
+
+def ensure_project_policy_logits_fast(
+    spec: ActionEncodingSpec,
+    device: Union[str, torch.device] = "cpu",
+) -> bool:
+    """
+    Attempt to build the fast extension and verify that it runs for the given device.
+
+    Returns True when the C++ path is available, False otherwise.
+    """
+    try:
+        ext = _load_extension()
+    except Exception:
+        return False
+
+    if ext is None:
+        return False
+
+    torch_device = torch.device(device)
+    if torch_device.type == "cuda" and not torch.cuda.is_available():
+        return False
+    dtypes = [torch.float32]
+    if torch_device.type == "cuda":
+        dtypes.append(torch.float16)
+
+    for dtype in dtypes:
+        log_p1 = torch.zeros((1, spec.placement_dim), dtype=dtype, device=torch_device)
+        log_p2 = torch.zeros_like(log_p1)
+        log_pmc = torch.zeros_like(log_p1)
+        legal_mask = torch.zeros((1, spec.total_dim), dtype=torch.bool, device=torch_device)
+        if spec.total_dim > 0:
+            legal_mask[..., 0] = True
+        try:
+            result = project_policy_logits_fast(log_p1, log_p2, log_pmc, legal_mask, spec)
+        except RuntimeError:
+            return False
+        if result is None:
+            return False
+    return True
