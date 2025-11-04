@@ -7,12 +7,12 @@ data packing).
 
 ## Layout
 
-- `common/` – shared helpers (device handling, tensor utilities).
-- `game/` – batched state representation, vectorized rule application, move encoding.
-- `mcts/` – vectorized Monte Carlo Tree Search (shared NN evaluations).
-- `net/` – input/output glue between the model and batched action encoding.
-- `self_play/` – orchestration for batched rollouts and data collection.
-- `train/` – training pipeline consuming tensorized samples.
+- `common/` �?shared helpers (device handling, tensor utilities).
+- `game/` �?batched state representation, vectorized rule application, move encoding.
+- `mcts/` �?vectorized Monte Carlo Tree Search (shared NN evaluations).
+- `net/` �?input/output glue between the model and batched action encoding.
+- `self_play/` �?orchestration for batched rollouts and data collection.
+- `train/` �?training pipeline consuming tensorized samples.
 
 Each module currently exposes the target API via `NotImplementedError` stubs.
 They will be filled in incrementally while keeping the legacy `src/` pipeline
@@ -38,8 +38,10 @@ remains untouched so we can A/B compare behaviours during the rollout.
 
 ## Utilities
 
-- `tools/cross_check_mcts.py` – 对拍脚本，随机采样若干局面并比较传统 `src.mcts.MCTS` 与
-  `v1.mcts.vectorized_mcts.VectorizedMCTS` 的策略分布差异，便于在重构过程中快速验证行为一致性。
+- `tools/cross_check_mcts.py` �?对拍脚本，随机采样若干局面并比较传统 `src.mcts.MCTS` �?
+  `v1.mcts.vectorized_mcts.VectorizedMCTS` 的策略分布差异，便于在重构过程中快速验证行为一致性�?
+
+- `tools/benchmark_policy_projection.py` - Benchmark policy projection performance with configurable `--states`, `--batch-size`, `--runs`, `--device`, and optional `--verify` parity checks.
 
 (torchenv) PS D:\CODES\liuzhou> tree /f /a ./v1 | findstr /v "\.pyc __pycache__ \__init__.py" 
 
@@ -75,3 +77,5 @@ remains untouched so we can A/B compare behaviours during the rollout.
 |   |   pipeline.py
 |   |
 |
+
+
