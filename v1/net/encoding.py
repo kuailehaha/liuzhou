@@ -13,6 +13,7 @@ import torch
 
 from ..game.move_encoder import ActionEncodingSpec, DEFAULT_ACTION_SPEC, DIRECTIONS
 from ..game.state_batch import TensorStateBatch
+from .project_policy_logits_fast import project_policy_logits_fast
 
 _PHASE_ORDER = (
     1,  # PLACEMENT
@@ -88,7 +89,7 @@ def _phase_planes(
     return phase_one_hot.expand(-1, -1, height, width)
 
 
-def project_policy_logits(
+def _project_policy_logits_python(
     logits: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     legal_mask: torch.BoolTensor,
     spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC,
@@ -195,3 +196,28 @@ def project_policy_logits(
             probs[idx, legal_indices] = row_probs
 
     return probs, masked_logits
+
+
+def project_policy_logits(
+    logits: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    legal_mask: torch.BoolTensor,
+    spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Combine raw logits with legal-action masks, preferring the fast C++ path when available.
+
+    Returns tuple `(probs, masked_logits)` for downstream sampling/training.
+    """
+    if len(logits) != 3:
+        raise ValueError("project_policy_logits expects a tuple of (log_p1, log_p2, log_pmc).")
+
+    log_p1, log_p2, log_pmc = logits
+    try:
+        fast_result = project_policy_logits_fast(log_p1, log_p2, log_pmc, legal_mask, spec)
+    except RuntimeError:
+        fast_result = None
+
+    if fast_result is not None:
+        return fast_result
+
+    return _project_policy_logits_python(logits, legal_mask, spec)
