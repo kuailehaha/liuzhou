@@ -138,6 +138,7 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
         auto legal_row = legal_mask[b];
         const int64_t legal_count = legal_row.sum().item<int64_t>();
         if (legal_count == 0) {
+            masked_logits.index_put_({b, Slice()}, 0);
             continue;
         }
 
