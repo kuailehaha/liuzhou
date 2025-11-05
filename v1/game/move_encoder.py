@@ -8,7 +8,7 @@ fixed-size tensor representations consumed by neural networks and sampling code.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -106,22 +106,35 @@ def encode_actions(
     spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC,
     *,
     use_fast: bool = True,
-) -> torch.BoolTensor:
+    return_metadata: bool = False,
+) -> Union[torch.BoolTensor, Tuple[torch.BoolTensor, Optional[torch.Tensor]]]:
     """
     Produce a legal-action mask of shape (B, spec.total_dim).
     """
     device = batch.board.device
 
     if use_fast:
+        fast_mask = None
+        fast_metadata = None
         if device.type == "cpu":
-            fast_mask = _encode_actions_fast(batch, spec)
+            result = _encode_actions_fast(batch, spec, return_metadata=return_metadata)
         else:
             cpu_batch = batch.to(torch.device("cpu"))
-            fast_mask = _encode_actions_fast(cpu_batch, spec)
-        if fast_mask is not None:
-            return fast_mask.to(device)
+            result = _encode_actions_fast(cpu_batch, spec, return_metadata=return_metadata)
+        if result is not None:
+            if return_metadata:
+                fast_mask, fast_metadata = result
+            else:
+                fast_mask = result
+            mask = fast_mask.to(device)
+            if return_metadata:
+                return mask, fast_metadata
+            return mask
 
-    return encode_actions_python(batch, spec)
+    mask = encode_actions_python(batch, spec)
+    if return_metadata:
+        return mask, None
+    return mask
 
 
 DIRECTIONS: Tuple[Tuple[int, int], ...] = ((-1, 0), (1, 0), (0, -1), (0, 1))

@@ -30,6 +30,16 @@ from ..game.move_encoder import (
 from ..game.state_batch import TensorStateBatch, from_game_states, to_game_states
 from ..net.encoding import project_policy_logits, states_to_model_input
 
+ACTION_KIND_INVALID = 0
+ACTION_KIND_PLACEMENT = 1
+ACTION_KIND_MOVEMENT = 2
+ACTION_KIND_MARK_SELECTION = 3
+ACTION_KIND_CAPTURE_SELECTION = 4
+ACTION_KIND_FORCED_REMOVAL_SELECTION = 5
+ACTION_KIND_COUNTER_REMOVAL_SELECTION = 6
+ACTION_KIND_NO_MOVES_REMOVAL_SELECTION = 7
+ACTION_KIND_PROCESS_REMOVAL = 8
+
 
 def _move_to_key(move):
     if isinstance(move, dict):
@@ -148,6 +158,102 @@ def _indices_to_moves(
     return moves
 
 
+def _metadata_to_moves(
+    metadata: torch.Tensor,
+    state: GameState,
+    spec: ActionEncodingSpec,
+) -> List[dict]:
+    """
+    Convert fast encode metadata into structured move dictionaries.
+    """
+    if metadata.numel() == 0:
+        return []
+
+    board_size = state.BOARD_SIZE
+    moves: List[dict] = []
+
+    entries = metadata.tolist()
+    for kind, primary, secondary, extra in entries:
+        if kind == ACTION_KIND_PLACEMENT:
+            cell = int(primary)
+            r = cell // board_size
+            c = cell % board_size
+            move = {
+                "phase": Phase.PLACEMENT,
+                "action_type": "place",
+                "position": (r, c),
+            }
+        elif kind == ACTION_KIND_MOVEMENT:
+            from_idx = int(primary)
+            dir_idx = int(secondary)
+            if dir_idx < 0 or dir_idx >= len(DIRECTIONS):
+                continue
+            r_from = from_idx // board_size
+            c_from = from_idx % board_size
+            dr, dc = DIRECTIONS[dir_idx]
+            move = {
+                "phase": Phase.MOVEMENT,
+                "action_type": "move",
+                "from_position": (r_from, c_from),
+                "to_position": (r_from + dr, c_from + dc),
+            }
+        elif kind == ACTION_KIND_MARK_SELECTION:
+            cell = int(primary)
+            r = cell // board_size
+            c = cell % board_size
+            move = {
+                "phase": Phase.MARK_SELECTION,
+                "action_type": "mark",
+                "position": (r, c),
+            }
+        elif kind == ACTION_KIND_CAPTURE_SELECTION:
+            cell = int(primary)
+            r = cell // board_size
+            c = cell % board_size
+            move = {
+                "phase": Phase.CAPTURE_SELECTION,
+                "action_type": "capture",
+                "position": (r, c),
+            }
+        elif kind == ACTION_KIND_FORCED_REMOVAL_SELECTION:
+            cell = int(primary)
+            r = cell // board_size
+            c = cell % board_size
+            move = {
+                "phase": Phase.FORCED_REMOVAL,
+                "action_type": "remove",
+                "position": (r, c),
+            }
+        elif kind == ACTION_KIND_COUNTER_REMOVAL_SELECTION:
+            cell = int(primary)
+            r = cell // board_size
+            c = cell % board_size
+            move = {
+                "phase": Phase.COUNTER_REMOVAL,
+                "action_type": "counter_remove",
+                "position": (r, c),
+            }
+        elif kind == ACTION_KIND_NO_MOVES_REMOVAL_SELECTION:
+            cell = int(primary)
+            r = cell // board_size
+            c = cell % board_size
+            move = {
+                "phase": Phase.MOVEMENT,
+                "action_type": "no_moves_remove",
+                "position": (r, c),
+            }
+        elif kind == ACTION_KIND_PROCESS_REMOVAL:
+            move = {
+                "phase": Phase.REMOVAL,
+                "action_type": "process_removal",
+            }
+        else:
+            continue
+        moves.append(move)
+
+    return moves
+
+
 class _MCTSNode:
     __slots__ = (
         "state",
@@ -165,6 +271,7 @@ class _MCTSNode:
         "virtual_loss",
         "cached_legal_indices",   # torch.Tensor | None  (shape: [L], dtype: long)
         "cached_legal_moves",     # List[dict] | None
+        "cached_legal_metadata",  # torch.Tensor | None
         "cached_children",        # Dict[int, Tuple[GameState, dict]] | None
     )
 
@@ -191,6 +298,7 @@ class _MCTSNode:
         self.virtual_loss = 0.0
         self.cached_legal_indices = None
         self.cached_legal_moves = None
+        self.cached_legal_metadata = None
         self.cached_children = None
 
     def _evaluate_terminal(self) -> Optional[float]:
@@ -449,7 +557,9 @@ class VectorizedMCTS:
         values = values.squeeze(1).clamp(-1.0, 1.0)
 
         pri_mask_start = time.perf_counter() if profiling else None
-        legal_eval_mask = encode_actions(tensor_batch, spec)
+        legal_eval_mask, action_metadata = encode_actions(
+            tensor_batch, spec, return_metadata=True
+        )
         if pri_mask_start is not None:
             profile_acc["pri_encode_actions"] += time.perf_counter() - pri_mask_start
 
@@ -461,19 +571,30 @@ class VectorizedMCTS:
         apply_start = time.perf_counter() if profiling else None
         for bi, node in enumerate(pending_nodes):
             mask_row = legal_eval_mask[bi]
-            legal_indices = mask_row.nonzero(as_tuple=False).view(-1)
-            if legal_indices.numel() == 0:
+            legal_indices_cpu = mask_row.nonzero(as_tuple=False).view(-1)
+            if legal_indices_cpu.numel() == 0:
                 node.cached_legal_indices = torch.empty(0, dtype=torch.long, device=log_p1.device)
                 node.cached_legal_moves = []
+                node.cached_legal_metadata = None
                 node.make_terminal(-1.0)
                 continue
 
-            if legal_indices.device != log_p1.device:
-                legal_indices = legal_indices.to(log_p1.device)
+            legal_indices = legal_indices_cpu.to(log_p1.device)
 
-            legal_moves = _indices_to_moves(legal_indices, eval_states[bi], spec)
+            if action_metadata is not None:
+                meta_row = action_metadata[bi]
+                legal_meta = meta_row.index_select(0, legal_indices_cpu).contiguous()
+            else:
+                legal_meta = None
+
+            if legal_meta is not None:
+                legal_moves = _metadata_to_moves(legal_meta, eval_states[bi], spec)
+            else:
+                legal_moves = _indices_to_moves(legal_indices_cpu, eval_states[bi], spec)
+
             node.cached_legal_indices = legal_indices
             node.cached_legal_moves = legal_moves
+            node.cached_legal_metadata = legal_meta
 
             priors_t = probs[bi, legal_indices]
             priors = priors_t.to("cpu").tolist()
@@ -579,23 +700,34 @@ class VectorizedMCTS:
                 apply_start = time.perf_counter() if profiling else None
                 for bi, (ridx, leaf, path) in enumerate(eval_info):
                     mask_row = legal_eval_mask[bi]
-                    legal_indices = mask_row.nonzero(as_tuple=False).view(-1)
-                    if legal_indices.numel() == 0:
+                    legal_indices_cpu = mask_row.nonzero(as_tuple=False).view(-1)
+                    if legal_indices_cpu.numel() == 0:
                         leaf.cached_legal_indices = torch.empty(
                             0, dtype=torch.long, device=log_p1.device
                         )
                         leaf.cached_legal_moves = []
+                        leaf.cached_legal_metadata = None
                         self._revert_virtual_loss(path)
                         leaf.make_terminal(-1.0)
                         _backpropagate(path, -1.0)
                         continue
 
-                    if legal_indices.device != log_p1.device:
-                        legal_indices = legal_indices.to(log_p1.device)
+                    legal_indices = legal_indices_cpu.to(log_p1.device)
 
-                    legal_moves = _indices_to_moves(legal_indices, eval_states[bi], spec)
+                    if action_metadata is not None:
+                        meta_row = action_metadata[bi]
+                        legal_meta = meta_row.index_select(0, legal_indices_cpu).contiguous()
+                    else:
+                        legal_meta = None
+
+                    if legal_meta is not None:
+                        legal_moves = _metadata_to_moves(legal_meta, eval_states[bi], spec)
+                    else:
+                        legal_moves = _indices_to_moves(legal_indices_cpu, eval_states[bi], spec)
+
                     leaf.cached_legal_indices = legal_indices
                     leaf.cached_legal_moves = legal_moves
+                    leaf.cached_legal_metadata = legal_meta
 
                     priors_t = probs[bi, legal_indices]
                     priors = priors_t.to("cpu").tolist()

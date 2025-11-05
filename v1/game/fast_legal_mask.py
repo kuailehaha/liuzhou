@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 from torch.utils.cpp_extension import load
@@ -30,7 +30,7 @@ def _load_extension():
         return None
 
 
-def encode_actions_fast(batch, spec) -> Optional[torch.Tensor]:
+def encode_actions_fast(batch, spec, *, return_metadata: bool = False) -> Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
     """
     Attempt to build legal masks using the C++ extension.
 
@@ -48,7 +48,7 @@ def encode_actions_fast(batch, spec) -> Optional[torch.Tensor]:
     if batch.board.device.type != "cpu":
         return None
 
-    return ext.encode_actions_fast(
+    result = ext.encode_actions_fast(
         batch.board,
         batch.marks_black,
         batch.marks_white,
@@ -64,4 +64,8 @@ def encode_actions_fast(batch, spec) -> Optional[torch.Tensor]:
         spec.selection_dim,
         spec.auxiliary_dim,
     )
-
+    if result is None:
+        return None
+    if return_metadata:
+        return result
+    return result[0]

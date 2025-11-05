@@ -28,6 +28,20 @@ inline int flat_index(int r, int c, int size) {
     return r * size + c;
 }
 
+enum ActionKind : int32_t {
+    kActionInvalid = 0,
+    kActionPlacement = 1,
+    kActionMovement = 2,
+    kActionMarkSelection = 3,
+    kActionCaptureSelection = 4,
+    kActionForcedRemovalSelection = 5,
+    kActionCounterRemovalSelection = 6,
+    kActionNoMovesRemovalSelection = 7,
+    kActionProcessRemoval = 8,
+};
+
+constexpr int kMetaFields = 4;
+
 inline bool is_marked(const bool* marked, int idx) {
     return marked != nullptr && marked[idx];
 }
@@ -296,7 +310,7 @@ std::vector<int> no_moves_removal_targets(
 
 }  // namespace
 
-torch::Tensor encode_actions_fast(
+std::tuple<torch::Tensor, torch::Tensor> encode_actions_fast(
     torch::Tensor board,
     torch::Tensor marks_black,
     torch::Tensor marks_white,
@@ -332,8 +346,10 @@ torch::Tensor encode_actions_fast(
 
     const int64_t total_dim = placement_dim + movement_dim + selection_dim + auxiliary_dim;
 
-    auto options = torch::TensorOptions().dtype(torch::kBool).device(board.device());
-    torch::Tensor mask = torch::zeros({B, total_dim}, options);
+    auto mask_options = torch::TensorOptions().dtype(torch::kBool).device(board.device());
+    auto meta_options = torch::TensorOptions().dtype(torch::kInt32).device(board.device());
+    torch::Tensor mask = torch::zeros({B, total_dim}, mask_options);
+    torch::Tensor metadata = torch::full({B, total_dim, kMetaFields}, -1, meta_options);
 
     const int8_t* board_ptr = board.data_ptr<int8_t>();
     const bool* marks_black_ptr = marks_black.data_ptr<bool>();
@@ -345,8 +361,17 @@ torch::Tensor encode_actions_fast(
     const int64_t* forced_removals_ptr = forced_removals_done.data_ptr<int64_t>();
 
     bool* mask_ptr = mask.data_ptr<bool>();
+    int32_t* meta_ptr = metadata.data_ptr<int32_t>();
 
     const int cell_count = size * size;
+
+    auto set_metadata = [&](int64_t global_index, ActionKind kind, int32_t primary, int32_t secondary, int32_t extra) {
+        int64_t offset = global_index * kMetaFields;
+        meta_ptr[offset + 0] = static_cast<int32_t>(kind);
+        meta_ptr[offset + 1] = primary;
+        meta_ptr[offset + 2] = secondary;
+        meta_ptr[offset + 3] = extra;
+    };
 
     for (int64_t b = 0; b < B; ++b) {
         const int8_t* board_state = board_ptr + b * cell_count;
@@ -358,18 +383,14 @@ torch::Tensor encode_actions_fast(
         int pending_capture_rem = static_cast<int>(pending_captures_remaining_ptr[b]);
         int forced_done = static_cast<int>(forced_removals_ptr[b]);
 
-        std::vector<int> placement_indices;
-        std::vector<int> movement_indices;
-        std::vector<int> selection_indices;
-        bool process_removal = false;
-
         if (phase_val == kPhasePlacement) {
-            placement_indices.reserve(cell_count);
             for (int r = 0; r < size; ++r) {
                 for (int c = 0; c < size; ++c) {
                     int idx = flat_index(r, c, size);
                     if (board_state[idx] == 0) {
-                        placement_indices.push_back(idx);
+                        int64_t global_index = b * total_dim + idx;
+                        mask_ptr[global_index] = true;
+                        set_metadata(global_index, kActionPlacement, idx, -1, -1);
                     }
                 }
             }
@@ -377,7 +398,6 @@ torch::Tensor encode_actions_fast(
 
         bool has_movement = false;
         if (phase_val == kPhaseMovement) {
-            movement_indices.reserve(cell_count);
             for (int r = 0; r < size; ++r) {
                 for (int c = 0; c < size; ++c) {
                     int base_idx = flat_index(r, c, size);
@@ -391,7 +411,14 @@ torch::Tensor encode_actions_fast(
                             int dest_idx = flat_index(nr, nc, size);
                             if (board_state[dest_idx] == 0) {
                                 int move_offset = base_idx * 4 + dir;
-                                movement_indices.push_back(move_offset);
+                                int64_t global_index = b * total_dim + placement_dim + move_offset;
+                                mask_ptr[global_index] = true;
+                                set_metadata(
+                                    global_index,
+                                    kActionMovement,
+                                    base_idx,
+                                    dir,
+                                    dest_idx);
                                 has_movement = true;
                             }
                         }
@@ -399,6 +426,17 @@ torch::Tensor encode_actions_fast(
                 }
             }
         }
+
+        auto emit_selection = [&](const std::vector<int>& indices, ActionKind kind) {
+            int64_t base = b * total_dim + placement_dim + movement_dim;
+            for (int idx : indices) {
+                if (idx >= 0 && idx < selection_dim) {
+                    int64_t global_index = base + idx;
+                    mask_ptr[global_index] = true;
+                    set_metadata(global_index, kind, idx, -1, -1);
+                }
+            }
+        };
 
         if (phase_val == kPhaseMarkSelection) {
             const bool* opponent_marked = (current_val == kPlayerBlack) ? marks_white_state : marks_black_state;
@@ -408,7 +446,7 @@ torch::Tensor encode_actions_fast(
                 size,
                 pending_mark_rem,
                 current_val);
-            selection_indices.insert(selection_indices.end(), targets.begin(), targets.end());
+            emit_selection(targets, kActionMarkSelection);
         } else if (phase_val == kPhaseCaptureSelection) {
             const bool* opponent_marked = (current_val == kPlayerBlack) ? marks_white_state : marks_black_state;
             auto targets = generate_capture_targets(
@@ -417,43 +455,26 @@ torch::Tensor encode_actions_fast(
                 size,
                 pending_capture_rem,
                 current_val);
-            selection_indices.insert(selection_indices.end(), targets.begin(), targets.end());
+            emit_selection(targets, kActionCaptureSelection);
         } else if (phase_val == kPhaseForcedRemoval) {
             auto targets = forced_removal_targets(board_state, size, forced_done);
-            selection_indices.insert(selection_indices.end(), targets.begin(), targets.end());
+            emit_selection(targets, kActionForcedRemovalSelection);
         } else if (phase_val == kPhaseCounterRemoval) {
             auto targets = counter_removal_targets(board_state, size, current_val);
-            selection_indices.insert(selection_indices.end(), targets.begin(), targets.end());
+            emit_selection(targets, kActionCounterRemovalSelection);
         } else if (phase_val == kPhaseMovement && !has_movement) {
             auto targets = no_moves_removal_targets(board_state, size, current_val);
-            selection_indices.insert(selection_indices.end(), targets.begin(), targets.end());
+            emit_selection(targets, kActionNoMovesRemovalSelection);
         }
 
-        if (phase_val == kPhaseRemoval) {
-            process_removal = true;
-        }
-
-        int64_t row_offset = b * total_dim;
-
-        for (int idx : placement_indices) {
-            mask_ptr[row_offset + idx] = true;
-        }
-        for (int idx : movement_indices) {
-            if (idx >= 0 && idx < movement_dim) {
-                mask_ptr[row_offset + placement_dim + idx] = true;
-            }
-        }
-        for (int idx : selection_indices) {
-            if (idx >= 0 && idx < selection_dim) {
-                mask_ptr[row_offset + placement_dim + movement_dim + idx] = true;
-            }
-        }
-        if (process_removal && auxiliary_dim > 0) {
-            mask_ptr[row_offset + placement_dim + movement_dim + selection_dim] = true;
+        if (phase_val == kPhaseRemoval && auxiliary_dim > 0) {
+            int64_t global_index = b * total_dim + placement_dim + movement_dim + selection_dim;
+            mask_ptr[global_index] = true;
+            set_metadata(global_index, kActionProcessRemoval, -1, -1, -1);
         }
     }
 
-    return mask;
+    return {mask, metadata};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
