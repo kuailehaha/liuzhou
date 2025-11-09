@@ -571,15 +571,16 @@ class VectorizedMCTS:
         apply_start = time.perf_counter() if profiling else None
         for bi, node in enumerate(pending_nodes):
             mask_row = legal_eval_mask[bi]
-            legal_indices_cpu = mask_row.nonzero(as_tuple=False).view(-1)
-            if legal_indices_cpu.numel() == 0:
+            legal_indices_gpu = mask_row.nonzero(as_tuple=False).view(-1)
+            if legal_indices_gpu.numel() == 0:
                 node.cached_legal_indices = torch.empty(0, dtype=torch.long, device=log_p1.device)
                 node.cached_legal_moves = []
                 node.cached_legal_metadata = None
                 node.make_terminal(-1.0)
                 continue
 
-            legal_indices = legal_indices_cpu.to(log_p1.device)
+            legal_indices = legal_indices_gpu.to(log_p1.device)
+            legal_indices_cpu = legal_indices_gpu.to("cpu")
 
             if action_metadata is not None:
                 meta_row = action_metadata[bi]
@@ -688,7 +689,9 @@ class VectorizedMCTS:
                 total_b += len(eval_info)
 
                 pri_mask_start = time.perf_counter() if profiling else None
-                legal_eval_mask = encode_actions(tensor_batch, spec)
+                legal_eval_mask, action_metadata = encode_actions(
+                    tensor_batch, spec, return_metadata=True
+                )
                 if pri_mask_start is not None:
                     profile_acc["pri_encode_actions"] += time.perf_counter() - pri_mask_start
 
@@ -700,8 +703,8 @@ class VectorizedMCTS:
                 apply_start = time.perf_counter() if profiling else None
                 for bi, (ridx, leaf, path) in enumerate(eval_info):
                     mask_row = legal_eval_mask[bi]
-                    legal_indices_cpu = mask_row.nonzero(as_tuple=False).view(-1)
-                    if legal_indices_cpu.numel() == 0:
+                    legal_indices_gpu = mask_row.nonzero(as_tuple=False).view(-1)
+                    if legal_indices_gpu.numel() == 0:
                         leaf.cached_legal_indices = torch.empty(
                             0, dtype=torch.long, device=log_p1.device
                         )
@@ -712,7 +715,8 @@ class VectorizedMCTS:
                         _backpropagate(path, -1.0)
                         continue
 
-                    legal_indices = legal_indices_cpu.to(log_p1.device)
+                    legal_indices = legal_indices_gpu.to(log_p1.device)
+                    legal_indices_cpu = legal_indices_gpu.to("cpu")
 
                     if action_metadata is not None:
                         meta_row = action_metadata[bi]
