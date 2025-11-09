@@ -565,6 +565,7 @@ class VectorizedMCTS:
 
         pri_project_start = time.perf_counter() if profiling else None
         probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
+        probs_cpu = probs.to("cpu")
         if pri_project_start is not None:
             profile_acc["pri_project_policy_logits"] += time.perf_counter() - pri_project_start
 
@@ -597,8 +598,8 @@ class VectorizedMCTS:
             node.cached_legal_moves = legal_moves
             node.cached_legal_metadata = legal_meta
 
-            priors_t = probs[bi, legal_indices]
-            priors = priors_t.to("cpu").tolist()
+            priors_t = probs_cpu[bi, legal_indices_cpu]
+            priors = priors_t.tolist()
 
             node.expand(
                 legal_moves,
@@ -697,6 +698,7 @@ class VectorizedMCTS:
 
                 pri_project_start = time.perf_counter() if profiling else None
                 probs, _ = project_policy_logits((log_p1, log_p2, log_pmc), legal_eval_mask, spec)
+                probs_cpu = probs.to("cpu")
                 if pri_project_start is not None:
                     profile_acc["pri_project_policy_logits"] += time.perf_counter() - pri_project_start
 
@@ -733,8 +735,8 @@ class VectorizedMCTS:
                     leaf.cached_legal_moves = legal_moves
                     leaf.cached_legal_metadata = legal_meta
 
-                    priors_t = probs[bi, legal_indices]
-                    priors = priors_t.to("cpu").tolist()
+                    priors_t = probs_cpu[bi, legal_indices_cpu]
+                    priors = priors_t.tolist()
 
                     self._revert_virtual_loss(path)
                     leaf.expand(
