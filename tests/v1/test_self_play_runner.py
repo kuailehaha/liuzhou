@@ -1,3 +1,11 @@
+"""
+Self-play runner smoke test for the tensorized pipeline.
+
+Usage:
+  pytest tests/v1/test_self_play_runner.py -q
+Seeds: torch.manual_seed(0xF00DCAFE).
+"""
+
 import pytest
 import torch
 
@@ -10,9 +18,11 @@ from v1.self_play.runner import SelfPlayConfig, run_self_play
 
 torch = pytest.importorskip("torch")
 
+SEED = 0xF00DCAFE
+
 
 def test_run_self_play_shapes():
-    torch.manual_seed(0)
+    torch.manual_seed(SEED)
     model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
 
     cfg = SelfPlayConfig(

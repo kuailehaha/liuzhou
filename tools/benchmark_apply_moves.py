@@ -170,11 +170,11 @@ def summarize(samples: Sequence[float]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark apply_move throughput across implementations.")
-    parser.add_argument("--states", type=int, default=256, help="Number of random states to sample.")
+    parser.add_argument("--states", type=int, default=1000, help="Number of random states to sample.")
     parser.add_argument("--batch-size", type=int, default=64, help="Chunk size for tensor fast path.")
     parser.add_argument("--runs", type=int, default=5, help="Benchmark repetitions.")
-    parser.add_argument("--device", type=str, default="cpu", help="Reserved for parity with policy benchmark (must be cpu).")
-    parser.add_argument("--max-random-moves", type=int, default=40, help="Random rollout depth for sampled states.")
+    parser.add_argument("--device", type=str, default="cpu", help="Device flag for parity; benchmark runs on CPU only.")
+    parser.add_argument("--max-random-moves", type=int, default=80, help="Random rollout depth for sampled states.")
     parser.add_argument("--seed", type=int, default=0, help="Seed for state sampling.")
     args = parser.parse_args()
 

@@ -2,7 +2,7 @@
 Benchmark legacy rule-engine legal mask generation against the tensorized encoder.
 
 Usage:
-    python tools/benchmark_legal_mask.py --states 256 --batch-size 64
+    python -m tools.benchmark_legal_mask --states 1000 --batch-size 64 --runs 5 --max-random-moves 80 --seed 0
 """
 
 from __future__ import annotations
@@ -123,11 +123,12 @@ def verify_masks(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark legal action mask generation.")
-    parser.add_argument("--states", type=int, default=256, help="Number of random states to sample.")
+    parser.add_argument("--states", type=int, default=1000, help="Number of random states to sample.")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for tensor encoder.")
-    parser.add_argument("--max-random-moves", type=int, default=40, help="Random rollout depth for state sampling.")
+    parser.add_argument("--max-random-moves", type=int, default=80, help="Random rollout depth for state sampling.")
     parser.add_argument("--device", type=str, default="cpu", help="Device for tensor benchmark (cpu or cuda).")
     parser.add_argument("--runs", type=int, default=5, help="Number of benchmark repetitions.")
+    parser.add_argument("--seed", type=int, default=0, help="Seed for state sampling.")
     parser.add_argument("--verify", action="store_true", help="Also verify masks match between implementations.")
     args = parser.parse_args()
 
@@ -137,7 +138,7 @@ def main() -> None:
     cfg = CrossCheckConfig(
         num_states=args.states,
         max_random_moves=args.max_random_moves,
-        seed=0,
+        seed=args.seed,
     )
     states = sample_states(cfg)
 

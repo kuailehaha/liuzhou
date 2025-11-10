@@ -1,6 +1,16 @@
+"""
+Accuracy tests ensuring fast policy projection matches legacy implementations.
+
+Usage:
+  pytest tests/v1/test_policy_projection_fast_accuracy.py -q > tests/result/policy_proj_accuracy.txt
+Seeds: torch.manual_seed(0xF00DCAFE).
+"""
+
 import pytest
 
 torch = pytest.importorskip("torch")
+
+SEED = 0xF00DCAFE
 
 from src.game_state import GameState, Phase, Player
 from src.move_generator import generate_all_legal_moves
@@ -49,7 +59,7 @@ def test_fast_extension_matches_python_and_legacy():
     batch = from_game_states(states)
     legal_mask = encode_actions(batch, spec)
 
-    torch.manual_seed(2048)
+    torch.manual_seed(SEED)
     log_shape = (len(states), states[0].BOARD_SIZE * states[0].BOARD_SIZE)
     log_p1 = torch.randn(log_shape)
     log_p2 = torch.randn_like(log_p1)

@@ -1,3 +1,10 @@
+"""
+Tensor encoding parity regression tests for v1.
+
+Usage:
+  pytest tests/v1/test_encoding_compat.py -q
+"""
+
 import pytest
 
 torch = pytest.importorskip("torch")

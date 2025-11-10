@@ -1,3 +1,10 @@
+"""
+State batch tensor conversion regression tests.
+
+Usage:
+  pytest tests/v1/test_state_batch.py -q
+"""
+
 import pytest
 
 torch = pytest.importorskip("torch")

@@ -1,3 +1,11 @@
+"""
+Accuracy test validating C++ batch apply moves against legacy Python.
+
+Usage:
+  pytest tests/v1/test_fast_apply_moves.py -q > tests/result/apply_moves_accuracy.txt
+Seeds: random.Random(0xF00DCAFE); max_random_moves=80; 10_000 sampled states.
+"""
+
 import random
 
 import torch
@@ -8,6 +16,9 @@ from src.move_generator import apply_move, generate_all_legal_moves
 from v1.game.move_encoder import ActionEncodingSpec, DEFAULT_ACTION_SPEC, encode_actions
 from v1.game.state_batch import TensorStateBatch, from_game_states, to_game_states
 from v1.game.fast_apply_moves import batch_apply_moves_fast
+
+
+SEED = 0xF00DCAFE
 
 
 ACTION_KIND_PLACEMENT = 1
@@ -57,7 +68,7 @@ def _metadata_to_move(code, state: GameState, spec: ActionEncodingSpec):
 
 
 def _sample_states(num_states: int, max_moves: int) -> list[GameState]:
-    rng = random.Random(0xC0FFEE)
+    rng = random.Random(SEED)
     states = []
     for _ in range(num_states):
         state = GameState()

@@ -1,3 +1,11 @@
+"""
+Training pipeline smoke tests for the tensorized implementation.
+
+Usage:
+  pytest tests/v1/test_train_pipeline.py -q
+Seeds: torch.manual_seed(0xF00DCAFE).
+"""
+
 import pytest
 import torch
 
@@ -14,6 +22,8 @@ from v1.train.pipeline import (
 
 torch = pytest.importorskip("torch")
 
+SEED = 0xF00DCAFE
+
 
 def _make_model():
     model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
@@ -21,7 +31,7 @@ def _make_model():
 
 
 def test_generate_training_data_and_train_iteration():
-    torch.manual_seed(0)
+    torch.manual_seed(SEED)
     model = _make_model()
     cfg = TrainingLoopConfig(batch_size=2, epochs=1, learning_rate=1e-3)
 
@@ -41,7 +51,7 @@ def test_generate_training_data_and_train_iteration():
 
 
 def test_training_loop_runs_iterations():
-    torch.manual_seed(0)
+    torch.manual_seed(SEED)
     model = _make_model()
     cfg = TrainingLoopConfig(batch_size=2, epochs=1, learning_rate=1e-3)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)

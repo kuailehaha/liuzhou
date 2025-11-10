@@ -1,3 +1,10 @@
+"""
+Random agent smoke tests.
+
+Usage:
+  pytest tests/random_agent/test_random_agent_debug.py -q
+Seed defaults are set inside helpers (e.g., 42, 7).
+"""
 import random
 from typing import List, Tuple
 

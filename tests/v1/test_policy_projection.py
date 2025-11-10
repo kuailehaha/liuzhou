@@ -1,6 +1,16 @@
+"""
+Policy projection parity tests bridging legacy and tensor pipelines.
+
+Usage:
+  pytest tests/v1/test_policy_projection.py -q
+Seeds: torch.manual_seed(0xF00DCAFE).
+"""
+
 import pytest
 
 torch = pytest.importorskip("torch")
+
+SEED = 0xF00DCAFE
 
 from src.game_state import GameState, Phase, Player
 from src.move_generator import generate_all_legal_moves
@@ -44,7 +54,7 @@ def test_project_policy_logits_matches_legacy_multi_move():
     batch = from_game_states([state])
     legal_mask = encode_actions(batch, DEFAULT_ACTION_SPEC)
 
-    torch.manual_seed(1234)
+    torch.manual_seed(SEED)
     log_p1 = torch.randn(1, state.BOARD_SIZE * state.BOARD_SIZE)
     log_p2 = torch.randn_like(log_p1)
     log_pmc = torch.randn_like(log_p1)
@@ -120,7 +130,7 @@ def test_project_policy_logits_handles_no_legal_actions():
 
 
 def test_end_to_end_policy_alignment_with_network():
-    torch.manual_seed(2025)
+    torch.manual_seed(SEED)
     states = [
         _movement_state_multiple(),
         _forced_removal_single(),

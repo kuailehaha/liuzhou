@@ -1,3 +1,10 @@
+"""
+Action encoding accuracy tests covering legacy and tensor paths.
+
+Usage:
+  pytest tests/v1/test_move_encoder.py -q
+"""
+
 import pytest
 
 torch = pytest.importorskip("torch")

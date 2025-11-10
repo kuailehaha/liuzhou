@@ -1,3 +1,9 @@
+"""
+Utility script to inspect and set PyTorch intra/interop thread counts.
+
+Usage:
+  python -m tools.get_thread
+"""
 import os
 import torch
 

@@ -203,11 +203,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark policy projection performance across implementations."
     )
-    parser.add_argument("--states", type=int, default=256, help="Number of random states to sample.")
+    parser.add_argument("--states", type=int, default=1000, help="Number of random states to sample.")
     parser.add_argument("--batch-size", type=int, default=64, help="Chunk size for tensor paths.")
     parser.add_argument("--runs", type=int, default=5, help="Benchmark repetitions.")
     parser.add_argument("--device", type=str, default="cpu", help="Device for tensor-Python benchmark (cpu or cuda).")
-    parser.add_argument("--max-random-moves", type=int, default=40, help="Random rollout depth for sampled states.")
+    parser.add_argument("--max-random-moves", type=int, default=80, help="Random rollout depth for sampled states.")
     parser.add_argument("--seed", type=int, default=0, help="Seed for state sampling and logits.")
     parser.add_argument("--verify", action="store_true", help="Also verify outputs against legacy logic.")
     args = parser.parse_args()

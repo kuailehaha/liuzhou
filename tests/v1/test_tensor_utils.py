@@ -1,3 +1,10 @@
+"""
+Tensor utility unit tests.
+
+Usage:
+  pytest tests/v1/test_tensor_utils.py -q
+"""
+
 import pytest
 
 torch = pytest.importorskip("torch")

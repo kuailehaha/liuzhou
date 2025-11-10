@@ -1,3 +1,10 @@
+"""
+Smoke test ensuring v1 modules remain importable.
+
+Usage:
+  pytest tests/v1/test_scaffold.py -q
+"""
+
 import importlib
 
 

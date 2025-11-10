@@ -1,3 +1,9 @@
+"""
+Enhanced random agent tests with aggregated stats.
+
+Usage:
+  pytest tests/random_agent/test_random_agent_enhanced.py -q
+"""
 import random
 from typing import Dict, Union
 

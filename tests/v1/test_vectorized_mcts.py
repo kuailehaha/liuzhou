@@ -1,3 +1,11 @@
+"""
+Vectorized MCTS smoke tests ensuring deterministic policy outputs.
+
+Usage:
+  pytest tests/v1/test_vectorized_mcts.py -q
+Seeds: torch.manual_seed(0xF00DCAFE).
+"""
+
 import pytest
 
 from src.game_state import GameState
@@ -12,8 +20,11 @@ from v1.mcts.vectorized_mcts import VectorizedMCTS, VectorizedMCTSConfig
 
 torch = pytest.importorskip("torch")
 
+SEED = 0xF00DCAFE
+
 
 def test_vectorized_mcts_returns_probabilities():
+    torch.manual_seed(SEED)
     model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
     config = VectorizedMCTSConfig(num_simulations=4, temperature=1.0, exploration_weight=1.0)
     vmcts = VectorizedMCTS(model=model, config=config, device="cpu")
@@ -30,6 +41,7 @@ def test_vectorized_mcts_returns_probabilities():
 
 
 def test_advance_roots_reuses_tree():
+    torch.manual_seed(SEED)
     model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
     config = VectorizedMCTSConfig(num_simulations=4, temperature=1.0, exploration_weight=1.0)
     vmcts = VectorizedMCTS(model=model, config=config, device="cpu")
