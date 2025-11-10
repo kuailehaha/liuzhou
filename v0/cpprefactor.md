@@ -62,6 +62,7 @@
   - 结构化 move <-> 扁平索引互转；
   - `encode_actions`、`decode_action_indices` C++ 版。
 - 产生的 move/编码直接喂给 `fast_apply_moves`，减少 Python 粘合。
+- **现状**：`v0/include/v0/move_generator.hpp`+`src/moves/move_generator.cpp` 提供 `MoveRecord`/`ActionCode`、全阶段生成、C++ `apply_move` 及编码函数。`v0_core` 暴露了 `generate_all_legal_moves_struct`/`generate_moves_with_codes` 等接口，`v0/python/move_generator.py` 现已封装成与 `src.move_generator` 兼容（含 `return_codes` 选项），并附带 `apply_move` 与 `_generate_moves_*` helper。
 
 ### 4. Tensor/Net (`v0/src/net`)
 - C++ 实现 `states_to_model_input`：批量构造 BCHW tensor，与原 Python 完全等价。

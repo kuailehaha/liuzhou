@@ -4,6 +4,7 @@
 
 #include "v0/game_state.hpp"
 #include "v0/rule_engine.hpp"
+#include "v0/move_generator.hpp"
 
 namespace py = pybind11;
 
@@ -78,6 +79,88 @@ PYBIND11_MODULE(v0_core, m) {
         .value("BLACK", v0::Player::kBlack)
         .value("WHITE", v0::Player::kWhite)
         .export_values();
+
+    py::enum_<v0::ActionType>(m, "ActionType")
+        .value("PLACE", v0::ActionType::kPlace)
+        .value("MOVE", v0::ActionType::kMove)
+        .value("MARK", v0::ActionType::kMark)
+        .value("CAPTURE", v0::ActionType::kCapture)
+        .value("FORCED_REMOVAL", v0::ActionType::kForcedRemoval)
+        .value("COUNTER_REMOVAL", v0::ActionType::kCounterRemoval)
+        .value("NO_MOVES_REMOVAL", v0::ActionType::kNoMovesRemoval)
+        .value("PROCESS_REMOVAL", v0::ActionType::kProcessRemoval)
+        .export_values();
+
+    py::class_<v0::MoveRecord>(m, "MoveRecord")
+        .def_property_readonly("phase", [](const v0::MoveRecord& move) { return move.phase; })
+        .def_property_readonly(
+            "action_type",
+            [](const v0::MoveRecord& move) { return move.action_type; })
+        .def_property_readonly(
+            "action_type_name",
+            [](const v0::MoveRecord& move) { return std::string(v0::ActionTypeToString(move.action_type)); })
+        .def_property_readonly(
+            "position",
+            [](const v0::MoveRecord& move) -> py::object {
+                if (move.HasPosition()) {
+                    return py::cast(move.Position());
+                }
+                return py::none();
+            })
+        .def_property_readonly(
+            "from_position",
+            [](const v0::MoveRecord& move) -> py::object {
+                if (move.HasFrom()) {
+                    return py::cast(move.From());
+                }
+                return py::none();
+            })
+        .def_property_readonly(
+            "to_position",
+            [](const v0::MoveRecord& move) -> py::object {
+                if (move.HasTo()) {
+                    return py::cast(move.To());
+                }
+                return py::none();
+            })
+        .def(
+            "to_dict",
+            [](const v0::MoveRecord& move) {
+                py::dict d;
+                d["phase"] = move.phase;
+                d["action_type"] = py::str(v0::ActionTypeToString(move.action_type));
+                if (move.action_type == v0::ActionType::kMove) {
+                    d["from_position"] = move.From();
+                    d["to_position"] = move.To();
+                } else if (move.HasPosition()) {
+                    d["position"] = move.Position();
+                }
+                return d;
+            })
+        .def_static("placement", &v0::MoveRecord::Placement, py::arg("position"))
+        .def_static("mark", &v0::MoveRecord::Mark, py::arg("position"))
+        .def_static("capture", &v0::MoveRecord::Capture, py::arg("position"))
+        .def_static("forced_removal", &v0::MoveRecord::ForcedRemoval, py::arg("position"))
+        .def_static("counter_removal", &v0::MoveRecord::CounterRemoval, py::arg("position"))
+        .def_static("no_moves_removal", &v0::MoveRecord::NoMovesRemoval, py::arg("position"))
+        .def_static("process_removal", &v0::MoveRecord::ProcessRemoval)
+        .def_static(
+            "movement",
+            &v0::MoveRecord::Movement,
+            py::arg("from_position"),
+            py::arg("to_position"));
+
+    py::class_<v0::ActionCode>(m, "ActionCode")
+        .def(py::init<>())
+        .def_readwrite("kind", &v0::ActionCode::kind)
+        .def_readwrite("primary", &v0::ActionCode::primary)
+        .def_readwrite("secondary", &v0::ActionCode::secondary)
+        .def_readwrite("extra", &v0::ActionCode::extra)
+        .def(
+            "to_tuple",
+            [](const v0::ActionCode& code) {
+                return py::make_tuple(code.kind, code.primary, code.secondary, code.extra);
+            });
 
     py::class_<v0::GameState>(m, "GameState")
         .def(py::init<>())
@@ -186,6 +269,35 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("state"),
         py::arg("move"),
         py::arg("capture_positions") = py::none(),
+        py::arg("quiet") = false);
+
+    m.def(
+        "generate_all_legal_moves_struct",
+        &v0::GenerateAllLegalMoves,
+        py::arg("state"));
+    m.def(
+        "generate_moves_with_codes",
+        &v0::GenerateMovesWithCodes,
+        py::arg("state"));
+    m.def(
+        "generate_forced_removal_moves_struct",
+        &v0::GenerateForcedRemovalMoves,
+        py::arg("state"));
+    m.def(
+        "generate_no_moves_options_struct",
+        &v0::GenerateNoMovesOptions,
+        py::arg("state"));
+    m.def(
+        "generate_counter_removal_moves_struct",
+        &v0::GenerateCounterRemovalMoves,
+        py::arg("state"));
+    m.def("encode_action_codes", &v0::EncodeActions, py::arg("moves"));
+    m.def("encode_action_code", &v0::EncodeAction, py::arg("move"));
+    m.def(
+        "apply_move_struct",
+        &v0::ApplyMove,
+        py::arg("state"),
+        py::arg("move"),
         py::arg("quiet") = false);
 
     m.def("version", []() { return std::string("v0-core"); });

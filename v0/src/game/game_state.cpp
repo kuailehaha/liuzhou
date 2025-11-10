@@ -4,8 +4,8 @@
 
 namespace v0 {
 
-std::vector<std::pair<int, int>> MarkSet::ToVector() const {
-    std::vector<std::pair<int, int>> coords;
+std::vector<Coord> MarkSet::ToVector() const {
+    std::vector<Coord> coords;
     coords.reserve(bits.count());
     for (int idx = 0; idx < kCellCount; ++idx) {
         if (bits.test(idx)) {
@@ -36,8 +36,8 @@ int GameState::CountPlayerPieces(Player player) const {
     return count;
 }
 
-std::vector<std::pair<int, int>> GameState::GetPlayerPieces(Player player) const {
-    std::vector<std::pair<int, int>> pieces;
+std::vector<Coord> GameState::GetPlayerPieces(Player player) const {
+    std::vector<Coord> pieces;
     pieces.reserve(kCellCount);
     int target = PlayerValue(player);
     for (int idx = 0; idx < kCellCount; ++idx) {
@@ -54,6 +54,25 @@ const MarkSet& GameState::Marks(Player player) const {
 
 MarkSet& GameState::Marks(Player player) {
     return player == Player::kBlack ? marked_black : marked_white;
+}
+
+std::optional<Player> GameState::GetWinner() const {
+    if (phase == Phase::kPlacement) {
+        return std::nullopt;
+    }
+    int black_pieces = CountPlayerPieces(Player::kBlack);
+    int white_pieces = CountPlayerPieces(Player::kWhite);
+    if (black_pieces == 0) {
+        return Player::kWhite;
+    }
+    if (white_pieces == 0) {
+        return Player::kBlack;
+    }
+    return std::nullopt;
+}
+
+bool GameState::IsGameOver() const {
+    return GetWinner().has_value() || HasReachedMoveLimit();
 }
 
 }  // namespace v0

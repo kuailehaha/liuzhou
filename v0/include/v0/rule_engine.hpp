@@ -7,7 +7,6 @@
 
 namespace v0 {
 
-using Coord = std::pair<int, int>;
 using Move = std::pair<Coord, Coord>;
 
 std::vector<Coord> GeneratePlacementPositions(const GameState& state);
@@ -45,5 +44,21 @@ GameState ApplyMovePhase3(
     const Move& move,
     const std::vector<Coord>& capture_positions,
     bool quiet = false);
+
+bool IsPieceInShape(
+    const GameState& state,
+    int r,
+    int c,
+    int player_value,
+    const MarkSet& marked_set);
+
+inline bool IsPieceInShape(
+    const GameState& state,
+    int r,
+    int c,
+    Player player,
+    const MarkSet& marked_set) {
+    return IsPieceInShape(state, r, c, PlayerValue(player), marked_set);
+}
 
 }  // namespace v0

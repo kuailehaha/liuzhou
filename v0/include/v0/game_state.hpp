@@ -3,8 +3,7 @@
 #include <array>
 #include <bitset>
 #include <cstdint>
-#include <stdexcept>
-#include <string>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -17,6 +16,8 @@ constexpr int kMaxMoveCount = 200;
 inline int CellIndex(int row, int col) {
     return row * kBoardSize + col;
 }
+
+using Coord = std::pair<int, int>;
 
 enum class Phase : int32_t {
     kPlacement = 1,
@@ -84,7 +85,7 @@ struct MarkSet {
         return bits.none();
     }
 
-    std::vector<std::pair<int, int>> ToVector() const;
+    std::vector<Coord> ToVector() const;
 };
 
 class GameState {
@@ -127,7 +128,7 @@ class GameState {
     }
 
     int CountPlayerPieces(Player player) const;
-    std::vector<std::pair<int, int>> GetPlayerPieces(Player player) const;
+    std::vector<Coord> GetPlayerPieces(Player player) const;
 
     const MarkSet& Marks(Player player) const;
     MarkSet& Marks(Player player);
@@ -136,6 +137,9 @@ class GameState {
         marked_black.Clear();
         marked_white.Clear();
     }
+
+    std::optional<Player> GetWinner() const;
+    bool IsGameOver() const;
 };
 
 }  // namespace v0

@@ -134,19 +134,6 @@ bool CheckLines(
     return count >= 6;
 }
 
-bool IsPieceInShape(
-    const GameState& state,
-    int r,
-    int c,
-    int player_value,
-    const MarkSet& marked_set) {
-    if (state.BoardAt(r, c) != player_value) {
-        return false;
-    }
-    return CheckSquares(state, r, c, player_value, marked_set) ||
-        CheckLines(state, r, c, player_value, marked_set);
-}
-
 ShapeType DetectShapeFormed(
     const GameState& state,
     int r,
@@ -202,6 +189,22 @@ std::vector<Coord> FilterUnmarked(
 }
 
 }  // namespace
+
+bool IsPieceInShape(
+    const GameState& state,
+    int r,
+    int c,
+    int player_value,
+    const MarkSet& marked_set) {
+    if (!InBounds(r, c)) {
+        return false;
+    }
+    if (state.BoardAt(r, c) != player_value) {
+        return false;
+    }
+    return CheckSquares(state, r, c, player_value, marked_set) ||
+        CheckLines(state, r, c, player_value, marked_set);
+}
 
 std::vector<Coord> GeneratePlacementPositions(const GameState& state) {
     if (state.phase != Phase::kPlacement) {
