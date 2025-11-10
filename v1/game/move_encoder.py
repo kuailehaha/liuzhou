@@ -24,6 +24,15 @@ from .rules_tensor import (
 from .state_batch import TensorStateBatch
 from .fast_legal_mask import encode_actions_fast as _encode_actions_fast
 
+ACTION_KIND_PLACEMENT = 1
+ACTION_KIND_MOVEMENT = 2
+ACTION_KIND_MARK_SELECTION = 3
+ACTION_KIND_CAPTURE_SELECTION = 4
+ACTION_KIND_FORCED_REMOVAL_SELECTION = 5
+ACTION_KIND_COUNTER_REMOVAL_SELECTION = 6
+ACTION_KIND_NO_MOVES_REMOVAL_SELECTION = 7
+ACTION_KIND_PROCESS_REMOVAL = 8
+
 
 @dataclass(frozen=True)
 class ActionEncodingSpec:
@@ -63,9 +72,11 @@ DEFAULT_ACTION_SPEC = ActionEncodingSpec(
 def encode_actions_python(
     batch: TensorStateBatch,
     spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC,
-) -> torch.BoolTensor:
+    *,
+    return_metadata: bool = False,
+) -> Union[torch.BoolTensor, Tuple[torch.BoolTensor, torch.Tensor]]:
     """
-    Pure-Python/tensor implementation of the legal-action mask.
+    Pure-Python/tensor implementation of the legal-action mask and optional metadata.
     """
     device = batch.board.device
     B = batch.batch_size
@@ -98,7 +109,79 @@ def encode_actions_python(
     # Only first auxiliary slot is currently used for process_removal
     mask[:, auxiliary_slice.start : auxiliary_slice.start + 1] = process_mask
 
-    return mask
+    if not return_metadata:
+        return mask
+
+    metadata = _build_metadata_from_mask(
+        batch,
+        mask,
+        spec,
+        board_size=board_size,
+    )
+    return mask, metadata
+
+
+def _build_metadata_from_mask(
+    batch: TensorStateBatch,
+    mask: torch.BoolTensor,
+    spec: ActionEncodingSpec,
+    *,
+    board_size: int,
+) -> torch.Tensor:
+    """
+    Populate action codes (kind, primary, secondary, extra) aligned with the legal mask.
+    """
+    device = mask.device
+    B, total_dim = mask.shape
+    metadata = torch.full((B, total_dim, 4), -1, dtype=torch.int32, device=device)
+
+    placement_dim = spec.placement_dim
+    movement_dim = spec.movement_dim
+    selection_dim = spec.selection_dim
+    dirs = len(DIRECTIONS)
+
+    selection_kind_map = {
+        Phase.MARK_SELECTION.value: ACTION_KIND_MARK_SELECTION,
+        Phase.CAPTURE_SELECTION.value: ACTION_KIND_CAPTURE_SELECTION,
+        Phase.FORCED_REMOVAL.value: ACTION_KIND_FORCED_REMOVAL_SELECTION,
+        Phase.COUNTER_REMOVAL.value: ACTION_KIND_COUNTER_REMOVAL_SELECTION,
+    }
+
+    for b in range(B):
+        legal_indices = mask[b].nonzero(as_tuple=False).view(-1)
+        if legal_indices.numel() == 0:
+            continue
+        phase_val = int(batch.phase[b].item())
+        for action_idx in legal_indices.tolist():
+            if action_idx < placement_dim:
+                metadata[b, action_idx, 0] = ACTION_KIND_PLACEMENT
+                metadata[b, action_idx, 1] = action_idx
+            elif action_idx < placement_dim + movement_dim:
+                rel = action_idx - placement_dim
+                cell_idx = rel // dirs
+                dir_idx = rel % dirs
+                r_from = cell_idx // board_size
+                c_from = cell_idx % board_size
+                dr, dc = DIRECTIONS[dir_idx]
+                dest_r = r_from + dr
+                dest_c = c_from + dc
+                dest_idx = dest_r * board_size + dest_c
+                metadata[b, action_idx, 0] = ACTION_KIND_MOVEMENT
+                metadata[b, action_idx, 1] = cell_idx
+                metadata[b, action_idx, 2] = dir_idx
+                metadata[b, action_idx, 3] = dest_idx
+            elif action_idx < placement_dim + movement_dim + selection_dim:
+                rel = action_idx - (placement_dim + movement_dim)
+                if phase_val == Phase.MOVEMENT.value:
+                    kind = ACTION_KIND_NO_MOVES_REMOVAL_SELECTION
+                else:
+                    kind = selection_kind_map.get(phase_val, ACTION_KIND_MARK_SELECTION)
+                metadata[b, action_idx, 0] = kind
+                metadata[b, action_idx, 1] = rel
+            else:
+                metadata[b, action_idx, 0] = ACTION_KIND_PROCESS_REMOVAL
+
+    return metadata
 
 
 def encode_actions(
@@ -128,13 +211,16 @@ def encode_actions(
                 fast_mask = result
             mask = fast_mask.to(device)
             if return_metadata:
-                return mask, fast_metadata
+                metadata_cpu = fast_metadata.to(torch.device("cpu"))
+                return mask, metadata_cpu
             return mask
 
-    mask = encode_actions_python(batch, spec)
+    python_result = encode_actions_python(batch, spec, return_metadata=return_metadata)
     if return_metadata:
-        return mask, None
-    return mask
+        mask, metadata = python_result
+        metadata_cpu = metadata.to(torch.device("cpu"))
+        return mask, metadata_cpu
+    return python_result
 
 
 DIRECTIONS: Tuple[Tuple[int, int], ...] = ((-1, 0), (1, 0), (0, -1), (0, 1))
