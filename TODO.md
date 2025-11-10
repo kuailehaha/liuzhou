@@ -89,7 +89,7 @@ TODO以产生时间为准。
 
 ### 2025.11.09
 
-- [x] C++ 层重写 atch_apply_moves，并补充准确性测试（	ests/v1/test_fast_apply_moves.py）与性能脚本（	ests/v1/test_fast_apply_moves_performance.py、	ools/benchmark_apply_moves.py）
+- [x] C++ 层重写 batch_apply_moves，并补充准确性测试（tests/v1/test_fast_apply_moves.py）与性能脚本（tests/v1/test_fast_apply_moves_performance.py、tools/benchmark_apply_moves.py）
 
 ### 2025.11.10
 
