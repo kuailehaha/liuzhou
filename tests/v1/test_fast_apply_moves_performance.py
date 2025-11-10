@@ -105,7 +105,7 @@ def _time_call(fn, repeats=5):
 
 @pytest.mark.slow
 def test_fast_apply_moves_performance_cpu():
-    states = _sample_states(num_states=64, max_random_moves=50)
+    states = _sample_states(num_states=10000, max_random_moves=50)
     batch = from_game_states(states, device=torch.device("cpu"))
     spec = DEFAULT_ACTION_SPEC
 
