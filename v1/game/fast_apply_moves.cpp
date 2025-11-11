@@ -754,6 +754,8 @@ void apply_action(
     }
 }
 
+}  // namespace
+
 std::tuple<
     torch::Tensor,
     torch::Tensor,
@@ -882,8 +884,6 @@ batch_apply_moves(
         out_move_count,
     };
 }
-
-}  // namespace
 
 }  // namespace v0
 

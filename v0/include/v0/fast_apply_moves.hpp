@@ -16,9 +16,8 @@ std::tuple<
     torch::Tensor,
     torch::Tensor,
     torch::Tensor,
-    torch::Tensor,
     torch::Tensor>
-batch_apply_moves_fast(
+batch_apply_moves(
     torch::Tensor board,
     torch::Tensor marks_black,
     torch::Tensor marks_white,

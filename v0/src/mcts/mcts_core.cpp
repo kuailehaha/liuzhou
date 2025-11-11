@@ -307,7 +307,7 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
             parent_ptr[i] = parent_indices[i];
         }
 
-        auto next_batch = batch_apply_moves_fast(
+        auto next_batch = batch_apply_moves(
             batch_cpu.board,
             batch_cpu.marks_black.to(torch::kUInt8),
             batch_cpu.marks_white.to(torch::kUInt8),
