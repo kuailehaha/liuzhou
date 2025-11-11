@@ -2,10 +2,13 @@
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
+#include <string>
+
 #include "v0/game_state.hpp"
 #include "v0/move_generator.hpp"
 #include "v0/net_encoding.hpp"
 #include "v0/project_policy.hpp"
+#include "v0/tensor_state_batch.hpp"
 #include "v0/rule_engine.hpp"
 
 namespace py = pybind11;
@@ -301,6 +304,52 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("state"),
         py::arg("move"),
         py::arg("quiet") = false);
+
+    py::class_<v0::TensorStateBatch>(m, "TensorStateBatch")
+        .def(py::init<>())
+        .def_property_readonly("board", [](const v0::TensorStateBatch& batch) { return batch.board; })
+        .def_property_readonly("marks_black", [](const v0::TensorStateBatch& batch) { return batch.marks_black; })
+        .def_property_readonly("marks_white", [](const v0::TensorStateBatch& batch) { return batch.marks_white; })
+        .def_property_readonly("phase", [](const v0::TensorStateBatch& batch) { return batch.phase; })
+        .def_property_readonly("current_player", [](const v0::TensorStateBatch& batch) { return batch.current_player; })
+        .def_property_readonly(
+            "pending_marks_required",
+            [](const v0::TensorStateBatch& batch) { return batch.pending_marks_required; })
+        .def_property_readonly(
+            "pending_marks_remaining",
+            [](const v0::TensorStateBatch& batch) { return batch.pending_marks_remaining; })
+        .def_property_readonly(
+            "pending_captures_required",
+            [](const v0::TensorStateBatch& batch) { return batch.pending_captures_required; })
+        .def_property_readonly(
+            "pending_captures_remaining",
+            [](const v0::TensorStateBatch& batch) { return batch.pending_captures_remaining; })
+        .def_property_readonly(
+            "forced_removals_done",
+            [](const v0::TensorStateBatch& batch) { return batch.forced_removals_done; })
+        .def_property_readonly("move_count", [](const v0::TensorStateBatch& batch) { return batch.move_count; })
+        .def_property_readonly("mask_alive", [](const v0::TensorStateBatch& batch) { return batch.mask_alive; })
+        .def_property_readonly("board_size", [](const v0::TensorStateBatch& batch) { return batch.board_size; })
+        .def("device", [](const v0::TensorStateBatch& batch) { return batch.board.device(); })
+        .def(
+            "to",
+            [](const v0::TensorStateBatch& batch, const std::string& device) {
+                return batch.To(torch::Device(device));
+            },
+            py::arg("device"))
+        .def("clone", &v0::TensorStateBatch::Clone);
+
+    m.def(
+        "tensor_batch_from_game_states",
+        [](const std::vector<v0::GameState>& states, const std::string& device) {
+            return v0::FromGameStates(states, torch::Device(device));
+        },
+        py::arg("states"),
+        py::arg("device") = std::string("cpu"));
+    m.def(
+        "tensor_batch_to_game_states",
+        &v0::ToGameStates,
+        py::arg("batch"));
 
     m.def(
         "states_to_model_input",

@@ -42,12 +42,15 @@
 
 ## 各阶段任务详情
 
-### 1. State Core (`v0/src/game`)
+### 1. State Core + Tensor batches (`v0/src/game`)
 - `GameState`（持久化 6x6 board、标记集合、pending 计数器、move_count）。
 - 标记集合使用紧凑 bitset (两枚 64-bit) 以便复制；提供 Python dict <-> C++ 转换。
 - 工具函数：`is_board_full`, `get_player_pieces`, `has_reached_move_limit`, `get_winner`。
 - 添加轻量断言：阶段与 pending 数一致（避免隐式 bug）。
-- **现状**：`v0/include/v0/game_state.hpp` 与 `v0/src/game/game_state.cpp` 已实现 Phase/Player 枚举、bitset 标记集与基础方法，并通过 `v0_core.GameState` 暴露到 Python（board/marks 属性支持列表/元组读写）。
+- **现状**：
+  - `v0/include/v0/game_state.hpp` 与 `v0/src/game/game_state.cpp` 已实现 Phase/Player 枚举、bitset 标记集与基础方法，并通过 `v0_core.GameState` 暴露到 Python（board/marks 属性支持列表/元组读写）。
+  - `v0/include/v0/tensor_state_batch.hpp` + `v0/src/game/tensor_state_batch.cpp` 提供 `TensorStateBatch`（含 `to/clone`）、`tensor_batch_from_game_states`、`tensor_batch_to_game_states`，并在 `v0/python/state_batch.py` 暴露 Python 友好封装。
+  - 验收：`python tools/verify_v0_state_batch.py --samples 128 --max-moves 60 --device cpu`（如需 CUDA 替换 `--device cuda:0`）；该脚本会随机生成局面后做 C++ ↔ Python round-trip 校验。
 
 ### 2. Rule Engine (`v0/src/rules`)
 - 逐函数复刻：`generate_placement_positions`, `generate_mark_targets`, `generate_capture_targets`, `process_phase2_removals`, `apply_*` 系列。
