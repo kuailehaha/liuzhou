@@ -5,9 +5,13 @@
 #include <tuple>
 #include <vector>
 
+namespace v0 {
+
 namespace {
 
 constexpr int kDirections[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+
+}  // namespace
 
 std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
     const torch::Tensor& log_p1,
@@ -163,11 +167,13 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
     return {probs, masked_logits};
 }
 
-}  // namespace
+}  // namespace v0
 
+#ifndef PROJECT_POLICY_NO_MODULE
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "project_policy_logits_fast",
-        &project_policy_logits_fast,
+        &v0::project_policy_logits_fast,
         "Fused policy projection with masked softmax");
 }
+#endif

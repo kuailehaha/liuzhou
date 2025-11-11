@@ -18,6 +18,13 @@ from torch.utils.cpp_extension import load
 
 from ..game.move_encoder import ActionEncodingSpec
 
+try:
+    import v0_core  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - fallback to legacy build
+    v0_core = None
+
+_V0_FAST = getattr(v0_core, "project_policy_logits_fast", None) if v0_core is not None else None
+
 
 @lru_cache()
 def _load_extension():
@@ -61,6 +68,21 @@ def project_policy_logits_fast(
     Returns ``None`` when the extension is unavailable or when tensors are on
     unsupported devices, signalling the caller to fall back to the Python path.
     """
+    if _V0_FAST is not None:
+        try:
+            return _V0_FAST(
+                log_p1,
+                log_p2,
+                log_pmc,
+                legal_mask,
+                spec.placement_dim,
+                spec.movement_dim,
+                spec.selection_dim,
+                spec.auxiliary_dim,
+            )
+        except RuntimeError:
+            pass
+
     ext = _load_extension()
     if ext is None:
         return None
@@ -94,6 +116,37 @@ def ensure_project_policy_logits_fast(
 
     Returns True when the C++ path is available, False otherwise.
     """
+    if _V0_FAST is not None:
+        try:
+            torch_device = torch.device(device)
+            if torch_device.type == "cuda" and not torch.cuda.is_available():
+                return False
+            dtypes = [torch.float32]
+            if torch_device.type == "cuda":
+                dtypes.append(torch.float16)
+            for dtype in dtypes:
+                log_p1 = torch.zeros((1, spec.placement_dim), dtype=dtype, device=torch_device)
+                log_p2 = torch.zeros_like(log_p1)
+                log_pmc = torch.zeros_like(log_p1)
+                legal_mask = torch.zeros((1, spec.total_dim), dtype=torch.bool, device=torch_device)
+                if spec.total_dim > 0:
+                    legal_mask[..., 0] = True
+                result = _V0_FAST(
+                    log_p1,
+                    log_p2,
+                    log_pmc,
+                    legal_mask,
+                    spec.placement_dim,
+                    spec.movement_dim,
+                    spec.selection_dim,
+                    spec.auxiliary_dim,
+                )
+                if result is None:
+                    return False
+            return True
+        except RuntimeError:
+            return False
+
     try:
         ext = _load_extension()
     except Exception:

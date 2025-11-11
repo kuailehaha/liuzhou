@@ -68,6 +68,7 @@
 - C++ 实现 `states_to_model_input`：批量构造 BCHW tensor，与原 Python 完全等价。
 - 包装已有 `project_policy_logits_fast`，暴露统一 API（含 legal mask 生成）。
 - 处理 value head post-process（sigmoid/tanh/temperature 配置）及 dirichlet 噪声采样入口（可用 ATen 随机）。
+- **现状**：`v0/src/net/encoding.cpp` + `v0_core.states_to_model_input` 现已提供 BCHW 组装；`project_policy_logits_fast.cpp` 通过共享编译直接挂到 `v0_core.project_policy_logits_fast`，Python 端 `v1/net/encoding.py` 与 `project_policy_logits_fast.py` 已优先走 C++ 路径。新增 `postprocess_value_head` 与 `apply_temperature_scaling` 便于后续替换遗留 Python 温度/取值处理。
 
 ### 5. MCTS Core (`v0/src/mcts`)
 - `_MCTSNode` 结构（value, visits, prior, children map / flat vector）。

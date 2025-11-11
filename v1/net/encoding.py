@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from typing import Tuple
 
+try:
+    import v0_core  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - optional dependency
+    v0_core = None
+
 import torch
 
 from ..game.move_encoder import ActionEncodingSpec, DEFAULT_ACTION_SPEC, DIRECTIONS
@@ -36,6 +41,18 @@ def states_to_model_input(batch: TensorStateBatch) -> torch.Tensor:
     """
     if not isinstance(batch, TensorStateBatch):
         raise TypeError(f"states_to_model_input expects TensorStateBatch, got {type(batch)!r}")
+
+    if v0_core is not None and hasattr(v0_core, "states_to_model_input"):
+        try:
+            return v0_core.states_to_model_input(
+                batch.board,
+                batch.marks_black,
+                batch.marks_white,
+                batch.phase,
+                batch.current_player,
+            )
+        except RuntimeError:
+            pass
 
     board = batch.board
     if board.dim() != 3:

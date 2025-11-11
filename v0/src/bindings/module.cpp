@@ -3,8 +3,10 @@
 #include <torch/extension.h>
 
 #include "v0/game_state.hpp"
-#include "v0/rule_engine.hpp"
 #include "v0/move_generator.hpp"
+#include "v0/net_encoding.hpp"
+#include "v0/project_policy.hpp"
+#include "v0/rule_engine.hpp"
 
 namespace py = pybind11;
 
@@ -299,6 +301,36 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("state"),
         py::arg("move"),
         py::arg("quiet") = false);
+
+    m.def(
+        "states_to_model_input",
+        &v0::states_to_model_input,
+        py::arg("board"),
+        py::arg("marks_black"),
+        py::arg("marks_white"),
+        py::arg("phase"),
+        py::arg("current_player"));
+    m.def(
+        "project_policy_logits_fast",
+        &v0::project_policy_logits_fast,
+        py::arg("log_p1"),
+        py::arg("log_p2"),
+        py::arg("log_pmc"),
+        py::arg("legal_mask"),
+        py::arg("placement_dim"),
+        py::arg("movement_dim"),
+        py::arg("selection_dim"),
+        py::arg("auxiliary_dim"));
+    m.def(
+        "postprocess_value_head",
+        &v0::postprocess_value_head,
+        py::arg("raw_values"));
+    m.def(
+        "apply_temperature_scaling",
+        &v0::apply_temperature_scaling,
+        py::arg("probs"),
+        py::arg("temperature"),
+        py::arg("dim") = -1);
 
     m.def("version", []() { return std::string("v0-core"); });
 }
