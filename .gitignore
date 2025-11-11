@@ -3,6 +3,7 @@
 *.json
 *.txt
 *.log
+*_log.
 ####################
 # 模型检查点 / 临时 #
 ####################
@@ -20,4 +21,6 @@ checkpoints*/        # checkpoints/ checkpoints_eval_run/ 等一律忽略
 __pycache__/
 *.py[cod]
 
+
 models/
+build/

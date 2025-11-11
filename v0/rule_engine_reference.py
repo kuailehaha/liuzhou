@@ -37,11 +37,11 @@ def apply_placement_move(state: GameState, position: Tuple[int, int]) -> GameSta
         new_state.marked_white if current_player == Player.BLACK else new_state.marked_black
     )
     if (r, c) in opponent_marked:
-        raise ValueError(f"位置 ({r}, {c}) 已被对方标记，不能落�?)
+        raise ValueError(f"位置 ({r}, {c}) 已被对方标记，不能落�?)
 
     new_state.board[r][c] = current_player.value
 
-    # 检测是否形成形�?    own_marked = (
+    # 检测是否形成形�?    own_marked = (
         new_state.marked_black if current_player == Player.BLACK else new_state.marked_white
     )
     already_marked = (r, c) in own_marked
@@ -124,7 +124,7 @@ def apply_mark_selection(state: GameState, position: Tuple[int, int]) -> GameSta
     if (r, c) in opponent_marked:
         raise ValueError("该棋子已经被标记")
 
-    # 如果对方还有未构成形状的普通棋子，则不能标记形状中的棋�?    opponent_normal_pieces = [
+    # 如果对方还有未构成形状的普通棋子，则不能标记形状中的棋�?    opponent_normal_pieces = [
         (rr, cc)
         for rr in range(GameState.BOARD_SIZE)
         for cc in range(GameState.BOARD_SIZE)
@@ -226,11 +226,11 @@ def apply_movement_move(
         raise ValueError("当前不是走子阶段")
 
     if new_state.board[r_from][c_from] != new_state.current_player.value:
-        raise ValueError("起始位置不是当前玩家的棋�?)
+        raise ValueError("起始位置不是当前玩家的棋�?)
     if new_state.board[r_to][c_to] != 0:
         raise ValueError("目标位置不是空位")
     if not ((abs(r_from - r_to) == 1 and c_from == c_to) or (abs(c_from - c_to) == 1 and r_from == r_to)):
-        raise ValueError("只能水平或垂直移动一�?)
+        raise ValueError("只能水平或垂直移动一�?)
 
     new_state.board[r_to][c_to] = new_state.board[r_from][c_from]
     new_state.board[r_from][c_from] = 0
@@ -320,7 +320,7 @@ def apply_capture_selection(
 
     if new_state.count_player_pieces(opponent) == 0:
         if not quiet:
-            print(f"游戏结束！玩�?{new_state.current_player.name} 获胜�?)
+            print(f"游戏结束！玩�?{new_state.current_player.name} 获胜�?)
         return new_state
 
     if new_state.pending_captures_remaining > 0:
@@ -345,23 +345,23 @@ def apply_forced_removal(state: GameState, piece_to_remove: Tuple[int, int]) -> 
         if new_state.board[r][c] != Player.BLACK.value:
             raise ValueError("必须移除黑方棋子")
         if is_piece_in_shape(new_state.board, r, c, Player.BLACK.value, set()):
-            raise ValueError("构成方或洲的棋子不能被强制移�?)
+            raise ValueError("构成方或洲的棋子不能被强制移�?)
         new_state.board[r][c] = 0
         new_state.forced_removals_done = 1
         new_state.current_player = Player.BLACK
     elif new_state.forced_removals_done == 1:
         if new_state.current_player != Player.BLACK:
-            raise ValueError("强制移除顺序错误：应由黑方移除白�?)
+            raise ValueError("强制移除顺序错误：应由黑方移除白�?)
         if new_state.board[r][c] != Player.WHITE.value:
             raise ValueError("必须移除白方棋子")
         if is_piece_in_shape(new_state.board, r, c, Player.WHITE.value, set()):
-            raise ValueError("构成方或洲的棋子不能被强制移�?)
+            raise ValueError("构成方或洲的棋子不能被强制移�?)
         new_state.board[r][c] = 0
         new_state.forced_removals_done = 2
         new_state.phase = Phase.MOVEMENT
         new_state.current_player = Player.WHITE
     else:
-        raise RuntimeError("强制移除状态异�?)
+        raise RuntimeError("强制移除状态异�?)
 
     return new_state
 
@@ -373,7 +373,7 @@ def handle_no_moves_phase3(
 ) -> GameState:
     new_state = state.copy()
     if new_state.phase != Phase.MOVEMENT:
-        raise ValueError("无子可动处理只能在走子阶段触�?)
+        raise ValueError("无子可动处理只能在走子阶段触�?)
 
     r, c = stucked_player_removes
     current_player = new_state.current_player
@@ -400,7 +400,7 @@ def handle_no_moves_phase3(
 
     if new_state.count_player_pieces(opponent) == 0:
         if not quiet:
-            print(f"游戏结束！玩�?{current_player.name} 获胜�?)
+            print(f"游戏结束！玩�?{current_player.name} 获胜�?)
         return new_state
 
     new_state.phase = Phase.COUNTER_REMOVAL
@@ -443,7 +443,7 @@ def apply_counter_removal_phase3(
 
     if new_state.count_player_pieces(stuck_player) == 0:
         if not quiet:
-            print(f"游戏结束！玩�?{remover.name} 获胜�?)
+            print(f"游戏结束！玩�?{remover.name} 获胜�?)
         return new_state
 
     new_state.phase = Phase.MOVEMENT
@@ -501,7 +501,7 @@ def check_lines(
 ) -> bool:
     size = len(board)
 
-    # 水平检�?    count = 1
+    # 水平检�?    count = 1
     for dc in range(c - 1, -1, -1):
         if board[r][dc] == player_value and (r, dc) not in marked_set:
             count += 1
@@ -515,7 +515,7 @@ def check_lines(
     if count >= 6:
         return True
 
-    # 垂直检�?    count = 1
+    # 垂直检�?    count = 1
     for dr in range(r - 1, -1, -1):
         if board[dr][c] == player_value and (dr, c) not in marked_set:
             count += 1
