@@ -30,12 +30,18 @@ torch::TensorOptions LongCPU() {
     return torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
 }
 
+// double WinnerValue(const GameState& state, Player to_act) {
+//     auto winner = state.GetWinner();
+//     if (!winner.has_value()) {
+//         return 0.0;
+//     }
+//     return winner == to_act ? 1.0 : -1.0;
+// }
+
 double WinnerValue(const GameState& state, Player to_act) {
-    auto winner = state.get_winner();
-    if (!winner.has_value()) {
-        return 0.0;
-    }
-    return winner == to_act ? 1.0 : -1.0;
+    const auto w = state.GetWinner();           // or state.Winner()
+    if (!w.has_value()) return 0.0;
+    return (*w == to_act) ? 1.0 : -1.0;
 }
 
 }  // namespace
@@ -77,7 +83,7 @@ int MCTSCore::AllocateNode(const GameState& state) {
     node.visit_count = 0.0;
     node.virtual_loss = 0.0;
     node.is_expanded = false;
-    node.is_terminal = state.is_game_over();
+    node.is_terminal = state.IsGameOver();
     node.terminal_value = WinnerValue(state, state.current_player);
     return static_cast<int>(nodes_.size() - 1);
 }
@@ -339,8 +345,9 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         Node& node = nodes_[leaves[bi]];
         RevertVirtualLoss(paths[bi]);
 
-        torch::Scalar value_scalar = values_cpu[static_cast<int64_t>(bi)];
-        double leaf_value = value_scalar.item<double>();
+        // torch::Scalar value_scalar = values_cpu[static_cast<int64_t>(bi)];
+        // double leaf_value = value_scalar.item<double>();
+        double leaf_value = values_cpu[static_cast<int64_t>(bi)].item<double>();
 
         torch::Tensor mask_row = legal_mask_cpu[static_cast<int64_t>(bi)];
         auto legal_indices = torch::nonzero(mask_row).view(-1);
@@ -415,6 +422,7 @@ void MCTSCore::RunSimulations(int num_simulations) {
                 Backpropagate(path, node.terminal_value);
                 ++sim;
                 continue;
+            }
             ApplyVirtualLoss(path);
             leaves.push_back(leaf);
             paths.push_back(path);
