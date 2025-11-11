@@ -1,9 +1,8 @@
-
-
 *.json
 *.txt
 *.log
 *_log.
+
 ####################
 # 模型检查点 / 临时 #
 ####################
@@ -21,6 +20,8 @@ checkpoints*/        # checkpoints/ checkpoints_eval_run/ 等一律忽略
 __pycache__/
 *.py[cod]
 
-
 models/
 build/
+
+# 例外规则：跟踪特定的 CMakeLists.txt 文件
+!**/CMakeLists.txt
