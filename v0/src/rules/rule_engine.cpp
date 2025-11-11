@@ -65,6 +65,7 @@ bool CheckSquares(
             int rr = r + dr;
             int cc = c + dc;
             if (rr >= 0 && rr < kBoardSize - 1 && cc >= 0 && cc < kBoardSize - 1) {
+                bool ok = true;
                 std::array<std::pair<int, int>, 4> cells = {{
                     {rr, cc},
                     {rr, cc + 1},
