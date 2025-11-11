@@ -79,6 +79,25 @@
 - Expansion：调用 C++ move generator + `fast_apply_moves` + NN 编码；支持缓存/staleness。
 - 回传：值反转、虚拟损失、温度策略生成；输出与 `v1/mcts/vectorized_mcts.py` 兼容。
 - PyBind 对应类：`VectorizedMCTS`，方法 `search`, `advance_roots`, `set_root_states`, `clear_cache` 等。
+- **现状（S2/S3/S4完成）**：
+  - `v0/include/v0/mcts_core.hpp` + `v0/src/mcts/mcts_core.cpp` 提供 C++ `MCTSCore`，实现节点池化、PUCT selection、虚损、批量 expansion/backprop。Expansion 已串联 `TensorStateBatch` → `states_to_model_input` → forward 回调 → `project_policy_logits_fast` → `fast_legal_mask` → `batch_apply_moves_fast`，并保持编码动作排序、Dirichlet 注入与 Python 逻辑一致。
+  - `v0_core.MCTSCore` / `MCTSConfig` 通过 PyBind 暴露，可在 Python 端调用 `set_forward_callback` 注册模型前向函数，回调只需返回 `(log_p1, log_p2, log_pmc, value)` 四个 Tensor，其他搜索逻辑完全在 C++ 执行。
+  - `v0/python/mcts.py` 新增 `MCTS` 封装类，表面接口（`search`/`advance_root`/`reset`/`set_root_state(s)`/`set_temperature`）与 `src.mcts.MCTS` 对齐，便于上层替换。使用示例：
+
+    ```python
+    from v0.python.mcts import MCTS as V0MCTS
+    from src.neural_network import ChessNet
+
+    model = ChessNet(board_size=6)
+    mcts = V0MCTS(model, num_simulations=256, device="cuda:0", add_dirichlet_noise=True)
+    moves, policy = mcts.search(GameState())
+    ```
+
+  - 临时切换：在自博弈/评测脚本中用环境变量控制，示例：
+    ```bash
+    USE_V0_MCTS=1 python tools/self_play_runner.py ...
+    ```
+    （当 `USE_V0_MCTS` 为 `1` 时导入 `v0.python.mcts.MCTS`，否则沿用 `src.mcts.MCTS`。）
 - **现状**：`v0/python/mcts.py` 搬运 `VectorizedMCTS` 并在 `_expand_nodes`/多根模拟中批量调用 `batch_apply_moves_fast`，节点扩展支持重用 C++ 子局面；新增 `MCTS` 包装类以兼容 `src.mcts.MCTS` API（`search`/`advance_root`/`reset`）。后续可将核心逻辑继续下沉到纯 C++。
 
 ### 6. Glue / CLI / Docs
@@ -102,3 +121,9 @@
 
 ---
 准备工作完成后，建议按上述顺序逐模块推进，每完成一步即可运行对应 diff 测试，确保重构在“测试为纲”的节奏下进行。
+- `tools/verify_v0_mcts.py`：MCTS 行为一致性。命令示例  
+  `python tools/verify_v0_mcts.py --samples 25 --sims 64 --max-moves 60 --tolerance 5e-3`
+
+脚本阈值：当前在 CPU 上 `max_linf ≈ 1e-3`，`max_l1 ≈ 3e-3`；若超出 5e-3 需调查差异来源。
+
+切换说明：在自博弈/评测入口（self_play runner、evaluate runner 等）加入 `USE_V0_MCTS` 判断，默认为 0 时使用 `src.mcts.MCTS`，置为 1 时使用 `v0.python.mcts.MCTS`。这样可以在回归/性能对比中一键切换，也便于遇到问题时快速回退。

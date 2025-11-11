@@ -4,5 +4,6 @@
     "python-envs.pythonProjects": [],
     "files.associations": {
         "vector": "cpp"
-    }
+    },
+    "cmake.sourceDirectory": "D:/CODES/liuzhou/v0"
 }

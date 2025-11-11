@@ -7,6 +7,7 @@
 #include "v0/game_state.hpp"
 #include "v0/move_generator.hpp"
 #include "v0/net_encoding.hpp"
+#include "v0/mcts_core.hpp"
 #include "v0/project_policy.hpp"
 #include "v0/tensor_state_batch.hpp"
 #include "v0/rule_engine.hpp"
@@ -350,6 +351,59 @@ PYBIND11_MODULE(v0_core, m) {
         "tensor_batch_to_game_states",
         &v0::ToGameStates,
         py::arg("batch"));
+
+    py::class_<v0::MCTSConfig>(m, "MCTSConfig")
+        .def(py::init<>())
+        .def_readwrite("num_simulations", &v0::MCTSConfig::num_simulations)
+        .def_readwrite("exploration_weight", &v0::MCTSConfig::exploration_weight)
+        .def_readwrite("temperature", &v0::MCTSConfig::temperature)
+        .def_readwrite("add_dirichlet_noise", &v0::MCTSConfig::add_dirichlet_noise)
+        .def_readwrite("dirichlet_alpha", &v0::MCTSConfig::dirichlet_alpha)
+        .def_readwrite("dirichlet_epsilon", &v0::MCTSConfig::dirichlet_epsilon)
+        .def_readwrite("batch_size", &v0::MCTSConfig::batch_size)
+        .def_readwrite("virtual_loss", &v0::MCTSConfig::virtual_loss)
+        .def_readwrite("seed", &v0::MCTSConfig::seed)
+        .def_property(
+            "device",
+            [](const v0::MCTSConfig& cfg) { return cfg.device.str(); },
+            [](v0::MCTSConfig& cfg, const std::string& dev) { cfg.device = torch::Device(dev); });
+
+    py::class_<v0::MCTSCore>(m, "MCTSCore")
+        .def(py::init<v0::MCTSConfig>())
+        .def(
+            "set_forward_callback",
+            [](v0::MCTSCore& core, py::function fn) {
+                py::object fn_keep = fn;
+                core.SetForwardCallback([fn_keep](const torch::Tensor& inputs) {
+                    py::gil_scoped_acquire gil;
+                    py::object result = fn_keep(inputs);
+                    py::tuple tup = result.cast<py::tuple>();
+                    if (tup.size() != 4) {
+                        throw std::runtime_error("forward callback must return a tuple(log_p1, log_p2, log_pmc, value)");
+                    }
+                    torch::Tensor log_p1 = tup[0].cast<torch::Tensor>();
+                    torch::Tensor log_p2 = tup[1].cast<torch::Tensor>();
+                    torch::Tensor log_pmc = tup[2].cast<torch::Tensor>();
+                    torch::Tensor value = tup[3].cast<torch::Tensor>();
+                    return std::make_tuple(log_p1, log_p2, log_pmc, value);
+                });
+            },
+            py::arg("callback"))
+        .def(
+            "set_root_state",
+            [](v0::MCTSCore& core, const v0::GameState& state) { core.SetRootState(state); },
+            py::arg("state"))
+        .def("reset", &v0::MCTSCore::Reset)
+        .def("run_simulations", &v0::MCTSCore::RunSimulations, py::arg("num_simulations"))
+        .def(
+            "get_policy",
+            [](const v0::MCTSCore& core, double temperature) {
+                return core.GetPolicy(temperature);
+            },
+            py::arg("temperature") = 1.0)
+        .def("advance_root", &v0::MCTSCore::AdvanceRoot, py::arg("action_index"))
+        .def_property_readonly("root_value", &v0::MCTSCore::RootValue)
+        .def_property_readonly("root_state", &v0::MCTSCore::RootState, py::return_value_policy::reference_internal);
 
     m.def(
         "states_to_model_input",
