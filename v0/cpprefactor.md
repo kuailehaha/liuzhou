@@ -76,6 +76,7 @@
 - Expansion：调用 C++ move generator + `fast_apply_moves` + NN 编码；支持缓存/staleness。
 - 回传：值反转、虚拟损失、温度策略生成；输出与 `v1/mcts/vectorized_mcts.py` 兼容。
 - PyBind 对应类：`VectorizedMCTS`，方法 `search`, `advance_roots`, `set_root_states`, `clear_cache` 等。
+- **现状**：`v0/python/mcts.py` 搬运 `VectorizedMCTS` 并在 `_expand_nodes`/多根模拟中批量调用 `batch_apply_moves_fast`，节点扩展支持重用 C++ 子局面；新增 `MCTS` 包装类以兼容 `src.mcts.MCTS` API（`search`/`advance_root`/`reset`）。后续可将核心逻辑继续下沉到纯 C++。
 
 ### 6. Glue / CLI / Docs
 - `v0/python/` 下提供 shim（例如 `from v0.python import move_generator as move_generator_v0`），可通过环境变量 `USE_V0_CPP=1` 选择。

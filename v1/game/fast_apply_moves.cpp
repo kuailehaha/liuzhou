@@ -6,6 +6,8 @@
 #include <tuple>
 #include <vector>
 
+namespace v0 {
+
 namespace {
 
 enum Phase : int {
@@ -883,10 +885,13 @@ batch_apply_moves(
 
 }  // namespace
 
+}  // namespace v0
+
+#ifndef FAST_APPLY_MOVES_NO_MODULE
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "batch_apply_moves",
-        &batch_apply_moves,
+        &v0::batch_apply_moves,
         "Apply encoded actions to tensorized game states (CPU)");
 }
-
+#endif

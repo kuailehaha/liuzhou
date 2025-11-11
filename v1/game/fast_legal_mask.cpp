@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <vector>
 
+namespace v0 {
+
 namespace {
 
 constexpr int kPhasePlacement = 1;
@@ -477,10 +479,14 @@ std::tuple<torch::Tensor, torch::Tensor> encode_actions_fast(
     return {mask, metadata};
 }
 
+}  // namespace v0
+
+#ifndef FAST_LEGAL_MASK_NO_MODULE
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "encode_actions_fast",
-        &encode_actions_fast,
+        &v0::encode_actions_fast,
         "Fast legal action mask encoder");
 }
+#endif
 
