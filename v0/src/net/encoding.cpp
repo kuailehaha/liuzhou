@@ -60,9 +60,15 @@ torch::Tensor states_to_model_input(
     auto opp_marks = torch::where(current_is_black, marks_white_f, marks_black_f);
     auto mark_planes = torch::stack({self_marks, opp_marks}, 1);
 
-    auto phase_ids = torch::tensor(
-        kPhaseOrder,
-        torch::TensorOptions().dtype(torch::kInt64).device(phase.device()));
+    // auto phase_ids = torch::tensor(
+    //     kPhaseOrder,
+    //     torch::TensorOptions().dtype(torch::kInt64).device(phase.device()));
+
+    auto phase_ids = torch::arange(
+        /*start=*/1,
+        /*end=*/static_cast<int64_t>(kPhaseOrder.size()) + 1,
+        torch::TensorOptions().dtype(torch::kInt64)
+    ).to(phase.device());
     auto matches =
         phase.view({batch_size, 1}).eq(phase_ids.view({1, static_cast<int64_t>(kPhaseOrder.size())}));
     auto phase_one_hot = matches.to(dtype).view({batch_size, static_cast<int64_t>(kPhaseOrder.size()), 1, 1});
