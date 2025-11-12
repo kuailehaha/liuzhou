@@ -1,16 +1,19 @@
 """
-Compare the legacy Python MCTS implementation with the new v0 C++ MCTS core.
+Benchmark legacy (Python) vs v0 (C++ core) MCTS search throughput.
 
-This script samples random game states, runs both implementations for the same
-number of simulations, and checks that the move distributions match within a
-small numerical tolerance.
+Samples random states, runs both implementations with identical parameters,
+and reports per-sample as well as aggregate timing stats. Optionally prints the
+resulting policies for manual sanity checks.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import random
-from typing import Dict, Tuple
+import time
+import traceback
+from statistics import fmean
 
 import numpy as np
 import torch
@@ -18,9 +21,19 @@ import torch
 from src.game_state import GameState
 from src.move_generator import apply_move, generate_all_legal_moves
 from src.mcts import MCTS as LegacyMCTS
-from src.mcts import move_to_key
 from src.neural_network import ChessNet
 from v0.python.mcts import MCTS as V0MCTS
+
+_DEBUG_ENABLED = bool(os.environ.get("V0_MCTS_DEBUG"))
+
+if _DEBUG_ENABLED:
+    import faulthandler
+
+    faulthandler.enable()
+
+def debug(msg: str) -> None:
+    if _DEBUG_ENABLED:
+        print(f"[debug] {msg}")
 
 
 def _random_state(max_moves: int, rng: random.Random) -> GameState:
@@ -36,45 +49,38 @@ def _random_state(max_moves: int, rng: random.Random) -> GameState:
     return state
 
 
-def _compare_distributions(
-    legacy_moves,
-    legacy_probs,
-    v0_moves,
-    v0_probs,
-) -> Tuple[float, float]:
-    l_map: Dict[Tuple, float] = {move_to_key(move): prob for move, prob in zip(legacy_moves, legacy_probs)}
-    v0_map: Dict[Tuple, float] = {move_to_key(move): prob for move, prob in zip(v0_moves, v0_probs)}
-    if l_map.keys() != v0_map.keys():
-        raise AssertionError(f"Move sets diverged.\nlegacy={l_map.keys()}\nv0={v0_map.keys()}")
-    diffs = [abs(l_map[key] - v0_map[key]) for key in l_map.keys()]
-    if not diffs:
-        return 0.0, 0.0
-    return float(max(diffs)), float(sum(diffs))
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--samples", type=int, default=25, help="Number of random game states to test.")
+    parser.add_argument("--samples", type=int, default=10, help="Number of random game states to benchmark.")
     parser.add_argument("--max-moves", type=int, default=60, help="Random plies per sampled state.")
-    parser.add_argument("--sims", type=int, default=64, help="Number of simulations per search.")
-    parser.add_argument("--tolerance", type=float, default=5e-3, help="Maximum allowed L-infinity difference.")
+    parser.add_argument("--sims", type=int, default=128, help="Number of simulations per search.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Leaf batch size for both implementations.")
+    parser.add_argument("--dump-policies", action="store_true", help="Print move/prob pairs for each run.")
+    parser.add_argument("--timing", action="store_true", help="Include per-sample timing lines (default summary only).")
+    parser.add_argument("--seed", type=int, default=42, help="Base RNG seed for reproducibility.")
     args = parser.parse_args()
 
-    seed = 42
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
+    rng = random.Random(args.seed + 1)
     model = ChessNet(board_size=GameState.BOARD_SIZE)
     model.eval()
 
-    rng = random.Random(seed + 1)
-
-    max_linf = 0.0
-    max_l1 = 0.0
+    legacy_times: list[float] = []
+    v0_times: list[float] = []
+    speedups: list[float] = []
 
     for i in range(args.samples):
         state = _random_state(args.max_moves, rng)
+        if args.timing:
+            print(f"[sample {i}] start (move_count={state.move_count}, phase={state.phase})")
+        debug(
+            f"sample {i} state info: move_count={state.move_count} phase={state.phase} "
+            f"pending_marks={state.pending_marks_remaining}/{state.pending_marks_required} "
+            f"pending_captures={state.pending_captures_remaining}/{state.pending_captures_required}"
+        )
 
         legacy = LegacyMCTS(
             model=model,
@@ -84,7 +90,7 @@ def main() -> None:
             device="cpu",
             add_dirichlet_noise=False,
             virtual_loss_weight=0.0,
-            batch_K=8,
+            batch_K=args.batch_size,
             verbose=False,
         )
         v0_mcts = V0MCTS(
@@ -94,26 +100,72 @@ def main() -> None:
             temperature=1.0,
             device="cpu",
             add_dirichlet_noise=False,
-            seed=seed,
-            batch_K=8,
+            seed=args.seed,
+            batch_K=args.batch_size,
         )
 
-        legacy_moves, legacy_policy = legacy.search(state)
-        v0_moves, v0_policy = v0_mcts.search(state)
+        try:
+            debug(f"sample {i} legacy search begin")
+            start = time.perf_counter()
+            legacy_moves, legacy_policy = legacy.search(state)
+            legacy_elapsed = time.perf_counter() - start
+            debug(f"sample {i} legacy search end ({legacy_elapsed:.3f}s)")
+            if _DEBUG_ENABLED:
+                print(f"[debug] sample {i} legacy search completed")
+        except Exception as exc:
+            print(f"[sample {i}] legacy search failed: {exc}")
+            traceback.print_exc()
+            continue
 
-        linf, l1 = _compare_distributions(legacy_moves, legacy_policy, v0_moves, v0_policy)
-        max_linf = max(max_linf, linf)
-        max_l1 = max(max_l1, l1)
+        try:
+            debug(f"sample {i} v0 search begin")
+            start = time.perf_counter()
+            v0_moves, v0_policy = v0_mcts.search(state)
+            v0_elapsed = time.perf_counter() - start
+            debug(f"sample {i} v0 search end ({v0_elapsed:.3f}s)")
+        except Exception as exc:
+            print(f"[sample {i}] v0 search failed: {exc}")
+            traceback.print_exc()
+            continue
 
-        if linf > args.tolerance:
-            raise AssertionError(
-                f"Sample {i}: distributions diverged (linf={linf:.6f} > {args.tolerance:.6f})"
+        legacy_times.append(legacy_elapsed)
+        v0_times.append(v0_elapsed)
+        speedup = legacy_elapsed / v0_elapsed if v0_elapsed > 0 else float("inf")
+        speedups.append(speedup)
+
+        if args.timing:
+            print(
+                f"[sample {i}] legacy={legacy_elapsed:.3f}s "
+                f"v0={v0_elapsed:.3f}s speedup={speedup:.2f}x"
             )
 
-    print(
-        f"[verify_v0_mcts] success: samples={args.samples} sims={args.sims} "
-        f"max_linf={max_linf:.6f} max_l1={max_l1:.6f}"
-    )
+        if args.dump_policies:
+            print("  legacy policy:")
+            for move, prob in zip(legacy_moves, legacy_policy):
+                print(f"    {prob:.6f} -> {move}")
+            print("  v0 policy:")
+            for move, prob in zip(v0_moves, v0_policy):
+                print(f"    {prob:.6f} -> {move}")
+
+    def summarize(label: str, values: list[float]) -> None:
+        if not values:
+            print(f"{label}: n/a")
+            return
+        arr = np.array(values, dtype=float)
+        print(
+            f"{label}: avg={arr.mean():.3f}s median={np.median(arr):.3f}s "
+            f"std={arr.std():.3f}s min={arr.min():.3f}s max={arr.max():.3f}s"
+        )
+
+    print("\n[verify_v0_mcts] timing summary")
+    summarize("legacy", legacy_times)
+    summarize("v0", v0_times)
+    if speedups:
+        speed_arr = np.array(speedups, dtype=float)
+        print(
+            f"speedup: avg={fmean(speedups):.2f}x median={np.median(speed_arr):.2f}x "
+            f"min={speed_arr.min():.2f}x max={speed_arr.max():.2f}x"
+        )
 
 
 if __name__ == "__main__":

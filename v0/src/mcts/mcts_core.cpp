@@ -3,7 +3,11 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
+#include <string>
+#include <sstream>
 
 #include <pybind11/pybind11.h>
 
@@ -17,6 +21,42 @@ namespace v0 {
 namespace py = pybind11;
 
 namespace {
+
+bool DebugEnabled() {
+    static bool enabled = []() {
+        const char* env = std::getenv("V0_MCTS_DEBUG");
+        if (!env) {
+            return false;
+        }
+        if (env[0] == '\0') {
+            return false;
+        }
+        if (env[0] == '0' && env[1] == '\0') {
+            return false;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+void DebugLog(const std::string& msg) {
+    if (DebugEnabled()) {
+        std::cerr << "[MCTSCore] " << msg << std::endl;
+    }
+}
+
+std::string ShapeToString(const torch::Tensor& t) {
+    std::ostringstream oss;
+    oss << "(";
+    for (int64_t i = 0; i < t.dim(); ++i) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << t.size(i);
+    }
+    oss << ")";
+    return oss.str();
+}
 
 torch::TensorOptions BoolCPU() {
     return torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
@@ -69,7 +109,12 @@ void MCTSCore::Reset() {
 
 void MCTSCore::SetRootState(const GameState& state) {
     Reset();
-    root_index_ = AllocateNode(state);
+    try {
+        root_index_ = AllocateNode(state);
+    } catch (const std::exception& err) {
+        DebugLog(std::string("SetRootState: AllocateNode failed: ") + err.what());
+        throw;
+    }
 }
 
 int MCTSCore::AllocateNode(const GameState& state) {
@@ -192,32 +237,68 @@ std::vector<double> MCTSCore::SampleDirichlet(int count, double alpha) {
 }
 
 void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std::vector<int>>& paths) {
-    if (leaves.empty()) {
-        return;
-    }
+    try {
+        if (leaves.empty()) {
+            return;
+        }
+        DebugLog("ExpandBatch start: leaves=" + std::to_string(leaves.size()) +
+            ", nodes=" + std::to_string(nodes_.size()));
 
     std::vector<GameState> eval_states;
     eval_states.reserve(leaves.size());
-    for (int idx : leaves) {
-        eval_states.push_back(nodes_[idx].state);
-    }
+        for (int idx : leaves) {
+            if (idx < 0 || idx >= static_cast<int>(nodes_.size())) {
+                std::ostringstream oss;
+                oss << "ExpandBatch: invalid leaf index " << idx
+                    << " with nodes_.size()=" << nodes_.size();
+                DebugLog(oss.str());
+                throw std::runtime_error(oss.str());
+            }
+            eval_states.push_back(nodes_[idx].state);
+        }
+        if (eval_states.size() != leaves.size()) {
+            std::ostringstream oss;
+            oss << "ExpandBatch: eval_states mismatch leaves=" << leaves.size()
+                << " actual=" << eval_states.size();
+            DebugLog(oss.str());
+            throw std::runtime_error(oss.str());
+        }
 
-    TensorStateBatch batch_device = FromGameStates(eval_states, config_.device);
-    torch::Tensor inputs = BuildModelInputs(batch_device);
-    if (!forward_cb_) {
-        throw std::runtime_error("Forward callback not set for MCTSCore.");
-    }
+        DebugLog("ExpandBatch: converting states to tensors, eval_states=" + std::to_string(eval_states.size()));
+        TensorStateBatch batch_device;
+        try {
+            batch_device = FromGameStates(eval_states, config_.device);
+        } catch (const std::exception& e) {
+            DebugLog(std::string("ExpandBatch: FromGameStates failed: ") + e.what());
+            throw;
+        }
+        if (batch_device.board.size(0) != static_cast<int64_t>(leaves.size())) {
+            std::ostringstream oss;
+            oss << "ExpandBatch: tensor batch size mismatch, expected "
+                << leaves.size() << " got " << batch_device.board.size(0);
+            DebugLog(oss.str());
+            throw std::runtime_error(oss.str());
+        }
+        DebugLog("ExpandBatch: batch_device board shape " + ShapeToString(batch_device.board));
+        torch::Tensor inputs = BuildModelInputs(batch_device);
+        if (!forward_cb_) {
+            throw std::runtime_error("Forward callback not set for MCTSCore.");
+        }
+        DebugLog("ExpandBatch: inputs shape " + ShapeToString(inputs));
 
-    torch::Tensor log_p1, log_p2, log_pmc, values;
-    {
-        py::gil_scoped_acquire gil;
-        std::tie(log_p1, log_p2, log_pmc, values) = forward_cb_(inputs);
-    }
+        torch::Tensor log_p1, log_p2, log_pmc, values;
+        {
+            py::gil_scoped_acquire gil;
+            std::tie(log_p1, log_p2, log_pmc, values) = forward_cb_(inputs);
+        }
+        DebugLog("ExpandBatch: NN outputs log_p shape " + ShapeToString(log_p1) +
+            ", values shape " + ShapeToString(values));
 
-    TensorStateBatch batch_cpu = batch_device.To(torch::Device(torch::kCPU));
-    auto [legal_mask_cpu, metadata_cpu] = encode_actions_fast(
-        batch_cpu.board,
-        batch_cpu.marks_black.to(torch::kBool),
+        TensorStateBatch batch_cpu = batch_device.To(torch::Device(torch::kCPU));
+        DebugLog("ExpandBatch: batch_device moved to CPU");
+        auto [legal_mask_cpu, metadata_cpu] = encode_actions_fast(
+            batch_cpu.board,
+            batch_cpu.marks_black.to(torch::kBool),
         batch_cpu.marks_white.to(torch::kBool),
         batch_cpu.phase,
         batch_cpu.current_player,
@@ -225,24 +306,26 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         batch_cpu.pending_marks_remaining,
         batch_cpu.pending_captures_required,
         batch_cpu.pending_captures_remaining,
-        batch_cpu.forced_removals_done,
-        kPlacementDim,
-        kMovementDim,
-        kSelectionDim,
-        kAuxiliaryDim);
+            batch_cpu.forced_removals_done,
+            kPlacementDim,
+            kMovementDim,
+            kSelectionDim,
+            kAuxiliaryDim);
+        DebugLog("ExpandBatch: legal mask shape " + ShapeToString(legal_mask_cpu));
 
-    auto legal_mask = legal_mask_cpu.to(log_p1.device());
-    auto [probs, _] = project_policy_logits_fast(
+        auto legal_mask = legal_mask_cpu.to(log_p1.device());
+        auto [probs, _] = project_policy_logits_fast(
         log_p1,
         log_p2,
         log_pmc,
         legal_mask,
         kPlacementDim,
         kMovementDim,
-        kSelectionDim,
-        kAuxiliaryDim);
-    auto probs_cpu = probs.to(torch::kCPU);
-    auto values_cpu = values.to(torch::kCPU);
+            kSelectionDim,
+            kAuxiliaryDim);
+        auto probs_cpu = probs.to(torch::kCPU);
+        auto values_cpu = values.to(torch::kCPU);
+        DebugLog("ExpandBatch: projected policy shape " + ShapeToString(probs_cpu));
 
     std::vector<int> parent_indices;
     std::vector<std::array<int32_t, 4>> action_codes;
@@ -291,81 +374,86 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         }
     }
 
-    std::vector<GameState> child_states;
-    if (!action_codes.empty()) {
-        torch::Tensor action_tensor = torch::empty({static_cast<int64_t>(action_codes.size()), 4}, IntCPU());
-        auto action_ptr = action_tensor.data_ptr<int32_t>();
-        for (size_t i = 0; i < action_codes.size(); ++i) {
-            for (int k = 0; k < 4; ++k) {
-                action_ptr[i * 4 + k] = action_codes[i][k];
+        std::vector<GameState> child_states;
+        if (!action_codes.empty()) {
+            torch::Tensor action_tensor = torch::empty({static_cast<int64_t>(action_codes.size()), 4}, IntCPU());
+            auto action_ptr = action_tensor.data_ptr<int32_t>();
+            for (size_t i = 0; i < action_codes.size(); ++i) {
+                for (int k = 0; k < 4; ++k) {
+                    action_ptr[i * 4 + k] = action_codes[i][k];
+                }
             }
-        }
-        torch::Tensor parent_tensor = torch::empty(
-            {static_cast<int64_t>(parent_indices.size())}, LongCPU());
-        auto parent_ptr = parent_tensor.data_ptr<int64_t>();
-        for (size_t i = 0; i < parent_indices.size(); ++i) {
-            parent_ptr[i] = parent_indices[i];
-        }
+            torch::Tensor parent_tensor = torch::empty(
+                {static_cast<int64_t>(parent_indices.size())}, LongCPU());
+            auto parent_ptr = parent_tensor.data_ptr<int64_t>();
+            for (size_t i = 0; i < parent_indices.size(); ++i) {
+                parent_ptr[i] = parent_indices[i];
+            }
 
-        auto next_batch = batch_apply_moves(
-            batch_cpu.board,
-            batch_cpu.marks_black,
-            batch_cpu.marks_white,
-            batch_cpu.phase,
-            batch_cpu.current_player,
-            batch_cpu.pending_marks_required,
-            batch_cpu.pending_marks_remaining,
-            batch_cpu.pending_captures_required,
-            batch_cpu.pending_captures_remaining,
-            batch_cpu.forced_removals_done,
-            batch_cpu.move_count,
-            action_tensor,
-            parent_tensor);
+            DebugLog("ExpandBatch: applying moves for total_actions=" + std::to_string(action_codes.size()));
+            auto next_batch = batch_apply_moves(
+                batch_cpu.board,
+                batch_cpu.marks_black,
+                batch_cpu.marks_white,
+                batch_cpu.phase,
+                batch_cpu.current_player,
+                batch_cpu.pending_marks_required,
+                batch_cpu.pending_marks_remaining,
+                batch_cpu.pending_captures_required,
+                batch_cpu.pending_captures_remaining,
+                batch_cpu.forced_removals_done,
+                batch_cpu.move_count,
+                action_tensor,
+                parent_tensor);
 
-        TensorStateBatch child_batch{
-            std::get<0>(next_batch),
-            std::get<1>(next_batch).to(torch::kBool),
-            std::get<2>(next_batch).to(torch::kBool),
-            std::get<3>(next_batch),
-            std::get<4>(next_batch),
-            std::get<5>(next_batch),
-            std::get<6>(next_batch),
-            std::get<7>(next_batch),
-            std::get<8>(next_batch),
-            std::get<9>(next_batch),
-            std::get<10>(next_batch),
-            torch::ones(std::get<0>(next_batch).size(0), BoolCPU()),
-            batch_cpu.board_size};
+            TensorStateBatch child_batch{
+                std::get<0>(next_batch),
+                std::get<1>(next_batch).to(torch::kBool),
+                std::get<2>(next_batch).to(torch::kBool),
+                std::get<3>(next_batch),
+                std::get<4>(next_batch),
+                std::get<5>(next_batch),
+                std::get<6>(next_batch),
+                std::get<7>(next_batch),
+                std::get<8>(next_batch),
+                std::get<9>(next_batch),
+                std::get<10>(next_batch),
+                torch::ones(std::get<0>(next_batch).size(0), BoolCPU()),
+                batch_cpu.board_size};
 
-        child_states = ToGameStates(child_batch);
-    }
-
-    size_t state_cursor = 0;
-    for (size_t bi = 0; bi < leaves.size(); ++bi) {
-        Node& node = nodes_[leaves[bi]];
-        RevertVirtualLoss(paths[bi]);
-
-        // torch::Scalar value_scalar = values_cpu[static_cast<int64_t>(bi)];
-        // double leaf_value = value_scalar.item<double>();
-        double leaf_value = values_cpu[static_cast<int64_t>(bi)].item<double>();
-
-        torch::Tensor mask_row = legal_mask_cpu[static_cast<int64_t>(bi)];
-        auto legal_indices = torch::nonzero(mask_row).view(-1);
-        if (legal_indices.size(0) == 0) {
-            node.is_terminal = true;
-            node.terminal_value = -1.0;
-            Backpropagate(paths[bi], -1.0);
-            continue;
+            child_states = ToGameStates(child_batch);
+            DebugLog("ExpandBatch: child_states size=" + std::to_string(child_states.size()));
         }
 
-        node.is_expanded = true;
-        node.children.clear();
+        DebugLog("ExpandBatch prepared actions=" + std::to_string(total_actions));
 
-        std::vector<double> node_priors = priors[bi];
-        if (config_.add_dirichlet_noise && node.parent == -1 && node_priors.size() > 1) {
-            auto noise = SampleDirichlet(static_cast<int>(node_priors.size()), config_.dirichlet_alpha);
-            for (size_t i = 0; i < node_priors.size(); ++i) {
-                node_priors[i] = (1.0 - config_.dirichlet_epsilon) * node_priors[i] +
+        size_t state_cursor = 0;
+        for (size_t bi = 0; bi < leaves.size(); ++bi) {
+            int node_idx = leaves[bi];
+            RevertVirtualLoss(paths[bi]);
+
+            // torch::Scalar value_scalar = values_cpu[static_cast<int64_t>(bi)];
+            // double leaf_value = value_scalar.item<double>();
+            double leaf_value = values_cpu[static_cast<int64_t>(bi)].item<double>();
+
+            torch::Tensor mask_row = legal_mask_cpu[static_cast<int64_t>(bi)];
+            auto legal_indices = torch::nonzero(mask_row).view(-1);
+            if (legal_indices.size(0) == 0) {
+                nodes_[node_idx].is_terminal = true;
+                nodes_[node_idx].terminal_value = -1.0;
+                Backpropagate(paths[bi], -1.0);
+                continue;
+            }
+
+            nodes_[node_idx].is_expanded = true;
+            nodes_[node_idx].children.clear();
+
+            std::vector<double> node_priors = priors[bi];
+            int parent_idx = nodes_[node_idx].parent;
+            if (config_.add_dirichlet_noise && parent_idx == -1 && node_priors.size() > 1) {
+                auto noise = SampleDirichlet(static_cast<int>(node_priors.size()), config_.dirichlet_alpha);
+                for (size_t i = 0; i < node_priors.size(); ++i) {
+                    node_priors[i] = (1.0 - config_.dirichlet_epsilon) * node_priors[i] +
                     config_.dirichlet_epsilon * noise[i];
             }
         }
@@ -383,23 +471,37 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
             for (double& p : node_priors) {
                 p *= inv;
             }
-        }
+            }
 
-        for (int j = 0; j < child_counts[bi]; ++j) {
-            GameState child_state = child_states[state_cursor++];
-            int child_idx = AllocateNode(child_state);
-            Node& child = nodes_[child_idx];
-            child.parent = leaves[bi];
-            child.action_index = action_indices[bi][j];
-            child.prior = node_priors[j];
-            node.children.push_back(child_idx);
-        }
+            for (int j = 0; j < child_counts[bi]; ++j) {
+                GameState child_state = child_states[state_cursor++];
+                int child_idx = AllocateNode(child_state);
+                Node& child = nodes_[child_idx];
+                child.parent = node_idx;
+                child.action_index = action_indices[bi][j];
+                child.prior = node_priors[j];
+                nodes_[node_idx].children.push_back(child_idx);
+            }
 
-        std::sort(node.children.begin(), node.children.end(), [&](int lhs, int rhs) {
-            return nodes_[lhs].action_index < nodes_[rhs].action_index;
-        });
+            auto& children = nodes_[node_idx].children;
+            std::sort(children.begin(), children.end(), [&](int lhs, int rhs) {
+                return nodes_[lhs].action_index < nodes_[rhs].action_index;
+            });
 
         Backpropagate(paths[bi], leaf_value);
+    }
+    } catch (const c10::Error& err) {
+        std::ostringstream oss;
+        oss << "MCTSCore::ExpandBatch c10::Error (leaves=" << leaves.size()
+            << ", batch_size=" << config_.batch_size << "): " << err.what();
+        DebugLog(oss.str());
+        throw std::runtime_error(oss.str());
+    } catch (const std::exception& err) {
+        std::ostringstream oss;
+        oss << "MCTSCore::ExpandBatch std::exception (leaves=" << leaves.size()
+            << ", batch_size=" << config_.batch_size << "): " << err.what();
+        DebugLog(oss.str());
+        throw std::runtime_error(oss.str());
     }
 }
 
@@ -407,7 +509,13 @@ void MCTSCore::RunSimulations(int num_simulations) {
     if (root_index_ < 0) {
         throw std::runtime_error("MCTS root not set.");
     }
+    DebugLog("RunSimulations start: num_simulations=" + std::to_string(num_simulations) +
+        ", batch_size=" + std::to_string(config_.batch_size));
     for (int sim = 0; sim < num_simulations; ) {
+        if (DebugEnabled() && sim % 16 == 0) {
+            DebugLog("RunSimulations progress: sim=" + std::to_string(sim) + "/" +
+                std::to_string(num_simulations));
+        }
         std::vector<int> leaves;
         std::vector<std::vector<int>> paths;
 
@@ -430,7 +538,13 @@ void MCTSCore::RunSimulations(int num_simulations) {
         }
 
         if (!leaves.empty()) {
-            ExpandBatch(leaves, paths);
+            DebugLog("RunSimulations expanding batch with leaves=" + std::to_string(leaves.size()));
+            try {
+                ExpandBatch(leaves, paths);
+            } catch (const std::exception& err) {
+                DebugLog(std::string("RunSimulations: ExpandBatch failed: ") + err.what());
+                throw;
+            }
         }
     }
 }

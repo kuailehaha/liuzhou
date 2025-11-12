@@ -134,7 +134,16 @@ class MCTS:
         Run MCTS simulations from the provided state and return (moves, probs).
         """
         self._ensure_root(state)
-        self._core.run_simulations(self.params.num_simulations)
+        try:
+            self._core.run_simulations(self.params.num_simulations)
+        except Exception as exc:
+            debug_info = (
+                f"phase={state.phase} move_count={state.move_count} "
+                f"pending_marks={state.pending_marks_remaining}/{state.pending_marks_required} "
+                f"pending_captures={state.pending_captures_remaining}/{state.pending_captures_required} "
+                f"forced_removals_done={state.forced_removals_done}"
+            )
+            raise RuntimeError(f"v0 MCTS run_simulations failed ({debug_info}): {exc}") from exc
 
         policy_pairs = self._core.get_policy(self.params.temperature)
         if not policy_pairs:

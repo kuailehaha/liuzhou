@@ -41,8 +41,8 @@ constexpr Directions kDirections[4] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
 
 struct BatchInputs {
     const int8_t* board;
-    const bool* marks_black;
-    const bool* marks_white;
+const bool* marks_black;
+const bool* marks_white;
     const int64_t* phase;
     const int64_t* current_player;
     const int64_t* pending_marks_required;
