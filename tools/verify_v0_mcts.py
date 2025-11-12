@@ -56,6 +56,12 @@ def main() -> None:
     parser.add_argument("--sims", type=int, default=128, help="Number of simulations per search.")
     parser.add_argument("--batch-size", type=int, default=16, help="Leaf batch size for both implementations.")
     parser.add_argument("--dump-policies", action="store_true", help="Print move/prob pairs for each run.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="Device to run both legacy and v0 models on (e.g. 'cpu', 'cuda').",
+    )
     parser.add_argument("--timing", action="store_true", help="Include per-sample timing lines (default summary only).")
     parser.add_argument("--seed", type=int, default=42, help="Base RNG seed for reproducibility.")
     args = parser.parse_args()
@@ -65,8 +71,17 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     rng = random.Random(args.seed + 1)
-    model = ChessNet(board_size=GameState.BOARD_SIZE)
-    model.eval()
+    base_model = ChessNet(board_size=GameState.BOARD_SIZE)
+    base_model.eval()
+    model = base_model
+
+    v0_device = torch.device(args.device)
+    if v0_device.type == "cpu":
+        model_v0 = base_model
+    else:
+        model_v0 = ChessNet(board_size=GameState.BOARD_SIZE).to(v0_device)
+        model_v0.load_state_dict(base_model.state_dict())
+        model_v0.eval()
 
     legacy_times: list[float] = []
     v0_times: list[float] = []
@@ -94,11 +109,11 @@ def main() -> None:
             verbose=False,
         )
         v0_mcts = V0MCTS(
-            model=model,
+            model=model_v0,
             num_simulations=args.sims,
             exploration_weight=1.0,
             temperature=1.0,
-            device="cpu",
+            device=args.device,
             add_dirichlet_noise=False,
             seed=args.seed,
             batch_K=args.batch_size,

@@ -71,13 +71,13 @@
 - C++ 实现 `states_to_model_input`：批量构造 BCHW tensor，与原 Python 完全等价。
 - 包装已有 `project_policy_logits_fast`，暴露统一 API（含 legal mask 生成）。
 - 处理 value head post-process（sigmoid/tanh/temperature 配置）及 dirichlet 噪声采样入口（可用 ATen 随机）。
-- **现状**：`v0/src/net/encoding.cpp` + `v0_core.states_to_model_input` 现已提供 BCHW 组装；`project_policy_logits_fast.cpp` 通过共享编译直接挂到 `v0_core.project_policy_logits_fast`，Python 端 `v1/net/encoding.py` 与 `project_policy_logits_fast.py` 已优先走 C++ 路径。新增 `postprocess_value_head` 与 `apply_temperature_scaling` 便于后续替换遗留 Python 温度/取值处理。
+- **现状**：`v0/src/net/encoding.cpp` + `v0_core.states_to_model_input` 现已提供 BCHW 组装；`v0/src/net/project_policy_logits_fast.cpp`、`v0/src/game/fast_legal_mask.cpp`、`v0/src/game/fast_apply_moves.cpp` 已本地化，不再依赖 `v1/*` 源。Python 侧也同步迁移了 `move_encoder.py`、`state_batch.py`、`rules_tensor.py`、`fast_legal_mask.py`，`v0/python/mcts.py` 全量引用这些副本即可跑完自博弈。新增 `postprocess_value_head` 与 `apply_temperature_scaling` 便于后续替换遗留 Python 温度/取值处理。
 
 ### 5. MCTS Core (`v0/src/mcts`)
 - `_MCTSNode` 结构（value, visits, prior, children map / flat vector）。
 - Batched selection：按 `batch_leaves` 并行推进，用 C++ 实现 UCB 计算、mask 过滤。
 - Expansion：调用 C++ move generator + `fast_apply_moves` + NN 编码；支持缓存/staleness。
-- 回传：值反转、虚拟损失、温度策略生成；输出与 `v1/mcts/vectorized_mcts.py` 兼容。
+- 回传：值反转、虚拟损失、温度策略生成；输出与现有 Python `src.mcts.MCTS` / `v0.python.mcts.MCTS` 兼容。
 - PyBind 对应类：`VectorizedMCTS`，方法 `search`, `advance_roots`, `set_root_states`, `clear_cache` 等。
 - **现状（S2/S3/S4完成）**：
   - `v0/include/v0/mcts_core.hpp` + `v0/src/mcts/mcts_core.cpp` 提供 C++ `MCTSCore`，实现节点池化、PUCT selection、虚损、批量 expansion/backprop。Expansion 已串联 `TensorStateBatch` → `states_to_model_input` → forward 回调 → `project_policy_logits_fast` → `fast_legal_mask` → `batch_apply_moves_fast`，并保持编码动作排序、Dirichlet 注入与 Python 逻辑一致。
@@ -127,3 +127,16 @@
 脚本阈值：当前在 CPU 上 `max_linf ≈ 1e-3`，`max_l1 ≈ 3e-3`；若超出 5e-3 需调查差异来源。
 
 切换说明：在自博弈/评测入口（self_play runner、evaluate runner 等）加入 `USE_V0_MCTS` 判断，默认为 0 时使用 `src.mcts.MCTS`，置为 1 时使用 `v0.python.mcts.MCTS`。这样可以在回归/性能对比中一键切换，也便于遇到问题时快速回退。
+
+
+python -m tools.verify_v0_mcts --samples 128 --sims 128 --batch-size 128 --device cpu --timing
+[verify_v0_mcts] timing summary
+legacy: avg=0.449s median=0.431s std=0.143s min=0.201s max=0.904s
+v0: avg=0.073s median=0.066s std=0.024s min=0.036s max=0.127s
+speedup: avg=6.74x median=6.32x min=2.70x max=18.76x
+
+python -m tools.verify_v0_mcts --samples 128 --sims 128 --batch-size 128 --device cuda --timing
+[verify_v0_mcts] timing summary
+legacy: avg=0.454s median=0.429s std=0.143s min=0.206s max=0.898s
+v0: avg=0.051s median=0.039s std=0.059s min=0.014s max=0.672s
+speedup: avg=11.77x median=10.99x min=0.86x max=41.76x

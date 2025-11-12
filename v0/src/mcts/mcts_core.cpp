@@ -264,22 +264,24 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
             throw std::runtime_error(oss.str());
         }
 
-        DebugLog("ExpandBatch: converting states to tensors, eval_states=" + std::to_string(eval_states.size()));
-        TensorStateBatch batch_device;
+        DebugLog("ExpandBatch: converting states to tensors (CPU), eval_states=" + std::to_string(eval_states.size()));
+        TensorStateBatch batch_cpu;
         try {
-            batch_device = FromGameStates(eval_states, config_.device);
+            batch_cpu = FromGameStates(eval_states, torch::Device(torch::kCPU));
         } catch (const std::exception& e) {
             DebugLog(std::string("ExpandBatch: FromGameStates failed: ") + e.what());
             throw;
         }
-        if (batch_device.board.size(0) != static_cast<int64_t>(leaves.size())) {
+        if (batch_cpu.board.size(0) != static_cast<int64_t>(leaves.size())) {
             std::ostringstream oss;
             oss << "ExpandBatch: tensor batch size mismatch, expected "
-                << leaves.size() << " got " << batch_device.board.size(0);
+                << leaves.size() << " got " << batch_cpu.board.size(0);
             DebugLog(oss.str());
             throw std::runtime_error(oss.str());
         }
-        DebugLog("ExpandBatch: batch_device board shape " + ShapeToString(batch_device.board));
+        DebugLog("ExpandBatch: batch_cpu board shape " + ShapeToString(batch_cpu.board));
+        TensorStateBatch batch_device =
+            config_.device.is_cpu() ? batch_cpu : batch_cpu.To(config_.device);
         torch::Tensor inputs = BuildModelInputs(batch_device);
         if (!forward_cb_) {
             throw std::runtime_error("Forward callback not set for MCTSCore.");
@@ -294,8 +296,6 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         DebugLog("ExpandBatch: NN outputs log_p shape " + ShapeToString(log_p1) +
             ", values shape " + ShapeToString(values));
 
-        TensorStateBatch batch_cpu = batch_device.To(torch::Device(torch::kCPU));
-        DebugLog("ExpandBatch: batch_device moved to CPU");
         auto [legal_mask_cpu, metadata_cpu] = encode_actions_fast(
             batch_cpu.board,
             batch_cpu.marks_black.to(torch::kBool),

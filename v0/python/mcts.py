@@ -16,13 +16,13 @@ import torch
 import v0_core
 from src.game_state import GameState
 from src.move_generator import apply_move
-from v1.game.move_encoder import (
+from .move_encoder import (
     ActionEncodingSpec,
     DEFAULT_ACTION_SPEC,
     action_to_index,
     decode_action_indices,
 )
-from v1.game.state_batch import from_game_states
+from .state_batch import from_game_states
 
 __all__ = ["MCTS"]
 
