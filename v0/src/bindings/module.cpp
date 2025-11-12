@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/numpy.h>   // ← 新增
 #include <torch/extension.h>
 
 #include <string>
@@ -65,6 +66,106 @@ void MarksFromVector(
         }
         marked.Add(coord);
     }
+}
+
+v0::GameState GameStateFromPyLike(const py::object& py_state) {
+    if (!py_state || py_state.is_none()) {
+        throw std::runtime_error("state 不能为空");
+    }
+
+    auto require_attr = [&](const char* name) -> py::object {
+        if (!py::hasattr(py_state, name)) {
+            throw std::runtime_error(std::string("Python GameState 缺少属性: ") + name);
+        }
+        return py_state.attr(name);
+    };
+
+    auto to_int = [](const py::object& obj, const char* attr_name) -> int {
+        py::object value_obj = obj;
+        if (py::hasattr(obj, "value")) {
+            value_obj = obj.attr("value");
+        }
+        try {
+            return value_obj.cast<int>();
+        } catch (const py::cast_error&) {
+            throw std::runtime_error(std::string("无法把属性转换为 int: ") + attr_name);
+        }
+    };
+
+    v0::GameState state;
+
+    py::list board_list = py::list(require_attr("board"));
+    BoardFromNested(state, board_list.cast<std::vector<std::vector<int>>>());
+
+    auto parse_phase = [&](const py::object& obj) -> v0::Phase {
+        int value = to_int(obj, "phase");
+        if (value < static_cast<int>(v0::Phase::kPlacement) ||
+            value > static_cast<int>(v0::Phase::kCounterRemoval)) {
+            throw std::runtime_error("phase 枚举值超出范围");
+        }
+        return static_cast<v0::Phase>(value);
+    };
+
+    auto parse_player = [&](const py::object& obj) -> v0::Player {
+        int value = to_int(obj, "current_player");
+        if (value == static_cast<int>(v0::Player::kBlack)) {
+            return v0::Player::kBlack;
+        }
+        if (value == static_cast<int>(v0::Player::kWhite)) {
+            return v0::Player::kWhite;
+        }
+        throw std::runtime_error("current_player 枚举值必须是 1 或 -1");
+    };
+
+    state.phase = parse_phase(require_attr("phase"));
+    state.current_player = parse_player(require_attr("current_player"));
+
+    auto assign_marks = [&](const char* attr_name, v0::Player player) {
+        if (!py::hasattr(py_state, attr_name)) {
+            state.Marks(player).Clear();
+            return;
+        }
+        py::object marks_obj = py_state.attr(attr_name);
+        if (marks_obj.is_none()) {
+            state.Marks(player).Clear();
+            return;
+        }
+        std::vector<v0::Coord> coords = py::list(marks_obj).cast<std::vector<v0::Coord>>();
+        MarksFromVector(state, player, coords);
+    };
+
+    assign_marks("marked_black", v0::Player::kBlack);
+    assign_marks("marked_white", v0::Player::kWhite);
+
+    auto assign_optional_int = [&](const char* attr_name, int32_t& field) {
+        if (!py::hasattr(py_state, attr_name)) {
+            return;
+        }
+        py::object attr = py_state.attr(attr_name);
+        if (attr.is_none()) {
+            return;
+        }
+        field = attr.cast<int32_t>();
+    };
+
+    assign_optional_int("forced_removals_done", state.forced_removals_done);
+    assign_optional_int("move_count", state.move_count);
+    assign_optional_int("pending_marks_required", state.pending_marks_required);
+    assign_optional_int("pending_marks_remaining", state.pending_marks_remaining);
+    assign_optional_int("pending_captures_required", state.pending_captures_required);
+    assign_optional_int("pending_captures_remaining", state.pending_captures_remaining);
+
+    return state;
+}
+
+v0::GameState CoerceGameStateLike(const py::object& state_obj) {
+    if (!state_obj || state_obj.is_none()) {
+        throw std::runtime_error("state 不能为空");
+    }
+    if (py::isinstance<v0::GameState>(state_obj)) {
+        return state_obj.cast<v0::GameState>();
+    }
+    return GameStateFromPyLike(state_obj);
 }
 }  // namespace
 
@@ -392,6 +493,12 @@ PYBIND11_MODULE(v0_core, m) {
         .def(
             "set_root_state",
             [](v0::MCTSCore& core, const v0::GameState& state) { core.SetRootState(state); },
+            py::arg("state"))
+        .def(
+            "set_root_state",
+            [](v0::MCTSCore& core, py::object state_like) {
+                core.SetRootState(CoerceGameStateLike(state_like));
+            },
             py::arg("state"))
         .def("reset", &v0::MCTSCore::Reset)
         .def("run_simulations", &v0::MCTSCore::RunSimulations, py::arg("num_simulations"))
