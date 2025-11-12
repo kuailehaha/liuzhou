@@ -57,10 +57,10 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16, help="Leaf batch size for both implementations.")
     parser.add_argument("--dump-policies", action="store_true", help="Print move/prob pairs for each run.")
     parser.add_argument(
-        "--device",
+        "--fwd-device",
         type=str,
         default="cpu",
-        help="Device to run both legacy and v0 models on (e.g. 'cpu', 'cuda').",
+        help="Device used for both legacy and v0 forward passes (e.g. 'cpu', 'cuda', 'cuda:0').",
     )
     parser.add_argument("--timing", action="store_true", help="Include per-sample timing lines (default summary only).")
     parser.add_argument("--seed", type=int, default=42, help="Base RNG seed for reproducibility.")
@@ -71,17 +71,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     rng = random.Random(args.seed + 1)
-    base_model = ChessNet(board_size=GameState.BOARD_SIZE)
-    base_model.eval()
-    model = base_model
-
-    v0_device = torch.device(args.device)
-    if v0_device.type == "cpu":
-        model_v0 = base_model
-    else:
-        model_v0 = ChessNet(board_size=GameState.BOARD_SIZE).to(v0_device)
-        model_v0.load_state_dict(base_model.state_dict())
-        model_v0.eval()
+    fwd_device = torch.device(args.fwd_device)
+    model = ChessNet(board_size=GameState.BOARD_SIZE).to(fwd_device)
+    model.eval()
 
     legacy_times: list[float] = []
     v0_times: list[float] = []
@@ -102,18 +94,18 @@ def main() -> None:
             num_simulations=args.sims,
             exploration_weight=1.0,
             temperature=1.0,
-            device="cpu",
+            device=args.fwd_device,
             add_dirichlet_noise=False,
             virtual_loss_weight=0.0,
             batch_K=args.batch_size,
             verbose=False,
         )
         v0_mcts = V0MCTS(
-            model=model_v0,
+            model=model,
             num_simulations=args.sims,
             exploration_weight=1.0,
             temperature=1.0,
-            device=args.device,
+            device=args.fwd_device,
             add_dirichlet_noise=False,
             seed=args.seed,
             batch_K=args.batch_size,

@@ -129,14 +129,15 @@
 切换说明：在自博弈/评测入口（self_play runner、evaluate runner 等）加入 `USE_V0_MCTS` 判断，默认为 0 时使用 `src.mcts.MCTS`，置为 1 时使用 `v0.python.mcts.MCTS`。这样可以在回归/性能对比中一键切换，也便于遇到问题时快速回退。
 
 
-python -m tools.verify_v0_mcts --samples 128 --sims 128 --batch-size 128 --device cpu --timing
+python -m tools.verify_v0_mcts --samples 128 --sims 128 --batch-size 128 --fwd-device cuda --timing
 [verify_v0_mcts] timing summary
-legacy: avg=0.449s median=0.431s std=0.143s min=0.201s max=0.904s
-v0: avg=0.073s median=0.066s std=0.024s min=0.036s max=0.127s
-speedup: avg=6.74x median=6.32x min=2.70x max=18.76x
+legacy: avg=0.464s median=0.447s std=0.158s min=0.219s max=1.198s
+v0: avg=0.046s median=0.035s std=0.041s min=0.013s max=0.450s
+speedup: avg=12.99x median=11.40x min=2.66x max=49.48x
 
-python -m tools.verify_v0_mcts --samples 128 --sims 128 --batch-size 128 --device cuda --timing
+
+python -m tools.verify_v0_mcts --samples 128 --sims 128 --batch-size 128 --fwd-device cpu --timing
 [verify_v0_mcts] timing summary
-legacy: avg=0.454s median=0.429s std=0.143s min=0.206s max=0.898s
-v0: avg=0.051s median=0.039s std=0.059s min=0.014s max=0.672s
-speedup: avg=11.77x median=10.99x min=0.86x max=41.76x
+legacy: avg=0.467s median=0.448s std=0.150s min=0.208s max=0.910s
+v0: avg=0.074s median=0.066s std=0.027s min=0.037s max=0.176s
+speedup: avg=6.91x median=6.40x min=2.96x max=18.73x
