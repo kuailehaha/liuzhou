@@ -9,3 +9,7 @@ rmdir /S /Q build\v0
 cmake -S v0 -B build/v0 -G "Ninja" -DUSE_CUDA=ON -DBUILD_CUDA_KERNELS=ON
 cmake --build build\v0 --config Release
 ```
+
+```powershell
+$env:PYTHONPATH = "D:\CODES\liuzhou;D:\CODES\liuzhou\build\v0\src"
+```
