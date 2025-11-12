@@ -5,6 +5,7 @@
 
 #include <string>
 
+#include "v0/fast_legal_mask.hpp"
 #include "v0/game_state.hpp"
 #include "v0/move_generator.hpp"
 #include "v0/net_encoding.hpp"
@@ -520,6 +521,23 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("marks_white"),
         py::arg("phase"),
         py::arg("current_player"));
+    m.def(
+        "encode_actions_fast",
+        &v0::encode_actions_fast,
+        py::arg("board"),
+        py::arg("marks_black"),
+        py::arg("marks_white"),
+        py::arg("phase"),
+        py::arg("current_player"),
+        py::arg("pending_marks_required"),
+        py::arg("pending_marks_remaining"),
+        py::arg("pending_captures_required"),
+        py::arg("pending_captures_remaining"),
+        py::arg("forced_removals_done"),
+        py::arg("placement_dim"),
+        py::arg("movement_dim"),
+        py::arg("selection_dim"),
+        py::arg("auxiliary_dim"));
     m.def(
         "project_policy_logits_fast",
         &v0::project_policy_logits_fast,

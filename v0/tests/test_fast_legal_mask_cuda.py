@@ -1,6 +1,9 @@
 import pytest
 import torch
-
+import os, sys
+# pyd_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "build", "v0", "src"))
+# sys.path.append(pyd_path)
+sys.path.append(r"D:\CODES\liuzhou\build\v0\src")
 import v0_core
 
 
