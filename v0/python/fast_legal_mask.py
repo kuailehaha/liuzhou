@@ -15,45 +15,42 @@ def encode_actions_fast(
     *,
     return_metadata: bool = False,
 ) -> Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    if batch.board.device.type != "cpu":
-        board = batch.board.to("cpu")
-        marks_black = batch.marks_black.to("cpu")
-        marks_white = batch.marks_white.to("cpu")
-        phase = batch.phase.to("cpu")
-        current_player = batch.current_player.to("cpu")
-        pending_marks_required = batch.pending_marks_required.to("cpu")
-        pending_marks_remaining = batch.pending_marks_remaining.to("cpu")
-        pending_captures_required = batch.pending_captures_required.to("cpu")
-        pending_captures_remaining = batch.pending_captures_remaining.to("cpu")
-        forced_removals_done = batch.forced_removals_done.to("cpu")
-    else:
-        board = batch.board
-        marks_black = batch.marks_black
-        marks_white = batch.marks_white
-        phase = batch.phase
-        current_player = batch.current_player
-        pending_marks_required = batch.pending_marks_required
-        pending_marks_remaining = batch.pending_marks_remaining
-        pending_captures_required = batch.pending_captures_required
-        pending_captures_remaining = batch.pending_captures_remaining
-        forced_removals_done = batch.forced_removals_done
-
-    result = v0_core.encode_actions_fast(
-        board,
-        marks_black,
-        marks_white,
-        phase,
-        current_player,
-        pending_marks_required,
-        pending_marks_remaining,
-        pending_captures_required,
-        pending_captures_remaining,
-        forced_removals_done,
-        spec.placement_dim,
-        spec.movement_dim,
-        spec.selection_dim,
-        spec.auxiliary_dim,
+    tensors = (
+        batch.board,
+        batch.marks_black,
+        batch.marks_white,
+        batch.phase,
+        batch.current_player,
+        batch.pending_marks_required,
+        batch.pending_marks_remaining,
+        batch.pending_captures_required,
+        batch.pending_captures_remaining,
+        batch.forced_removals_done,
     )
+
+    def _invoke(args):
+        return v0_core.encode_actions_fast(
+            *args,
+            spec.placement_dim,
+            spec.movement_dim,
+            spec.selection_dim,
+            spec.auxiliary_dim,
+        )
+
+    result = None
+    tried_cuda = False
+    if tensors[0].device.type == "cuda":
+        tried_cuda = True
+        try:
+            result = _invoke(tensors)
+        except RuntimeError as exc:  # CUDA kernels missing -> fall back to CPU
+            if "CUDA kernels were not built" not in str(exc):
+                raise
+
+    if result is None:
+        cpu_tensors = tuple(t.to("cpu") for t in tensors) if tried_cuda else tensors
+        result = _invoke(cpu_tensors)
+
     if result is None:
         return None
     if return_metadata:

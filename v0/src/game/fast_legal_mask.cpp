@@ -4,45 +4,11 @@
 #include <cstdint>
 #include <vector>
 
+#include "fast_legal_mask_common.hpp"
+
 namespace v0 {
 
 namespace {
-
-constexpr int kPhasePlacement = 1;
-constexpr int kPhaseMarkSelection = 2;
-constexpr int kPhaseRemoval = 3;
-constexpr int kPhaseMovement = 4;
-constexpr int kPhaseCaptureSelection = 5;
-constexpr int kPhaseForcedRemoval = 6;
-constexpr int kPhaseCounterRemoval = 7;
-
-constexpr int kPlayerBlack = 1;
-constexpr int kPlayerWhite = -1;
-
-struct Directions {
-    int dr;
-    int dc;
-};
-
-const Directions kDirections[4] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
-
-inline int flat_index(int r, int c, int size) {
-    return r * size + c;
-}
-
-enum ActionKind : int32_t {
-    kActionInvalid = 0,
-    kActionPlacement = 1,
-    kActionMovement = 2,
-    kActionMarkSelection = 3,
-    kActionCaptureSelection = 4,
-    kActionForcedRemovalSelection = 5,
-    kActionCounterRemovalSelection = 6,
-    kActionNoMovesRemovalSelection = 7,
-    kActionProcessRemoval = 8,
-};
-
-constexpr int kMetaFields = 4;
 
 inline bool is_marked(const bool* marked, int idx) {
     return marked != nullptr && marked[idx];
@@ -284,7 +250,7 @@ std::vector<int> generate_capture_targets(
 
 }  // namespace
 
-std::tuple<torch::Tensor, torch::Tensor> encode_actions_fast(
+std::tuple<torch::Tensor, torch::Tensor> encode_actions_fast_cpu(
     torch::Tensor board,
     torch::Tensor marks_black,
     torch::Tensor marks_white,
@@ -449,6 +415,81 @@ std::tuple<torch::Tensor, torch::Tensor> encode_actions_fast(
     }
 
     return {mask, metadata};
+}
+
+#if defined(V0_HAS_CUDA_LEGAL_MASK)
+std::tuple<torch::Tensor, torch::Tensor> encode_actions_fast_cuda(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    int64_t placement_dim,
+    int64_t movement_dim,
+    int64_t selection_dim,
+    int64_t auxiliary_dim);
+#endif
+
+std::tuple<torch::Tensor, torch::Tensor> encode_actions_fast(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    int64_t placement_dim,
+    int64_t movement_dim,
+    int64_t selection_dim,
+    int64_t auxiliary_dim) {
+    if (board.device().is_cuda()) {
+#if defined(V0_HAS_CUDA_LEGAL_MASK)
+        return encode_actions_fast_cuda(
+            board.contiguous(),
+            marks_black.contiguous(),
+            marks_white.contiguous(),
+            phase.contiguous(),
+            current_player.contiguous(),
+            pending_marks_required.contiguous(),
+            pending_marks_remaining.contiguous(),
+            pending_captures_required.contiguous(),
+            pending_captures_remaining.contiguous(),
+            forced_removals_done.contiguous(),
+            placement_dim,
+            movement_dim,
+            selection_dim,
+            auxiliary_dim);
+#else
+        TORCH_CHECK(
+            false,
+            "encode_actions_fast: requested CUDA tensors but CUDA kernels were not built. "
+            "Please rebuild with -DBUILD_CUDA_KERNELS=ON.");
+#endif
+    }
+
+    return encode_actions_fast_cpu(
+        board.contiguous(),
+        marks_black.contiguous(),
+        marks_white.contiguous(),
+        phase.contiguous(),
+        current_player.contiguous(),
+        pending_marks_required.contiguous(),
+        pending_marks_remaining.contiguous(),
+        pending_captures_required.contiguous(),
+        pending_captures_remaining.contiguous(),
+        forced_removals_done.contiguous(),
+        placement_dim,
+        movement_dim,
+        selection_dim,
+        auxiliary_dim);
 }
 
 }// namespace v0
