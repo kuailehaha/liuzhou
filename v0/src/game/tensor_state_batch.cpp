@@ -88,8 +88,8 @@ TensorStateBatch FromGameStates(
     auto mask_alive = torch::ones(batch_size, TensorOptionsForDevice(torch::kBool, norm_device));
 
     auto board_ptr = board.data_ptr<int8_t>();
-    auto marks_black_ptr = marks_black.data_ptr<uint8_t>();
-    auto marks_white_ptr = marks_white.data_ptr<uint8_t>();
+    auto marks_black_ptr = marks_black.data_ptr<bool>();
+    auto marks_white_ptr = marks_white.data_ptr<bool>();
     auto phase_ptr = phase.data_ptr<int64_t>();
     auto current_ptr = current_player.data_ptr<int64_t>();
     auto pending_marks_required_ptr = pending_marks_required.data_ptr<int64_t>();
@@ -105,9 +105,9 @@ TensorStateBatch FromGameStates(
 
         for (int idx = 0; idx < cell_count; ++idx) {
             marks_black_ptr[b * cell_count + idx] =
-                state.marked_black.ContainsIndex(idx) ? 1 : 0;
+                state.marked_black.ContainsIndex(idx);
             marks_white_ptr[b * cell_count + idx] =
-                state.marked_white.ContainsIndex(idx) ? 1 : 0;
+                state.marked_white.ContainsIndex(idx);
         }
 
         phase_ptr[b] = static_cast<int64_t>(state.phase);
@@ -154,8 +154,8 @@ std::vector<GameState> ToGameStates(const TensorStateBatch& batch) {
     auto move_count_cpu = batch.move_count.to(torch::kCPU, torch::kInt64);
 
     const int8_t* board_ptr = board_cpu.data_ptr<int8_t>();
-    const uint8_t* marks_black_ptr = marks_black_cpu.data_ptr<uint8_t>();
-    const uint8_t* marks_white_ptr = marks_white_cpu.data_ptr<uint8_t>();
+    const bool* marks_black_ptr = marks_black_cpu.data_ptr<bool>();
+    const bool* marks_white_ptr = marks_white_cpu.data_ptr<bool>();
     const int64_t* phase_ptr = phase_cpu.data_ptr<int64_t>();
     const int64_t* current_ptr = current_cpu.data_ptr<int64_t>();
     const int64_t* pending_marks_required_ptr = pending_marks_required_cpu.data_ptr<int64_t>();

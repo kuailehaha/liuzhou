@@ -309,8 +309,8 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
 
         auto next_batch = batch_apply_moves(
             batch_cpu.board,
-            batch_cpu.marks_black.to(torch::kUInt8),
-            batch_cpu.marks_white.to(torch::kUInt8),
+            batch_cpu.marks_black,
+            batch_cpu.marks_white,
             batch_cpu.phase,
             batch_cpu.current_player,
             batch_cpu.pending_marks_required,

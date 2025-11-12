@@ -62,13 +62,10 @@ def batch_apply_moves_fast(
     parent_indices = parent_indices.to("cpu", dtype=torch.long, copy=False)
     action_codes = action_codes.to("cpu", dtype=torch.int32, copy=False)
 
-    marks_black_u8 = batch.marks_black.to(dtype=torch.uint8, copy=False)
-    marks_white_u8 = batch.marks_white.to(dtype=torch.uint8, copy=False)
-
     result = ext.batch_apply_moves(
         batch.board,
-        marks_black_u8,
-        marks_white_u8,
+        batch.marks_black,
+        batch.marks_white,
         batch.phase,
         batch.current_player,
         batch.pending_marks_required,
@@ -83,8 +80,8 @@ def batch_apply_moves_fast(
 
     (
         board,
-        marks_black_u8,
-        marks_white_u8,
+        marks_black,
+        marks_white,
         phase,
         current_player,
         pending_marks_required,
@@ -94,9 +91,6 @@ def batch_apply_moves_fast(
         forced_removals_done,
         move_count,
     ) = result
-
-    marks_black = marks_black_u8.to(dtype=torch.bool)
-    marks_white = marks_white_u8.to(dtype=torch.bool)
 
     mask_alive = torch.ones(board.size(0), dtype=torch.bool, device=board.device)
     config = TensorGameConfig(board_size=batch.config.board_size, device=board.device)

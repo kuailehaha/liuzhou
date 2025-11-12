@@ -41,8 +41,8 @@ constexpr Directions kDirections[4] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
 
 struct BatchInputs {
     const int8_t* board;
-    const uint8_t* marks_black;
-    const uint8_t* marks_white;
+    const bool* marks_black;
+    const bool* marks_white;
     const int64_t* phase;
     const int64_t* current_player;
     const int64_t* pending_marks_required;
@@ -55,8 +55,8 @@ struct BatchInputs {
 
 struct BatchOutputs {
     int8_t* board;
-    uint8_t* marks_black;
-    uint8_t* marks_white;
+    bool* marks_black;
+    bool* marks_white;
     int64_t* phase;
     int64_t* current_player;
     int64_t* pending_marks_required;
@@ -84,7 +84,7 @@ inline void rc_from_cell(int cell, int size, int& r, int& c) {
     c = cell % size;
 }
 
-inline bool is_marked(const uint8_t* marked, int idx) {
+inline bool is_marked(const bool* marked, int idx) {
     return marked && marked[idx];
 }
 
@@ -94,7 +94,7 @@ bool check_squares(
     int r,
     int c,
     int player_value,
-    const uint8_t* marked) {
+    const bool* marked) {
     for (int dr : {0, -1}) {
         for (int dc : {0, -1}) {
             int rr = r + dr;
@@ -129,7 +129,7 @@ bool check_lines(
     int r,
     int c,
     int player_value,
-    const uint8_t* marked) {
+    const bool* marked) {
     int count = 1;
     for (int dc = c - 1; dc >= 0; --dc) {
         int idx = cell_from_rc(r, dc, size);
@@ -183,7 +183,7 @@ ShapeResult detect_shape(
     int r,
     int c,
     int player_value,
-    const uint8_t* marked) {
+    const bool* marked) {
     bool found_square = check_squares(board, size, r, c, player_value, marked);
     bool found_line = check_lines(board, size, r, c, player_value, marked);
     if (found_line) {
@@ -201,7 +201,7 @@ bool is_piece_in_shape(
     int r,
     int c,
     int player_value,
-    const uint8_t* marked) {
+    const bool* marked) {
     if (board[cell_from_rc(r, c, size)] != player_value) {
         return false;
     }
@@ -220,7 +220,7 @@ int count_player_pieces(const int8_t* board, int size, int player_value) {
     return count;
 }
 
-bool has_any_marked(const uint8_t* marked, int cell_count) {
+bool has_any_marked(const bool* marked, int cell_count) {
     for (int idx = 0; idx < cell_count; ++idx) {
         if (marked[idx]) {
             return true;
@@ -229,8 +229,8 @@ bool has_any_marked(const uint8_t* marked, int cell_count) {
     return false;
 }
 
-void clear_marks(uint8_t* marked, int cell_count) {
-    std::fill(marked, marked + cell_count, uint8_t{0});
+void clear_marks(bool* marked, int cell_count) {
+    std::fill(marked, marked + cell_count, false);
 }
 
 bool is_board_full(const int8_t* board, int cell_count) {
@@ -268,8 +268,8 @@ int64_t switch_player(int64_t current_player) {
 
 void apply_placement(
     int8_t* board,
-    uint8_t* marks_black,
-    uint8_t* marks_white,
+    bool* marks_black,
+    bool* marks_white,
     int64_t& phase,
     int64_t& current_player,
     int64_t& pending_marks_required,
@@ -290,13 +290,13 @@ void apply_placement(
     int idx = cell_from_rc(r, c, size);
     TORCH_CHECK(board[idx] == 0, "Placement cell is not empty.");
 
-    const uint8_t* opponent_marked = current_player == 1 ? marks_white : marks_black;
+    const bool* opponent_marked = current_player == 1 ? marks_white : marks_black;
     TORCH_CHECK(!is_marked(opponent_marked, idx), "Placement cell is marked by opponent.");
 
     board[idx] = static_cast<int8_t>(current_player);
 
-    uint8_t* own_marked = current_player == 1 ? marks_black : marks_white;
-    bool already_marked = own_marked[idx] != 0;
+    bool* own_marked = current_player == 1 ? marks_black : marks_white;
+    bool already_marked = own_marked[idx];
 
     if (!already_marked) {
         auto shape = detect_shape(
@@ -332,8 +332,8 @@ void apply_placement(
 
 void apply_mark_selection(
     int8_t* board,
-    uint8_t* marks_black,
-    uint8_t* marks_white,
+    bool* marks_black,
+    bool* marks_white,
     int64_t& phase,
     int64_t& current_player,
     int64_t& pending_marks_required,
@@ -348,7 +348,7 @@ void apply_mark_selection(
     int idx = cell_from_rc(r, c, size);
 
     int opponent_value = static_cast<int>(-current_player);
-    uint8_t* opponent_marked = opponent_value == -1 ? marks_white : marks_black;
+    bool* opponent_marked = opponent_value == -1 ? marks_white : marks_black;
 
     TORCH_CHECK(board[idx] == opponent_value, "Selected cell is not opponent piece.");
     TORCH_CHECK(!opponent_marked[idx], "Selected opponent piece already marked.");
@@ -374,7 +374,7 @@ void apply_mark_selection(
         TORCH_CHECK(false, "Cannot mark piece in shape while unmarked normal pieces remain.");
     }
 
-    opponent_marked[idx] = 1;
+    opponent_marked[idx] = true;
     pending_marks_remaining -= 1;
     if (pending_marks_remaining > 0) {
         return;
@@ -391,8 +391,8 @@ void apply_mark_selection(
 
 void process_removal_phase(
     int8_t* board,
-    uint8_t* marks_black,
-    uint8_t* marks_white,
+    bool* marks_black,
+    bool* marks_white,
     int64_t& phase,
     int64_t& current_player,
     int64_t& forced_removals_done,
@@ -496,8 +496,8 @@ void apply_no_moves_removal(
 
 void apply_capture_selection(
     int8_t* board,
-    uint8_t* marks_black,
-    uint8_t* marks_white,
+    bool* marks_black,
+    bool* marks_white,
     int64_t& phase,
     int64_t& current_player,
     int64_t& pending_captures_remaining,
@@ -511,7 +511,7 @@ void apply_capture_selection(
     int idx = cell_from_rc(r, c, size);
 
     int opponent_value = static_cast<int>(-current_player);
-    uint8_t* opponent_marked = opponent_value == -1 ? marks_white : marks_black;
+    bool* opponent_marked = opponent_value == -1 ? marks_white : marks_black;
     TORCH_CHECK(board[idx] == opponent_value, "Capture target must be opponent piece.");
 
     std::vector<int> opponent_normal;
@@ -631,10 +631,10 @@ void apply_action(
     int8_t* board_out = out.board + out_index * cell_count;
     copy_state(board_out, in.board + parent * cell_count, cell_count);
 
-    uint8_t* marks_black_out = out.marks_black + out_index * cell_count;
+    bool* marks_black_out = out.marks_black + out_index * cell_count;
     copy_state(marks_black_out, in.marks_black + parent * cell_count, cell_count);
 
-    uint8_t* marks_white_out = out.marks_white + out_index * cell_count;
+    bool* marks_white_out = out.marks_white + out_index * cell_count;
     copy_state(marks_white_out, in.marks_white + parent * cell_count, cell_count);
 
     out.phase[out_index] = in.phase[parent];
@@ -829,8 +829,8 @@ batch_apply_moves(
 
     BatchInputs in{
         board.data_ptr<int8_t>(),
-        marks_black.data_ptr<uint8_t>(),
-        marks_white.data_ptr<uint8_t>(),
+        marks_black.data_ptr<bool>(),
+        marks_white.data_ptr<bool>(),
         phase.data_ptr<int64_t>(),
         current_player.data_ptr<int64_t>(),
         pending_marks_required.data_ptr<int64_t>(),
@@ -843,8 +843,8 @@ batch_apply_moves(
 
     BatchOutputs out{
         out_board.data_ptr<int8_t>(),
-        out_marks_black.data_ptr<uint8_t>(),
-        out_marks_white.data_ptr<uint8_t>(),
+        out_marks_black.data_ptr<bool>(),
+        out_marks_white.data_ptr<bool>(),
         out_phase.data_ptr<int64_t>(),
         out_current_player.data_ptr<int64_t>(),
         out_pending_marks_required.data_ptr<int64_t>(),

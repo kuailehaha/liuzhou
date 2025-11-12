@@ -141,7 +141,8 @@ class MCTS:
             return [], np.array([], dtype=float)
 
         action_indices = torch.tensor([idx for idx, _ in policy_pairs], dtype=torch.long)
-        batch = from_game_states([state], device=torch.device("cpu"))
+        replicated_states = [state.copy() for _ in policy_pairs]
+        batch = from_game_states(replicated_states, device=torch.device("cpu"))
         decoded = decode_action_indices(action_indices, batch, self.spec)
 
         moves: List[dict] = []
@@ -203,4 +204,3 @@ class MCTS:
 
     def get_root_value(self) -> float:
         return self._core.root_value
-
