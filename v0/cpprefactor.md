@@ -57,6 +57,40 @@ The top-level `CMakeLists.txt` builds a single `v0_core` extension that links al
 6. **Self-play / training integration**  
    - Wire `v0.python.mcts.MCTS` into the self-play runner, add config flags, and benchmark end-to-end training loops on both CPU and GPU forward paths.
 
+### GPU/CUDA Rewrite Plan
+
+Goal: keep tensors on GPU from `FromGameStates → NN → legal mask → expanded child batch` so the only unavoidable host interaction is when we convert child batches back to `GameState` for storage in `nodes_`.
+
+We will tackle this in four layers. Each layer should land with parity tests mirroring the CPU path (e.g., compare CUDA kernel outputs against the existing CPU implementation on random states).
+
+#### Stage 1 – GPU-friendly Tensor Batch Construction (`tensor_state_batch.cpp`)
+1. **Pinned host buffer**: add an optional path where we build into pinned CPU memory (using `torch::empty_pin_memory`) and immediately issue an async `cudaMemcpyAsync` into a CUDA tensor, synchronized on the default stream. This is the low-risk stepping stone.
+2. **Direct CUDA kernel**: write a simple CUDA kernel that copies the `GameState` struct into the target tensors (board/marks/phase etc.), invoked via `at::cuda::CUDAStream`. This avoids the intermediate host tensor entirely.
+3. **API surface**: expose `tensor_batch_from_game_states(states, device)` that chooses CPU/pinned/CUDA paths automatically, and update PyBind so `v0_core.tensor_batch_from_game_states(states, "cuda")` is supported.
+
+#### Stage 2 – CUDA Legal Mask (`fast_legal_mask`)
+1. **Kernel design**: break the CPU implementation into kernels per phase (placement, movement, selections). Each kernel should read the flattened board/marks arrays and write into the same metadata layout (`(B, total_dim, 4)`).
+2. **Launch configuration**: use `(batch_size, cells)` style grids so each warp handles a subset of board cells; leverage shared memory for the 6x6 board to reduce global-memory reads.
+3. **Fallback**: keep the current CPU code behind `#ifndef FAST_LEGAL_MASK_NO_MODULE` and compile CUDA version when `TORCH_CUDA_FOUND`. At runtime choose CUDA kernel only if `board.device().is_cuda()`.
+4. **Testing**: extend `tools/verify_v0_state_batch.py` or add `tools/verify_v0_legal_mask.py` to compare CPU vs CUDA masks/metadata on random states.
+
+#### Stage 3 – CUDA Fast Apply Moves (`fast_apply_moves`)
+1. **Data layout**: operate on the same `(B, H, W)` int8 board plus bool marks arrays. Each kernel should:
+   - copy parent board/marks into child slots,
+   - apply action-specific mutations (placement/move/selection) using thread-blocks per parent,
+   - update scalar tensors (phase, current_player, pending counters).
+2. **Action metadata**: the CUDA kernel will read the `(N,4)` action tensor and parent indices exactly as the CPU version does; ensure we keep metadata in GPU memory throughout.
+3. **Housekeeping**: maintain the `BatchInputs`/`BatchOutputs` structs for the CPU fallback, but add CUDA equivalents guarded with `#ifdef __CUDACC__`.
+4. **Parity tests**: add a CUDA-aware variant of `tests/v1/test_fast_apply_moves.py` that runs both CPU and CUDA implementations and checks resulting states.
+
+#### Stage 4 – MCTSCore Integration
+1. **Device plumbing**: extend `MCTSConfig` with `tensor_device` (default `"cpu"`). During `ExpandBatch`, build the batch on that device, run NN/legal mask/move kernels without toggling back to CPU unless CUDA is unavailable.
+2. **Stream management**: ensure `forward_cb_` (PyTorch model) and CUDA kernels share the same stream/guard (`at::cuda::CUDAGuard guard(tensor_device)`).
+3. **Host conversion**: only when `child_states` are ready do we move the tensors back to CPU via `TensorStateBatch child_batch_gpu -> child_batch_cpu`; reuse the existing `ToGameStates`.
+4. **Fallback logic**: if CUDA kernels are not compiled or the device is `"cpu"`, continue to use the current CPU path.
+
+Each stage lands separately with documentation plus scripts demonstrating speedups (e.g., update `tools/verify_v0_mcts` or add `tools/benchmark_cuda_kernels.py` to show the CPU vs CUDA delta).
+
 ## Reference Commands
 
 ```bash
