@@ -4,45 +4,19 @@
 #include <array>
 #include <cstdint>
 #include <tuple>
+#include <utility>
 #include <vector>
+
+#include "fast_legal_mask_common.hpp"
 
 namespace v0 {
 
 namespace {
 
-enum Phase : int {
-    kPhasePlacement = 1,
-    kPhaseMarkSelection = 2,
-    kPhaseRemoval = 3,
-    kPhaseMovement = 4,
-    kPhaseCaptureSelection = 5,
-    kPhaseForcedRemoval = 6,
-    kPhaseCounterRemoval = 7,
-};
-
-enum ActionKind : int32_t {
-    kActionInvalid = 0,
-    kActionPlacement = 1,
-    kActionMovement = 2,
-    kActionMarkSelection = 3,
-    kActionCaptureSelection = 4,
-    kActionForcedRemovalSelection = 5,
-    kActionCounterRemovalSelection = 6,
-    kActionNoMovesRemovalSelection = 7,
-    kActionProcessRemoval = 8,
-};
-
-struct Directions {
-    int dr;
-    int dc;
-};
-
-constexpr Directions kDirections[4] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
-
 struct BatchInputs {
     const int8_t* board;
-const bool* marks_black;
-const bool* marks_white;
+    const bool* marks_black;
+    const bool* marks_white;
     const int64_t* phase;
     const int64_t* current_player;
     const int64_t* pending_marks_required;
@@ -756,6 +730,7 @@ void apply_action(
 
 }  // namespace
 
+#if defined(V0_HAS_CUDA_APPLY_MOVES)
 std::tuple<
     torch::Tensor,
     torch::Tensor,
@@ -768,7 +743,35 @@ std::tuple<
     torch::Tensor,
     torch::Tensor,
     torch::Tensor>
-batch_apply_moves(
+batch_apply_moves_cuda(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    torch::Tensor move_count,
+    torch::Tensor action_codes,
+    torch::Tensor parent_indices);
+#endif
+
+std::tuple<
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor>
+batch_apply_moves_cpu(
     torch::Tensor board,
     torch::Tensor marks_black,
     torch::Tensor marks_white,
@@ -883,6 +886,72 @@ batch_apply_moves(
         out_forced_removals_done,
         out_move_count,
     };
+}
+
+std::tuple<
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor>
+batch_apply_moves(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    torch::Tensor move_count,
+    torch::Tensor action_codes,
+    torch::Tensor parent_indices) {
+    if (board.device().is_cuda()) {
+#if defined(V0_HAS_CUDA_APPLY_MOVES)
+        return batch_apply_moves_cuda(
+            std::move(board),
+            std::move(marks_black),
+            std::move(marks_white),
+            std::move(phase),
+            std::move(current_player),
+            std::move(pending_marks_required),
+            std::move(pending_marks_remaining),
+            std::move(pending_captures_required),
+            std::move(pending_captures_remaining),
+            std::move(forced_removals_done),
+            std::move(move_count),
+            std::move(action_codes),
+            std::move(parent_indices));
+#else
+        TORCH_CHECK(
+            false,
+            "batch_apply_moves: requested CUDA tensors but CUDA kernels were not built. "
+            "Rebuild with -DBUILD_CUDA_KERNELS=ON to enable GPU support.");
+#endif
+    }
+
+    return batch_apply_moves_cpu(
+        std::move(board),
+        std::move(marks_black),
+        std::move(marks_white),
+        std::move(phase),
+        std::move(current_player),
+        std::move(pending_marks_required),
+        std::move(pending_marks_remaining),
+        std::move(pending_captures_required),
+        std::move(pending_captures_remaining),
+        std::move(forced_removals_done),
+        std::move(move_count),
+        std::move(action_codes),
+        std::move(parent_indices));
 }
 
 }  // namespace v0

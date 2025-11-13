@@ -45,7 +45,7 @@ The top-level `CMakeLists.txt` builds a single `v0_core` extension that links al
 ## Next Steps / TODO
 
 1. **GPU legality & move kernels**  
-   - `fast_legal_mask` now has a CUDA path (`src/game/fast_legal_mask_cuda.cu`) that builds behind `-DBUILD_CUDA_KERNELS=ON` and is covered by `tests/test_fast_legal_mask_cuda.py`. Next step is to port `fast_apply_moves` so the expansion chain can stay on device.
+   - Both `fast_legal_mask` and `fast_apply_moves` now have CUDA paths (`src/game/fast_legal_mask_cuda.cu`, `src/game/fast_apply_moves_cuda.cu`) guarded by `-DBUILD_CUDA_KERNELS=ON`, with parity tests (`tests/test_fast_legal_mask_cuda.py`, `tests/test_fast_apply_moves_cuda.py`). The remaining work here is wiring these kernels through the rest of the pipeline (projected policy, TensorStateBatch, etc.) so expansion never leaves the GPU.
 2. **MCTSCore pointer/index hygiene**  
    - Finish replacing all long-lived `Node&` references with index lookups (selection / virtual loss / backprop) to avoid reallocation hazards when `std::vector<Node>` grows.
 3. **Tensor batch direct-to-GPU path**  
