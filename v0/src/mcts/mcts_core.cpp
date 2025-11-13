@@ -296,35 +296,36 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         DebugLog("ExpandBatch: NN outputs log_p shape " + ShapeToString(log_p1) +
             ", values shape " + ShapeToString(values));
 
-        auto [legal_mask_cpu, metadata_cpu] = encode_actions_fast(
-            batch_cpu.board,
-            batch_cpu.marks_black.to(torch::kBool),
-        batch_cpu.marks_white.to(torch::kBool),
-        batch_cpu.phase,
-        batch_cpu.current_player,
-        batch_cpu.pending_marks_required,
-        batch_cpu.pending_marks_remaining,
-        batch_cpu.pending_captures_required,
-        batch_cpu.pending_captures_remaining,
-            batch_cpu.forced_removals_done,
+        auto [legal_mask_device, metadata_device] = encode_actions_fast(
+            batch_device.board,
+            batch_device.marks_black.to(torch::kBool),
+            batch_device.marks_white.to(torch::kBool),
+            batch_device.phase,
+            batch_device.current_player,
+            batch_device.pending_marks_required,
+            batch_device.pending_marks_remaining,
+            batch_device.pending_captures_required,
+            batch_device.pending_captures_remaining,
+            batch_device.forced_removals_done,
             kPlacementDim,
             kMovementDim,
             kSelectionDim,
             kAuxiliaryDim);
-        DebugLog("ExpandBatch: legal mask shape " + ShapeToString(legal_mask_cpu));
+        DebugLog("ExpandBatch: legal mask shape " + ShapeToString(legal_mask_device));
 
-        auto legal_mask = legal_mask_cpu.to(log_p1.device());
         auto [probs, _] = project_policy_logits_fast(
-        log_p1,
-        log_p2,
-        log_pmc,
-        legal_mask,
-        kPlacementDim,
-        kMovementDim,
+            log_p1,
+            log_p2,
+            log_pmc,
+            legal_mask_device,
+            kPlacementDim,
+            kMovementDim,
             kSelectionDim,
             kAuxiliaryDim);
         auto probs_cpu = probs.to(torch::kCPU);
         auto values_cpu = values.to(torch::kCPU);
+        auto legal_mask_cpu = legal_mask_device.to(torch::kCPU);
+        auto metadata_cpu = metadata_device.to(torch::kCPU);
         DebugLog("ExpandBatch: projected policy shape " + ShapeToString(probs_cpu));
 
     std::vector<int> parent_indices;
@@ -391,20 +392,25 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
             }
 
             DebugLog("ExpandBatch: applying moves for total_actions=" + std::to_string(action_codes.size()));
+            const auto tensor_device = batch_device.board.device();
+            torch::Tensor action_tensor_device =
+                tensor_device.is_cpu() ? action_tensor : action_tensor.to(tensor_device);
+            torch::Tensor parent_tensor_device =
+                tensor_device.is_cpu() ? parent_tensor : parent_tensor.to(tensor_device);
             auto next_batch = batch_apply_moves(
-                batch_cpu.board,
-                batch_cpu.marks_black,
-                batch_cpu.marks_white,
-                batch_cpu.phase,
-                batch_cpu.current_player,
-                batch_cpu.pending_marks_required,
-                batch_cpu.pending_marks_remaining,
-                batch_cpu.pending_captures_required,
-                batch_cpu.pending_captures_remaining,
-                batch_cpu.forced_removals_done,
-                batch_cpu.move_count,
-                action_tensor,
-                parent_tensor);
+                batch_device.board,
+                batch_device.marks_black,
+                batch_device.marks_white,
+                batch_device.phase,
+                batch_device.current_player,
+                batch_device.pending_marks_required,
+                batch_device.pending_marks_remaining,
+                batch_device.pending_captures_required,
+                batch_device.pending_captures_remaining,
+                batch_device.forced_removals_done,
+                batch_device.move_count,
+                action_tensor_device,
+                parent_tensor_device);
 
             TensorStateBatch child_batch{
                 std::get<0>(next_batch),
