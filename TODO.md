@@ -98,3 +98,4 @@ TODO以产生时间为准。
 ### 2025.11.13
 
 - [ ] 训练时可以random训练或者是先训练后面那部分，再逐渐往前训练直至收敛
+- [ ] v0 CUDA benchmarking: the current benchmark supports specs like `tensor_device=cpu:forward_device=cuda`, but MCTSCore still assumes legal masks and logits live on the same device (`project_policy_logits_fast` requires aligned devices). To benchmark "forward on CUDA while the tree stays on CPU", we need to add device-alignment/copy logic inside `ExpandBatch`, then rerun the tool to quantify the CUDA kernels' benefit.

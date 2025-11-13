@@ -57,10 +57,10 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16, help="Leaf batch size for both implementations.")
     parser.add_argument("--dump-policies", action="store_true", help="Print move/prob pairs for each run.")
     parser.add_argument(
-        "--fwd-device",
+        "--device",
         type=str,
         default="cpu",
-        help="Device used for both legacy and v0 forward passes (e.g. 'cpu', 'cuda', 'cuda:0').",
+        help="Device used for both legacy and v0(e.g. 'cpu', 'cuda', 'cuda:0').",
     )
     parser.add_argument("--timing", action="store_true", help="Include per-sample timing lines (default summary only).")
     parser.add_argument("--seed", type=int, default=42, help="Base RNG seed for reproducibility.")
@@ -71,8 +71,8 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     rng = random.Random(args.seed + 1)
-    fwd_device = torch.device(args.fwd_device)
-    model = ChessNet(board_size=GameState.BOARD_SIZE).to(fwd_device)
+    device = torch.device(args.device)
+    model = ChessNet(board_size=GameState.BOARD_SIZE).to(device)
     model.eval()
 
     legacy_times: list[float] = []
@@ -94,7 +94,7 @@ def main() -> None:
             num_simulations=args.sims,
             exploration_weight=1.0,
             temperature=1.0,
-            device=args.fwd_device,
+            device=args.device,
             add_dirichlet_noise=False,
             virtual_loss_weight=0.0,
             batch_K=args.batch_size,
@@ -105,7 +105,7 @@ def main() -> None:
             num_simulations=args.sims,
             exploration_weight=1.0,
             temperature=1.0,
-            device=args.fwd_device,
+            device=args.device,
             add_dirichlet_noise=False,
             seed=args.seed,
             batch_K=args.batch_size,

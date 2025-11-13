@@ -295,6 +295,7 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         TensorStateBatch batch_device =
             config_.device.is_cpu() ? batch_cpu : batch_cpu.To(config_.device);
         torch::Tensor inputs = BuildModelInputs(batch_device);
+        DebugLog("ExpandBatch: inputs device " + inputs.device().str());
         if (!forward_cb_) {
             throw std::runtime_error("Forward callback not set for MCTSCore.");
         }
@@ -307,6 +308,8 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         }
         DebugLog("ExpandBatch: NN outputs log_p shape " + ShapeToString(log_p1) +
             ", values shape " + ShapeToString(values));
+        DebugLog("ExpandBatch: NN outputs devices log_p=" + log_p1.device().str() +
+            " values=" + values.device().str());
 
         auto [legal_mask_device, metadata_device] = encode_actions_fast(
             batch_device.board,
