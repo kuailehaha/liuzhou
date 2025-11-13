@@ -382,7 +382,7 @@ def test_fast_apply_moves_cuda_performance_smoke() -> None:
 
     batch = _random_apply_batch(NUM_ACTIONS)
 
-    runs = 5
+    runs = 100
     cpu_times: List[float] = []
     cuda_times: List[float] = []
 

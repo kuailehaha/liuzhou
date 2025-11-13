@@ -4,6 +4,10 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(TORCH_CUDA_AVAILABLE)
+#include <c10/cuda/CUDAGuard.h>
+#endif
+
 namespace v0 {
 
 namespace {
@@ -168,17 +172,33 @@ std::vector<GameState> ToGameStates(const TensorStateBatch& batch) {
     const int64_t batch_size = batch.board.size(0);
     const int64_t cell_count = batch.board.size(1) * batch.board.size(2);
 
-    auto board_cpu = batch.board.to(torch::kCPU, torch::kInt8);
-    auto marks_black_cpu = batch.marks_black.to(torch::kCPU, torch::kBool);
-    auto marks_white_cpu = batch.marks_white.to(torch::kCPU, torch::kBool);
-    auto phase_cpu = batch.phase.to(torch::kCPU, torch::kInt64);
-    auto current_cpu = batch.current_player.to(torch::kCPU, torch::kInt64);
-    auto pending_marks_required_cpu = batch.pending_marks_required.to(torch::kCPU, torch::kInt64);
-    auto pending_marks_remaining_cpu = batch.pending_marks_remaining.to(torch::kCPU, torch::kInt64);
-    auto pending_captures_required_cpu = batch.pending_captures_required.to(torch::kCPU, torch::kInt64);
-    auto pending_captures_remaining_cpu = batch.pending_captures_remaining.to(torch::kCPU, torch::kInt64);
-    auto forced_removals_cpu = batch.forced_removals_done.to(torch::kCPU, torch::kInt64);
-    auto move_count_cpu = batch.move_count.to(torch::kCPU, torch::kInt64);
+    const bool source_is_cuda = batch.board.device().is_cuda();
+
+#if defined(TORCH_CUDA_AVAILABLE)
+    c10::optional<at::cuda::CUDAGuard> guard;
+    if (source_is_cuda) {
+        guard.emplace(batch.board.device());
+    }
+#endif
+
+    auto to_cpu = [&](const torch::Tensor& src, torch::ScalarType dtype) {
+        if (src.device().is_cpu() && src.scalar_type() == dtype) {
+            return src.contiguous();
+        }
+        return src.to(torch::kCPU, dtype, /*non_blocking=*/false, /*copy=*/true).contiguous();
+    };
+
+    auto board_cpu = to_cpu(batch.board, torch::kInt8);
+    auto marks_black_cpu = to_cpu(batch.marks_black, torch::kBool);
+    auto marks_white_cpu = to_cpu(batch.marks_white, torch::kBool);
+    auto phase_cpu = to_cpu(batch.phase, torch::kInt64);
+    auto current_cpu = to_cpu(batch.current_player, torch::kInt64);
+    auto pending_marks_required_cpu = to_cpu(batch.pending_marks_required, torch::kInt64);
+    auto pending_marks_remaining_cpu = to_cpu(batch.pending_marks_remaining, torch::kInt64);
+    auto pending_captures_required_cpu = to_cpu(batch.pending_captures_required, torch::kInt64);
+    auto pending_captures_remaining_cpu = to_cpu(batch.pending_captures_remaining, torch::kInt64);
+    auto forced_removals_cpu = to_cpu(batch.forced_removals_done, torch::kInt64);
+    auto move_count_cpu = to_cpu(batch.move_count, torch::kInt64);
 
     const int8_t* board_ptr = board_cpu.data_ptr<int8_t>();
     const bool* marks_black_ptr = marks_black_cpu.data_ptr<bool>();

@@ -272,7 +272,7 @@ def test_fast_legal_mask_cuda_performance_smoke() -> None:
     # reuse same batch for fair comparison
     batch_cpu = _random_cpu_batch(NUM_STATES)
 
-    runs = 5
+    runs = 100
     cpu_times_ms = []
     cuda_times_ms = []
 

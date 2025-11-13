@@ -11,6 +11,12 @@
 
 #include <pybind11/pybind11.h>
 
+#include <c10/util/Optional.h>
+
+#if defined(TORCH_CUDA_AVAILABLE)
+#include <c10/cuda/CUDAGuard.h>
+#endif
+
 #include "v0/fast_apply_moves.hpp"
 #include "v0/fast_legal_mask.hpp"
 #include "v0/net_encoding.hpp"
@@ -241,6 +247,12 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         if (leaves.empty()) {
             return;
         }
+#if defined(TORCH_CUDA_AVAILABLE)
+        c10::optional<at::cuda::CUDAGuard> device_guard;
+        if (config_.device.is_cuda()) {
+            device_guard.emplace(config_.device);
+        }
+#endif
         DebugLog("ExpandBatch start: leaves=" + std::to_string(leaves.size()) +
             ", nodes=" + std::to_string(nodes_.size()));
 
