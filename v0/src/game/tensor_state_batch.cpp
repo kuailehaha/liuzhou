@@ -70,22 +70,30 @@ TensorStateBatch FromGameStates(
     const auto norm_device = NormalizeDevice(device);
     const int64_t batch_size = static_cast<int64_t>(states.size());
     const int64_t cell_count = kCellCount;
+    const bool target_cuda = norm_device.is_cuda();
 
-    auto board = torch::zeros(
-        {batch_size, kBoardSize, kBoardSize},
-        TensorOptionsForDevice(torch::kInt8, norm_device));
-    auto marks_black = torch::zeros_like(board, TensorOptionsForDevice(torch::kBool, norm_device));
-    auto marks_white = torch::zeros_like(board, TensorOptionsForDevice(torch::kBool, norm_device));
+    const auto cpu_device = torch::Device(torch::kCPU);
+    auto cpu_options = [&](torch::ScalarType dtype) {
+        auto opts = TensorOptionsForDevice(dtype, cpu_device);
+        if (target_cuda) {
+            opts = opts.pinned_memory(true);
+        }
+        return opts;
+    };
 
-    auto phase = torch::empty(batch_size, TensorOptionsForDevice(torch::kInt64, norm_device));
-    auto current_player = torch::empty(batch_size, TensorOptionsForDevice(torch::kInt64, norm_device));
-    auto pending_marks_required = torch::empty(batch_size, TensorOptionsForDevice(torch::kInt64, norm_device));
-    auto pending_marks_remaining = torch::empty(batch_size, TensorOptionsForDevice(torch::kInt64, norm_device));
-    auto pending_captures_required = torch::empty(batch_size, TensorOptionsForDevice(torch::kInt64, norm_device));
-    auto pending_captures_remaining = torch::empty(batch_size, TensorOptionsForDevice(torch::kInt64, norm_device));
-    auto forced_removals_done = torch::empty(batch_size, TensorOptionsForDevice(torch::kInt64, norm_device));
-    auto move_count = torch::empty(batch_size, TensorOptionsForDevice(torch::kInt64, norm_device));
-    auto mask_alive = torch::ones(batch_size, TensorOptionsForDevice(torch::kBool, norm_device));
+    auto board = torch::zeros({batch_size, kBoardSize, kBoardSize}, cpu_options(torch::kInt8));
+    auto marks_black = torch::zeros({batch_size, kBoardSize, kBoardSize}, cpu_options(torch::kBool));
+    auto marks_white = torch::zeros({batch_size, kBoardSize, kBoardSize}, cpu_options(torch::kBool));
+
+    auto phase = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto current_player = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto pending_marks_required = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto pending_marks_remaining = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto pending_captures_required = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto pending_captures_remaining = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto forced_removals_done = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto move_count = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto mask_alive = torch::ones(batch_size, cpu_options(torch::kBool));
 
     auto board_ptr = board.data_ptr<int8_t>();
     auto marks_black_ptr = marks_black.data_ptr<bool>();
@@ -120,7 +128,7 @@ TensorStateBatch FromGameStates(
         move_count_ptr[b] = state.move_count;
     }
 
-    TensorStateBatch batch{
+    TensorStateBatch host_batch{
         board,
         marks_black,
         marks_white,
@@ -134,7 +142,26 @@ TensorStateBatch FromGameStates(
         move_count,
         mask_alive,
         kBoardSize};
-    return batch;
+
+    if (!target_cuda) {
+        return host_batch;
+    }
+
+    TensorStateBatch device_batch;
+    device_batch.board = host_batch.board.to(norm_device, /*non_blocking=*/true);
+    device_batch.marks_black = host_batch.marks_black.to(norm_device, true);
+    device_batch.marks_white = host_batch.marks_white.to(norm_device, true);
+    device_batch.phase = host_batch.phase.to(norm_device, true);
+    device_batch.current_player = host_batch.current_player.to(norm_device, true);
+    device_batch.pending_marks_required = host_batch.pending_marks_required.to(norm_device, true);
+    device_batch.pending_marks_remaining = host_batch.pending_marks_remaining.to(norm_device, true);
+    device_batch.pending_captures_required = host_batch.pending_captures_required.to(norm_device, true);
+    device_batch.pending_captures_remaining = host_batch.pending_captures_remaining.to(norm_device, true);
+    device_batch.forced_removals_done = host_batch.forced_removals_done.to(norm_device, true);
+    device_batch.move_count = host_batch.move_count.to(norm_device, true);
+    device_batch.mask_alive = host_batch.mask_alive.to(norm_device, true);
+    device_batch.board_size = host_batch.board_size;
+    return device_batch;
 }
 
 std::vector<GameState> ToGameStates(const TensorStateBatch& batch) {
