@@ -326,6 +326,7 @@ __global__ void EncodeActionsKernel(
 
     bool has_movement = false;
     if (phase_val == kPhaseMovement) {
+        const Directions dirs[4] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
         for (int r = 0; r < size; ++r) {
             for (int c = 0; c < size; ++c) {
                 const int base_idx = flat_index(r, c, size);
@@ -333,8 +334,8 @@ __global__ void EncodeActionsKernel(
                     continue;
                 }
                 for (int dir = 0; dir < 4; ++dir) {
-                    const int nr = r + kDirections[dir].dr;
-                    const int nc = c + kDirections[dir].dc;
+                    const int nr = r + dirs[dir].dr;
+                    const int nc = c + dirs[dir].dc;
                     if (nr >= 0 && nr < size && nc >= 0 && nc < size) {
                         const int dest_idx = flat_index(nr, nc, size);
                         if (board_state[dest_idx] == 0) {
