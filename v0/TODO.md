@@ -106,3 +106,6 @@ TODO以产生时间为准。
 - [x] 实现 `python v0/generate_data.py`，可指定模型 checkpoint/算力配置批量生成样本并落盘。
 - [x] `v0/train.py` 支持 `--data_files` 离线训练模式，或用 `--save_self_play_dir` 将在线自博弈数据自动写入 `v0/data/self_play`。
 - [ ] 后续：给数据生成/训练脚本补 README 片段，写明 JSONL 结构、metadata 字段、典型命令。
+- [ ] 排查：动作空间是否相同？
+- [ ] 排查：verify_v0速度优化12倍，benchmark速度为何只优化3倍？
+
