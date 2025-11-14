@@ -237,7 +237,7 @@ std::vector<int> generate_capture_targets(
     for (int r = 0; r < size; ++r) {
         for (int c = 0; c < size; ++c) {
             int idx = flat_index(r, c, size);
-            if (board[idx] == opponent_value && is_marked(opponent_marked, idx)) {
+            if (board[idx] == opponent_value) {
                 candidates.push_back(idx);
             }
         }

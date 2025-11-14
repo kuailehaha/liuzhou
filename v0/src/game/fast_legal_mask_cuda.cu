@@ -203,7 +203,7 @@ __device__ void GenerateCaptureTargets(
     IndexList candidates;
     candidates.Clear();
     for (int idx = 0; idx < size * size; ++idx) {
-        if (board[idx] == opponent_value && DeviceIsMarked(opponent_marked, idx)) {
+        if (board[idx] == opponent_value) {
             candidates.Push(idx);
         }
     }
