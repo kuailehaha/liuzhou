@@ -31,6 +31,13 @@ using ForwardCallback = std::function<
 
 class MCTSCore {
    public:
+    struct ChildStats {
+        int action_index{-1};
+        double prior{0.0};
+        double visit_count{0.0};
+        double value_sum{0.0};
+    };
+
     explicit MCTSCore(MCTSConfig config);
 
     void SetForwardCallback(ForwardCallback cb);
@@ -45,6 +52,8 @@ class MCTSCore {
     void AdvanceRoot(int action_index);
 
     double RootValue() const;
+    double RootVisitCount() const;
+    std::vector<ChildStats> GetRootChildrenStats() const;
 
     const GameState& RootState() const;
 

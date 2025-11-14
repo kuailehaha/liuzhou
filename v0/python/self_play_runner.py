@@ -67,6 +67,7 @@ def self_play_single_game_v0(
         dirichlet_epsilon=dirichlet_epsilon,
         batch_K=batch_leaves,
         seed=seed,
+        verbose=mcts_verbose,
     )
 
     state = GameState()
@@ -85,6 +86,7 @@ def self_play_single_game_v0(
                 f"[Self-Play] Move {move_count + 1} | player={player} | "
                 f"temperature={current_temp:.2f} | legal_moves={len(moves)}"
             )
+            print(state)
 
         policy = np.asarray(policy, dtype=np.float64)
         if policy.size and policy.sum() <= 0:
@@ -105,6 +107,11 @@ def self_play_single_game_v0(
         state = apply_move(state, move, quiet=True)
         mcts.advance_root(move)
         move_count += 1
+
+        if verbose:
+            chosen_prob = float(policy[int(move_idx)]) if policy.size > 0 else 0.0
+            print(f"[Self-Play] Selected move: {move} | policy_prob={chosen_prob:.4f}")
+            print(state)
 
         winner = state.get_winner()
         if winner is not None:

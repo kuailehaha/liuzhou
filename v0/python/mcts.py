@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import math
 import numpy as np
 import torch
 
@@ -73,10 +74,12 @@ class MCTS:
         dirichlet_epsilon: float = 0.25,
         batch_K: int = 16,
         seed: int = 12345,
+        verbose: bool = False,
     ) -> None:
         self.model = model
         self.spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC
         self.device = torch.device(device)
+        self.verbose = bool(verbose)
         self.params = MCTSParams(
             num_simulations=num_simulations,
             exploration_weight=exploration_weight,
@@ -127,6 +130,70 @@ class MCTS:
             self._current_state = state.copy()
             self._root_signature = signature
 
+    def _log_search(
+        self,
+        state: GameState,
+        moves: List[dict],
+        probs: np.ndarray,
+        action_to_move: Dict[int, dict],
+        action_to_policy: Dict[int, float],
+    ) -> None:
+        print(
+            f"\n[v0.MCTS] root_player={state.current_player.name} "
+            f"| temperature={self.params.temperature:.2f} | legal_moves={len(moves)}"
+        )
+        print(state)
+        if not moves:
+            print("  (no legal moves from this state)")
+            return
+
+        child_stats = self._core.get_root_children_stats()
+        parent_visit = max(1.0, float(getattr(self._core, "root_visit_count", 0.0) or 0.0))
+        rows = []
+        for stats in child_stats:
+            action_idx = int(stats.get("action_index", -1))
+            move = action_to_move.get(action_idx)
+            if move is None:
+                continue
+            visit = float(stats.get("visit_count", 0.0))
+            value_sum = float(stats.get("value_sum", 0.0))
+            prior = float(stats.get("prior", 0.0))
+            q_value = value_sum / visit if visit > 0 else 0.0
+            u_value = self.params.exploration_weight * prior * math.sqrt(parent_visit) / (1.0 + visit)
+            policy_prob = action_to_policy.get(action_idx, 0.0)
+            rows.append(
+                {
+                    "visit": visit,
+                    "q": q_value,
+                    "p": prior,
+                    "u": u_value,
+                    "pu": q_value + u_value,
+                    "pi": policy_prob,
+                    "move": move,
+                }
+            )
+
+        rows.sort(key=lambda item: item["visit"], reverse=True)
+        if not rows:
+            print("  (no child stats available)")
+        else:
+            print("  -- Root children (sorted by visit count) --")
+            for idx, row in enumerate(rows, start=1):
+                print(
+                    f"  [{idx:02d}] N={row['visit']:5.0f} | Q={row['q']:+.3f} | "
+                    f"P={row['p']:.3f} | U={row['u']:.3f} | Q+U={row['pu']:+.3f} | "
+                    f"pi={row['pi']:.3f} | move={row['move']}"
+                )
+
+        if len(moves) > 1:
+            sorted_idx = np.argsort(probs)[::-1]
+            topk = min(10, len(sorted_idx))
+            print("  -- Policy ranking --")
+            for rank in range(topk):
+                idx = sorted_idx[rank]
+                print(f"    #{rank + 1:02d} pi={probs[idx]:.3f} move={moves[idx]}")
+        print("-" * 48)
+
     # ------------------------------------------------------------------ Public API
 
     def search(self, state: GameState) -> Tuple[List[dict], np.ndarray]:
@@ -156,11 +223,16 @@ class MCTS:
 
         moves: List[dict] = []
         probs: List[float] = []
+        action_ids: List[int] = []
+        action_to_move: Dict[int, dict] = {}
         for (idx, prob), move in zip(policy_pairs, decoded):
             if move is None:
                 continue
+            idx_int = int(idx)
             moves.append(move)
             probs.append(float(prob))
+            action_ids.append(idx_int)
+            action_to_move[idx_int] = move
 
         if not moves:
             return [], np.array([], dtype=float)
@@ -171,6 +243,15 @@ class MCTS:
             probs_array[:] = 1.0 / len(probs_array)
         else:
             probs_array /= total
+
+        if action_ids:
+            action_to_policy = {action_ids[i]: float(probs_array[i]) for i in range(len(action_ids))}
+        else:
+            action_to_policy = {}
+
+        if self.verbose:
+            self._log_search(state, moves, probs_array, action_to_move, action_to_policy)
+
         return moves, probs_array
 
     def advance_root(self, move: dict) -> None:

@@ -154,6 +154,33 @@ double MCTSCore::RootValue() const {
     return root.value_sum / root.visit_count;
 }
 
+double MCTSCore::RootVisitCount() const {
+    if (root_index_ < 0) {
+        return 0.0;
+    }
+    const Node& root = nodes_[root_index_];
+    return root.visit_count;
+}
+
+std::vector<MCTSCore::ChildStats> MCTSCore::GetRootChildrenStats() const {
+    std::vector<ChildStats> stats;
+    if (root_index_ < 0) {
+        return stats;
+    }
+    const Node& root = nodes_[root_index_];
+    stats.reserve(root.children.size());
+    for (int child_idx : root.children) {
+        const Node& child = nodes_[child_idx];
+        stats.push_back(ChildStats{
+            child.action_index,
+            child.prior,
+            child.visit_count,
+            child.value_sum,
+        });
+    }
+    return stats;
+}
+
 std::vector<int> MCTSCore::SelectPath() {
     std::vector<int> path;
     if (root_index_ < 0) {

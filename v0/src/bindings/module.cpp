@@ -510,8 +510,23 @@ PYBIND11_MODULE(v0_core, m) {
                 return core.GetPolicy(temperature);
             },
             py::arg("temperature") = 1.0)
+        .def(
+            "get_root_children_stats",
+            [](const v0::MCTSCore& core) {
+                py::list result;
+                for (const auto& stats : core.GetRootChildrenStats()) {
+                    py::dict entry;
+                    entry["action_index"] = stats.action_index;
+                    entry["prior"] = stats.prior;
+                    entry["visit_count"] = stats.visit_count;
+                    entry["value_sum"] = stats.value_sum;
+                    result.append(entry);
+                }
+                return result;
+            })
         .def("advance_root", &v0::MCTSCore::AdvanceRoot, py::arg("action_index"))
         .def_property_readonly("root_value", &v0::MCTSCore::RootValue)
+        .def_property_readonly("root_visit_count", &v0::MCTSCore::RootVisitCount)
         .def_property_readonly("root_state", &v0::MCTSCore::RootState, py::return_value_policy::reference_internal);
 
     m.def(
