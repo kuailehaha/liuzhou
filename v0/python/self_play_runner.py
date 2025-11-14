@@ -52,6 +52,7 @@ def self_play_single_game_v0(
     batch_leaves: int,
     seed: int,
     verbose: bool = False,
+    mcts_verbose: bool = False,
     soft_value_k: float = 2.0,
 ) -> Tuple[List[GameState], List[np.ndarray], float, float]:
     rng = np.random.default_rng(seed)
