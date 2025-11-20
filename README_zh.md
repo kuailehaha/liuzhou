@@ -130,16 +130,6 @@
 该规则集与当前代码逻辑（`rule_engine.py`、`move_generator.py`、以及 Monte Carlo 搜索模块）一致。
 在编写测试、调试游戏逻辑或将引擎移植到其他语言时，请以此文档为权威参考。
 
----
-
-## ♺️ 张量化管线（Tensorized Pipeline）
-
-- 1/net/encoding.states_to_model_input 在批量级别将 GameState 结构转换为网络需要的 (B, C, H, W) 形状。
-- 1/mcts/vectorized_mcts.VectorizedMCTS 直接对这些形状进行批量 MCTS 检索，支持温度控制和 Dirichlet 噪声参数（VectorizedMCTSConfig 中搜集）。
-- project_policy_logits 保证自单双端对 logits 的遮罩/归一逻辑完全一致，总括 MCTS 、自学和训练。
-- 	ools/cross_check_policy_projection.py 与 	ools/cross_check_mcts.py 用于对比 v1 和 legacy 管线的分布结果。
-
-在 v1 环路中，state_to_tensor 已不再出现；若需回到 legacy 流程，只需使用 src/ 中的原始模块。
 
 ## 📂 代码结构（Code Structure）
 
@@ -222,3 +212,4 @@
 保存检查点 → 下一迭代
 
 ```
+
