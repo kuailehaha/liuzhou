@@ -544,7 +544,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--self_play_batch_leaves",
         type=int,
-        default=32,
+        default=256,
         help="Number of leaf evaluations batched together inside v0 MCTS.",
     )
     parser.add_argument(
