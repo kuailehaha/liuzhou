@@ -1,11 +1,11 @@
 """
-Batch runner for the v1 test matrix (accuracy, performance, smoke suites).
+Batch runner for the test matrix (legacy, v0, integration, benchmark suites).
 
 Usage examples:
   python -m tools.run_test_matrix                # run all groups
-  python -m tools.run_test_matrix --group accuracy --group performance
+  python -m tools.run_test_matrix --group legacy --group v0
   python -m tools.run_test_matrix --dry-run      # print commands only
-  python -m tools.run_test_matrix --pytest-args -k fast
+  python -m tools.run_test_matrix --pytest-args -k mcts
 """
 
 from __future__ import annotations
@@ -38,109 +38,102 @@ class TestJob:
 
 
 TEST_GROUPS = {
-    "accuracy": [
+    "legacy": [
         TestJob(
-            name="fast_apply_moves_accuracy",
-            log_path=Path("tests/result/apply_moves_accuracy.txt"),
+            name="legacy_mcts",
+            log_path=Path("tests/result/legacy_mcts.txt"),
             kind="pytest",
-            test_path=Path("tests/v1/test_fast_apply_moves.py"),
-            pytest_args=("-q",),
+            test_path=Path("tests/legacy/test_mcts.py"),
+            pytest_args=("-v",),
         ),
         TestJob(
-            name="policy_projection_fast_accuracy",
-            log_path=Path("tests/result/policy_proj_accuracy.txt"),
+            name="legacy_self_play",
+            log_path=Path("tests/result/legacy_self_play.txt"),
             kind="pytest",
-            test_path=Path("tests/v1/test_policy_projection_fast_accuracy.py"),
-            pytest_args=("-q",),
-        ),
-        TestJob(
-            name="policy_projection_regression",
-            log_path=Path("tests/result/policy_projection_regression.txt"),
-            kind="pytest",
-            test_path=Path("tests/v1/test_policy_projection.py"),
-            pytest_args=("-q",),
-        ),
-        TestJob(
-            name="move_encoder_accuracy",
-            log_path=Path("tests/result/move_encoder_accuracy.txt"),
-            kind="pytest",
-            test_path=Path("tests/v1/test_move_encoder.py"),
-            pytest_args=("-q",),
+            test_path=Path("tests/legacy/test_self_play.py"),
+            pytest_args=("-v",),
         ),
     ],
-    "performance": [
+    "v0": [
         TestJob(
-            name="fast_apply_moves_performance",
-            log_path=Path("tools/result/apply_moves_perf.txt"),
+            name="v0_actions",
+            log_path=Path("tests/result/v0_actions.txt"),
             kind="pytest",
-            test_path=Path("tests/v1/test_fast_apply_moves_performance.py"),
-            pytest_args=("-s",),
+            test_path=Path("tests/v0/test_actions.py"),
+            pytest_args=("-v",),
         ),
         TestJob(
-            name="policy_projection_fast_performance",
-            log_path=Path("tools/result/policy_proj_perf.txt"),
+            name="v0_state_batch",
+            log_path=Path("tests/result/v0_state_batch.txt"),
             kind="pytest",
-            test_path=Path("tests/v1/test_policy_projection_fast_performance.py"),
-            pytest_args=("-s",),
+            test_path=Path("tests/v0/test_state_batch.py"),
+            pytest_args=("-v",),
         ),
         TestJob(
-            name="legal_mask_benchmark_cli",
-            log_path=Path("tools/result/legal_mask_bench.txt"),
+            name="v0_mcts",
+            log_path=Path("tests/result/v0_mcts.txt"),
+            kind="pytest",
+            test_path=Path("tests/v0/test_mcts.py"),
+            pytest_args=("-v",),
+        ),
+    ],
+    "v0_cuda": [
+        TestJob(
+            name="v0_cuda_apply_moves",
+            log_path=Path("tests/result/v0_cuda_apply_moves.txt"),
+            kind="pytest",
+            test_path=Path("tests/v0/cuda/test_fast_apply_moves_cuda.py"),
+            pytest_args=("-v",),
+        ),
+        TestJob(
+            name="v0_cuda_legal_mask",
+            log_path=Path("tests/result/v0_cuda_legal_mask.txt"),
+            kind="pytest",
+            test_path=Path("tests/v0/cuda/test_fast_legal_mask_cuda.py"),
+            pytest_args=("-v",),
+        ),
+    ],
+    "integration": [
+        TestJob(
+            name="integration_self_play",
+            log_path=Path("tests/result/integration_self_play.txt"),
+            kind="pytest",
+            test_path=Path("tests/integration/test_self_play.py"),
+            pytest_args=("-v",),
+        ),
+    ],
+    "random_agent": [
+        TestJob(
+            name="random_agent",
+            log_path=Path("tests/result/random_agent.txt"),
             kind="cli",
-            module="tools.benchmark_legal_mask",
-            # defaults align with TEST_README.md; can be overridden via --pytest-args passthrough not applicable to CLI
+            module="tests.random_agent.run_tests",
+            cli_args=("basic", "-n", "10", "-s", "42"),
+        ),
+    ],
+    "benchmark": [
+        TestJob(
+            name="benchmark_mcts",
+            log_path=Path("tools/result/benchmark_mcts.txt"),
+            kind="cli",
+            module="tools.benchmark_mcts",
             cli_args=(
-                "--states", "1000",
-                "--batch-size", "64",
-                "--runs", "5",
-                "--max-random-moves", "80",
+                "--samples", "3",
+                "--sims", "32",
                 "--device", "cpu",
-                "--seed", "0",
+                "--skip-legacy",
             ),
         ),
-    ],
-    "smoke": [
         TestJob(
-            name="encoding_compat_smoke",
-            log_path=Path("tests/result/encoding_compat_smoke.txt"),
-            kind="pytest",
-            test_path=Path("tests/v1/test_encoding_compat.py"),
-            pytest_args=("-q",),
-        ),
-        TestJob(
-            name="state_batch_smoke",
-            log_path=Path("tests/result/state_batch_smoke.txt"),
-            kind="pytest",
-            test_path=Path("tests/v1/test_state_batch.py"),
-            pytest_args=("-q",),
-        ),
-        TestJob(
-            name="vectorized_mcts_smoke",
-            log_path=Path("tests/result/vectorized_mcts_smoke.txt"),
-            kind="pytest",
-            test_path=Path("tests/v1/test_vectorized_mcts.py"),
-            pytest_args=("-q",),
-        ),
-        TestJob(
-            name="train_pipeline_smoke",
-            log_path=Path("tests/result/train_pipeline_smoke.txt"),
-            kind="pytest",
-            test_path=Path("tests/v1/test_train_pipeline.py"),
-            pytest_args=("-q",),
-        ),
-        TestJob(
-            name="self_play_runner_smoke",
-            log_path=Path("tests/result/self_play_runner_smoke.txt"),
-            kind="pytest",
-            test_path=Path("tests/v1/test_self_play_runner.py"),
-            pytest_args=("-q",),
-        ),
-        TestJob(
-            name="scaffold_smoke",
-            log_path=Path("tests/result/scaffold_smoke.txt"),
-            kind="pytest",
-            test_path=Path("tests/v1/test_scaffold.py"),
-            pytest_args=("-q",),
+            name="benchmark_self_play",
+            log_path=Path("tools/result/benchmark_self_play.txt"),
+            kind="cli",
+            module="tools.benchmark_self_play",
+            cli_args=(
+                "--num-games", "1",
+                "--mcts-simulations", "16",
+                "--skip-legacy",
+            ),
         ),
     ],
 }
@@ -238,4 +231,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

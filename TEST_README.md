@@ -1,83 +1,133 @@
-# Test Matrix (Accuracy & Performance)
+# Test Matrix (Legacy & v0)
 
-This document standardizes how we validate every native rewrite. Each module must
-ship with:
-
-1. **Accuracy tests** (`tests/` via `pytest`): deterministic parity checks between
-   legacy, tensor‑python, and tensor‑fast implementations.
-2. **Performance benchmarks** (`tools/` scripts): throughput comparisons across
-   legacy / tensor‑python / tensor‑fast.
-
-All new tests should be added to this matrix and follow the conventions below.
+本文档描述项目的测试组织结构和运行方式。
 
 ---
 
-## Global Conventions
+## 目录结构
 
-| Item                     | Requirement                                                                                         |
-| ------------------------ | --------------------------------------------------------------------------------------------------- |
-| Device                   | Default to `cpu`. If a script supports CUDA, call it out explicitly at the top of the file.        |
-| Random seeds (accuracy)  | `rng = random.Random(0xF00DCAFE)` (plus matching `torch.manual_seed` if tensors are used).         |
-| State sampling (accuracy)| `num_states = 10_000`, `max_random_moves = 80`.                                                     |
-| Benchmark CLI            | Use the shared parser signature (see **Benchmark CLI Template**).                                   |
-| Output artifacts         | Accuracy logs → `tests/result/<name>.txt`; Benchmark logs → `tools/result/<name>.txt`.             |
-| Usage strings            | Every test/benchmark file must include a short “Usage” section or module docstring showing the CLI. |
+```
+tests/
+├── legacy/           # legacy (纯 Python) 实现测试
+│   ├── test_mcts.py          # MCTS 单元测试
+│   └── test_self_play.py     # 自我对弈冒烟测试
+│
+├── v0/               # v0 (C++ core) 实现测试
+│   ├── test_actions.py       # action 编码正确性
+│   ├── test_state_batch.py   # state batch 往返正确性
+│   ├── test_mcts.py          # v0 MCTS 正确性
+│   └── cuda/                 # CUDA 相关测试
+│       ├── test_fast_apply_moves_cuda.py
+│       └── test_fast_legal_mask_cuda.py
+│
+├── integration/      # 集成测试
+│   └── test_self_play.py
+│
+└── random_agent/     # 随机智能体测试
+    └── ...
 
-### Benchmark CLI Template
-
-```python
-parser = argparse.ArgumentParser(
-    description="Benchmark <module> throughput across implementations."
-)
-parser.add_argument("--states", type=int, default=1000, help="Number of random states to sample.")
-parser.add_argument("--batch-size", type=int, default=64, help="Chunk size for tensor fast path.")
-parser.add_argument("--runs", type=int, default=5, help="Benchmark repetitions.")
-parser.add_argument("--device", type=str, default="cpu", help="Device (cpu by default; mention if cuda is supported).")
-parser.add_argument("--max-random-moves", type=int, default=80, help="Random rollout depth for sampled states.")
-parser.add_argument("--seed", type=int, default=0, help="Seed for state sampling.")
+tools/
+├── benchmark_mcts.py         # MCTS 性能基准
+├── benchmark_self_play.py    # 自我对弈性能基准
+├── benchmark_cuda.py         # CUDA 设备对比
+├── run_test_matrix.py        # 批量运行测试
+└── get_thread.py             # 线程信息工具
 ```
 
-Scripts may clamp `--device` back to CPU if the underlying kernel lacks CUDA support, but the flag must still exist for parity with other benchmarks.
+---
+
+## 快速开始
+
+### 运行所有测试
+
+```bash
+# 运行 legacy 测试
+pytest tests/legacy/ -v
+
+# 运行 v0 测试
+pytest tests/v0/ -v
+
+# 运行 v0 CUDA 测试 (需要 CUDA)
+pytest tests/v0/cuda/ -v
+
+# 运行集成测试
+pytest tests/integration/ -v
+
+# 运行所有测试
+pytest tests/ -v
+```
+
+### 使用测试矩阵运行器
+
+```bash
+# 运行所有测试组
+python -m tools.run_test_matrix
+
+# 只运行特定组
+python -m tools.run_test_matrix --group legacy --group v0
+
+# 预览命令但不执行
+python -m tools.run_test_matrix --dry-run
+
+# 失败时立即停止
+python -m tools.run_test_matrix --fail-fast
+```
 
 ---
 
-## Accuracy Tests (`pytest` under `tests/`)
+## 测试分组
 
-| File                                        | Purpose / Notes                                                                                     | Usage Example                                                                 | Result File                      |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------- |
-| `tests/v1/test_policy_projection_fast_accuracy.py` | Ensures tensor-fast policy projection matches legacy distributions (uses shared seed & state budget). | `pytest tests/v1/test_policy_projection_fast_accuracy.py -q > tests/result/policy_proj_accuracy.txt` | `tests/result/policy_proj_accuracy.txt` |
-| `tests/v1/test_fast_apply_moves.py`         | Validates C++ `batch_apply_moves` against Python `apply_move` on 10k sampled states.                | `pytest tests/v1/test_fast_apply_moves.py -q > tests/result/apply_moves_accuracy.txt`               | `tests/result/apply_moves_accuracy.txt` |
-
-**Guidelines**
-- Always seed both Python’s `random` and `torch`.
-- Mention the seed and sampling parameters in the docstring or test header.
-- If a native extension is unavailable, the test should `pytest.skip`, but still emit a log to the result file explaining why.
-
----
-
-## Performance Benchmarks (`tools/` or `tests/…_performance.py`)
-
-| File / Module                                           | Notes                                                                                          | Usage Example                                                                                             | Result File                           |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| `tests/v1/test_policy_projection_fast_performance.py`   | Pytest-marked “slow” micro-benchmark for policy projection (legacy vs tensor-python vs C++ fast). | `pytest tests/v1/test_policy_projection_fast_performance.py -s > tools/result/policy_proj_perf.txt`       | `tools/result/policy_proj_perf.txt`   |
-| `tools/benchmark_policy_projection.py`                  | CLI benchmark with batching, summarizing mean ± stdev across runs.                              | `python -m tools.benchmark_policy_projection --states 1000 --batch-size 128 --runs 5 > tools/result/policy_proj_bench.txt` | `tools/result/policy_proj_bench.txt` |
-| `tests/v1/test_fast_apply_moves_performance.py`         | Pytest “slow” benchmark for apply pipeline (uses metadata + fast path).                         | `pytest tests/v1/test_fast_apply_moves_performance.py -s > tools/result/apply_moves_perf.txt`             | `tools/result/apply_moves_perf.txt`   |
-| `tools/benchmark_apply_moves.py`                        | Standalone CLI benchmark for apply_move throughput (CPU only today).                            | `python -m tools.benchmark_apply_moves --states 1000 --runs 5 > tools/result/apply_moves_bench.txt`       | `tools/result/apply_moves_bench.txt`  |
-
-**Guidelines**
-- Benchmarks should reuse the accuracy seed/state sampler when generating scenarios for timing.
-- Always print per-run timings and a final summary in the format `legacy=X ms, tensor-python=Y ms, tensor-fast=Z ms`.
-- When the fast path is unavailable, print “N/A” but keep legacy/tensor-python numbers for reference.
-- Store raw stdout in the corresponding `tools/result/*.txt` file so regressions can be tracked.
+| 组名 | 说明 | 测试文件 |
+|------|------|----------|
+| `legacy` | Legacy Python 实现测试 | `tests/legacy/test_*.py` |
+| `v0` | v0 C++ core 实现测试 | `tests/v0/test_*.py` |
+| `v0_cuda` | v0 CUDA 特定测试 | `tests/v0/cuda/test_*.py` |
+| `integration` | 集成测试 | `tests/integration/test_*.py` |
+| `random_agent` | 随机智能体测试 | `tests/random_agent/` |
+| `benchmark` | 性能基准 (CLI) | `tools/benchmark_*.py` |
 
 ---
 
-## Adding a New Native Implementation
+## 性能基准
 
-1. **Accuracy**: create `tests/v1/test_<module>_accuracy.py` following the seed/state conventions. Update the table above with Usage + result path.
-2. **Performance**: add both a pytest-style micro benchmark and/or a CLI under `tools/`. Ensure the CLI matches the shared parser and logs to `tools/result`.
-3. **Documentation**: append the new entries to this README as soon as the tests land, so future contributors can discover them quickly.
-4. **CI / Local workflow**: before merging a native rewrite, run both accuracy and performance suites, capture the outputs into the result folders, and mention them in the PR summary if relevant.
+```bash
+# MCTS 性能对比 (legacy vs v0)
+python -m tools.benchmark_mcts --samples 10 --sims 128 --device cpu
 
-This single document should stay in sync with the actual test files—treat it as the source of truth for how we validate native kernels.
+# 仅测试 v0 性能
+python -m tools.benchmark_mcts --samples 10 --sims 128 --skip-legacy
 
+# 自我对弈性能
+python -m tools.benchmark_self_play --num-games 4 --mcts-simulations 64
+
+# CUDA vs CPU 对比
+python -m tools.benchmark_cuda --samples 10 --sims 128 --devices cpu,cuda
+```
+
+---
+
+## 约定
+
+| 项目 | 约定 |
+|------|------|
+| 随机种子 (accuracy) | `rng = random.Random(0xF00DCAFE)` + `torch.manual_seed(...)` |
+| 状态采样 (accuracy) | `num_states = 400`, `max_random_moves = 160` |
+| 设备 | 默认 `cpu`，CUDA 测试会自动跳过如果不可用 |
+| 慢速测试 | 使用 `@pytest.mark.slow` 标记，可通过 `-m "not slow"` 排除 |
+
+---
+
+## 结果日志
+
+- 测试日志: `tests/result/*.txt`
+- 基准日志: `tools/result/*.txt`
+
+---
+
+## 添加新测试
+
+1. **Legacy 测试**: 放入 `tests/legacy/test_<name>.py`
+2. **v0 测试**: 放入 `tests/v0/test_<name>.py`
+3. **v0 CUDA 测试**: 放入 `tests/v0/cuda/test_<name>.py`
+4. **性能基准**: 放入 `tools/benchmark_<name>.py`
+5. 更新 `tools/run_test_matrix.py` 中的 `TEST_GROUPS`
