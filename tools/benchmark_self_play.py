@@ -141,7 +141,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override games per worker (auto-computed if omitted).",
     )
-    parser.add_argument("--batch-leaves", type=int, default=32, help="v0 leaf batch size.")
+    parser.add_argument("--batch-leaves", type=int, default=256, help="v0 leaf batch size.")
     parser.add_argument("--dirichlet-alpha", type=float, default=0.3, help="Dirichlet alpha for v0.")
     parser.add_argument("--dirichlet-epsilon", type=float, default=0.25, help="Dirichlet epsilon for v0.")
     parser.add_argument("--disable-dirichlet-noise", action="store_true", help="Disable root Dirichlet noise.")

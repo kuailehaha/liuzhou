@@ -55,7 +55,7 @@ def train_pipeline_v0(
     checkpoint_dir: str = "./checkpoints_v0",
     device: str = "cpu",
     runtime_config: Optional[Dict[str, Any]] = None,
-    self_play_batch_leaves: int = 32,
+    self_play_batch_leaves: int = 256,
     self_play_dirichlet_alpha: float = 0.3,
     self_play_dirichlet_epsilon: float = 0.25,
     data_files: Optional[Sequence[str]] = None,
