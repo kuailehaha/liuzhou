@@ -1,2 +1,0 @@
-# Accuracy / consistency verification tests
-
