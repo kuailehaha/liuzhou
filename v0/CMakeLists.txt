@@ -1,121 +1,45 @@
-
-
 cmake_minimum_required(VERSION 3.20)
 
-# ================= 基础开关 =================
-# 关掉 Windows manifest，避免 rc/mt 报错
-set(CMAKE_EXE_LINKER_FLAGS    "${CMAKE_EXE_LINKER_FLAGS} /MANIFEST:NO"   CACHE STRING "" FORCE)
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /MANIFEST:NO" CACHE STRING "" FORCE)
+# ================= 平台无关的基础设置（Linux/macOS/WSL） =================
+project(liuzhou_v0 LANGUAGES CXX)
 
-# ================= 硬编码环境路径（按需改） =================
-# Python
-set(PYTHON_EXECUTABLE "C:/Users/wuqin/.conda/envs/torchenv/python.exe" CACHE FILEPATH "" FORCE)
-get_filename_component(_PY_ENV_DIR "${PYTHON_EXECUTABLE}" DIRECTORY)
-
-# Torch (Conda)
-set(TORCH_ROOT       "${_PY_ENV_DIR}/Lib/site-packages/torch"            CACHE PATH "" FORCE)
-set(TORCH_LIB_DIR    "${TORCH_ROOT}/lib"                                  CACHE PATH "" FORCE)
-set(TORCH_CMAKE_ROOT "${TORCH_ROOT}/share/cmake"                          CACHE PATH "" FORCE)
-set(TORCH_PYTHON_LIBRARY "${TORCH_LIB_DIR}/torch_python.lib"              CACHE FILEPATH "" FORCE)
-set(Torch_DIR        "${TORCH_CMAKE_ROOT}/Torch"                          CACHE PATH "" FORCE)
-set(Caffe2_DIR       "${TORCH_CMAKE_ROOT}/Caffe2"                         CACHE PATH "" FORCE)
-
-# pybind11 CMake
-set(PYBIND11_CMAKE_DIR "C:/Users/wuqin/.conda/envs/torchenv/Lib/site-packages/pybind11/share/cmake/pybind11" CACHE PATH "" FORCE)
-
-# VS 工具链 (x64)
-set(CMAKE_C_COMPILER   "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe"   CACHE FILEPATH "" FORCE)
-set(CMAKE_CXX_COMPILER "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe"   CACHE FILEPATH "" FORCE)
-set(CMAKE_LINKER       "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/link.exe" CACHE FILEPATH "" FORCE)
-set(CMAKE_RC_COMPILER  "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64/rc.exe" CACHE FILEPATH "" FORCE)
-set(CMAKE_MT           "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64/mt.exe" CACHE FILEPATH "" FORCE)
-
-# CUDA 12.6
-set(CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6" CACHE PATH "" FORCE)
-set(CMAKE_CUDA_COMPILER "${CUDA_TOOLKIT_ROOT}/bin/nvcc.exe" CACHE FILEPATH "" FORCE)
-set(CUDAToolkit_ROOT         "${CUDA_TOOLKIT_ROOT}"         CACHE PATH "" FORCE)
-set(CUDA_TOOLKIT_ROOT_DIR    "${CUDA_TOOLKIT_ROOT}"         CACHE PATH "" FORCE)
-set(CUDAToolkit_INCLUDE_DIR  "${CUDA_TOOLKIT_ROOT}/include" CACHE PATH "" FORCE)
-set(CUDAToolkit_LIBRARY_DIR  "${CUDA_TOOLKIT_ROOT}/lib/x64" CACHE PATH "" FORCE)
-set(CUDA_CUDART_LIBRARY      "${CUDA_TOOLKIT_ROOT}/lib/x64/cudart.lib" CACHE FILEPATH "" FORCE)
-
-# 让 find_package 能按我们的路径找
-set(CMAKE_PREFIX_PATH
-  "${TORCH_CMAKE_ROOT};${PYBIND11_CMAKE_DIR}"
-  CACHE STRING "Prefix path for Torch/pybind11" FORCE)
-# # 让 -ccbin 使用 8.3 短路径（和 nvcc 打印的一模一样）
-# set(MSVC_CL_DIR_SHORT "C:/PROGRA~2/MICROS~4/2022/BUILDT~1/VC/Tools/MSVC/1444~1.352/bin/Hostx64/x64")
-# set(CMAKE_CUDA_HOST_COMPILER "${MSVC_CL_DIR_SHORT}/cl.exe" CACHE FILEPATH "" FORCE)
-
-# # 确保 PATH 里的第一个 cl.exe 也是同一个短路径，避免 nvcc 比对不一致
-# # （注意：这会只影响本次 CMake 配置/生成流程的环境）
-# set(ENV{PATH} "${MSVC_CL_DIR_SHORT};$ENV{PATH}")
-# set(MSVC_CL_DIR_LONG "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/HostX64/x64")
-# set(CMAKE_CUDA_HOST_COMPILER "${MSVC_CL_DIR_LONG}/cl.exe" CACHE FILEPATH "" FORCE)
-# set(CUDAHOSTCXX "${MSVC_CL_DIR_LONG}/cl.exe" CACHE FILEPATH "" FORCE)
-# # 确保 nvcc 在 PATH 里看到的 cl.exe 也是这条长路径
-# set(ENV{PATH} "${MSVC_CL_DIR_LONG};$ENV{PATH}")
-
-# ✅ 统一使用你写死的长路径
-set(MSVC_CL_DIR_LONG "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/HostX64/x64")
-
-# C/C++
-set(CMAKE_C_COMPILER   "${MSVC_CL_DIR_LONG}/cl.exe" CACHE FILEPATH "" FORCE)
-set(CMAKE_CXX_COMPILER "${MSVC_CL_DIR_LONG}/cl.exe" CACHE FILEPATH "" FORCE)
-
-# 告诉 nvcc 的 host 编译器（有些 CMake 版本还是会自己塞 -ccbin，用长路径兜底）
-set(CMAKE_CUDA_HOST_COMPILER "${MSVC_CL_DIR_LONG}/cl.exe" CACHE FILEPATH "" FORCE)
-set(CUDAHOSTCXX "${MSVC_CL_DIR_LONG}/cl.exe" CACHE FILEPATH "" FORCE)
-
-# 关键：强制 nvcc 使用这条长路径作为 -ccbin
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --compiler-bindir=\"${MSVC_CL_DIR_LONG}\"")
-
-# 把同一条长路径放到 PATH 最前，保证 nvcc 检测 PATH 时看到的也是同一条
-set(ENV{PATH} "${MSVC_CL_DIR_LONG};$ENV{PATH}")
-# ================= 工程设置 =================
-project(liuzhou_v0 LANGUAGES CXX CUDA)
+option(USE_CUDA "Build with CUDA kernels" ON)
+set(BUILD_CUDA_KERNELS ${USE_CUDA} CACHE BOOL "Build CUDA kernels for v0_core")
 
 set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# 你项目里需要的宏
-add_compile_definitions(_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH _HAS_DEPRECATED_RESULT_OF=1)
-
-# 架构
-set(CMAKE_CUDA_ARCHITECTURES 86)
-
-# ================= 关键：严格分离 MSVC 与 NVCC 选项 =================
-# —— 只给 C/C++ ：（不会传到 NVCC）
-set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} /utf-8 /bigobj /MP /wd4267")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8 /bigobj /MP /wd4267")
-
-# —— 只给 CUDA（通过 -Xcompiler 转发到 cl.exe），且修正 CUDA 选项拼写
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --allow-unsupported-compiler --expt-relaxed-constexpr --expt-extended-lambda")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/utf-8 -Xcompiler=/bigobj -Xcompiler=/MP -Xcompiler=/wd4267")
-
-# （可选）修正 CMake 生成的 PDB 转发参数引号问题
-if(MSVC)
-  foreach(_cuda_rule CMAKE_CUDA_COMPILE_OBJECT CMAKE_CUDA_DEVICE_LINK_LIBRARY CMAKE_CUDA_DEVICE_LINK_EXECUTABLE)
-    if(DEFINED ${_cuda_rule})
-      string(REPLACE "-Xcompiler=-Fd<TARGET_COMPILE_PDB>,-FS"
-                     "-Xcompiler=\"-Fd<TARGET_COMPILE_PDB>,-FS\""
-             ${_cuda_rule} "${${_cuda_rule}}")
-    endif()
-  endforeach()
-endif()
+# GCC/Clang 常用安全开关；MSVC 仍然可以自定义
+# 注意：每个选项需要单独使用生成器表达式，避免分号列表被错误解析
+add_compile_options(
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall>
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wextra>
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wpedantic>
+)
 
 # ================= 依赖 =================
-# 指定 Python
-set(Python3_EXECUTABLE "${PYTHON_EXECUTABLE}" CACHE FILEPATH "" FORCE)
+# Python（允许用户用 -DPython3_EXECUTABLE=... 覆盖）
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
-# pybind11（CONFIG）
+# pybind11（CONFIG 模式，推荐通过 pip/conda 安装）
 find_package(pybind11 CONFIG REQUIRED)
 
-# Torch
+# Torch（需提前设置 Torch_DIR 或 CMAKE_PREFIX_PATH 指向 libtorch/share/cmake/Torch）
 find_package(Torch REQUIRED)
+
+# CUDA（仅在需要时启用；没有 CUDA 或只想 CPU 时可 -DUSE_CUDA=OFF）
+if(BUILD_CUDA_KERNELS)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA arch list" FORCE)
+  endif()
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  set(CMAKE_CUDA_EXTENSIONS OFF)
+endif()
 
 # ================= 子目录 =================
 add_subdirectory(src)

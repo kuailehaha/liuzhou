@@ -11,6 +11,28 @@ find_package(Torch REQUIRED)
 
 set(V0_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../include)
 
+# Torch Python 库：优先用导出的目标，其次回落到变量，最后手动查找
+set(_TORCH_PY_LIB "")
+if(TARGET torch_python)
+  set(_TORCH_PY_LIB torch_python)
+elseif(TARGET Torch::Python)
+  set(_TORCH_PY_LIB Torch::Python)
+elseif(DEFINED TORCH_PYTHON_LIBRARY)
+  set(_TORCH_PY_LIB "${TORCH_PYTHON_LIBRARY}")
+else()
+  # 手动查找 libtorch_python.so
+  find_library(_TORCH_PY_LIB_PATH
+    NAMES torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib"
+    NO_DEFAULT_PATH
+  )
+  if(_TORCH_PY_LIB_PATH)
+    set(_TORCH_PY_LIB "${_TORCH_PY_LIB_PATH}")
+  endif()
+endif()
+
+message(STATUS "Torch Python library: ${_TORCH_PY_LIB}")
+
 # ---- 可选 CUDA 源清单（有 .cu 再填；没有就留空，完全不触发 nvcc） ----
 option(BUILD_CUDA_KERNELS "Build CUDA kernels for v0_core" ${USE_CUDA})
 set(CUDA_SRCS)
@@ -34,7 +56,7 @@ function(add_v0_extension target)
   # 链接 Torch（含 torch_python）、保持和你原先一致
   target_link_libraries(${target} PRIVATE
     ${TORCH_LIBRARIES}
-    "${TORCH_PYTHON_LIBRARY}"
+    ${_TORCH_PY_LIB}
   )
 
   target_compile_definitions(${target} PRIVATE
@@ -52,6 +74,15 @@ function(add_v0_extension target)
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8;-Xcompiler=/bigobj;-Xcompiler=/MP;-Xcompiler=/wd4267;-Xcompiler=/EHsc>
     )
+  else()
+    # GCC/Clang：常规警告和 -fPIC，CUDA 分支保证与主机编译器一致
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+      $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+      $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>
+      $<$<COMPILE_LANGUAGE:CXX>:-fvisibility=hidden>
+    )
+    set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
   endif()
 endfunction()
 
@@ -73,14 +104,18 @@ add_v0_extension(
 # ---- 仅当有 CUDA 源且你想编 CUDA 时，才对 v0_core 打开 CUDA 支持 ----
 if(BUILD_CUDA_KERNELS AND CUDA_SRCS)
   # 目标级别启用 CUDA 语言（而不是全局 enable_language）
-  enable_language(CUDA)
+  if(NOT CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+  endif()
 
   # 明确告诉 CMake：这些文件用 CUDA 编译
   set_source_files_properties(${CUDA_SRCS} PROPERTIES LANGUAGE CUDA)
 
   # CUDA 目标属性与体系结构
+  # 注意：关闭 CUDA_SEPARABLE_COMPILATION，因为 .cu 文件之间没有跨文件的
+  # __device__ 函数调用，不需要分离编译。分离编译会导致 fatbinData 符号问题。
   set_target_properties(v0_core PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_SEPARABLE_COMPILATION OFF
     CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
