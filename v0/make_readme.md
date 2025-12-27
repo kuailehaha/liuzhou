@@ -1,4 +1,34 @@
-windows RTX 3060
+# V0 C++ Core 构建指南
+
+本文档说明如何在 Windows 和 Linux 上编译 v0 C++ 核心扩展。
+
+---
+
+## 环境准备
+
+### Python 环境
+
+```bash
+conda create -n liuzhou python=3.13 -y
+conda activate liuzhou
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+
+# 获取 PyTorch CMake 路径
+python3 -c "import torch; print(torch.__version__); print(torch.utils.cmake_prefix_path)"
+```
+
+### 系统依赖
+
+```bash
+# Linux
+sudo apt install cmake ninja-build pybind11-dev
+
+# Windows: 安装 Visual Studio 2022 + MSVC + Ninja
+```
+
+---
+
+## Windows (RTX 3060)
 
 装MSVC，ninja
 
@@ -16,8 +46,9 @@ cmake --build build\v0 --config Release
 $env:PYTHONPATH = "D:\CODES\liuzhou;D:\CODES\liuzhou\build\v0\src"
 ```
 
+---
 
-linux H20
+## Linux (H20)
 
 建议使用 CMake + Make/Ninja，按需开启 CUDA（Hopper 架构 90）。
 

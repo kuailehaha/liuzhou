@@ -99,3 +99,21 @@ TODO以产生时间为准。
 
 - [ ] 训练时可以random训练或者是先训练后面那部分，再逐渐往前训练直至收敛
 - [ ] v0 CUDA benchmarking: the current benchmark supports specs like `tensor_device=cpu:forward_device=cuda`, but MCTSCore still assumes legal masks and logits live on the same device (`project_policy_logits_fast` requires aligned devices). To benchmark "forward on CUDA while the tree stays on CPU", we need to add device-alignment/copy logic inside `ExpandBatch`, then rerun the tool to quantify the CUDA kernels' benefit.
+
+### 2025.11.14
+
+- [x] 新增 `v0/data/` 目录，统一存放离线自博弈样本（JSONL + meta）。
+- [x] 实现 `python v0/generate_data.py`，可指定模型 checkpoint/算力配置批量生成样本并落盘。
+- [x] `v0/train.py` 支持 `--data_files` 离线训练模式，或用 `--save_self_play_dir` 将在线自博弈数据自动写入 `v0/data/self_play`。
+- [ ] 后续：给数据生成/训练脚本补 README 片段，写明 JSONL 结构、metadata 字段、典型命令。
+- [ ] 排查：动作空间是否相同？
+- [ ] 排查：verify_v0速度优化12倍，benchmark速度为何只优化3倍？
+
+### 2025.12.27
+
+- [x] 将 v0 C++ 扩展的 MSVC 编译支持扩展到 Linux（CMake + Ninja）
+- [x] 清理测试代码，整理测试目录结构
+- [x] 删除 v1 目录（已废弃的张量化方案）
+- [x] 合并 v0/TODO.md 到根目录
+- [x] 整理说明文件（MD文档）
+- [ ] 进行大规模训练
