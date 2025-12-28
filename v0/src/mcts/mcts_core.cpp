@@ -198,9 +198,11 @@ std::vector<int> MCTSCore::SelectPath() {
         int best_child = -1;
         for (int child_idx : node.children) {
             Node& child = nodes_[child_idx];
+            // 关键修复：子节点的 Q 是从子节点玩家视角的，父节点选择时需要取负
+            // 因为对子节点玩家有利 = 对父节点玩家不利
             double q = child.visit_count > 0 ? (child.value_sum / child.visit_count) : 0.0;
             double u = config_.exploration_weight * child.prior * sqrt_total / (1.0 + child.visit_count);
-            double score = q + u;
+            double score = -q + u;  // 取负！父节点选择对自己有利的着法
             if (score > best_score) {
                 best_score = score;
                 best_child = child_idx;

@@ -120,8 +120,14 @@ for ((iter=1; iter<=ITERATIONS; iter++)); do
         echo "  首次训练，从随机模型开始"
     fi
     
+    # 【修复】只使用当前迭代生成的数据文件，而不是所有历史数据
+    ITER_PREFIX="iter_$(printf '%04d' $iter)"
+    CURRENT_DATA_FILES="$DATA_DIR/${ITER_PREFIX}_*.jsonl"
+    DATA_FILE_COUNT=$(ls -1 $CURRENT_DATA_FILES 2>/dev/null | wc -l)
+    echo "  本次迭代数据文件: ${DATA_FILE_COUNT} 个 (${ITER_PREFIX}_*)"
+    
     python -m v0.train \
-        --data_files "$DATA_DIR"/*.jsonl \
+        --data_files $CURRENT_DATA_FILES \
         --iterations 1 \
         --epochs $TRAIN_EPOCHS \
         --batch_size $TRAIN_BATCH_SIZE \
@@ -137,6 +143,15 @@ for ((iter=1; iter<=ITERATIONS; iter++)); do
     if [ -f "$CHECKPOINT_DIR/model_iter_1.pt" ]; then
         cp "$CHECKPOINT_DIR/model_iter_1.pt" "$LATEST_MODEL"
         echo "  已保存 latest_model.pt 用于下次迭代"
+    fi
+    
+    # 【优化】删除旧迭代的数据文件，释放磁盘空间（保留最近 N 次迭代的数据）
+    KEEP_LAST_ITERS=3  # 保留最近3次迭代的数据
+    if [ $iter -gt $KEEP_LAST_ITERS ]; then
+        OLD_ITER=$((iter - KEEP_LAST_ITERS))
+        OLD_PREFIX="iter_$(printf '%04d' $OLD_ITER)"
+        rm -f "$DATA_DIR"/${OLD_PREFIX}_*.jsonl "$DATA_DIR"/${OLD_PREFIX}_*.json 2>/dev/null || true
+        echo "  已清理旧数据: ${OLD_PREFIX}_*"
     fi
     
     ITER_END=$(date +%s)
