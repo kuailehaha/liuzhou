@@ -106,6 +106,20 @@ for ((iter=1; iter<=ITERATIONS; iter++)); do
     # ========== 阶段2: 训练 ==========
     echo "[$(date +%H:%M:%S)] 阶段2: 训练..."
     
+    # 【关键修复】加载上一次训练的模型继续训练，而不是从随机模型开始
+    # 优先使用 latest_model.pt（每次训练后保存），其次使用 best_model.pt
+    LATEST_MODEL="$CHECKPOINT_DIR/latest_model.pt"
+    LOAD_MODEL=""
+    if [ -f "$LATEST_MODEL" ]; then
+        LOAD_MODEL="--load_checkpoint $LATEST_MODEL"
+        echo "  继续训练模型: $LATEST_MODEL"
+    elif [ -f "$BEST_MODEL" ]; then
+        LOAD_MODEL="--load_checkpoint $BEST_MODEL"
+        echo "  继续训练模型: $BEST_MODEL"
+    else
+        echo "  首次训练，从随机模型开始"
+    fi
+    
     python -m v0.train \
         --data_files "$DATA_DIR"/*.jsonl \
         --iterations 1 \
@@ -116,7 +130,14 @@ for ((iter=1; iter<=ITERATIONS; iter++)); do
         --checkpoint_dir "$CHECKPOINT_DIR" \
         --eval_games_vs_random $EVAL_GAMES \
         --eval_games_vs_best 0 \
+        $LOAD_MODEL \
         > "logs/train_iter${iter}.log" 2>&1
+    
+    # 每次训练后，将 model_iter_1.pt 复制为 latest_model.pt，确保下次迭代可以继续训练
+    if [ -f "$CHECKPOINT_DIR/model_iter_1.pt" ]; then
+        cp "$CHECKPOINT_DIR/model_iter_1.pt" "$LATEST_MODEL"
+        echo "  已保存 latest_model.pt 用于下次迭代"
+    fi
     
     ITER_END=$(date +%s)
     

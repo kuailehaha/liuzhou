@@ -62,6 +62,7 @@ def train_pipeline_v0(
     data_samples_per_iteration: Optional[int] = None,
     data_shuffle: bool = False,
     save_self_play_dir: Optional[str] = None,
+    load_checkpoint: Optional[str] = None,
 ) -> None:
     """Complete v0 training pipeline (self-play -> training -> evaluation)."""
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -204,6 +205,21 @@ def train_pipeline_v0(
 
     board_size = GameState.BOARD_SIZE
     current_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
+    
+    # Load checkpoint if provided
+    if load_checkpoint and os.path.exists(load_checkpoint):
+        print(f"Loading model checkpoint from: {load_checkpoint}")
+        checkpoint = torch.load(load_checkpoint, map_location=device)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        current_model.load_state_dict(state_dict)
+        loaded_iteration = checkpoint.get("iteration", 0)
+        print(f"Loaded model from iteration {loaded_iteration}")
+    else:
+        if load_checkpoint:
+            print(f"Warning: Checkpoint not found at {load_checkpoint}, starting with random model.")
+        else:
+            print("No checkpoint specified, starting with random model.")
+    
     current_model.to(device)
 
     best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
@@ -595,6 +611,12 @@ if __name__ == "__main__":
         default=None,
         help="If set, dumps generated self-play samples (JSONL) into this directory each iteration.",
     )
+    parser.add_argument(
+        "--load_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint file to load and resume training from.",
+    )
 
     args = parser.parse_args()
 
@@ -631,4 +653,5 @@ if __name__ == "__main__":
         data_samples_per_iteration=args.data_samples_per_iteration,
         data_shuffle=args.data_shuffle,
         save_self_play_dir=args.save_self_play_dir,
+        load_checkpoint=args.load_checkpoint,
     )
