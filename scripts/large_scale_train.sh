@@ -10,7 +10,7 @@ export PYTHONPATH=/home/ubuntu/.cache/liuzhou:/home/ubuntu/.cache/liuzhou/v0/bui
 ITERATIONS=${1:-100}           # 总训练迭代次数
 
 # 自博弈配置 (H20 优化)
-NUM_PARALLEL=16                 # 4个并行生成服务
+NUM_PARALLEL=12                 # 12个并行生成服务
 GAMES_PER_SERVICE=32           # 每服务32局 → 每迭代128局
 MCTS_SIMS=800                  # MCTS模拟次数
 BATCH_LEAVES=512               # H20显存大，可以设512
