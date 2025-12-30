@@ -150,10 +150,9 @@ class MCTSNode:
     def get_best_child(self, exploration_weight: float = 1.0) -> "MCTSNode":
         """
         使用 PUCT 公式选择最佳子节点：
-          PUCT = -Q(s,a) + c_puct * P(s,a) * sqrt(N_parent) / (1 + N(s,a))
+          PUCT = Q(s,a) + c_puct * P(s,a) * sqrt(N_parent) / (1 + N(s,a))
         其中：
-          - Q(s,a) = child.value() = value_sum / visit_count（子节点玩家视角）
-          - 取负是因为子节点的 Q 从子节点玩家视角存储，父节点选择时需要翻转
+          - Q(s,a) = child.value() = value_sum / visit_count（根执手视角）
           - P(s,a) = child.prior（先验概率，根处可能含Dirichlet）
           - N_parent = max(1, self.visit_count)  # 防止首轮 sqrt(0)
           - N(s,a) = child.visit_count
@@ -167,10 +166,10 @@ class MCTSNode:
         best_score = -float("inf")
 
         for child in self.children:
-            Q = child.value()                 # 平均价值（子节点玩家视角）
+            Q = child.value()                 # 平均价值（根执手视角）
             P = child.prior                   # 先验
             U = exploration_weight * P * math.sqrt(parent_N) / (1 + child.visit_count)
-            puct = -Q + U  # 关键修复：取负，因为 Q 是从子节点玩家视角
+            puct = Q + U
             if puct > best_score:
                 best_score = puct
                 best_child = child
@@ -192,7 +191,7 @@ class MCTSNode:
             Q = child.value()
             P = child.prior
             U = exploration_weight * P * math.sqrt(parent_N) / (1 + child.visit_count)
-            puct = -Q + U  # 关键修复：取负
+            puct = Q + U
             if puct > best_score:
                 best_score, best_child = puct, child
         return best_child

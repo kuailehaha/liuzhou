@@ -161,14 +161,13 @@ class MCTS:
             q_value = value_sum / visit if visit > 0 else 0.0
             u_value = self.params.exploration_weight * prior * math.sqrt(parent_visit) / (1.0 + visit)
             policy_prob = action_to_policy.get(action_idx, 0.0)
-            # 注意：实际选择分数是 -Q + U（子节点Q从对手视角，需要取负）
             rows.append(
                 {
                     "visit": visit,
                     "q": q_value,
                     "p": prior,
                     "u": u_value,
-                    "pu": -q_value + u_value,  # 修正：实际使用 -Q + U
+                    "pu": q_value + u_value,
                     "pi": policy_prob,
                     "move": move,
                 }
