@@ -7,7 +7,7 @@ reconstructed from `v0_core.encode_actions_fast`.
 
 Seed / sampling conventions:
     - rng seed: 0x7777
-    - num_states: 400
+    - num_states: 4000
     - max_random_moves: 160
 
 Usage:
@@ -39,7 +39,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 SEED = 0x7777
-NUM_STATES = 400
+NUM_STATES = 4000
 MAX_RANDOM_MOVES = 160
 
 MoveKey = Tuple

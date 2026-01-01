@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from src.game_state import GameState, Player, Phase
 from src.neural_network import ChessNet, state_to_tensor, NUM_INPUT_CHANNELS, get_move_probabilities
 from src.mcts import self_play
-from src.evaluate import MCTSAgent, RandomAgent, evaluate_against_agent
+from src.evaluate import MCTSAgent, RandomAgent, evaluate_against_agent, evaluate_against_agent_parallel
 from src.random_agent import RandomAgent
 from src.move_generator import MoveType, generate_all_legal_moves
 
@@ -323,6 +323,7 @@ def train_pipeline(
     eval_games_vs_best: int = 20,
     win_rate_threshold: float = 0.55,
     mcts_sims_eval: int = 100,
+    eval_workers: int = 0,
     checkpoint_dir: str = "./checkpoints",
     device: str = "cpu",
     runtime_config: Optional[Dict[str, Any]] = None,
@@ -392,6 +393,14 @@ def train_pipeline(
         mcts_sims_eval = evaluation_cfg["mcts_simulations"]
     eval_games_vs_random = evaluation_cfg.get("games_vs_random", eval_games_vs_random)
     eval_games_vs_best = evaluation_cfg.get("games_vs_best", eval_games_vs_best)
+    eval_workers_cfg = evaluation_cfg.get("workers", evaluation_cfg.get("num_workers", eval_workers))
+    try:
+        eval_workers = int(eval_workers_cfg) if eval_workers_cfg is not None else 0
+    except (TypeError, ValueError):
+        eval_workers = 0
+    if eval_workers <= 0:
+        eval_workers = sp_workers
+    eval_workers = max(1, eval_workers)
 
     soft_value_cfg = runtime_config.get("soft_value_labels", {})
     try:
@@ -549,26 +558,41 @@ def train_pipeline(
         _stage_banner("eval", eval_label, iteration, iterations, stage_history)
         current_model.eval()
         eval_start_time = time.perf_counter()
-        challenger_agent = MCTSAgent(
-            current_model,
-            mcts_simulations=mcts_sims_eval,
-            temperature=eval_temperature,
-            device=device,
-            add_dirichlet_noise=eval_add_dirichlet,
-            verbose=eval_verbose,
-            mcts_verbose=eval_mcts_verbose,
-        )
-        random_opponent = RandomAgent()
 
         print(f"Evaluating challenger against RandomAgent ({eval_games_vs_random} games)...")
-        stats_vs_rnd = evaluate_against_agent(
-            challenger_agent,
-            random_opponent,
-            eval_games_vs_random,
-            device,
-            verbose=eval_verbose,
-            game_verbose=eval_game_verbose,
-        )
+        if eval_workers > 1:
+            stats_vs_rnd = evaluate_against_agent_parallel(
+                challenger_checkpoint=iter_model_path,
+                opponent_checkpoint=None,
+                num_games=eval_games_vs_random,
+                device=device,
+                mcts_simulations=mcts_sims_eval,
+                temperature=eval_temperature,
+                add_dirichlet_noise=eval_add_dirichlet,
+                num_workers=eval_workers,
+                verbose=eval_verbose,
+                game_verbose=eval_game_verbose,
+                mcts_verbose=eval_mcts_verbose,
+            )
+        else:
+            challenger_agent = MCTSAgent(
+                current_model,
+                mcts_simulations=mcts_sims_eval,
+                temperature=eval_temperature,
+                device=device,
+                add_dirichlet_noise=eval_add_dirichlet,
+                verbose=eval_verbose,
+                mcts_verbose=eval_mcts_verbose,
+            )
+            random_opponent = RandomAgent()
+            stats_vs_rnd = evaluate_against_agent(
+                challenger_agent,
+                random_opponent,
+                eval_games_vs_random,
+                device,
+                verbose=eval_verbose,
+                game_verbose=eval_game_verbose,
+            )
         print(f"Challenger win rate vs RandomAgent: {stats_vs_rnd.win_rate:.2%}")
         print(
             "Challenger record vs RandomAgent: "
@@ -589,31 +613,47 @@ def train_pipeline(
                 best_model_updated = True
             else:
                 print("Loading best_model.pt for comparison...")
-                best_model_checkpoint = torch.load(best_model_path, map_location=device)
-                best_model_eval = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
-                best_model_eval.load_state_dict(best_model_checkpoint["model_state_dict"])
-                best_model_eval.to(device)
-                best_model_eval.eval()
-                
-                best_agent_opponent = MCTSAgent(
-                    best_model_eval,
-                    mcts_simulations=mcts_sims_eval,
-                    temperature=eval_temperature,
-                    device=device,
-                    add_dirichlet_noise=eval_add_dirichlet,
-                    verbose=eval_verbose,
-                    mcts_verbose=eval_mcts_verbose,
-                )
 
                 print(f"Evaluating challenger against BestModel ({eval_games_vs_best} games)...")
-                stats_vs_best_model = evaluate_against_agent(
-                    challenger_agent,
-                    best_agent_opponent,
-                    eval_games_vs_best,
-                    device,
-                    verbose=eval_verbose,
-                    game_verbose=eval_game_verbose,
-                )
+                if eval_workers > 1:
+                    stats_vs_best_model = evaluate_against_agent_parallel(
+                        challenger_checkpoint=iter_model_path,
+                        opponent_checkpoint=best_model_path,
+                        num_games=eval_games_vs_best,
+                        device=device,
+                        mcts_simulations=mcts_sims_eval,
+                        temperature=eval_temperature,
+                        add_dirichlet_noise=eval_add_dirichlet,
+                        num_workers=eval_workers,
+                        verbose=eval_verbose,
+                        game_verbose=eval_game_verbose,
+                        mcts_verbose=eval_mcts_verbose,
+                    )
+                else:
+                    best_model_checkpoint = torch.load(best_model_path, map_location=device)
+                    best_model_eval = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
+                    best_model_eval.load_state_dict(best_model_checkpoint["model_state_dict"])
+                    best_model_eval.to(device)
+                    best_model_eval.eval()
+
+                    best_agent_opponent = MCTSAgent(
+                        best_model_eval,
+                        mcts_simulations=mcts_sims_eval,
+                        temperature=eval_temperature,
+                        device=device,
+                        add_dirichlet_noise=eval_add_dirichlet,
+                        verbose=eval_verbose,
+                        mcts_verbose=eval_mcts_verbose,
+                    )
+
+                    stats_vs_best_model = evaluate_against_agent(
+                        challenger_agent,
+                        best_agent_opponent,
+                        eval_games_vs_best,
+                        device,
+                        verbose=eval_verbose,
+                        game_verbose=eval_game_verbose,
+                    )
                 win_rate_vs_best_model = stats_vs_best_model.win_rate
                 print(f"Challenger win rate vs BestModel: {win_rate_vs_best_model:.2%}")
                 print(
@@ -672,6 +712,12 @@ if __name__ == "__main__":
     parser.add_argument("--self_play_virtual_loss", type=float, default=0.0, help="Virtual loss weight passed to MCTS during self-play.")
     parser.add_argument("--eval_games_vs_random", type=int, default=4, help="Games vs RandomAgent.")
     parser.add_argument("--eval_games_vs_best", type=int, default=4, help="Games vs BestModel.")
+    parser.add_argument(
+        "--eval_workers",
+        type=int,
+        default=0,
+        help="Number of parallel workers for evaluation (0 = use self_play_workers).",
+    )
     parser.add_argument("--win_rate_threshold", type=float, default=0.55, help="Win rate to beat opponent.")
     parser.add_argument("--mcts_sims_eval", type=int, default=20, help="MCTS sims for evaluation agent.")
     parser.add_argument(
@@ -715,6 +761,7 @@ if __name__ == "__main__":
         self_play_virtual_loss_weight=args.self_play_virtual_loss,
         eval_games_vs_random=args.eval_games_vs_random,
         eval_games_vs_best=args.eval_games_vs_best,
+        eval_workers=args.eval_workers,
         win_rate_threshold=args.win_rate_threshold,
         mcts_sims_eval=args.mcts_sims_eval,
         checkpoint_dir=args.checkpoint_dir,

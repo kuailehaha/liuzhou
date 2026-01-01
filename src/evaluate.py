@@ -1,13 +1,134 @@
-import numpy as np
-import torch
+import multiprocessing as mp
+import os
+import random
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import numpy as np
+import torch
+
 from src.game_state import GameState, Player, Phase
 from src.move_generator import generate_all_legal_moves, apply_move, MoveType
-from src.neural_network import ChessNet # For type hinting
+from src.neural_network import ChessNet, NUM_INPUT_CHANNELS # For type hinting
 from src.mcts import MCTS
 from src.random_agent import RandomAgent
+
+
+def _normalize_eval_games(num_games: int, log) -> int:
+    if num_games % 2 != 0:
+        adjusted = max(2, (num_games // 2) * 2)
+        if adjusted == 0 and num_games > 0:
+            adjusted = 2
+        log("Warning: num_games for evaluation should be even for fair comparison. Adjusting...")
+        num_games = adjusted
+    return num_games
+
+
+def _split_game_indices(num_games: int, num_workers: int) -> List[List[int]]:
+    if num_workers <= 0:
+        return []
+    buckets: List[List[int]] = [[] for _ in range(num_workers)]
+    for idx in range(num_games):
+        buckets[idx % num_workers].append(idx)
+    return [bucket for bucket in buckets if bucket]
+
+
+def _seed_worker(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+
+
+def _load_model_from_checkpoint(checkpoint_path: str, device: str) -> ChessNet:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    board_size = checkpoint.get("board_size", GameState.BOARD_SIZE)
+    num_inputs = checkpoint.get("num_input_channels", NUM_INPUT_CHANNELS)
+    model = ChessNet(board_size=board_size, num_input_channels=num_inputs)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def _play_game_indices(
+    game_indices: List[int],
+    num_games: int,
+    challenger_agent,
+    opponent_agent,
+    game_verbose: bool,
+) -> Tuple[int, int, int]:
+    wins = losses = draws = 0
+    half = num_games / 2
+    for idx in game_indices:
+        if idx < half:
+            result = play_single_game(challenger_agent, opponent_agent, verbose=game_verbose)
+            if result == 1.0:
+                wins += 1
+            elif result == -1.0:
+                losses += 1
+            else:
+                draws += 1
+        else:
+            result = play_single_game(opponent_agent, challenger_agent, verbose=game_verbose)
+            if result == -1.0:
+                wins += 1
+            elif result == 1.0:
+                losses += 1
+            else:
+                draws += 1
+    return wins, losses, draws
+
+
+def _eval_worker(
+    worker_id: int,
+    game_indices: List[int],
+    num_games: int,
+    device: str,
+    mcts_simulations: int,
+    temperature: float,
+    add_dirichlet_noise: bool,
+    challenger_checkpoint: str,
+    opponent_checkpoint: Optional[str],
+    game_verbose: bool,
+    mcts_verbose: Optional[bool],
+    seed: int,
+    threads_per_worker: int,
+) -> Tuple[int, int, int]:
+    torch.set_num_threads(max(1, int(threads_per_worker)))
+    _seed_worker(seed + worker_id)
+
+    device_obj = torch.device(device)
+    if device_obj.type == "cuda":
+        torch.cuda.set_device(device_obj.index or 0)
+
+    challenger_model = _load_model_from_checkpoint(challenger_checkpoint, device)
+    challenger_agent = MCTSAgent(
+        challenger_model,
+        mcts_simulations=mcts_simulations,
+        temperature=temperature,
+        device=device,
+        add_dirichlet_noise=add_dirichlet_noise,
+        verbose=False,
+        mcts_verbose=mcts_verbose,
+    )
+
+    if opponent_checkpoint:
+        opponent_model = _load_model_from_checkpoint(opponent_checkpoint, device)
+        opponent_agent = MCTSAgent(
+            opponent_model,
+            mcts_simulations=mcts_simulations,
+            temperature=temperature,
+            device=device,
+            add_dirichlet_noise=add_dirichlet_noise,
+            verbose=False,
+            mcts_verbose=mcts_verbose,
+        )
+    else:
+        opponent_agent = RandomAgent()
+
+    return _play_game_indices(game_indices, num_games, challenger_agent, opponent_agent, game_verbose)
 
 @dataclass
 class EvaluationStats:
@@ -165,6 +286,100 @@ def evaluate_against_agent(
         draws=challenger_draws,
         total_games=num_games
     )
+
+
+def evaluate_against_agent_parallel(
+    challenger_checkpoint: str,
+    opponent_checkpoint: Optional[str],
+    num_games: int,
+    device: str,
+    mcts_simulations: int,
+    temperature: float = 0.05,
+    add_dirichlet_noise: bool = False,
+    num_workers: int = 1,
+    verbose: bool = False,
+    game_verbose: Optional[bool] = None,
+    mcts_verbose: Optional[bool] = None,
+) -> EvaluationStats:
+    """Parallel evaluation using multiple worker processes."""
+    log = print if verbose else (lambda *args, **kwargs: None)
+    num_games = _normalize_eval_games(num_games, log)
+    if game_verbose is None:
+        game_verbose = verbose
+
+    num_workers = max(1, int(num_workers))
+    if num_games == 0:
+        return EvaluationStats(wins=0, losses=0, draws=0, total_games=0)
+
+    if num_workers == 1:
+        challenger_model = _load_model_from_checkpoint(challenger_checkpoint, device)
+        challenger_agent = MCTSAgent(
+            challenger_model,
+            mcts_simulations=mcts_simulations,
+            temperature=temperature,
+            device=device,
+            add_dirichlet_noise=add_dirichlet_noise,
+            verbose=verbose,
+            mcts_verbose=mcts_verbose,
+        )
+        if opponent_checkpoint:
+            opponent_model = _load_model_from_checkpoint(opponent_checkpoint, device)
+            opponent_agent = MCTSAgent(
+                opponent_model,
+                mcts_simulations=mcts_simulations,
+                temperature=temperature,
+                device=device,
+                add_dirichlet_noise=add_dirichlet_noise,
+                verbose=verbose,
+                mcts_verbose=mcts_verbose,
+            )
+        else:
+            opponent_agent = RandomAgent()
+
+        wins, losses, draws = _play_game_indices(
+            list(range(num_games)),
+            num_games,
+            challenger_agent,
+            opponent_agent,
+            game_verbose,
+        )
+        return EvaluationStats(wins=wins, losses=losses, draws=draws, total_games=num_games)
+
+    chunks = _split_game_indices(num_games, num_workers)
+    if not chunks:
+        return EvaluationStats(wins=0, losses=0, draws=0, total_games=num_games)
+
+    base_seed = int(time.time() * 1e6) & 0x7FFFFFFF
+    threads_per_worker = max(1, (os.cpu_count() or 1) // len(chunks))
+
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=len(chunks)) as pool:
+        results = pool.starmap(
+            _eval_worker,
+            [
+                (
+                    worker_id,
+                    chunks[worker_id],
+                    num_games,
+                    device,
+                    mcts_simulations,
+                    temperature,
+                    add_dirichlet_noise,
+                    challenger_checkpoint,
+                    opponent_checkpoint,
+                    game_verbose,
+                    mcts_verbose,
+                    base_seed,
+                    threads_per_worker,
+                )
+                for worker_id in range(len(chunks))
+            ],
+        )
+
+    wins = sum(result[0] for result in results)
+    losses = sum(result[1] for result in results)
+    draws = sum(result[2] for result in results)
+    return EvaluationStats(wins=wins, losses=losses, draws=draws, total_games=num_games)
 
 if __name__ == '__main__':
     # Basic smoke test for the evaluation utilities
