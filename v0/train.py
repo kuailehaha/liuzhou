@@ -48,6 +48,7 @@ def train_pipeline_v0(
     self_play_games_per_worker: Optional[int] = None,
     self_play_base_seed: Optional[int] = None,
     self_play_virtual_loss_weight: float = 1.0,
+    decisive_only: bool = False,
     eval_games_vs_random: int = 20,
     eval_games_vs_best: int = 20,
     win_rate_threshold: float = 0.55,
@@ -240,20 +241,21 @@ def train_pipeline_v0(
 
         iter_start_time = time.perf_counter()
         iteration_metrics: Dict[str, Any] = {
-            "iteration": iteration + 1,
-            "self_play_games_requested": (total_self_play_games if not offline_mode else None),
-            "mcts_simulations": num_mcts_simulations,
-            "epochs_requested": epochs,
-            "batch_size": batch_size,
-            "timestamp_start": time.time(),
-            "self_play_workers": sp_workers,
-            "self_play_games_per_worker": sp_games_per_worker,
-            "self_play_virtual_loss": sp_virtual_loss,
-            "self_play_base_seed": sp_base_seed,
-            "self_play_batch_leaves": sp_batch_leaves,
-            "self_play_dirichlet_alpha": sp_dirichlet_alpha,
-            "self_play_dirichlet_epsilon": sp_dirichlet_epsilon,
-        }
+                "iteration": iteration + 1,
+                "self_play_games_requested": (total_self_play_games if not offline_mode else None),
+                "mcts_simulations": num_mcts_simulations,
+                "epochs_requested": epochs,
+                "batch_size": batch_size,
+                "timestamp_start": time.time(),
+                "self_play_workers": sp_workers,
+                "self_play_games_per_worker": sp_games_per_worker,
+                "self_play_virtual_loss": sp_virtual_loss,
+                "self_play_base_seed": sp_base_seed,
+                "self_play_batch_leaves": sp_batch_leaves,
+                "self_play_dirichlet_alpha": sp_dirichlet_alpha,
+                "self_play_dirichlet_epsilon": sp_dirichlet_epsilon,
+                "decisive_only": bool(decisive_only),
+            }
 
         if soft_alpha_anneal_iters <= 0:
             current_alpha = soft_alpha_start
@@ -280,6 +282,11 @@ def train_pipeline_v0(
             baseline_train._stage_banner("self_play", data_label, iteration, iterations, stage_history)
             load_start_time = time.perf_counter()
             examples = _next_offline_batch()
+            if decisive_only:
+                before = len(examples)
+                examples = [ex for ex in examples if abs(ex[2]) > 0.0]
+                dropped = before - len(examples)
+                iteration_metrics["decisive_samples_dropped"] = dropped
             self_play_time = baseline_train._stage_finish(
                 "self_play", data_label, load_start_time, stage_history
             )
@@ -316,6 +323,10 @@ def train_pipeline_v0(
                 verbose=self_play_verbose,
             )
             training_data = training_data or []
+            if decisive_only:
+                before_games = len(training_data)
+                training_data = [game for game in training_data if game[2] != 0.0]
+                iteration_metrics["decisive_games_dropped"] = before_games - len(training_data)
             num_games_generated = len(training_data)
             flattened_samples = list(flatten_training_games(training_data))
             examples = flattened_samples
@@ -601,6 +612,11 @@ if __name__ == "__main__":
         help="Virtual loss weight used during v0 self-play.",
     )
     parser.add_argument(
+        "--decisive_only",
+        action="store_true",
+        help="Train only on decisive (win/loss) samples; drop draws regardless of soft_value.",
+    )
+    parser.add_argument(
         "--self_play_batch_leaves",
         type=int,
         default=256,
@@ -688,6 +704,7 @@ if __name__ == "__main__":
         self_play_games_per_worker=args.self_play_games_per_worker,
         self_play_base_seed=(None if args.self_play_base_seed == 0 else args.self_play_base_seed),
         self_play_virtual_loss_weight=args.self_play_virtual_loss,
+        decisive_only=args.decisive_only,
         eval_games_vs_random=args.eval_games_vs_random,
         eval_games_vs_best=args.eval_games_vs_best,
         eval_workers=args.eval_workers,
