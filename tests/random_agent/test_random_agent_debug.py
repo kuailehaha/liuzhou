@@ -8,9 +8,31 @@ Seed defaults are set inside helpers (e.g., 42, 7).
 import random
 from typing import List, Tuple
 
+import pytest
+
 from src.game_state import GameState, Player
 from src.move_generator import apply_move, generate_all_legal_moves
 from src.random_agent import RandomAgent
+
+
+@pytest.fixture
+def seed() -> int:
+    return 42
+
+
+@pytest.fixture
+def num_games() -> int:
+    return 10
+
+
+@pytest.fixture
+def max_turns() -> int:
+    return 60
+
+
+@pytest.fixture
+def verbose() -> bool:
+    return True
 
 
 def _play_random_game(seed: int = 42, max_turns: int = 60) -> Tuple[bool, List[GameState]]:
@@ -39,7 +61,7 @@ def _play_random_game(seed: int = 42, max_turns: int = 60) -> Tuple[bool, List[G
     return True, history
 
 
-def test_single_game(seed: int, max_turns: int = 60, verbose: bool = True) -> List[GameState]:
+def run_single_game(seed: int, max_turns: int = 60, verbose: bool = True) -> List[GameState]:
     """Run a single random-agent game and optionally print a brief summary."""
     success, history = _play_random_game(seed=seed, max_turns=max_turns)
     if verbose:
@@ -49,7 +71,7 @@ def test_single_game(seed: int, max_turns: int = 60, verbose: bool = True) -> Li
     return history
 
 
-def test_multiple_games(
+def run_multiple_games(
     num_games: int,
     seed: int,
     max_turns: int = 60,
@@ -75,6 +97,28 @@ def test_multiple_games(
         raise RuntimeError(f"{failures} random-agent games failed validation.")
 
     return num_games
+
+
+def test_single_game(seed: int, max_turns: int = 60, verbose: bool = True) -> None:
+    """Run a single random-agent game and assert it finishes cleanly."""
+    history = run_single_game(seed=seed, max_turns=max_turns, verbose=verbose)
+    assert len(history) >= 1
+
+
+def test_multiple_games(
+    num_games: int,
+    seed: int,
+    max_turns: int = 60,
+    verbose: bool = True,
+) -> None:
+    """Run several random-agent games in sequence and assert they finish cleanly."""
+    completed = run_multiple_games(
+        num_games=num_games,
+        seed=seed,
+        max_turns=max_turns,
+        verbose=verbose,
+    )
+    assert completed == num_games
 
 
 def test_single_game_smoke():

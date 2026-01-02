@@ -557,8 +557,27 @@ void MCTSCore::RunSimulations(int num_simulations) {
     if (root_index_ < 0) {
         throw std::runtime_error("MCTS root not set.");
     }
+    if (num_simulations <= 0) {
+        return;
+    }
     DebugLog("RunSimulations start: num_simulations=" + std::to_string(num_simulations) +
         ", batch_size=" + std::to_string(config_.batch_size));
+
+    // Ensure the root is expanded once before batching; otherwise the first batch
+    // will repeatedly select the unexpanded root and waste a whole batch.
+    {
+        Node& root = nodes_[root_index_];
+        if (!root.is_terminal && (!root.is_expanded || root.children.empty())) {
+            std::vector<int> leaves{root_index_};
+            std::vector<std::vector<int>> paths{std::vector<int>{root_index_}};
+            ApplyVirtualLoss(paths[0]);
+            ExpandBatch(leaves, paths);
+            num_simulations -= 1;
+            if (num_simulations <= 0) {
+                return;
+            }
+        }
+    }
     for (int sim = 0; sim < num_simulations; ) {
         if (DebugEnabled() && sim % 16 == 0) {
             DebugLog("RunSimulations progress: sim=" + std::to_string(sim) + "/" +

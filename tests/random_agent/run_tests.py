@@ -13,13 +13,13 @@ from pathlib import Path
 
 if __package__:
     from .test_random_agent_enhanced import run_enhanced_tests
-    from .test_random_agent_debug import test_single_game, test_multiple_games
+    from .test_random_agent_debug import run_single_game, run_multiple_games
 else:  # 支持直接执行: python tests/random_agent/run_tests.py
     PROJECT_ROOT = Path(__file__).resolve().parents[2]
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
     from tests.random_agent.test_random_agent_enhanced import run_enhanced_tests
-    from tests.random_agent.test_random_agent_debug import test_single_game, test_multiple_games
+    from tests.random_agent.test_random_agent_debug import run_single_game, run_multiple_games
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,11 +73,11 @@ def main() -> None:
 
     if args.mode == "single":
         print(f"测试单局游戏 (最大回合数: {args.turns})")
-        test_single_game(args.seed, max_turns=args.turns)
+        run_single_game(args.seed, max_turns=args.turns)
 
     elif args.mode == "multiple":
         print(f"测试多局游戏 (局数 {args.num}, 最大回合数: {args.turns})")
-        test_multiple_games(args.num, args.seed, max_turns=args.turns)
+        run_multiple_games(args.num, args.seed, max_turns=args.turns)
 
     elif args.mode == "enhanced":
         num = 1000 if args.num == 10 else args.num  # 增强模式默认 1000 局
