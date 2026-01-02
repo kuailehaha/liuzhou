@@ -53,6 +53,7 @@ class MCTSParams:
     add_dirichlet_noise: bool = False
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
+    virtual_loss: float = 1.0
     device: str = "cpu"
     seed: int = 12345
 
@@ -73,6 +74,7 @@ class MCTS:
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
         batch_K: int = 16,
+        virtual_loss: float = 1.0,
         seed: int = 12345,
         verbose: bool = False,
     ) -> None:
@@ -88,6 +90,7 @@ class MCTS:
             add_dirichlet_noise=add_dirichlet_noise,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
+            virtual_loss=virtual_loss,
             device=str(self.device),
             seed=seed,
         )
@@ -100,7 +103,7 @@ class MCTS:
         cfg.add_dirichlet_noise = self.params.add_dirichlet_noise
         cfg.dirichlet_alpha = self.params.dirichlet_alpha
         cfg.dirichlet_epsilon = self.params.dirichlet_epsilon
-        cfg.virtual_loss = 1.0
+        cfg.virtual_loss = float(self.params.virtual_loss)
         cfg.device = str(self.device)
         cfg.seed = self.params.seed
 

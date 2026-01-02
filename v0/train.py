@@ -47,7 +47,7 @@ def train_pipeline_v0(
     self_play_workers: int = 1,
     self_play_games_per_worker: Optional[int] = None,
     self_play_base_seed: Optional[int] = None,
-    self_play_virtual_loss_weight: float = 0.0,
+    self_play_virtual_loss_weight: float = 1.0,
     eval_games_vs_random: int = 20,
     eval_games_vs_best: int = 20,
     win_rate_threshold: float = 0.55,
@@ -124,6 +124,8 @@ def train_pipeline_v0(
         sp_virtual_loss = float(sp_virtual_loss_cfg)
     except (TypeError, ValueError):
         sp_virtual_loss = float(self_play_virtual_loss_weight)
+    if sp_virtual_loss < 0:
+        sp_virtual_loss = 0.0
 
     evaluation_cfg = runtime_config.get("evaluation", {})
     eval_temperature = evaluation_cfg.get("temperature", 0.05)
@@ -305,6 +307,7 @@ def train_pipeline_v0(
                 dirichlet_alpha=sp_dirichlet_alpha,
                 dirichlet_epsilon=sp_dirichlet_epsilon,
                 batch_leaves=sp_batch_leaves,
+                virtual_loss=sp_virtual_loss,
                 num_workers=sp_workers,
                 games_per_worker=sp_games_per_worker,
                 base_seed=sp_base_seed,
@@ -594,8 +597,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--self_play_virtual_loss",
         type=float,
-        default=0.0,
-        help="Virtual loss weight placeholder (kept for compatibility).",
+        default=1.0,
+        help="Virtual loss weight used during v0 self-play.",
     )
     parser.add_argument(
         "--self_play_batch_leaves",

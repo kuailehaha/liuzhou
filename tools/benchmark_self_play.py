@@ -100,6 +100,7 @@ def run_v0(args: argparse.Namespace, model: ChessNet, games_per_worker: Optional
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,
         batch_leaves=args.batch_leaves,
+        virtual_loss=args.v0_virtual_loss,
         num_workers=args.num_workers,
         games_per_worker=games_per_worker,
         base_seed=(None if args.base_seed == 0 else args.base_seed),
@@ -149,6 +150,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-seed", type=int, default=0, help="Base RNG seed (0 = auto).")
     parser.add_argument("--model-checkpoint", type=str, default=None, help="Optional checkpoint for the model.")
     parser.add_argument("--legacy-virtual-loss", type=float, default=0.0, help="Legacy virtual loss weight.")
+    parser.add_argument("--v0-virtual-loss", type=float, default=1.0, help="v0 virtual loss weight.")
     parser.add_argument("--legacy-mcts-verbose", action="store_true", help="Verbose logging for legacy MCTS.")
     parser.add_argument("--v0-mcts-verbose", action="store_true", help="Verbose logging for v0 MCTS.")
     parser.add_argument("--verbose", action="store_true", help="Print per-move logging (both pipelines).")

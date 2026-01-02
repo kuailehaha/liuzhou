@@ -156,6 +156,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--exploration_weight", type=float, default=1.0)
     parser.add_argument("--batch_leaves", type=int, default=256)
+    parser.add_argument("--virtual_loss", type=float, default=1.0)
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     parser.add_argument("--no_dirichlet", action="store_true")
@@ -177,6 +178,7 @@ def main() -> None:
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,
         batch_K=args.batch_leaves,
+        virtual_loss=args.virtual_loss,
         seed=args.seed,
         verbose=False,
     )
@@ -188,6 +190,7 @@ def main() -> None:
     print("== v0 policy index alignment check ==")
     print(
         f"states={len(states)} mcts_sims={args.mcts_sims} batch_leaves={args.batch_leaves} "
+        f"virtual_loss={args.virtual_loss:.3g} "
         f"dirichlet={'off' if args.no_dirichlet else 'on'}"
     )
 
