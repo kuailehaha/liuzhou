@@ -137,6 +137,8 @@ def train_network(
     lr: float = 0.001,
     weight_decay: float = 1e-4,
     soft_label_alpha: float = 0.0,
+    value_draw_weight: float = 1.0,
+    policy_draw_weight: float = 1.0,
     device: str = 'cpu',
     board_size: int = GameState.BOARD_SIZE
 ) -> Tuple[ChessNet, Dict[str, Any]]:
@@ -150,6 +152,8 @@ def train_network(
         epochs: 训练轮数。
         lr: 学习率。
         weight_decay: 权重衰减。
+        value_draw_weight: draw 样本在 value loss 中的权重（1.0=不降权）。
+        policy_draw_weight: draw 样本在 policy loss 中的权重（1.0=不降权）。
         device: 训练设备。
         board_size: 棋盘大小。
         
@@ -167,7 +171,8 @@ def train_network(
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     
     # 创建损失函数
-    value_loss_fn = nn.MSELoss()
+    value_draw_weight = max(0.0, float(value_draw_weight))
+    policy_draw_weight = max(0.0, float(policy_draw_weight))
     policy_loss_fn = nn.KLDivLoss(reduction='sum')
     
     # 训练循环
@@ -179,6 +184,7 @@ def train_network(
         value_loss_epoch = 0.0
         num_samples_processed = 0
         total_valid_policy_samples = 0
+        policy_weight_sum_epoch = 0.0
         soft_abs_epoch = 0.0
         mix_abs_epoch = 0.0
         soft_batches = 0
@@ -196,12 +202,23 @@ def train_network(
             
             current_batch_policy_loss = torch.tensor(0.0, device=device)
             y_mix = (1.0 - soft_label_alpha) * target_values_batch + soft_label_alpha * soft_values_batch
-            current_batch_value_loss = value_loss_fn(value_pred_batch, y_mix)
+
+            draw_weight = target_values_batch.new_full((), value_draw_weight)
+            one_weight = target_values_batch.new_ones(())
+            draw_mask = target_values_batch.abs() < 1e-8
+            weights = torch.where(draw_mask, draw_weight, one_weight)
+            weighted_sq = (value_pred_batch - y_mix) ** 2 * weights
+            weight_sum = weights.sum()
+            if weight_sum.item() > 0:
+                current_batch_value_loss = weighted_sq.sum() / weight_sum
+            else:
+                current_batch_value_loss = torch.tensor(0.0, device=device)
             soft_abs_epoch += soft_values_batch.abs().mean().item()
             mix_abs_epoch += y_mix.abs().mean().item()
             soft_batches += 1
             
             valid_policy_samples_in_batch = 0
+            policy_weight_sum_in_batch = 0.0
 
             # 处理批次中的每个样本以计算策略损失
             for i in range(states_tensor_batch.size(0)):
@@ -240,14 +257,17 @@ def train_network(
                 if network_log_softmax_for_moves.shape != target_policy_sample.shape:
                     # print(f"Warning: Shape mismatch for policy loss. Net: {network_log_softmax_for_moves.shape}, Target: {target_policy_sample.shape}. Skipping sample.")
                     continue
-                
+
+                value_abs = float(target_values_batch[i].abs().item())
+                policy_weight = policy_draw_weight if value_abs < 1e-8 else 1.0
                 sample_policy_loss = policy_loss_fn(network_log_softmax_for_moves, target_policy_sample)
-                current_batch_policy_loss += sample_policy_loss
+                current_batch_policy_loss += sample_policy_loss * policy_weight
                 valid_policy_samples_in_batch += 1
+                policy_weight_sum_in_batch += policy_weight
             
-            if valid_policy_samples_in_batch > 0:
+            if policy_weight_sum_in_batch > 0:
                 # 平均每个有效样本的策略损失 (因为KLDivLoss(reduction='sum')是对单个策略求和)
-                averaged_batch_policy_loss = current_batch_policy_loss / valid_policy_samples_in_batch
+                averaged_batch_policy_loss = current_batch_policy_loss / policy_weight_sum_in_batch
             else:
                 # 如果批次中没有有效的策略样本，则策略损失为0
                 averaged_batch_policy_loss = torch.tensor(0.0, device=device, requires_grad=True) 
@@ -262,10 +282,11 @@ def train_network(
             
             # 累积损失 (用于打印)
             total_loss_epoch += loss.item() * states_tensor_batch.size(0) # Weighted by batch size if some were skipped
-            policy_loss_epoch += averaged_batch_policy_loss.item() * valid_policy_samples_in_batch
+            policy_loss_epoch += averaged_batch_policy_loss.item() * policy_weight_sum_in_batch
             value_loss_epoch += current_batch_value_loss.item() * states_tensor_batch.size(0) # MSE is already mean
             num_samples_processed += states_tensor_batch.size(0)
             total_valid_policy_samples += valid_policy_samples_in_batch
+            policy_weight_sum_epoch += policy_weight_sum_in_batch
         
         denom = max(1, soft_batches)
         avg_soft_abs = soft_abs_epoch / denom
@@ -274,7 +295,7 @@ def train_network(
         # 打印每个 epoch 的损失
         if num_samples_processed > 0 :
             avg_loss = total_loss_epoch / num_samples_processed
-            avg_policy_loss = policy_loss_epoch / total_valid_policy_samples if total_valid_policy_samples > 0 else 0.0
+            avg_policy_loss = policy_loss_epoch / policy_weight_sum_epoch if policy_weight_sum_epoch > 0 else 0.0
             avg_value_loss = value_loss_epoch / num_samples_processed
             print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}, Avg Policy Loss: {avg_policy_loss:.4f}, Avg Value Loss: {avg_value_loss:.4f}")
             epoch_stats.append({
@@ -284,6 +305,7 @@ def train_network(
                 "avg_value_loss": float(avg_value_loss),
                 "samples": int(num_samples_processed),
                 "valid_policy_samples": int(total_valid_policy_samples),
+                "policy_weight_sum": float(policy_weight_sum_epoch),
                 "soft_alpha": float(soft_label_alpha),
                 "avg_soft_abs": float(avg_soft_abs),
                 "avg_mix_abs": float(avg_mix_abs),

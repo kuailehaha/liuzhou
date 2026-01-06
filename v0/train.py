@@ -48,7 +48,13 @@ def train_pipeline_v0(
     self_play_games_per_worker: Optional[int] = None,
     self_play_base_seed: Optional[int] = None,
     self_play_virtual_loss_weight: float = 1.0,
+    self_play_opening_random_moves: int = 4,
+    self_play_resign_threshold: float = -0.8,
+    self_play_resign_min_moves: int = 10,
+    self_play_resign_consecutive: int = 3,
     decisive_only: bool = False,
+    value_draw_weight: float = 0.1,
+    policy_draw_weight: float = 0.3,
     eval_games_vs_random: int = 20,
     eval_games_vs_best: int = 20,
     win_rate_threshold: float = 0.55,
@@ -127,6 +133,45 @@ def train_pipeline_v0(
         sp_virtual_loss = float(self_play_virtual_loss_weight)
     if sp_virtual_loss < 0:
         sp_virtual_loss = 0.0
+
+    sp_opening_cfg = self_play_cfg.get("opening_random_moves", self_play_opening_random_moves)
+    try:
+        sp_opening_random_moves = int(sp_opening_cfg)
+    except (TypeError, ValueError):
+        sp_opening_random_moves = int(self_play_opening_random_moves)
+    sp_opening_random_moves = max(0, sp_opening_random_moves)
+
+    sp_resign_threshold_cfg = self_play_cfg.get("resign_threshold", self_play_resign_threshold)
+    sp_resign_min_cfg = self_play_cfg.get("resign_min_moves", self_play_resign_min_moves)
+    sp_resign_consecutive_cfg = self_play_cfg.get("resign_consecutive", self_play_resign_consecutive)
+    try:
+        sp_resign_threshold = float(sp_resign_threshold_cfg)
+    except (TypeError, ValueError):
+        sp_resign_threshold = float(self_play_resign_threshold)
+    try:
+        sp_resign_min_moves = int(sp_resign_min_cfg)
+    except (TypeError, ValueError):
+        sp_resign_min_moves = int(self_play_resign_min_moves)
+    try:
+        sp_resign_consecutive = int(sp_resign_consecutive_cfg)
+    except (TypeError, ValueError):
+        sp_resign_consecutive = int(self_play_resign_consecutive)
+    sp_resign_min_moves = max(0, sp_resign_min_moves)
+    sp_resign_consecutive = max(1, sp_resign_consecutive)
+
+    try:
+        value_draw_weight = float(value_draw_weight)
+    except (TypeError, ValueError):
+        value_draw_weight = 1.0
+    if value_draw_weight < 0:
+        value_draw_weight = 0.0
+
+    try:
+        policy_draw_weight = float(policy_draw_weight)
+    except (TypeError, ValueError):
+        policy_draw_weight = 1.0
+    if policy_draw_weight < 0:
+        policy_draw_weight = 0.0
 
     evaluation_cfg = runtime_config.get("evaluation", {})
     eval_temperature = evaluation_cfg.get("temperature", 0.05)
@@ -254,7 +299,13 @@ def train_pipeline_v0(
                 "self_play_batch_leaves": sp_batch_leaves,
                 "self_play_dirichlet_alpha": sp_dirichlet_alpha,
                 "self_play_dirichlet_epsilon": sp_dirichlet_epsilon,
+                "self_play_opening_random_moves": sp_opening_random_moves,
+                "self_play_resign_threshold": sp_resign_threshold,
+                "self_play_resign_min_moves": sp_resign_min_moves,
+                "self_play_resign_consecutive": sp_resign_consecutive,
                 "decisive_only": bool(decisive_only),
+                "value_draw_weight": value_draw_weight,
+                "policy_draw_weight": policy_draw_weight,
             }
 
         if soft_alpha_anneal_iters <= 0:
@@ -315,6 +366,10 @@ def train_pipeline_v0(
                 dirichlet_epsilon=sp_dirichlet_epsilon,
                 batch_leaves=sp_batch_leaves,
                 virtual_loss=sp_virtual_loss,
+                opening_random_moves=sp_opening_random_moves,
+                resign_threshold=sp_resign_threshold,
+                resign_min_moves=sp_resign_min_moves,
+                resign_consecutive=sp_resign_consecutive,
                 num_workers=sp_workers,
                 games_per_worker=sp_games_per_worker,
                 base_seed=sp_base_seed,
@@ -366,6 +421,8 @@ def train_pipeline_v0(
                 lr=lr,
                 weight_decay=weight_decay,
                 soft_label_alpha=current_alpha,
+                value_draw_weight=value_draw_weight,
+                policy_draw_weight=policy_draw_weight,
                 device=device,
                 board_size=board_size,
             )
@@ -612,9 +669,45 @@ if __name__ == "__main__":
         help="Virtual loss weight used during v0 self-play.",
     )
     parser.add_argument(
+        "--self_play_opening_random_moves",
+        type=int,
+        default=4,
+        help="Number of opening moves to sample uniformly at random during self-play.",
+    )
+    parser.add_argument(
+        "--self_play_resign_threshold",
+        type=float,
+        default=-0.8,
+        help="Resign when root value <= threshold (set >=0 to disable).",
+    )
+    parser.add_argument(
+        "--self_play_resign_min_moves",
+        type=int,
+        default=10,
+        help="Disable resign for the first N moves.",
+    )
+    parser.add_argument(
+        "--self_play_resign_consecutive",
+        type=int,
+        default=3,
+        help="Require this many consecutive low-value steps to resign.",
+    )
+    parser.add_argument(
         "--decisive_only",
         action="store_true",
         help="Train only on decisive (win/loss) samples; drop draws regardless of soft_value.",
+    )
+    parser.add_argument(
+        "--value_draw_weight",
+        type=float,
+        default=0.1,
+        help="Weight for draw samples in value loss (1.0 = no downweight).",
+    )
+    parser.add_argument(
+        "--policy_draw_weight",
+        type=float,
+        default=0.3,
+        help="Weight for draw samples in policy loss (1.0 = no downweight).",
     )
     parser.add_argument(
         "--self_play_batch_leaves",
@@ -704,7 +797,13 @@ if __name__ == "__main__":
         self_play_games_per_worker=args.self_play_games_per_worker,
         self_play_base_seed=(None if args.self_play_base_seed == 0 else args.self_play_base_seed),
         self_play_virtual_loss_weight=args.self_play_virtual_loss,
+        self_play_opening_random_moves=args.self_play_opening_random_moves,
+        self_play_resign_threshold=args.self_play_resign_threshold,
+        self_play_resign_min_moves=args.self_play_resign_min_moves,
+        self_play_resign_consecutive=args.self_play_resign_consecutive,
         decisive_only=args.decisive_only,
+        value_draw_weight=args.value_draw_weight,
+        policy_draw_weight=args.policy_draw_weight,
         eval_games_vs_random=args.eval_games_vs_random,
         eval_games_vs_best=args.eval_games_vs_best,
         eval_workers=args.eval_workers,

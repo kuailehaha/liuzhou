@@ -52,6 +52,10 @@ def self_play_single_game_v0(
     batch_leaves: int,
     virtual_loss: float,
     seed: int,
+    opening_random_moves: int = 0,
+    resign_threshold: float = -0.8,
+    resign_min_moves: int = 10,
+    resign_consecutive: int = 3,
     verbose: bool = False,
     mcts_verbose: bool = False,
     soft_value_k: float = 2.0,
@@ -76,6 +80,12 @@ def self_play_single_game_v0(
     game_states: List[GameState] = []
     game_policies: List[np.ndarray] = []
     move_count = 0
+    opening_random_moves = max(0, int(opening_random_moves))
+    resign_threshold = float(resign_threshold)
+    resign_min_moves = max(0, int(resign_min_moves))
+    resign_consecutive = max(1, int(resign_consecutive))
+    enable_resign = resign_threshold < 0.0
+    resign_count = 0
 
     while True:
         current_temp = temperature_init if move_count < temperature_threshold else temperature_final
@@ -103,7 +113,23 @@ def self_play_single_game_v0(
             soft_value = _soft_value_from_state(state, soft_value_k)
             return game_states, game_policies, result, soft_value
 
-        move_idx = rng.choice(len(moves), p=policy if policy.size else None)
+        root_value = float(mcts.get_root_value())
+        if enable_resign and move_count >= resign_min_moves:
+            if root_value <= resign_threshold:
+                resign_count += 1
+                if resign_count >= resign_consecutive:
+                    result = -1.0 if state.current_player == Player.BLACK else 1.0
+                    soft_value = _soft_value_from_state(state, soft_value_k)
+                    return game_states, game_policies, result, soft_value
+            else:
+                resign_count = 0
+        else:
+            resign_count = 0
+
+        if opening_random_moves > 0 and move_count < opening_random_moves:
+            move_idx = rng.integers(len(moves))
+        else:
+            move_idx = rng.choice(len(moves), p=policy if policy.size else None)
         move = moves[int(move_idx)]
 
         state = apply_move(state, move, quiet=True)
@@ -178,6 +204,10 @@ def _v0_self_play_worker(
                     dirichlet_epsilon=cfg["dirichlet_epsilon"],
                     batch_leaves=cfg["batch_leaves"],
                     virtual_loss=cfg["virtual_loss"],
+                    opening_random_moves=cfg["opening_random_moves"],
+                    resign_threshold=cfg["resign_threshold"],
+                    resign_min_moves=cfg["resign_min_moves"],
+                    resign_consecutive=cfg["resign_consecutive"],
                     seed=game_seed,
                     verbose=bool(cfg.get("verbose", False)) and worker_id == 0,
                     mcts_verbose=bool(cfg.get("mcts_verbose", False)),
@@ -210,6 +240,10 @@ def self_play_v0(
     soft_value_k: float,
     mcts_verbose: bool,
     verbose: bool,
+    opening_random_moves: int = 0,
+    resign_threshold: float = -0.8,
+    resign_min_moves: int = 10,
+    resign_consecutive: int = 3,
 ) -> List[Tuple[List[GameState], List[np.ndarray], float, float]]:
     model.eval()
 
@@ -232,6 +266,10 @@ def self_play_v0(
                     dirichlet_epsilon=dirichlet_epsilon,
                     batch_leaves=batch_leaves,
                     virtual_loss=virtual_loss,
+                    opening_random_moves=opening_random_moves,
+                    resign_threshold=resign_threshold,
+                    resign_min_moves=resign_min_moves,
+                    resign_consecutive=resign_consecutive,
                     seed=seed,
                     verbose=verbose,
                     mcts_verbose=mcts_verbose,
@@ -261,6 +299,10 @@ def self_play_v0(
         "dirichlet_epsilon": dirichlet_epsilon,
         "batch_leaves": batch_leaves,
         "virtual_loss": virtual_loss,
+        "opening_random_moves": opening_random_moves,
+        "resign_threshold": resign_threshold,
+        "resign_min_moves": resign_min_moves,
+        "resign_consecutive": resign_consecutive,
         "soft_value_k": soft_value_k,
         "verbose": verbose,
         "mcts_verbose": mcts_verbose,

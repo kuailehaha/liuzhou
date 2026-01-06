@@ -101,6 +101,10 @@ def run_v0(args: argparse.Namespace, model: ChessNet, games_per_worker: Optional
         dirichlet_epsilon=args.dirichlet_epsilon,
         batch_leaves=args.batch_leaves,
         virtual_loss=args.v0_virtual_loss,
+        opening_random_moves=args.opening_random_moves,
+        resign_threshold=args.resign_threshold,
+        resign_min_moves=args.resign_min_moves,
+        resign_consecutive=args.resign_consecutive,
         num_workers=args.num_workers,
         games_per_worker=games_per_worker,
         base_seed=(None if args.base_seed == 0 else args.base_seed),
@@ -143,6 +147,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override games per worker (auto-computed if omitted).",
     )
     parser.add_argument("--batch-leaves", type=int, default=256, help="v0 leaf batch size.")
+    parser.add_argument("--opening-random-moves", type=int, default=4, help="Opening random moves for v0.")
+    parser.add_argument(
+        "--resign-threshold",
+        type=float,
+        default=-0.8,
+        help="Resign when root value <= threshold (set >=0 to disable).",
+    )
+    parser.add_argument(
+        "--resign-min-moves",
+        type=int,
+        default=10,
+        help="Disable resign for the first N moves.",
+    )
+    parser.add_argument(
+        "--resign-consecutive",
+        type=int,
+        default=3,
+        help="Require this many consecutive low-value steps to resign.",
+    )
     parser.add_argument("--dirichlet-alpha", type=float, default=0.3, help="Dirichlet alpha for v0.")
     parser.add_argument("--dirichlet-epsilon", type=float, default=0.25, help="Dirichlet epsilon for v0.")
     parser.add_argument("--disable-dirichlet-noise", action="store_true", help="Disable root Dirichlet noise.")

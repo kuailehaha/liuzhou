@@ -61,6 +61,10 @@ def generate_samples(args: argparse.Namespace) -> None:
         dirichlet_epsilon=args.dirichlet_epsilon,
         batch_leaves=args.batch_leaves,
         virtual_loss=args.virtual_loss,
+        opening_random_moves=args.opening_random_moves,
+        resign_threshold=args.resign_threshold,
+        resign_min_moves=args.resign_min_moves,
+        resign_consecutive=args.resign_consecutive,
         num_workers=args.self_play_workers,
         games_per_worker=games_per_worker,
         base_seed=(None if args.base_seed == 0 else args.base_seed),
@@ -105,6 +109,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch_leaves", type=int, default=256, help="Number of batched leaf evaluations per search.")
     parser.add_argument("--virtual_loss", type=float, default=1.0, help="Virtual loss weight for v0 MCTS.")
+    parser.add_argument(
+        "--opening_random_moves",
+        type=int,
+        default=4,
+        help="Number of opening moves to sample uniformly at random.",
+    )
+    parser.add_argument(
+        "--resign_threshold",
+        type=float,
+        default=-0.8,
+        help="Resign when root value <= threshold (set >=0 to disable).",
+    )
+    parser.add_argument(
+        "--resign_min_moves",
+        type=int,
+        default=10,
+        help="Disable resign for the first N moves.",
+    )
+    parser.add_argument(
+        "--resign_consecutive",
+        type=int,
+        default=3,
+        help="Require this many consecutive low-value steps to resign.",
+    )
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3, help="Dirichlet alpha for root noise.")
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25, help="Dirichlet epsilon blend.")
     parser.add_argument(
