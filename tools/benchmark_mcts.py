@@ -68,6 +68,42 @@ def main() -> None:
         default="cpu",
         help="Device used for both legacy and v0 (e.g. 'cpu', 'cuda', 'cuda:0').",
     )
+    parser.add_argument(
+        "--inference-backend",
+        "--inference_backend",
+        type=str,
+        default="graph",
+        choices=["graph", "ts", "py"],
+        help="Inference backend for v0 MCTS: graph|ts|py.",
+    )
+    parser.add_argument(
+        "--torchscript-path",
+        "--torchscript_path",
+        type=str,
+        default=None,
+        help="Optional TorchScript path for v0 inference backends.",
+    )
+    parser.add_argument(
+        "--torchscript-dtype",
+        "--torchscript_dtype",
+        type=str,
+        default=None,
+        help="Optional TorchScript dtype override (float16/float32/bfloat16).",
+    )
+    parser.add_argument(
+        "--inference-batch-size",
+        "--inference_batch_size",
+        type=int,
+        default=512,
+        help="Fixed batch size for graph inference backend.",
+    )
+    parser.add_argument(
+        "--inference-warmup-iters",
+        "--inference_warmup_iters",
+        type=int,
+        default=5,
+        help="Warmup iterations inside the graph inference engine.",
+    )
     parser.add_argument("--timing", action="store_true", help="Include per-sample timing lines (default summary only).")
     parser.add_argument("--seed", type=int, default=42, help="Base RNG seed for reproducibility.")
     parser.add_argument("--skip-legacy", action="store_true", help="Skip legacy MCTS (benchmark v0 only).")
@@ -130,6 +166,11 @@ def main() -> None:
             add_dirichlet_noise=False,
             seed=args.seed,
             batch_K=args.batch_size,
+            inference_backend=args.inference_backend,
+            torchscript_path=args.torchscript_path,
+            torchscript_dtype=args.torchscript_dtype,
+            inference_batch_size=args.inference_batch_size,
+            inference_warmup_iters=args.inference_warmup_iters,
         )
 
         try:
@@ -189,4 +230,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

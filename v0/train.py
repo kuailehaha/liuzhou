@@ -66,6 +66,11 @@ def train_pipeline_v0(
     self_play_batch_leaves: int = 256,
     self_play_dirichlet_alpha: float = 0.3,
     self_play_dirichlet_epsilon: float = 0.25,
+    self_play_inference_backend: str = "graph",
+    self_play_torchscript_path: Optional[str] = None,
+    self_play_torchscript_dtype: Optional[str] = None,
+    self_play_inference_batch_size: int = 512,
+    self_play_inference_warmup_iters: int = 5,
     data_files: Optional[Sequence[str]] = None,
     data_samples_per_iteration: Optional[int] = None,
     data_shuffle: bool = False,
@@ -216,6 +221,34 @@ def train_pipeline_v0(
     except (TypeError, ValueError):
         sp_batch_leaves = self_play_batch_leaves
     sp_batch_leaves = max(1, sp_batch_leaves)
+
+    sp_backend_cfg = self_play_cfg.get("inference_backend", self_play_inference_backend)
+    try:
+        sp_inference_backend = str(sp_backend_cfg) if sp_backend_cfg is not None else self_play_inference_backend
+    except (TypeError, ValueError):
+        sp_inference_backend = self_play_inference_backend
+
+    sp_torchscript_path = self_play_cfg.get("torchscript_path", self_play_torchscript_path)
+    if sp_torchscript_path is not None:
+        sp_torchscript_path = str(sp_torchscript_path)
+
+    sp_torchscript_dtype = self_play_cfg.get("torchscript_dtype", self_play_torchscript_dtype)
+    if sp_torchscript_dtype is not None:
+        sp_torchscript_dtype = str(sp_torchscript_dtype)
+
+    sp_batch_size_cfg = self_play_cfg.get("inference_batch_size", self_play_inference_batch_size)
+    try:
+        sp_inference_batch_size = int(sp_batch_size_cfg)
+    except (TypeError, ValueError):
+        sp_inference_batch_size = self_play_inference_batch_size
+    sp_inference_batch_size = max(1, sp_inference_batch_size)
+
+    sp_warmup_cfg = self_play_cfg.get("inference_warmup_iters", self_play_inference_warmup_iters)
+    try:
+        sp_inference_warmup_iters = int(sp_warmup_cfg)
+    except (TypeError, ValueError):
+        sp_inference_warmup_iters = self_play_inference_warmup_iters
+    sp_inference_warmup_iters = max(0, sp_inference_warmup_iters)
 
     dir_alpha_cfg = self_play_cfg.get("dirichlet_alpha", self_play_dirichlet_alpha)
     dir_eps_cfg = self_play_cfg.get("dirichlet_epsilon", self_play_dirichlet_epsilon)
@@ -376,6 +409,11 @@ def train_pipeline_v0(
                 soft_value_k=soft_value_k,
                 mcts_verbose=self_play_mcts_verbose,
                 verbose=self_play_verbose,
+                inference_backend=sp_inference_backend,
+                torchscript_path=sp_torchscript_path,
+                torchscript_dtype=sp_torchscript_dtype,
+                inference_batch_size=sp_inference_batch_size,
+                inference_warmup_iters=sp_inference_warmup_iters,
             )
             training_data = training_data or []
             if decisive_only:
@@ -716,6 +754,42 @@ if __name__ == "__main__":
         help="Number of leaf evaluations batched together inside v0 MCTS.",
     )
     parser.add_argument(
+        "--self_play_inference_backend",
+        "--self_play_inference-backend",
+        type=str,
+        default="graph",
+        choices=["graph", "ts", "py"],
+        help="Inference backend for v0 MCTS: graph|ts|py.",
+    )
+    parser.add_argument(
+        "--self_play_torchscript_path",
+        "--self_play_torchscript-path",
+        type=str,
+        default=None,
+        help="Optional TorchScript path for v0 inference backends.",
+    )
+    parser.add_argument(
+        "--self_play_torchscript_dtype",
+        "--self_play_torchscript-dtype",
+        type=str,
+        default=None,
+        help="Optional TorchScript dtype override (float16/float32/bfloat16).",
+    )
+    parser.add_argument(
+        "--self_play_inference_batch_size",
+        "--self_play_inference-batch-size",
+        type=int,
+        default=512,
+        help="Fixed batch size for graph inference backend.",
+    )
+    parser.add_argument(
+        "--self_play_inference_warmup_iters",
+        "--self_play_inference-warmup-iters",
+        type=int,
+        default=5,
+        help="Warmup iterations inside the graph inference engine.",
+    )
+    parser.add_argument(
         "--self_play_dirichlet_alpha",
         type=float,
         default=0.3,
@@ -815,6 +889,11 @@ if __name__ == "__main__":
         self_play_batch_leaves=args.self_play_batch_leaves,
         self_play_dirichlet_alpha=args.self_play_dirichlet_alpha,
         self_play_dirichlet_epsilon=args.self_play_dirichlet_epsilon,
+        self_play_inference_backend=args.self_play_inference_backend,
+        self_play_torchscript_path=args.self_play_torchscript_path,
+        self_play_torchscript_dtype=args.self_play_torchscript_dtype,
+        self_play_inference_batch_size=args.self_play_inference_batch_size,
+        self_play_inference_warmup_iters=args.self_play_inference_warmup_iters,
         data_files=args.data_files,
         data_samples_per_iteration=args.data_samples_per_iteration,
         data_shuffle=args.data_shuffle,

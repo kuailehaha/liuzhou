@@ -71,6 +71,11 @@ def generate_samples(args: argparse.Namespace) -> None:
         soft_value_k=args.soft_value_k,
         mcts_verbose=args.mcts_verbose,
         verbose=args.verbose,
+        inference_backend=args.inference_backend,
+        torchscript_path=args.torchscript_path,
+        torchscript_dtype=args.torchscript_dtype,
+        inference_batch_size=args.inference_batch_size,
+        inference_warmup_iters=args.inference_warmup_iters,
     )
 
     samples = list(flatten_training_games(training_data))
@@ -152,6 +157,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_prefix", type=str, default="self_play", help="Prefix for output filenames.")
     parser.add_argument("--verbose", action="store_true", help="Print per-move information during generation.")
     parser.add_argument("--mcts_verbose", action="store_true", help="Enable verbose logging inside v0 MCTS.")
+    parser.add_argument(
+        "--inference_backend",
+        "--inference-backend",
+        type=str,
+        default="graph",
+        choices=["graph", "ts", "py"],
+        help="Inference backend for v0 MCTS: graph|ts|py.",
+    )
+    parser.add_argument(
+        "--torchscript_path",
+        "--torchscript-path",
+        type=str,
+        default=None,
+        help="Optional TorchScript path for v0 inference backends.",
+    )
+    parser.add_argument(
+        "--torchscript_dtype",
+        "--torchscript-dtype",
+        type=str,
+        default=None,
+        help="Optional TorchScript dtype override (float16/float32/bfloat16).",
+    )
+    parser.add_argument(
+        "--inference_batch_size",
+        "--inference-batch-size",
+        type=int,
+        default=512,
+        help="Fixed batch size for graph inference backend.",
+    )
+    parser.add_argument(
+        "--inference_warmup_iters",
+        "--inference-warmup-iters",
+        type=int,
+        default=5,
+        help="Warmup iterations inside the graph inference engine.",
+    )
     return parser
 
 

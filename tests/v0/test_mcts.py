@@ -78,6 +78,7 @@ def test_v0_mcts_produces_valid_policy() -> None:
         add_dirichlet_noise=False,
         seed=SEED,
         batch_K=8,
+        inference_backend="py",
     )
 
     for i in range(NUM_SAMPLES):
@@ -134,6 +135,7 @@ def test_v0_mcts_consistency() -> None:
             add_dirichlet_noise=False,
             seed=SEED,
             batch_K=8,
+            inference_backend="py",
         )
         moves, policy = v0_mcts.search(state)
         results.append((moves, policy))
@@ -184,6 +186,7 @@ def test_v0_mcts_vs_legacy_move_coverage() -> None:
         add_dirichlet_noise=False,
         seed=SEED,
         batch_K=8,
+        inference_backend="py",
     )
 
     mismatches = []
@@ -214,4 +217,3 @@ def test_v0_mcts_vs_legacy_move_coverage() -> None:
             print(f"  Sample {m['sample']}: legacy_only={len(m['legacy_only'])}, v0_only={len(m['v0_only'])}")
     else:
         print(f"\n[test_v0_mcts_vs_legacy_move_coverage] All {NUM_SAMPLES} samples matched")
-

@@ -111,6 +111,11 @@ def run_v0(args: argparse.Namespace, model: ChessNet, games_per_worker: Optional
         soft_value_k=args.soft_value_k,
         mcts_verbose=args.v0_mcts_verbose,
         verbose=args.verbose,
+        inference_backend=args.inference_backend,
+        torchscript_path=args.torchscript_path,
+        torchscript_dtype=args.torchscript_dtype,
+        inference_batch_size=args.inference_batch_size,
+        inference_warmup_iters=args.inference_warmup_iters,
     )
     end = time.perf_counter()
     return _summarize_result("v0", start, end, training_data)
@@ -147,6 +152,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override games per worker (auto-computed if omitted).",
     )
     parser.add_argument("--batch-leaves", type=int, default=256, help="v0 leaf batch size.")
+    parser.add_argument(
+        "--inference-backend",
+        "--inference_backend",
+        type=str,
+        default="graph",
+        choices=["graph", "ts", "py"],
+        help="Inference backend for v0 MCTS: graph|ts|py.",
+    )
+    parser.add_argument(
+        "--torchscript-path",
+        "--torchscript_path",
+        type=str,
+        default=None,
+        help="Optional TorchScript path for v0 inference backends.",
+    )
+    parser.add_argument(
+        "--torchscript-dtype",
+        "--torchscript_dtype",
+        type=str,
+        default=None,
+        help="Optional TorchScript dtype override (float16/float32/bfloat16).",
+    )
+    parser.add_argument(
+        "--inference-batch-size",
+        "--inference_batch_size",
+        type=int,
+        default=512,
+        help="Fixed batch size for graph inference backend.",
+    )
+    parser.add_argument(
+        "--inference-warmup-iters",
+        "--inference_warmup_iters",
+        type=int,
+        default=5,
+        help="Warmup iterations inside the graph inference engine.",
+    )
     parser.add_argument("--opening-random-moves", type=int, default=4, help="Opening random moves for v0.")
     parser.add_argument(
         "--resign-threshold",

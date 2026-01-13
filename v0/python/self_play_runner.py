@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import os
 import random
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -28,6 +31,52 @@ def _serialize_model_state(model: ChessNet) -> bytes:
     buffer = io.BytesIO()
     torch.save(model.state_dict(), buffer)
     return buffer.getvalue()
+
+
+def _dtype_from_string(value: str) -> torch.dtype:
+    key = value.strip().lower()
+    if key in ("float32", "fp32", "f32"):
+        return torch.float32
+    if key in ("float16", "fp16", "f16"):
+        return torch.float16
+    if key in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    raise ValueError(f"Unsupported dtype: {value}")
+
+
+def _default_torchscript_dtype(device: torch.device) -> str:
+    if device.type == "cuda":
+        return "float16"
+    return "float32"
+
+
+def _export_torchscript(
+    model: ChessNet,
+    device: torch.device,
+    dtype_str: str,
+    batch_size: int,
+) -> str:
+    dtype = _dtype_from_string(dtype_str)
+    if device.type == "cpu" and dtype == torch.float16:
+        raise ValueError("float16 export is not supported on CPU.")
+    model_copy = copy.deepcopy(model)
+    model_copy.to(device=device, dtype=dtype)
+    model_copy.eval()
+    inputs = torch.zeros(
+        batch_size,
+        NUM_INPUT_CHANNELS,
+        GameState.BOARD_SIZE,
+        GameState.BOARD_SIZE,
+        device=device,
+        dtype=dtype,
+    )
+    with torch.inference_mode():
+        scripted = torch.jit.trace(model_copy, inputs, strict=False)
+        tmp = tempfile.NamedTemporaryFile(prefix="v0_self_play_", suffix=".pt", delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        scripted.save(str(tmp_path))
+    return str(tmp_path)
 
 
 def _soft_value_from_state(state: GameState, soft_value_k: float) -> float:
@@ -59,6 +108,11 @@ def self_play_single_game_v0(
     verbose: bool = False,
     mcts_verbose: bool = False,
     soft_value_k: float = 2.0,
+    inference_backend: str = "graph",
+    torchscript_path: Optional[str] = None,
+    torchscript_dtype: Optional[str] = None,
+    inference_batch_size: int = 512,
+    inference_warmup_iters: int = 5,
 ) -> Tuple[List[GameState], List[np.ndarray], float, float]:
     rng = np.random.default_rng(seed)
     mcts = FastMCTS(
@@ -74,6 +128,11 @@ def self_play_single_game_v0(
         virtual_loss=virtual_loss,
         seed=seed,
         verbose=mcts_verbose,
+        inference_backend=inference_backend,
+        torchscript_path=torchscript_path,
+        torchscript_dtype=torchscript_dtype,
+        inference_batch_size=inference_batch_size,
+        inference_warmup_iters=inference_warmup_iters,
     )
 
     state = GameState()
@@ -212,6 +271,11 @@ def _v0_self_play_worker(
                     verbose=bool(cfg.get("verbose", False)) and worker_id == 0,
                     mcts_verbose=bool(cfg.get("mcts_verbose", False)),
                     soft_value_k=cfg["soft_value_k"],
+                    inference_backend=cfg.get("inference_backend", "graph"),
+                    torchscript_path=cfg.get("torchscript_path"),
+                    torchscript_dtype=cfg.get("torchscript_dtype"),
+                    inference_batch_size=cfg.get("inference_batch_size", 512),
+                    inference_warmup_iters=cfg.get("inference_warmup_iters", 5),
                 )
             )
 
@@ -244,8 +308,27 @@ def self_play_v0(
     resign_threshold: float = -0.8,
     resign_min_moves: int = 10,
     resign_consecutive: int = 3,
+    inference_backend: str = "graph",
+    torchscript_path: Optional[str] = None,
+    torchscript_dtype: Optional[str] = None,
+    inference_batch_size: int = 512,
+    inference_warmup_iters: int = 5,
 ) -> List[Tuple[List[GameState], List[np.ndarray], float, float]]:
     model.eval()
+
+    backend = str(inference_backend).lower()
+    if backend != "py" and not torchscript_path:
+        device_obj = torch.device(device)
+        dtype_str = torchscript_dtype or _default_torchscript_dtype(device_obj)
+        if dtype_str.strip().lower() in ("auto", "none"):
+            dtype_str = _default_torchscript_dtype(device_obj)
+        torchscript_path = _export_torchscript(
+            model=model,
+            device=device_obj,
+            dtype_str=dtype_str,
+            batch_size=max(1, int(inference_batch_size)),
+        )
+        torchscript_dtype = dtype_str
 
     if num_workers <= 1:
         rng = random.Random(base_seed or int(time.time() * 1e6))
@@ -274,6 +357,11 @@ def self_play_v0(
                     verbose=verbose,
                     mcts_verbose=mcts_verbose,
                     soft_value_k=soft_value_k,
+                    inference_backend=inference_backend,
+                    torchscript_path=torchscript_path,
+                    torchscript_dtype=torchscript_dtype,
+                    inference_batch_size=inference_batch_size,
+                    inference_warmup_iters=inference_warmup_iters,
                 )
             )
         return games
@@ -309,6 +397,11 @@ def self_play_v0(
         "num_workers": num_workers,
         "num_input_channels": NUM_INPUT_CHANNELS,
         "games_per_worker": games_per_worker,
+        "inference_backend": inference_backend,
+        "torchscript_path": torchscript_path,
+        "torchscript_dtype": torchscript_dtype,
+        "inference_batch_size": inference_batch_size,
+        "inference_warmup_iters": inference_warmup_iters,
     }
 
     base_seed = base_seed or random.randint(1, 10**9)

@@ -7,7 +7,10 @@ all tree selection/expansion/backprop runs inside `v0_core.MCTSCore`.
 
 from __future__ import annotations
 
+import copy
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import math
@@ -17,6 +20,7 @@ import torch
 import v0_core
 from src.game_state import GameState
 from src.move_generator import apply_move
+from src.neural_network import NUM_INPUT_CHANNELS
 from .move_encoder import (
     ActionEncodingSpec,
     DEFAULT_ACTION_SPEC,
@@ -26,6 +30,17 @@ from .move_encoder import (
 from .state_batch import from_game_states
 
 __all__ = ["MCTS"]
+
+
+_BACKEND_ALIASES = {
+    "graph": "graph",
+    "cuda_graph": "graph",
+    "cudagraph": "graph",
+    "ts": "ts",
+    "torchscript": "ts",
+    "py": "py",
+    "python": "py",
+}
 
 
 def _state_signature(state: GameState) -> Tuple:
@@ -42,6 +57,66 @@ def _state_signature(state: GameState) -> Tuple:
         state.forced_removals_done,
         state.move_count,
     )
+
+
+def _normalize_backend(value: str) -> str:
+    key = (value or "graph").strip().lower()
+    if key in _BACKEND_ALIASES:
+        return _BACKEND_ALIASES[key]
+    raise ValueError(f"Unsupported inference backend: {value}")
+
+
+def _dtype_from_string(value: str) -> torch.dtype:
+    key = value.strip().lower()
+    if key in ("float32", "fp32", "f32"):
+        return torch.float32
+    if key in ("float16", "fp16", "f16"):
+        return torch.float16
+    if key in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    raise ValueError(f"Unsupported dtype: {value}")
+
+
+def _dtype_to_string(dtype: torch.dtype) -> str:
+    if dtype == torch.float32:
+        return "float32"
+    if dtype == torch.float16:
+        return "float16"
+    if dtype == torch.bfloat16:
+        return "bfloat16"
+    return str(dtype)
+
+
+def _default_torchscript_dtype(device: torch.device) -> str:
+    if device.type == "cuda":
+        return "float16"
+    return "float32"
+
+
+def _export_torchscript_model(
+    model: torch.nn.Module,
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    path: Path,
+) -> Path:
+    if device.type == "cpu" and dtype == torch.float16:
+        raise ValueError("float16 export is not supported on CPU.")
+    model_copy = copy.deepcopy(model)
+    model_copy.to(device=device, dtype=dtype)
+    model_copy.eval()
+    inputs = torch.zeros(
+        batch_size,
+        NUM_INPUT_CHANNELS,
+        GameState.BOARD_SIZE,
+        GameState.BOARD_SIZE,
+        device=device,
+        dtype=dtype,
+    )
+    with torch.inference_mode():
+        scripted = torch.jit.trace(model_copy, inputs, strict=False)
+        scripted.save(str(path))
+    return path
 
 
 @dataclass
@@ -77,11 +152,20 @@ class MCTS:
         virtual_loss: float = 1.0,
         seed: int = 12345,
         verbose: bool = False,
+        inference_backend: str = "graph",
+        torchscript_path: Optional[str] = None,
+        torchscript_dtype: Optional[str] = None,
+        inference_batch_size: int = 512,
+        inference_warmup_iters: int = 5,
     ) -> None:
         self.model = model
         self.spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC
         self.device = torch.device(device)
         self.verbose = bool(verbose)
+        self.inference_backend = _normalize_backend(inference_backend)
+        self._torchscript_path: Optional[Path] = None
+        self._torchscript_runner = None
+        self._inference_engine = None
         self.params = MCTSParams(
             num_simulations=num_simulations,
             exploration_weight=exploration_weight,
@@ -108,12 +192,73 @@ class MCTS:
         cfg.seed = self.params.seed
 
         self._core = v0_core.MCTSCore(cfg)
-        self._core.set_forward_callback(self._forward_callback)
+        self._configure_inference_backend(
+            torchscript_path=torchscript_path,
+            torchscript_dtype=torchscript_dtype,
+            inference_batch_size=inference_batch_size,
+            inference_warmup_iters=inference_warmup_iters,
+        )
 
         self._current_state: Optional[GameState] = None
         self._root_signature: Optional[Tuple] = None
 
     # ------------------------------------------------------------------ Helpers
+
+    def _configure_inference_backend(
+        self,
+        torchscript_path: Optional[str],
+        torchscript_dtype: Optional[str],
+        inference_batch_size: int,
+        inference_warmup_iters: int,
+    ) -> None:
+        if self.inference_backend == "py":
+            self._core.set_forward_callback(self._forward_callback)
+            return
+
+        dtype_str = torchscript_dtype or _default_torchscript_dtype(self.device)
+        if torchscript_dtype and torchscript_dtype.strip().lower() in ("auto", "none"):
+            dtype_str = _default_torchscript_dtype(self.device)
+        dtype = _dtype_from_string(dtype_str)
+
+        if torchscript_path:
+            path = Path(torchscript_path).expanduser().resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"TorchScript path not found: {path}")
+            self._torchscript_path = path
+        else:
+            tmp = tempfile.NamedTemporaryFile(prefix="v0_mcts_", suffix=".pt", delete=False)
+            tmp_path = Path(tmp.name)
+            tmp.close()
+            self._torchscript_path = _export_torchscript_model(
+                self.model,
+                self.device,
+                dtype,
+                max(1, int(inference_batch_size)),
+                tmp_path,
+            )
+
+        if self.inference_backend == "graph":
+            self._inference_engine = v0_core.InferenceEngine(
+                str(self._torchscript_path),
+                device=str(self.device),
+                dtype=_dtype_to_string(dtype),
+                batch_size=max(1, int(inference_batch_size)),
+                input_channels=NUM_INPUT_CHANNELS,
+                height=GameState.BOARD_SIZE,
+                width=GameState.BOARD_SIZE,
+                warmup_iters=max(0, int(inference_warmup_iters)),
+            )
+            if self.device.type == "cuda" and not self._inference_engine.graph_enabled:
+                print("[v0.MCTS] Warning: graph backend selected but graph capture is disabled.")
+            self._core.set_inference_engine(self._inference_engine)
+            return
+
+        self._torchscript_runner = v0_core.TorchScriptRunner(
+            str(self._torchscript_path),
+            device=str(self.device),
+            dtype=_dtype_to_string(dtype),
+        )
+        self._core.set_torchscript_runner(self._torchscript_runner)
 
     def _forward_callback(self, inputs: torch.Tensor):
         inputs = inputs.to(self.device, non_blocking=True)
