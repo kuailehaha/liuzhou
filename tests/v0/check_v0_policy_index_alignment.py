@@ -181,6 +181,7 @@ def main() -> None:
         virtual_loss=args.virtual_loss,
         seed=args.seed,
         verbose=False,
+        inference_backend="py",
     )
 
     states: List[GameState] = [GameState()]

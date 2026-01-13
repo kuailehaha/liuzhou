@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import os
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -36,6 +39,99 @@ def _auto_games_per_worker(num_games: int, num_workers: int, override: Optional[
     if override is not None and override > 0:
         return override
     return max(1, math.ceil(num_games / num_workers))
+
+
+def _dtype_from_string(value: str) -> torch.dtype:
+    key = value.strip().lower()
+    if key in ("float32", "fp32", "f32"):
+        return torch.float32
+    if key in ("float16", "fp16", "f16"):
+        return torch.float16
+    if key in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    raise ValueError(f"Unsupported dtype: {value}")
+
+
+def _default_torchscript_dtype(device: torch.device) -> str:
+    if device.type == "cuda":
+        return "float16"
+    return "float32"
+
+
+def _export_torchscript(
+    model: ChessNet,
+    device: torch.device,
+    dtype_str: str,
+    batch_size: int,
+) -> str:
+    dtype = _dtype_from_string(dtype_str)
+    if device.type == "cpu" and dtype == torch.float16:
+        raise ValueError("float16 export is not supported on CPU.")
+    model_copy = copy.deepcopy(model)
+    model_copy.to(device=device, dtype=dtype)
+    model_copy.eval()
+    inputs = torch.zeros(
+        batch_size,
+        NUM_INPUT_CHANNELS,
+        GameState.BOARD_SIZE,
+        GameState.BOARD_SIZE,
+        device=device,
+        dtype=dtype,
+    )
+    with torch.inference_mode():
+        scripted = torch.jit.trace(model_copy, inputs, strict=False)
+        tmp = tempfile.NamedTemporaryFile(prefix="v0_bench_self_play_", suffix=".pt", delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        scripted.save(str(tmp_path))
+    return str(tmp_path)
+
+
+def _prepare_inference_artifacts(
+    args: argparse.Namespace,
+    model: ChessNet,
+) -> Tuple[Optional[str], Optional[str], Optional[bool], Optional[str]]:
+    backend = str(args.inference_backend).lower()
+    if backend == "py":
+        return None, None, None, None
+
+    device = torch.device(args.device)
+    dtype_str = args.torchscript_dtype or _default_torchscript_dtype(device)
+    if dtype_str.strip().lower() in ("auto", "none"):
+        dtype_str = _default_torchscript_dtype(device)
+
+    created_path: Optional[str] = None
+    path = args.torchscript_path
+    if not path:
+        path = _export_torchscript(
+            model=model,
+            device=device,
+            dtype_str=dtype_str,
+            batch_size=max(1, int(args.inference_batch_size)),
+        )
+        created_path = path
+
+    graph_enabled: Optional[bool] = None
+    if backend == "graph" and device.type == "cuda":
+        try:
+            import v0_core
+
+            engine = v0_core.InferenceEngine(
+                path,
+                device=str(device),
+                dtype=dtype_str,
+                batch_size=max(1, int(args.inference_batch_size)),
+                input_channels=NUM_INPUT_CHANNELS,
+                height=GameState.BOARD_SIZE,
+                width=GameState.BOARD_SIZE,
+                warmup_iters=max(0, int(args.inference_warmup_iters)),
+            )
+            graph_enabled = bool(engine.graph_enabled)
+            del engine
+        except Exception:
+            graph_enabled = None
+
+    return path, dtype_str, graph_enabled, created_path
 
 
 def _summarize_result(
@@ -86,6 +182,25 @@ def run_legacy(args: argparse.Namespace, model: ChessNet, games_per_worker: Opti
 def run_v0(args: argparse.Namespace, model: ChessNet, games_per_worker: Optional[int]) -> Dict[str, Any]:
     if args.skip_v0:
         return {}
+    path, dtype_str, graph_enabled, created_path = _prepare_inference_artifacts(args, model)
+    torchscript_label = path if path else "none"
+    if args.torchscript_path:
+        torchscript_source = "provided"
+    elif path:
+        torchscript_source = "auto"
+    else:
+        torchscript_source = "n/a"
+
+    graph_label = "n/a" if graph_enabled is None else ("yes" if graph_enabled else "no")
+    print(
+        "[benchmark_self_play] inference_backend={backend} torchscript_path={path} "
+        "torchscript_source={source} graph_enabled={graph}".format(
+            backend=args.inference_backend,
+            path=torchscript_label,
+            source=torchscript_source,
+            graph=graph_label,
+        )
+    )
     start = time.perf_counter()
     training_data = self_play_v0(
         model=model,
@@ -112,12 +227,17 @@ def run_v0(args: argparse.Namespace, model: ChessNet, games_per_worker: Optional
         mcts_verbose=args.v0_mcts_verbose,
         verbose=args.verbose,
         inference_backend=args.inference_backend,
-        torchscript_path=args.torchscript_path,
-        torchscript_dtype=args.torchscript_dtype,
+        torchscript_path=path,
+        torchscript_dtype=dtype_str,
         inference_batch_size=args.inference_batch_size,
         inference_warmup_iters=args.inference_warmup_iters,
     )
     end = time.perf_counter()
+    if created_path:
+        try:
+            os.remove(created_path)
+        except OSError:
+            pass
     return _summarize_result("v0", start, end, training_data)
 
 

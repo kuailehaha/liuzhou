@@ -188,6 +188,36 @@ python -m cProfile -s cumtime -m tools.benchmark_self_play --num-games 2 --mcts-
 
 ---
 
+## 🧩 推理后端选择（graph/ts/py）
+
+默认后端是 `graph`（CUDA Graph 固定 batch=512）。同时支持 `ts`（TorchScript）与 `py`（Python 回调）。
+
+关键参数：
+
+- `--inference_backend graph|ts|py`（兼容 `--inference-backend`）
+- `--torchscript_path`（可选；不填则自动导出一次并复用）
+- `--torchscript_dtype float16|bfloat16|float32`
+
+Graph 前置条件：
+
+- 固定 batch=512、固定 dtype
+- 预分配输入/输出 buffer
+- capture 发生在非默认 stream
+
+最短可运行命令：
+
+```bash
+# graph 默认后端（自博弈 benchmark）
+python -m tools.benchmark_self_play --num-games 2 --mcts-simulations 200 --device cuda --skip-legacy
+
+# TorchScript 后端（显式指定 path）
+python scripts/export_torchscript.py --output v0/build/model.ts.pt --device cuda --dtype float16 --batch-size 512
+python -m tools.benchmark_self_play --num-games 2 --mcts-simulations 200 --device cuda --skip-legacy \
+  --inference-backend ts --torchscript-path v0/build/model.ts.pt --torchscript-dtype float16
+```
+
+---
+
 ## 📂 代码结构（Code Structure）
 
 ---
