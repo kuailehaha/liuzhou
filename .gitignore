@@ -24,5 +24,8 @@ __pycache__/
 models/
 build/
 
+references/
+
 # 例外规则：跟踪特定的 CMakeLists.txt 文件
 !**/CMakeLists.txt
+
