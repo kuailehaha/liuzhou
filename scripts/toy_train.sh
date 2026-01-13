@@ -2,7 +2,8 @@
 set -euo pipefail
 
 cd /home/ubuntu/.cache/liuzhou
-export PYTHONPATH=/home/ubuntu/.cache/liuzhou:/home/ubuntu/.cache/liuzhou/v0/build/src:$PYTHONPATH
+# export PYTHONPATH=/home/ubuntu/.cache/liuzhou:/home/ubuntu/.cache/liuzhou/v0/build/src:$PYTHONPATH
+export PYTHONPATH="/home/ubuntu/.cache/liuzhou:/home/ubuntu/.cache/liuzhou/v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # # legacy 版训练脚本
 # python -m src.train \

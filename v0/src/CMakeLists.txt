@@ -94,6 +94,7 @@ add_v0_extension(
   rules/rule_engine.cpp
   moves/move_generator.cpp
   net/encoding.cpp
+  net/torchscript_runner.cpp
   net/project_policy_logits_fast.cpp
   game/fast_legal_mask.cpp
   game/fast_apply_moves.cpp

@@ -14,6 +14,7 @@
 #include "v0/project_policy.hpp"
 #include "v0/tensor_state_batch.hpp"
 #include "v0/rule_engine.hpp"
+#include "v0/torchscript_runner.hpp"
 
 namespace py = pybind11;
 
@@ -591,6 +592,17 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("probs"),
         py::arg("temperature"),
         py::arg("dim") = -1);
+
+    py::class_<v0::TorchScriptRunner>(m, "TorchScriptRunner")
+        .def(
+            py::init<const std::string&, const std::string&, const std::string&, bool>(),
+            py::arg("path"),
+            py::arg("device") = std::string("cpu"),
+            py::arg("dtype") = std::string("auto"),
+            py::arg("use_inference_mode") = true)
+        .def("forward", &v0::TorchScriptRunner::Forward, py::arg("input"))
+        .def_property_readonly("device", &v0::TorchScriptRunner::DeviceString)
+        .def_property_readonly("dtype", &v0::TorchScriptRunner::DTypeString);
 
     m.def("version", []() { return std::string("v0-core"); });
 }
