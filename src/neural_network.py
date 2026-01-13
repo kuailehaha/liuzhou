@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 from src.game_state import GameState, Player, Phase
 from src.move_generator import generate_all_legal_moves, MoveType
 
@@ -62,77 +63,119 @@ def state_to_tensor(state: GameState, player_to_act: Player) -> torch.Tensor:
 
     return x.unsqueeze(0)  # (1,C,H,W)
 
+class GlobalPool(nn.Module):
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, H, W) -> (N, 3C)
+        n, c, _, _ = x.shape
+        x_flat = x.flatten(2)
+        mean = x_flat.mean(dim=2)
+        max_val = x_flat.max(dim=2)[0]
+        var = x_flat.var(dim=2, unbiased=False)
+        std = torch.sqrt(var + self.eps)
+        return torch.cat([mean, max_val, std], dim=1)
+
+class PreActResBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.act1 = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.act2 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv1(self.act1(self.bn1(x)))
+        out = self.conv2(self.act2(self.bn2(out)))
+        return x + out
+
+class PolicyHead(nn.Module):
+    def __init__(self, in_channels: int, policy_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, policy_channels, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(policy_channels)
+        self.act1 = nn.ReLU(inplace=True)
+        self.gpool = GlobalPool()
+        self.gpool_linear = nn.Linear(3 * policy_channels, policy_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(policy_channels)
+        self.act2 = nn.ReLU(inplace=True)
+        self.out_pos1 = nn.Conv2d(policy_channels, 1, kernel_size=1, bias=False)
+        self.out_pos2 = nn.Conv2d(policy_channels, 1, kernel_size=1, bias=False)
+        self.out_mark = nn.Conv2d(policy_channels, 1, kernel_size=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        p = self.act1(self.bn1(self.conv1(x)))
+        g = self.gpool_linear(self.gpool(p)).unsqueeze(-1).unsqueeze(-1)
+        p = p + g
+        p = self.act2(self.bn2(p))
+
+        pos1 = self.out_pos1(p).flatten(1)
+        pos2 = self.out_pos2(p).flatten(1)
+        mark = self.out_mark(p).flatten(1)
+        return (
+            F.log_softmax(pos1, dim=1),
+            F.log_softmax(pos2, dim=1),
+            F.log_softmax(mark, dim=1),
+        )
+
+class ValueHead(nn.Module):
+    def __init__(self, in_channels: int, value_channels: int, mlp_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, value_channels, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(value_channels)
+        self.act1 = nn.ReLU(inplace=True)
+        self.gpool = GlobalPool()
+        self.fc1 = nn.Linear(3 * value_channels, mlp_channels, bias=True)
+        self.act2 = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(mlp_channels, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        v = self.act1(self.bn1(self.conv1(x)))
+        v = self.act2(self.fc1(self.gpool(v)))
+        return torch.tanh(self.fc2(v))
+
 class ChessNet(nn.Module):
-    def __init__(self, board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS, hidden_conv_channels=64):
+    def __init__(
+        self,
+        board_size=GameState.BOARD_SIZE,
+        num_input_channels=NUM_INPUT_CHANNELS,
+        hidden_conv_channels: Optional[int] = None,
+        trunk_channels: int = 128,
+        num_blocks: int = 10,
+        policy_channels: int = 64,
+        value_channels: int = 64,
+        value_mlp_channels: int = 128,
+    ):
         super(ChessNet, self).__init__()
         self.board_size = board_size
         self.num_input_channels = num_input_channels
+        if hidden_conv_channels is not None:
+            trunk_channels = hidden_conv_channels
 
-        self.conv1 = nn.Conv2d(num_input_channels, hidden_conv_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(hidden_conv_channels)
-        self.conv2 = nn.Conv2d(hidden_conv_channels, hidden_conv_channels * 2, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(hidden_conv_channels * 2)
-        self.conv3 = nn.Conv2d(hidden_conv_channels * 2, hidden_conv_channels * 4, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(hidden_conv_channels * 4)
-        self.conv4 = nn.Conv2d(hidden_conv_channels * 4, hidden_conv_channels * 4, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm2d(hidden_conv_channels * 4)
+        self.stem_conv = nn.Conv2d(num_input_channels, trunk_channels, kernel_size=3, padding=1, bias=False)
+        self.stem_bn = nn.BatchNorm2d(trunk_channels)
+        self.stem_act = nn.ReLU(inplace=True)
 
-        # Policy head shared trunk
-        self.policy_common_conv = nn.Conv2d(hidden_conv_channels * 4, hidden_conv_channels, kernel_size=1)
-        self.policy_common_bn = nn.BatchNorm2d(hidden_conv_channels)
+        self.blocks = nn.ModuleList([PreActResBlock(trunk_channels) for _ in range(num_blocks)])
+        self.trunk_bn = nn.BatchNorm2d(trunk_channels)
+        self.trunk_act = nn.ReLU(inplace=True)
 
-        # Policy Head 1: primary position logits (placement, move destination, removals)
-        self.policy_pos1_conv = nn.Conv2d(hidden_conv_channels, 2, kernel_size=1)
-        self.policy_pos1_bn = nn.BatchNorm2d(2)
-        self.policy_pos1_fc = nn.Linear(2 * board_size * board_size, board_size * board_size)
-
-        # Policy Head 2: secondary position logits (move source)
-        self.policy_pos2_conv = nn.Conv2d(hidden_conv_channels, 2, kernel_size=1)
-        self.policy_pos2_bn = nn.BatchNorm2d(2)
-        self.policy_pos2_fc = nn.Linear(2 * board_size * board_size, board_size * board_size)
-
-        # Policy Head 3: mark/capture position logits
-        self.policy_mark_capture_conv = nn.Conv2d(hidden_conv_channels, 2, kernel_size=1)
-        self.policy_mark_capture_bn = nn.BatchNorm2d(2)
-        self.policy_mark_capture_fc = nn.Linear(2 * board_size * board_size, board_size * board_size)
-
-        # Value head
-        self.value_conv_common = nn.Conv2d(hidden_conv_channels * 4, hidden_conv_channels, kernel_size=1)
-        self.value_bn_common = nn.BatchNorm2d(hidden_conv_channels)
-        self.value_conv1 = nn.Conv2d(hidden_conv_channels, 1, kernel_size=1)
-        self.value_bn1 = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(1 * board_size * board_size, 256)
-        self.value_fc2 = nn.Linear(256, 1)
+        self.policy_head = PolicyHead(trunk_channels, policy_channels)
+        self.value_head = ValueHead(trunk_channels, value_channels, value_mlp_channels)
 
     def forward(self, x):
         # x: (batch_size, num_input_channels, board_size, board_size)
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        shared_features = F.relu(self.bn4(self.conv4(x)))
+        x = self.stem_act(self.stem_bn(self.stem_conv(x)))
+        for block in self.blocks:
+            x = block(x)
+        x = self.trunk_act(self.trunk_bn(x))
 
-        # --- policy heads ---
-        policy_latent = F.relu(self.policy_common_bn(self.policy_common_conv(shared_features)))
-
-        p1 = F.relu(self.policy_pos1_bn(self.policy_pos1_conv(policy_latent)))
-        p1 = p1.view(p1.size(0), -1)
-        log_policy_pos1 = F.log_softmax(self.policy_pos1_fc(p1), dim=1)
-
-        p2 = F.relu(self.policy_pos2_bn(self.policy_pos2_conv(policy_latent)))
-        p2 = p2.view(p2.size(0), -1)
-        log_policy_pos2 = F.log_softmax(self.policy_pos2_fc(p2), dim=1)
-
-        pmc = F.relu(self.policy_mark_capture_bn(self.policy_mark_capture_conv(policy_latent)))
-        pmc = pmc.view(pmc.size(0), -1)
-        log_policy_mark_capture = F.log_softmax(self.policy_mark_capture_fc(pmc), dim=1)
-
-        # --- value head ---
-        value_latent = F.relu(self.value_bn_common(self.value_conv_common(shared_features)))
-        v = F.relu(self.value_bn1(self.value_conv1(value_latent)))
-        v = v.view(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
-        value = torch.tanh(self.value_fc2(v))
-
+        log_policy_pos1, log_policy_pos2, log_policy_mark_capture = self.policy_head(x)
+        value = self.value_head(x)
         return log_policy_pos1, log_policy_pos2, log_policy_mark_capture, value
 
 def get_move_probabilities(
