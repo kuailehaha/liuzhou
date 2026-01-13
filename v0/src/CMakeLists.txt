@@ -94,6 +94,7 @@ add_v0_extension(
   rules/rule_engine.cpp
   moves/move_generator.cpp
   net/encoding.cpp
+  net/inference_engine.cpp
   net/torchscript_runner.cpp
   net/project_policy_logits_fast.cpp
   game/fast_legal_mask.cpp
@@ -143,4 +144,8 @@ target_compile_definitions(
 
 if(BUILD_CUDA_KERNELS)
   target_compile_definitions(v0_core PRIVATE V0_HAS_CUDA_LEGAL_MASK V0_HAS_CUDA_APPLY_MOVES)
+endif()
+
+if(C10_CUDA_LIBRARY)
+  target_compile_definitions(v0_core PRIVATE TORCH_CUDA_AVAILABLE)
 endif()

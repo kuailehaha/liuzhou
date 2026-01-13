@@ -3,6 +3,7 @@
 #include <pybind11/numpy.h>   // ← 新增
 #include <torch/extension.h>
 
+#include <memory>
 #include <string>
 
 #include "v0/fast_legal_mask.hpp"
@@ -15,6 +16,7 @@
 #include "v0/tensor_state_batch.hpp"
 #include "v0/rule_engine.hpp"
 #include "v0/torchscript_runner.hpp"
+#include "v0/inference_engine.hpp"
 
 namespace py = pybind11;
 
@@ -494,6 +496,28 @@ PYBIND11_MODULE(v0_core, m) {
             },
             py::arg("callback"))
         .def(
+            "set_torchscript_runner",
+            [](v0::MCTSCore& core, std::shared_ptr<v0::TorchScriptRunner> runner) {
+                if (!runner) {
+                    throw std::runtime_error("TorchScriptRunner is null");
+                }
+                core.SetForwardCallback([runner](const torch::Tensor& inputs) {
+                    return runner->Forward(inputs);
+                });
+            },
+            py::arg("runner"))
+        .def(
+            "set_inference_engine",
+            [](v0::MCTSCore& core, std::shared_ptr<v0::InferenceEngine> engine) {
+                if (!engine) {
+                    throw std::runtime_error("InferenceEngine is null");
+                }
+                core.SetForwardCallback([engine](const torch::Tensor& inputs) {
+                    return engine->Forward(inputs, inputs.size(0));
+                });
+            },
+            py::arg("engine"))
+        .def(
             "set_root_state",
             [](v0::MCTSCore& core, const v0::GameState& state) { core.SetRootState(state); },
             py::arg("state"))
@@ -593,7 +617,25 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("temperature"),
         py::arg("dim") = -1);
 
-    py::class_<v0::TorchScriptRunner>(m, "TorchScriptRunner")
+    py::class_<v0::InferenceEngine, std::shared_ptr<v0::InferenceEngine>>(m, "InferenceEngine")
+        .def(
+            py::init<const std::string&, const std::string&, const std::string&, int64_t, int64_t, int64_t, int64_t, int64_t, bool>(),
+            py::arg("path"),
+            py::arg("device") = std::string("cuda"),
+            py::arg("dtype") = std::string("float16"),
+            py::arg("batch_size") = 512,
+            py::arg("input_channels") = 11,
+            py::arg("height") = v0::kBoardSize,
+            py::arg("width") = v0::kBoardSize,
+            py::arg("warmup_iters") = 5,
+            py::arg("use_inference_mode") = true)
+        .def("forward", &v0::InferenceEngine::Forward, py::arg("input"), py::arg("n_valid") = -1)
+        .def_property_readonly("device", &v0::InferenceEngine::DeviceString)
+        .def_property_readonly("dtype", &v0::InferenceEngine::DTypeString)
+        .def_property_readonly("batch_size", &v0::InferenceEngine::BatchSize)
+        .def_property_readonly("graph_enabled", &v0::InferenceEngine::GraphEnabled);
+
+    py::class_<v0::TorchScriptRunner, std::shared_ptr<v0::TorchScriptRunner>>(m, "TorchScriptRunner")
         .def(
             py::init<const std::string&, const std::string&, const std::string&, bool>(),
             py::arg("path"),

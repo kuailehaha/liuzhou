@@ -187,3 +187,59 @@ def test_torchscript_runner_cuda_batch512_matches_eager(tmp_path) -> None:
     finally:
         torch.backends.cudnn.deterministic = prev_det
         torch.backends.cudnn.benchmark = prev_bench
+
+
+@pytest.mark.slow
+def test_inference_engine_cuda_graph_matches_torchscript(tmp_path) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    dtype_str = os.environ.get("V0_INFERENCE_DTYPE", os.environ.get("V0_TORCHSCRIPT_DTYPE", "float16"))
+    dtype = _dtype_from_string(dtype_str)
+    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("bfloat16 not supported on this CUDA device")
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    prev_det = torch.backends.cudnn.deterministic
+    prev_bench = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    try:
+        model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
+        model.to(device=device, dtype=dtype)
+        model.eval()
+
+        batch_size = 512
+        fixed_inputs = _fixed_input(batch_size, device, dtype)
+
+        model_path = tmp_path / "model_cuda_graph.ts.pt"
+        _export_torchscript(model, fixed_inputs, model_path)
+
+        runner = v0_core.TorchScriptRunner(
+            str(model_path),
+            device=str(device),
+            dtype=_dtype_to_string(dtype),
+        )
+        engine = v0_core.InferenceEngine(
+            str(model_path),
+            device=str(device),
+            dtype=_dtype_to_string(dtype),
+            batch_size=batch_size,
+            input_channels=NUM_INPUT_CHANNELS,
+            height=GameState.BOARD_SIZE,
+            width=GameState.BOARD_SIZE,
+            warmup_iters=5,
+        )
+
+        assert engine.graph_enabled
+
+        ref = runner.forward(fixed_inputs)
+        out = engine.forward(fixed_inputs, batch_size)
+
+        _assert_outputs_match(ref, out, batch_size, dtype)
+    finally:
+        torch.backends.cudnn.deterministic = prev_det
+        torch.backends.cudnn.benchmark = prev_bench

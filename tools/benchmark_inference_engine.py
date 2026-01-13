@@ -1,5 +1,5 @@
 """
-Benchmark eager Python vs C++ TorchScript forward throughput.
+Benchmark TorchScriptRunner vs InferenceEngine (CUDA Graph).
 """
 
 from __future__ import annotations
@@ -15,10 +15,8 @@ from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 
 
-def _parse_dtype(value: str) -> Optional[torch.dtype]:
+def _parse_dtype(value: str) -> torch.dtype:
     key = value.strip().lower()
-    if key in ("", "auto", "none"):
-        return None
     if key in ("float32", "fp32", "f32"):
         return torch.float32
     if key in ("float16", "fp16", "f16"):
@@ -28,16 +26,13 @@ def _parse_dtype(value: str) -> Optional[torch.dtype]:
     raise ValueError(f"Unsupported dtype: {value}")
 
 
-def _load_model(device: torch.device, dtype: Optional[torch.dtype], checkpoint: Optional[str]) -> ChessNet:
+def _load_model(device: torch.device, dtype: torch.dtype, checkpoint: Optional[str]) -> ChessNet:
     model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
     if checkpoint:
         ckpt = torch.load(checkpoint, map_location=device)
         state_dict = ckpt.get("model_state_dict", ckpt)
         model.load_state_dict(state_dict)
-    if dtype is None:
-        model = model.to(device=device)
-    else:
-        model = model.to(device=device, dtype=dtype)
+    model = model.to(device=device, dtype=dtype)
     model.eval()
     return model
 
@@ -63,15 +58,19 @@ def _time_loop(fn, iters: int, warmup: int, device: torch.device) -> float:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Benchmark eager vs C++ TorchScript forward.")
-    parser.add_argument("--device", default="cpu", help="cpu, cuda, or cuda:0.")
-    parser.add_argument("--dtype", default="float32", help="float32|float16|bfloat16|auto.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark TorchScriptRunner vs InferenceEngine (CUDA Graph)."
+    )
+    parser.add_argument("--device", default="cuda", help="cpu, cuda, or cuda:0.")
+    parser.add_argument("--dtype", default="float16", help="float32|float16|bfloat16.")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size for forward.")
     parser.add_argument("--iters", type=int, default=5000, help="Timed iterations.")
-    parser.add_argument("--warmup", type=int, default=50, help="Warmup iterations.")
+    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
+    parser.add_argument("--engine-warmup", type=int, default=5, help="Warmup iterations inside engine.")
     parser.add_argument("--checkpoint", default=None, help="Optional checkpoint to load.")
     parser.add_argument("--model-path", default=None, help="Existing TorchScript path to load.")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for input.")
+    parser.add_argument("--include-eager", action="store_true", help="Include eager model timing.")
     return parser
 
 
@@ -84,10 +83,14 @@ def main() -> None:
     if device.type == "cpu" and dtype == torch.float16:
         raise ValueError("float16 is not supported on CPU.")
 
+    if dtype == torch.bfloat16 and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise ValueError("bfloat16 not supported on this CUDA device.")
+
     torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
 
     model = _load_model(device, dtype, args.checkpoint)
-    model_dtype = next(model.parameters()).dtype
 
     batch_size = int(args.batch_size)
     input_tensor = torch.randn(
@@ -96,37 +99,71 @@ def main() -> None:
         GameState.BOARD_SIZE,
         GameState.BOARD_SIZE,
         device=device,
-        dtype=model_dtype,
+        dtype=dtype,
     )
 
     if args.model_path:
         model_path = Path(args.model_path).expanduser().resolve()
     else:
-        model_path = Path("build") / "torchscript_bench_model.ts.pt"
+        model_path = Path("build") / "torchscript_engine_model.ts.pt"
         model_path.parent.mkdir(parents=True, exist_ok=True)
         _export_torchscript(model, input_tensor, model_path)
 
-    import v0_core  # local import to ensure module exists
+    import v0_core
 
     runner = v0_core.TorchScriptRunner(
         str(model_path),
         device=str(device),
         dtype=args.dtype,
-        use_inference_mode=True,
+    )
+    engine = v0_core.InferenceEngine(
+        str(model_path),
+        device=str(device),
+        dtype=args.dtype,
+        batch_size=batch_size,
+        input_channels=NUM_INPUT_CHANNELS,
+        height=GameState.BOARD_SIZE,
+        width=GameState.BOARD_SIZE,
+        warmup_iters=args.engine_warmup,
     )
 
-    with torch.inference_mode():
-        eager_time = _time_loop(lambda: model(input_tensor), args.iters, args.warmup, device)
-    cpp_time = _time_loop(lambda: runner.forward(input_tensor), args.iters, args.warmup, device)
+    result = {
+        "device": str(device),
+        "dtype": args.dtype,
+        "batch": batch_size,
+        "graph_enabled": bool(engine.graph_enabled),
+    }
 
-    print("TorchScript forward benchmark:")
-    print(f"  device={device} dtype={args.dtype} batch={batch_size}")
-    print(f"  eager_avg_ms={eager_time * 1e3:.3f}")
-    print(f"  cpp_avg_ms={cpp_time * 1e3:.3f}")
-    if eager_time > 0:
-        print(f"  speedup={eager_time / cpp_time:.2f}x")
-    print(f"  eager_positions_per_sec={batch_size / eager_time:.2f}")
-    print(f"  cpp_positions_per_sec={batch_size / cpp_time:.2f}")
+    if args.include_eager:
+        with torch.inference_mode():
+            eager_time = _time_loop(lambda: model(input_tensor), args.iters, args.warmup, device)
+        result["eager_ms"] = eager_time * 1e3
+
+    ts_time = _time_loop(lambda: runner.forward(input_tensor), args.iters, args.warmup, device)
+    graph_time = _time_loop(
+        lambda: engine.forward(input_tensor, batch_size),
+        args.iters,
+        args.warmup,
+        device,
+    )
+
+    result["torchscript_ms"] = ts_time * 1e3
+    result["graph_ms"] = graph_time * 1e3
+    result["torchscript_pos_s"] = batch_size / ts_time
+    result["graph_pos_s"] = batch_size / graph_time
+    result["speedup"] = ts_time / graph_time if graph_time > 0 else float("inf")
+
+    print("InferenceEngine benchmark:")
+    print(
+        "  device={device} dtype={dtype} batch={batch} graph_enabled={graph_enabled}".format(**result)
+    )
+    if args.include_eager:
+        print(f"  eager_ms={result['eager_ms']:.3f}")
+    print(f"  torchscript_ms={result['torchscript_ms']:.3f}")
+    print(f"  graph_ms={result['graph_ms']:.3f}")
+    print(f"  speedup={result['speedup']:.2f}x")
+    print(f"  torchscript_pos_s={result['torchscript_pos_s']:.2f}")
+    print(f"  graph_pos_s={result['graph_pos_s']:.2f}")
 
 
 if __name__ == "__main__":
