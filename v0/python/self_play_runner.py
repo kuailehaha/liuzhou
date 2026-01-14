@@ -131,7 +131,11 @@ def _merge_eval_stats(target: Dict[str, object], incoming: Dict[str, object]) ->
     target["hist"] = target_hist
 
 
-def _format_eval_stats(stats: Dict[str, object], inference_batch_size: int) -> Dict[str, object]:
+def _format_eval_stats(
+    stats: Dict[str, object],
+    inference_batch_size: int,
+    mcts_leaf_batch_cap: int,
+) -> Dict[str, object]:
     eval_calls = int(stats.get("eval_calls", 0))
     eval_leaves = int(stats.get("eval_leaves", 0))
     full512_calls = int(stats.get("full512_calls", 0))
@@ -148,6 +152,8 @@ def _format_eval_stats(stats: Dict[str, object], inference_batch_size: int) -> D
         "avg_batch": avg_batch,
         "hist": hist,
         "full512_ratio": full512_ratio,
+        "mcts_leaf_batch_cap": int(mcts_leaf_batch_cap),
+        "graph_batch_size": int(inference_batch_size),
     }
     if inference_batch_size == 512:
         payload["pad_leaves"] = eval_calls * 512 - eval_leaves
@@ -378,7 +384,11 @@ def _v0_self_play_worker(
         stats_raw = None
         if eval_stats_enabled and worker_stats is not None:
             stats_raw = worker_stats
-            payload = _format_eval_stats(worker_stats, int(cfg.get("inference_batch_size", 512)))
+            payload = _format_eval_stats(
+                worker_stats,
+                int(cfg.get("inference_batch_size", 512)),
+                int(cfg.get("batch_leaves", 0)),
+            )
             payload["scope"] = "worker"
             payload["worker_id"] = worker_id
             payload["games"] = cfg["games_per_worker"]
@@ -480,7 +490,7 @@ def self_play_v0(
                 )
             )
         if eval_stats_enabled and run_stats is not None:
-            payload = _format_eval_stats(run_stats, inference_batch_size)
+            payload = _format_eval_stats(run_stats, inference_batch_size, batch_leaves)
             payload["scope"] = "run"
             payload["games"] = len(games)
             _print_eval_stats(payload)
@@ -563,7 +573,7 @@ def self_play_v0(
         )
 
     if eval_stats_enabled and summary_stats is not None:
-        payload = _format_eval_stats(summary_stats, inference_batch_size)
+        payload = _format_eval_stats(summary_stats, inference_batch_size, batch_leaves)
         payload["scope"] = "summary"
         payload["games"] = len(games)
         payload["num_workers"] = num_workers

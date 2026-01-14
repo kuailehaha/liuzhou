@@ -17,6 +17,7 @@
 #include "v0/rule_engine.hpp"
 #include "v0/torchscript_runner.hpp"
 #include "v0/inference_engine.hpp"
+#include "v0/eval_batcher.hpp"
 
 namespace py = pybind11;
 
@@ -518,6 +519,17 @@ PYBIND11_MODULE(v0_core, m) {
             },
             py::arg("engine"))
         .def(
+            "set_eval_batcher",
+            [](v0::MCTSCore& core, std::shared_ptr<v0::EvalBatcher> batcher) {
+                if (!batcher) {
+                    throw std::runtime_error("EvalBatcher is null");
+                }
+                core.SetForwardCallback([batcher](const torch::Tensor& inputs) {
+                    return batcher->Forward(inputs, inputs.size(0));
+                });
+            },
+            py::arg("batcher"))
+        .def(
             "set_root_state",
             [](v0::MCTSCore& core, const v0::GameState& state) { core.SetRootState(state); },
             py::arg("state"))
@@ -528,7 +540,11 @@ PYBIND11_MODULE(v0_core, m) {
             },
             py::arg("state"))
         .def("reset", &v0::MCTSCore::Reset)
-        .def("run_simulations", &v0::MCTSCore::RunSimulations, py::arg("num_simulations"))
+        .def(
+            "run_simulations",
+            &v0::MCTSCore::RunSimulations,
+            py::arg("num_simulations"),
+            py::call_guard<py::gil_scoped_release>())
         .def(
             "get_policy",
             [](const v0::MCTSCore& core, double temperature) {
@@ -650,6 +666,36 @@ PYBIND11_MODULE(v0_core, m) {
         .def_property_readonly("dtype", &v0::InferenceEngine::DTypeString)
         .def_property_readonly("batch_size", &v0::InferenceEngine::BatchSize)
         .def_property_readonly("graph_enabled", &v0::InferenceEngine::GraphEnabled);
+
+    py::class_<v0::EvalBatcher, std::shared_ptr<v0::EvalBatcher>>(m, "EvalBatcher")
+        .def(
+            py::init<std::shared_ptr<v0::InferenceEngine>, int64_t, int64_t, int64_t, int64_t, int64_t>(),
+            py::arg("engine"),
+            py::arg("batch_size") = 512,
+            py::arg("input_channels") = 11,
+            py::arg("height") = v0::kBoardSize,
+            py::arg("width") = v0::kBoardSize,
+            py::arg("timeout_ms") = 2)
+        .def("forward", &v0::EvalBatcher::Forward, py::arg("input"), py::arg("n_valid") = -1)
+        .def("shutdown", &v0::EvalBatcher::Shutdown)
+        .def("reset_eval_stats", &v0::EvalBatcher::ResetStats)
+        .def(
+            "get_eval_stats",
+            [](const v0::EvalBatcher& batcher) {
+                const auto stats = batcher.GetStats();
+                py::dict result;
+                result["eval_calls"] = stats.eval_calls;
+                result["eval_leaves"] = stats.eval_leaves;
+                result["full512_calls"] = stats.full512_calls;
+                py::list hist;
+                for (auto count : stats.hist) {
+                    hist.append(count);
+                }
+                result["hist"] = hist;
+                return result;
+            })
+        .def_property_readonly("batch_size", &v0::EvalBatcher::BatchSize)
+        .def_property_readonly("timeout_ms", &v0::EvalBatcher::TimeoutMs);
 
     py::class_<v0::TorchScriptRunner, std::shared_ptr<v0::TorchScriptRunner>>(m, "TorchScriptRunner")
         .def(

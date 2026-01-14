@@ -9,8 +9,6 @@
 #include <string>
 #include <sstream>
 
-#include <pybind11/pybind11.h>
-
 #include <c10/util/Optional.h>
 
 #if defined(TORCH_CUDA_AVAILABLE)
@@ -23,8 +21,6 @@
 #include "v0/project_policy.hpp"
 
 namespace v0 {
-
-namespace py = pybind11;
 
 namespace {
 
@@ -391,10 +387,7 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
         RecordEvalStats(static_cast<int64_t>(leaves.size()));
 
         torch::Tensor log_p1, log_p2, log_pmc, values;
-        {
-            py::gil_scoped_acquire gil;
-            std::tie(log_p1, log_p2, log_pmc, values) = forward_cb_(inputs);
-        }
+        std::tie(log_p1, log_p2, log_pmc, values) = forward_cb_(inputs);
         DebugLog("ExpandBatch: NN outputs log_p shape " + ShapeToString(log_p1) +
             ", values shape " + ShapeToString(values));
         DebugLog("ExpandBatch: NN outputs devices log_p=" + log_p1.device().str() +

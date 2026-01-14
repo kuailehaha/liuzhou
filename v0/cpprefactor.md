@@ -127,11 +127,13 @@ Fields:
 - `avg_batch`: eval_leaves / eval_calls
 - `hist`: fixed bucket histogram (1-32, 33-64, ..., 481-512, 513+)
 - `full512_ratio`: ratio of n_valid == 512
+- `mcts_leaf_batch_cap`: MCTSCore leaf batch cap (ExpandBatch max leaves)
+- `graph_batch_size`: InferenceEngine fixed batch size
 - `pad_leaves`: eval_calls * 512 - eval_leaves (only when inference_batch_size == 512)
 
 Example output:
 ```json
-{"avg_batch": 402.5, "eval_calls": 80, "eval_leaves": 32200, "full512_ratio": 0.35, "hist": {"1-32": 0, "33-64": 1, "65-96": 0, "97-128": 3, "129-160": 4, "161-192": 5, "193-224": 6, "225-256": 8, "257-288": 7, "289-320": 10, "321-352": 9, "353-384": 6, "385-416": 5, "417-448": 4, "449-480": 3, "481-512": 9, "513+": 0}, "pad_leaves": 8680, "scope": "run"}
+{"avg_batch": 402.5, "eval_calls": 80, "eval_leaves": 32200, "full512_ratio": 0.35, "graph_batch_size": 512, "hist": {"1-32": 0, "33-64": 1, "65-96": 0, "97-128": 3, "129-160": 4, "161-192": 5, "193-224": 6, "225-256": 8, "257-288": 7, "289-320": 10, "321-352": 9, "353-384": 6, "385-416": 5, "417-448": 4, "449-480": 3, "481-512": 9, "513+": 0}, "mcts_leaf_batch_cap": 256, "pad_leaves": 8680, "scope": "run"}
 ```
 
 Gate command (single process):

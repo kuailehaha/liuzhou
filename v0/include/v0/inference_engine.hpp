@@ -32,6 +32,8 @@ class InferenceEngine {
 
     int64_t BatchSize() const { return batch_size_; }
     bool GraphEnabled() const { return graph_enabled_; }
+    const torch::Device& Device() const { return device_; }
+    torch::ScalarType DType() const { return dtype_; }
     std::string DeviceString() const;
     std::string DTypeString() const;
 

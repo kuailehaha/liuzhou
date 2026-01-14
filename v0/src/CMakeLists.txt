@@ -8,6 +8,7 @@ set(PYBIND11_FINDPYTHON ON)
 # 先找 pybind11 / Torch（上层已把路径塞进 CMAKE_PREFIX_PATH）
 find_package(pybind11 CONFIG REQUIRED)
 find_package(Torch REQUIRED)
+find_package(Threads REQUIRED)
 
 set(V0_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../include)
 
@@ -57,6 +58,7 @@ function(add_v0_extension target)
   target_link_libraries(${target} PRIVATE
     ${TORCH_LIBRARIES}
     ${_TORCH_PY_LIB}
+    Threads::Threads
   )
 
   target_compile_definitions(${target} PRIVATE
@@ -100,6 +102,7 @@ add_v0_extension(
   game/fast_legal_mask.cpp
   game/fast_apply_moves.cpp
   mcts/mcts_core.cpp
+  mcts/eval_batcher.cpp
   ${CUDA_SRCS}  # 有 .cu 时才会起作用
 )
 
