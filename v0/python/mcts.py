@@ -442,3 +442,9 @@ class MCTS:
 
     def get_root_value(self) -> float:
         return self._core.root_value
+
+    def reset_eval_stats(self) -> None:
+        self._core.reset_eval_stats()
+
+    def get_eval_stats(self) -> Dict[str, object]:
+        return self._core.get_eval_stats()

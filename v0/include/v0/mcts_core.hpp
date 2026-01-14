@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <random>
@@ -31,6 +33,14 @@ using ForwardCallback = std::function<
 
 class MCTSCore {
    public:
+    struct EvalStats {
+        static constexpr int kHistBuckets = 17;
+        uint64_t eval_calls{0};
+        uint64_t eval_leaves{0};
+        uint64_t full512_calls{0};
+        std::array<uint64_t, kHistBuckets> hist{};
+    };
+
     struct ChildStats {
         int action_index{-1};
         double prior{0.0};
@@ -56,6 +66,8 @@ class MCTSCore {
     std::vector<ChildStats> GetRootChildrenStats() const;
 
     const GameState& RootState() const;
+    void ResetEvalStats();
+    EvalStats GetEvalStats() const;
 
    private:
     struct Node {
@@ -81,6 +93,7 @@ class MCTSCore {
     void Backpropagate(const std::vector<int>& path, double value);
 
     void ExpandBatch(const std::vector<int>& leaves, const std::vector<std::vector<int>>& paths);
+    void RecordEvalStats(int64_t n_valid);
 
     std::vector<double> SampleDirichlet(int count, double alpha);
 
@@ -91,6 +104,7 @@ class MCTSCore {
     std::vector<Node> nodes_;
     int root_index_{-1};
     std::mt19937 rng_;
+    EvalStats eval_stats_;
 };
 
 }  // namespace v0

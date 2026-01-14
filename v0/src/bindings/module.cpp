@@ -549,6 +549,22 @@ PYBIND11_MODULE(v0_core, m) {
                 }
                 return result;
             })
+        .def("reset_eval_stats", &v0::MCTSCore::ResetEvalStats)
+        .def(
+            "get_eval_stats",
+            [](const v0::MCTSCore& core) {
+                const auto stats = core.GetEvalStats();
+                py::dict result;
+                result["eval_calls"] = stats.eval_calls;
+                result["eval_leaves"] = stats.eval_leaves;
+                result["full512_calls"] = stats.full512_calls;
+                py::list hist;
+                for (auto count : stats.hist) {
+                    hist.append(count);
+                }
+                result["hist"] = hist;
+                return result;
+            })
         .def("advance_root", &v0::MCTSCore::AdvanceRoot, py::arg("action_index"))
         .def_property_readonly("root_value", &v0::MCTSCore::RootValue)
         .def_property_readonly("root_visit_count", &v0::MCTSCore::RootVisitCount)

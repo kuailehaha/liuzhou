@@ -45,6 +45,23 @@ bool DebugEnabled() {
     return enabled;
 }
 
+bool EvalStatsEnabled() {
+    static bool enabled = []() {
+        const char* env = std::getenv("V0_EVAL_STATS");
+        if (!env) {
+            return false;
+        }
+        if (env[0] == '\0') {
+            return false;
+        }
+        if (env[0] == '0' && env[1] == '\0') {
+            return false;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
 void DebugLog(const std::string& msg) {
     if (DebugEnabled()) {
         std::cerr << "[MCTSCore] " << msg << std::endl;
@@ -74,6 +91,19 @@ torch::TensorOptions IntCPU() {
 
 torch::TensorOptions LongCPU() {
     return torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+}
+
+constexpr int64_t kEvalHistBucketWidth = 32;
+constexpr int64_t kEvalFullBatch = 512;
+
+int EvalHistBucket(int64_t n_valid) {
+    if (n_valid <= 0) {
+        return 0;
+    }
+    if (n_valid > kEvalFullBatch) {
+        return MCTSCore::EvalStats::kHistBuckets - 1;
+    }
+    return static_cast<int>((n_valid - 1) / kEvalHistBucketWidth);
 }
 
 // double WinnerValue(const GameState& state, Player to_act) {
@@ -141,6 +171,14 @@ int MCTSCore::AllocateNode(const GameState& state) {
 
 const GameState& MCTSCore::RootState() const {
     return nodes_.at(root_index_).state;
+}
+
+void MCTSCore::ResetEvalStats() {
+    eval_stats_ = EvalStats{};
+}
+
+MCTSCore::EvalStats MCTSCore::GetEvalStats() const {
+    return eval_stats_;
 }
 
 double MCTSCore::RootValue() const {
@@ -251,6 +289,28 @@ torch::Tensor MCTSCore::BuildModelInputs(const TensorStateBatch& batch) {
         batch.current_player);
 }
 
+void MCTSCore::RecordEvalStats(int64_t n_valid) {
+    if (!EvalStatsEnabled()) {
+        return;
+    }
+    eval_stats_.eval_calls += 1;
+    if (n_valid <= 0) {
+        return;
+    }
+    eval_stats_.eval_leaves += static_cast<uint64_t>(n_valid);
+    if (n_valid == kEvalFullBatch) {
+        eval_stats_.full512_calls += 1;
+    }
+    int bucket = EvalHistBucket(n_valid);
+    if (bucket < 0) {
+        bucket = 0;
+    }
+    if (bucket >= EvalStats::kHistBuckets) {
+        bucket = EvalStats::kHistBuckets - 1;
+    }
+    eval_stats_.hist[static_cast<size_t>(bucket)] += 1;
+}
+
 std::vector<double> MCTSCore::SampleDirichlet(int count, double alpha) {
     std::gamma_distribution<double> gamma(alpha, 1.0);
     std::vector<double> samples(count);
@@ -327,6 +387,8 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
             throw std::runtime_error("Forward callback not set for MCTSCore.");
         }
         DebugLog("ExpandBatch: inputs shape " + ShapeToString(inputs));
+
+        RecordEvalStats(static_cast<int64_t>(leaves.size()));
 
         torch::Tensor log_p1, log_p2, log_pmc, values;
         {

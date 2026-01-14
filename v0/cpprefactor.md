@@ -112,3 +112,29 @@ speedup: avg=12.99x median=11.40x min=2.66x max=49.48x
 Use `V0_MCTS_DEBUG=1` to print detailed traces from the C++ core when diagnosing expansion issues.
 
 
+
+
+## Eval Stats (Batch Utilization)
+
+Set `V0_EVAL_STATS=1` to enable structured eval statistics from the C++ MCTS core.
+The counters are accumulated per `MCTSCore` instance and exposed through
+`MCTSCore.get_eval_stats()` / `MCTSCore.reset_eval_stats()`; the v0 self-play runner
+prints one JSON line per worker/run when the env var is set.
+
+Fields:
+- `eval_calls`: number of forward/eval calls (ExpandBatch invocations)
+- `eval_leaves`: total leaves evaluated across calls (sum of n_valid)
+- `avg_batch`: eval_leaves / eval_calls
+- `hist`: fixed bucket histogram (1-32, 33-64, ..., 481-512, 513+)
+- `full512_ratio`: ratio of n_valid == 512
+- `pad_leaves`: eval_calls * 512 - eval_leaves (only when inference_batch_size == 512)
+
+Example output:
+```json
+{"avg_batch": 402.5, "eval_calls": 80, "eval_leaves": 32200, "full512_ratio": 0.35, "hist": {"1-32": 0, "33-64": 1, "65-96": 0, "97-128": 3, "129-160": 4, "161-192": 5, "193-224": 6, "225-256": 8, "257-288": 7, "289-320": 10, "321-352": 9, "353-384": 6, "385-416": 5, "417-448": 4, "449-480": 3, "481-512": 9, "513+": 0}, "pad_leaves": 8680, "scope": "run"}
+```
+
+Gate command (single process):
+```bash
+V0_EVAL_STATS=1 python -m tools.benchmark_self_play --skip-legacy --num-workers 1 --num-games 16 --games-per-worker 16 --inference-backend graph
+```

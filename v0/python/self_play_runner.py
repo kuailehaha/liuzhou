@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import copy
 import io
+import json
 import os
 import random
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -74,9 +75,87 @@ def _export_torchscript(
         scripted = torch.jit.trace(model_copy, inputs, strict=False)
         tmp = tempfile.NamedTemporaryFile(prefix="v0_self_play_", suffix=".pt", delete=False)
         tmp_path = Path(tmp.name)
-        tmp.close()
-        scripted.save(str(tmp_path))
+    tmp.close()
+    scripted.save(str(tmp_path))
     return str(tmp_path)
+
+
+_EVAL_STATS_BUCKET_LABELS = [
+    "1-32",
+    "33-64",
+    "65-96",
+    "97-128",
+    "129-160",
+    "161-192",
+    "193-224",
+    "225-256",
+    "257-288",
+    "289-320",
+    "321-352",
+    "353-384",
+    "385-416",
+    "417-448",
+    "449-480",
+    "481-512",
+    "513+",
+]
+
+
+def _eval_stats_enabled() -> bool:
+    value = os.environ.get("V0_EVAL_STATS")
+    if not value:
+        return False
+    return value != "0"
+
+
+def _empty_eval_stats() -> Dict[str, object]:
+    return {
+        "eval_calls": 0,
+        "eval_leaves": 0,
+        "full512_calls": 0,
+        "hist": [0 for _ in _EVAL_STATS_BUCKET_LABELS],
+    }
+
+
+def _merge_eval_stats(target: Dict[str, object], incoming: Dict[str, object]) -> None:
+    if not incoming:
+        return
+    target["eval_calls"] = int(target.get("eval_calls", 0)) + int(incoming.get("eval_calls", 0))
+    target["eval_leaves"] = int(target.get("eval_leaves", 0)) + int(incoming.get("eval_leaves", 0))
+    target["full512_calls"] = int(target.get("full512_calls", 0)) + int(incoming.get("full512_calls", 0))
+    target_hist = list(target.get("hist", []))
+    incoming_hist = list(incoming.get("hist", []))
+    limit = min(len(target_hist), len(incoming_hist))
+    for i in range(limit):
+        target_hist[i] += int(incoming_hist[i])
+    target["hist"] = target_hist
+
+
+def _format_eval_stats(stats: Dict[str, object], inference_batch_size: int) -> Dict[str, object]:
+    eval_calls = int(stats.get("eval_calls", 0))
+    eval_leaves = int(stats.get("eval_leaves", 0))
+    full512_calls = int(stats.get("full512_calls", 0))
+    avg_batch = (eval_leaves / eval_calls) if eval_calls else 0.0
+    full512_ratio = (full512_calls / eval_calls) if eval_calls else 0.0
+    hist_counts = list(stats.get("hist", []))
+    hist = {
+        label: int(hist_counts[i]) if i < len(hist_counts) else 0
+        for i, label in enumerate(_EVAL_STATS_BUCKET_LABELS)
+    }
+    payload = {
+        "eval_calls": eval_calls,
+        "eval_leaves": eval_leaves,
+        "avg_batch": avg_batch,
+        "hist": hist,
+        "full512_ratio": full512_ratio,
+    }
+    if inference_batch_size == 512:
+        payload["pad_leaves"] = eval_calls * 512 - eval_leaves
+    return payload
+
+
+def _print_eval_stats(payload: Dict[str, object]) -> None:
+    print(json.dumps(payload, sort_keys=True))
 
 
 def _soft_value_from_state(state: GameState, soft_value_k: float) -> float:
@@ -113,6 +192,7 @@ def self_play_single_game_v0(
     torchscript_dtype: Optional[str] = None,
     inference_batch_size: int = 512,
     inference_warmup_iters: int = 5,
+    eval_stats_sink: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> Tuple[List[GameState], List[np.ndarray], float, float]:
     rng = np.random.default_rng(seed)
     mcts = FastMCTS(
@@ -134,6 +214,13 @@ def self_play_single_game_v0(
         inference_batch_size=inference_batch_size,
         inference_warmup_iters=inference_warmup_iters,
     )
+    if eval_stats_sink is not None:
+        mcts.reset_eval_stats()
+
+    def _finalize(result: float, soft_value: float):
+        if eval_stats_sink is not None:
+            eval_stats_sink(mcts.get_eval_stats())
+        return game_states, game_policies, result, soft_value
 
     state = GameState()
     game_states: List[GameState] = []
@@ -170,7 +257,7 @@ def self_play_single_game_v0(
             winner = state.get_winner()
             result = 0.0 if winner is None else (1.0 if winner == Player.BLACK else -1.0)
             soft_value = _soft_value_from_state(state, soft_value_k)
-            return game_states, game_policies, result, soft_value
+            return _finalize(result, soft_value)
 
         root_value = float(mcts.get_root_value())
         if enable_resign and move_count >= resign_min_moves:
@@ -179,7 +266,7 @@ def self_play_single_game_v0(
                 if resign_count >= resign_consecutive:
                     result = -1.0 if state.current_player == Player.BLACK else 1.0
                     soft_value = _soft_value_from_state(state, soft_value_k)
-                    return game_states, game_policies, result, soft_value
+                    return _finalize(result, soft_value)
             else:
                 resign_count = 0
         else:
@@ -204,11 +291,11 @@ def self_play_single_game_v0(
         if winner is not None:
             result = 1.0 if winner == Player.BLACK else -1.0
             soft_value = _soft_value_from_state(state, soft_value_k)
-            return game_states, game_policies, result, soft_value
+            return _finalize(result, soft_value)
 
         if state.has_reached_move_limit():
             soft_value = _soft_value_from_state(state, soft_value_k)
-            return game_states, game_policies, 0.0, soft_value
+            return _finalize(0.0, soft_value)
 
 
 def _v0_self_play_worker(
@@ -244,6 +331,14 @@ def _v0_self_play_worker(
         model.to(device)
         model.eval()
 
+        eval_stats_enabled = _eval_stats_enabled()
+        worker_stats = _empty_eval_stats() if eval_stats_enabled else None
+
+        def _sink(stats: Dict[str, object]) -> None:
+            if worker_stats is None:
+                return
+            _merge_eval_stats(worker_stats, stats)
+
         games: List[Tuple[List[GameState], List[np.ndarray], float, float]] = []
         base_seed = worker_seed
 
@@ -276,12 +371,22 @@ def _v0_self_play_worker(
                     torchscript_dtype=cfg.get("torchscript_dtype"),
                     inference_batch_size=cfg.get("inference_batch_size", 512),
                     inference_warmup_iters=cfg.get("inference_warmup_iters", 5),
+                    eval_stats_sink=_sink if eval_stats_enabled else None,
                 )
             )
 
-        return_queue.put(("ok", worker_id, games))
+        stats_raw = None
+        if eval_stats_enabled and worker_stats is not None:
+            stats_raw = worker_stats
+            payload = _format_eval_stats(worker_stats, int(cfg.get("inference_batch_size", 512)))
+            payload["scope"] = "worker"
+            payload["worker_id"] = worker_id
+            payload["games"] = cfg["games_per_worker"]
+            _print_eval_stats(payload)
+
+        return_queue.put(("ok", worker_id, games, stats_raw))
     except Exception as exc:
-        return_queue.put(("err", worker_id, repr(exc)))
+        return_queue.put(("err", worker_id, repr(exc), None))
 
 
 def self_play_v0(
@@ -330,9 +435,18 @@ def self_play_v0(
         )
         torchscript_dtype = dtype_str
 
+    eval_stats_enabled = _eval_stats_enabled()
+
     if num_workers <= 1:
         rng = random.Random(base_seed or int(time.time() * 1e6))
         games: List[Tuple[List[GameState], List[np.ndarray], float, float]] = []
+        run_stats = _empty_eval_stats() if eval_stats_enabled else None
+
+        def _sink(stats: Dict[str, object]) -> None:
+            if run_stats is None:
+                return
+            _merge_eval_stats(run_stats, stats)
+
         for _ in range(num_games):
             seed = rng.randint(0, 2**31 - 1)
             games.append(
@@ -362,8 +476,14 @@ def self_play_v0(
                     torchscript_dtype=torchscript_dtype,
                     inference_batch_size=inference_batch_size,
                     inference_warmup_iters=inference_warmup_iters,
+                    eval_stats_sink=_sink if eval_stats_enabled else None,
                 )
             )
+        if eval_stats_enabled and run_stats is not None:
+            payload = _format_eval_stats(run_stats, inference_batch_size)
+            payload["scope"] = "run"
+            payload["games"] = len(games)
+            _print_eval_stats(payload)
         return games
 
     if games_per_worker is None or games_per_worker <= 0:
@@ -374,6 +494,7 @@ def self_play_v0(
     model_bytes = _serialize_model_state(model)
     workers: List[mp.Process] = []
     games: List[Tuple[List[GameState], List[np.ndarray], float, float]] = []
+    summary_stats = _empty_eval_stats() if eval_stats_enabled else None
 
     common_cfg = {
         "mcts_simulations": mcts_simulations,
@@ -420,9 +541,11 @@ def self_play_v0(
 
         finished = 0
         while finished < num_workers:
-            status, worker_id, payload = return_queue.get()
+            status, worker_id, payload, stats_raw = return_queue.get()
             if status == "ok":
                 games.extend(payload)
+                if eval_stats_enabled and summary_stats is not None and stats_raw:
+                    _merge_eval_stats(summary_stats, stats_raw)
                 finished += 1
             else:
                 raise RuntimeError(f"Self-play worker {worker_id} failed: {payload}")
@@ -438,5 +561,12 @@ def self_play_v0(
         print(
             f"Warning: expected {num_workers * games_per_worker} games but received {len(games)}."
         )
+
+    if eval_stats_enabled and summary_stats is not None:
+        payload = _format_eval_stats(summary_stats, inference_batch_size)
+        payload["scope"] = "summary"
+        payload["games"] = len(games)
+        payload["num_workers"] = num_workers
+        _print_eval_stats(payload)
 
     return games[:num_games]
