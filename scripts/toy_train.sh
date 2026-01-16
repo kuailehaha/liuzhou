@@ -26,7 +26,7 @@ python -m v0.train \
   --self_play_games_per_worker 80 \
   --mcts_simulations 512 \
   --self_play_batch_leaves 512 \
-  --inference-batch-size 512 \
+  --self_play_inference_batch_size 512 \
   --self_play_opening_random_moves 8 \
   --self_play_resign_threshold -0.8 \
   --self_play_resign_min_moves 10 \
