@@ -18,7 +18,13 @@ import torch
 
 from src.game_state import GameState, Player
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
-from src.evaluate import MCTSAgent, evaluate_against_agent, evaluate_against_agent_parallel
+from src.evaluate import (
+    MCTSAgent,
+    V0MCTSAgent,
+    evaluate_against_agent,
+    evaluate_against_agent_parallel,
+    evaluate_against_agent_parallel_v0,
+)
 from src.random_agent import RandomAgent
 
 from v0.python.self_play_runner import self_play_v0
@@ -32,6 +38,16 @@ from v0.python.state_io import (
 import src.train as baseline_train
 
 SampleTuple = Tuple[GameState, np.ndarray, float, float]
+
+
+def _normalize_eval_backend(value: Optional[str]) -> str:
+    key = str(value or "legacy").strip().lower()
+    if key in ("legacy", "python", "py"):
+        return "legacy"
+    if key in ("v0", "cpp", "c++", "cuda"):
+        return "v0"
+    raise ValueError(f"Unsupported eval backend: {value}")
+
 
 def train_pipeline_v0(
     iterations: int = 10,
@@ -60,6 +76,7 @@ def train_pipeline_v0(
     win_rate_threshold: float = 0.55,
     mcts_sims_eval: int = 100,
     eval_workers: int = 0,
+    eval_backend: str = "legacy",
     checkpoint_dir: str = "./checkpoints_v0",
     device: str = "cpu",
     runtime_config: Optional[Dict[str, Any]] = None,
@@ -250,6 +267,47 @@ def train_pipeline_v0(
         sp_inference_warmup_iters = self_play_inference_warmup_iters
     sp_inference_warmup_iters = max(0, sp_inference_warmup_iters)
 
+    eval_backend = _normalize_eval_backend(evaluation_cfg.get("backend", eval_backend))
+
+    eval_batch_cfg = evaluation_cfg.get("batch_leaves", sp_batch_leaves)
+    try:
+        eval_batch_leaves = int(eval_batch_cfg)
+    except (TypeError, ValueError):
+        eval_batch_leaves = sp_batch_leaves
+    eval_batch_leaves = max(1, eval_batch_leaves)
+
+    eval_inference_backend_cfg = evaluation_cfg.get("inference_backend", sp_inference_backend)
+    try:
+        eval_inference_backend = (
+            str(eval_inference_backend_cfg)
+            if eval_inference_backend_cfg is not None
+            else sp_inference_backend
+        )
+    except (TypeError, ValueError):
+        eval_inference_backend = sp_inference_backend
+
+    eval_torchscript_path = evaluation_cfg.get("torchscript_path", None)
+    if eval_torchscript_path is not None:
+        eval_torchscript_path = str(eval_torchscript_path)
+
+    eval_torchscript_dtype = evaluation_cfg.get("torchscript_dtype", sp_torchscript_dtype)
+    if eval_torchscript_dtype is not None:
+        eval_torchscript_dtype = str(eval_torchscript_dtype)
+
+    eval_batch_size_cfg = evaluation_cfg.get("inference_batch_size", sp_inference_batch_size)
+    try:
+        eval_inference_batch_size = int(eval_batch_size_cfg)
+    except (TypeError, ValueError):
+        eval_inference_batch_size = sp_inference_batch_size
+    eval_inference_batch_size = max(1, eval_inference_batch_size)
+
+    eval_warmup_cfg = evaluation_cfg.get("inference_warmup_iters", sp_inference_warmup_iters)
+    try:
+        eval_inference_warmup_iters = int(eval_warmup_cfg)
+    except (TypeError, ValueError):
+        eval_inference_warmup_iters = sp_inference_warmup_iters
+    eval_inference_warmup_iters = max(0, eval_inference_warmup_iters)
+
     dir_alpha_cfg = self_play_cfg.get("dirichlet_alpha", self_play_dirichlet_alpha)
     dir_eps_cfg = self_play_cfg.get("dirichlet_epsilon", self_play_dirichlet_epsilon)
     try:
@@ -339,6 +397,7 @@ def train_pipeline_v0(
                 "decisive_only": bool(decisive_only),
                 "value_draw_weight": value_draw_weight,
                 "policy_draw_weight": policy_draw_weight,
+                "eval_backend": eval_backend,
             }
 
         if soft_alpha_anneal_iters <= 0:
@@ -508,31 +567,70 @@ def train_pipeline_v0(
         current_model.eval()
         eval_start_time = time.perf_counter()
 
+        v0_eval_kwargs = {
+            "batch_leaves": eval_batch_leaves,
+            "inference_backend": eval_inference_backend,
+            "torchscript_path": eval_torchscript_path,
+            "torchscript_dtype": eval_torchscript_dtype,
+            "inference_batch_size": eval_inference_batch_size,
+            "inference_warmup_iters": eval_inference_warmup_iters,
+        }
+
+        def _make_eval_agent(model: ChessNet):
+            if eval_backend == "v0":
+                return V0MCTSAgent(
+                    model,
+                    mcts_simulations=mcts_sims_eval,
+                    temperature=eval_temperature,
+                    device=device,
+                    add_dirichlet_noise=eval_add_dirichlet,
+                    verbose=eval_verbose,
+                    mcts_verbose=eval_mcts_verbose,
+                    **v0_eval_kwargs,
+                )
+            return MCTSAgent(
+                model,
+                mcts_simulations=mcts_sims_eval,
+                temperature=eval_temperature,
+                device=device,
+                add_dirichlet_noise=eval_add_dirichlet,
+                verbose=eval_verbose,
+                mcts_verbose=eval_mcts_verbose,
+            )
+
         print(f"Evaluating challenger against RandomAgent ({eval_games_vs_random} games)...")
         if eval_workers > 1:
-            stats_vs_rnd = evaluate_against_agent_parallel(
-                challenger_checkpoint=iter_model_path,
-                opponent_checkpoint=None,
-                num_games=eval_games_vs_random,
-                device=device,
-                mcts_simulations=mcts_sims_eval,
-                temperature=eval_temperature,
-                add_dirichlet_noise=eval_add_dirichlet,
-                num_workers=eval_workers,
-                verbose=eval_verbose,
-                game_verbose=eval_game_verbose,
-                mcts_verbose=eval_mcts_verbose,
-            )
+            if eval_backend == "v0":
+                stats_vs_rnd = evaluate_against_agent_parallel_v0(
+                    challenger_checkpoint=iter_model_path,
+                    opponent_checkpoint=None,
+                    num_games=eval_games_vs_random,
+                    device=device,
+                    mcts_simulations=mcts_sims_eval,
+                    temperature=eval_temperature,
+                    add_dirichlet_noise=eval_add_dirichlet,
+                    num_workers=eval_workers,
+                    verbose=eval_verbose,
+                    game_verbose=eval_game_verbose,
+                    mcts_verbose=eval_mcts_verbose,
+                    **v0_eval_kwargs,
+                )
+            else:
+                stats_vs_rnd = evaluate_against_agent_parallel(
+                    challenger_checkpoint=iter_model_path,
+                    opponent_checkpoint=None,
+                    num_games=eval_games_vs_random,
+                    device=device,
+                    mcts_simulations=mcts_sims_eval,
+                    temperature=eval_temperature,
+                    add_dirichlet_noise=eval_add_dirichlet,
+                    num_workers=eval_workers,
+                    verbose=eval_verbose,
+                    game_verbose=eval_game_verbose,
+                    mcts_verbose=eval_mcts_verbose,
+                )
         else:
-            challenger_agent = MCTSAgent(
-                current_model,
-                mcts_simulations=mcts_sims_eval,
-                temperature=eval_temperature,
-                device=device,
-                add_dirichlet_noise=eval_add_dirichlet,
-                verbose=eval_verbose,
-                mcts_verbose=eval_mcts_verbose,
-            )
+            challenger_agent = _make_eval_agent(current_model)
             random_opponent = RandomAgent()
             stats_vs_rnd = evaluate_against_agent(
                 challenger_agent,
@@ -565,19 +663,35 @@ def train_pipeline_v0(
 
                 print(f"Evaluating challenger against BestModel ({eval_games_vs_best} games)...")
                 if eval_workers > 1:
-                    stats_vs_best_model = evaluate_against_agent_parallel(
-                        challenger_checkpoint=iter_model_path,
-                        opponent_checkpoint=best_model_path,
-                        num_games=eval_games_vs_best,
-                        device=device,
-                        mcts_simulations=mcts_sims_eval,
-                        temperature=eval_temperature,
-                        add_dirichlet_noise=eval_add_dirichlet,
-                        num_workers=eval_workers,
-                        verbose=eval_verbose,
-                        game_verbose=eval_game_verbose,
-                        mcts_verbose=eval_mcts_verbose,
-                    )
+                    if eval_backend == "v0":
+                        stats_vs_best_model = evaluate_against_agent_parallel_v0(
+                            challenger_checkpoint=iter_model_path,
+                            opponent_checkpoint=best_model_path,
+                            num_games=eval_games_vs_best,
+                            device=device,
+                            mcts_simulations=mcts_sims_eval,
+                            temperature=eval_temperature,
+                            add_dirichlet_noise=eval_add_dirichlet,
+                            num_workers=eval_workers,
+                            verbose=eval_verbose,
+                            game_verbose=eval_game_verbose,
+                            mcts_verbose=eval_mcts_verbose,
+                            **v0_eval_kwargs,
+                        )
+                    else:
+                        stats_vs_best_model = evaluate_against_agent_parallel(
+                            challenger_checkpoint=iter_model_path,
+                            opponent_checkpoint=best_model_path,
+                            num_games=eval_games_vs_best,
+                            device=device,
+                            mcts_simulations=mcts_sims_eval,
+                            temperature=eval_temperature,
+                            add_dirichlet_noise=eval_add_dirichlet,
+                            num_workers=eval_workers,
+                            verbose=eval_verbose,
+                            game_verbose=eval_game_verbose,
+                            mcts_verbose=eval_mcts_verbose,
+                        )
                 else:
                     best_model_checkpoint = torch.load(best_model_path, map_location=device)
                     best_model_eval = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
@@ -585,15 +699,7 @@ def train_pipeline_v0(
                     best_model_eval.to(device)
                     best_model_eval.eval()
 
-                    best_agent_opponent = MCTSAgent(
-                        best_model_eval,
-                        mcts_simulations=mcts_sims_eval,
-                        temperature=eval_temperature,
-                        device=device,
-                        add_dirichlet_noise=eval_add_dirichlet,
-                        verbose=eval_verbose,
-                        mcts_verbose=eval_mcts_verbose,
-                    )
+                    best_agent_opponent = _make_eval_agent(best_model_eval)
 
                     stats_vs_best_model = evaluate_against_agent(
                         challenger_agent,
@@ -809,6 +915,12 @@ if __name__ == "__main__":
         default=0,
         help="Number of parallel workers for evaluation (0 = use self_play_workers).",
     )
+    parser.add_argument(
+        "--eval_backend",
+        type=str,
+        default="legacy",
+        help="Evaluation MCTS backend (legacy or v0).",
+    )
     parser.add_argument("--win_rate_threshold", type=float, default=0.55, help="Win-rate threshold.")
     parser.add_argument(
         "--mcts_sims_eval", type=int, default=100, help="MCTS simulations for evaluation agents."
@@ -881,6 +993,7 @@ if __name__ == "__main__":
         eval_games_vs_random=args.eval_games_vs_random,
         eval_games_vs_best=args.eval_games_vs_best,
         eval_workers=args.eval_workers,
+        eval_backend=args.eval_backend,
         win_rate_threshold=args.win_rate_threshold,
         mcts_sims_eval=args.mcts_sims_eval,
         checkpoint_dir=args.checkpoint_dir,

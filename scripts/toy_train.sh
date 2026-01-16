@@ -24,8 +24,9 @@ python -m v0.train \
   --iterations 40 \
   --self_play_workers 8 \
   --self_play_games_per_worker 80 \
-  --mcts_simulations 800 \
-  --self_play_batch_leaves 256 \
+  --mcts_simulations 512 \
+  --self_play_batch_leaves 512 \
+  --inference-batch-size 512 \
   --self_play_opening_random_moves 8 \
   --self_play_resign_threshold -0.8 \
   --self_play_resign_min_moves 10 \
@@ -37,5 +38,6 @@ python -m v0.train \
   --device cuda \
   --eval_games_vs_random 200 \
   --eval_games_vs_best 200 \
-  --mcts_sims_eval 100 \
+  --mcts_sims_eval 256 \
+  --eval_backend v0 \
   --checkpoint_dir ./checkpoints_v0

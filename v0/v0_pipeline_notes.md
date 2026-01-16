@@ -60,14 +60,14 @@ Conclusion: value sign is consistent; no obvious "objective reversed".
 
 ## 4) Evaluation
 
-- `v0/train.py` uses legacy eval:
-  - `src.evaluate.MCTSAgent` (legacy MCTS)
-  - `RandomAgent`
-  - `play_single_game` with `max_moves=200` (draw if limit hit)
+- `v0/train.py` defaults to legacy eval; set `--eval_backend v0` to use v0 MCTS.
+  - Legacy: `src.evaluate.MCTSAgent` (legacy MCTS)
+  - v0: `src.evaluate.V0MCTSAgent` (v0 core MCTS)
+  - Both use `RandomAgent` and `play_single_game` with `max_moves=200` (draw if limit hit)
 
 This means:
 - v0 self-play uses v0 MCTS + v0 core rules
-- evaluation uses legacy MCTS + legacy rules
+- evaluation uses legacy MCTS unless `eval_backend=v0`
 Any divergence between v0 rules and legacy rules can destroy the signal.
 
 ## 5) Likely failure points (based on current logs)
@@ -109,4 +109,3 @@ Any divergence between v0 rules and legacy rules can destroy the signal.
   retrain; check if win rate moves.
 - Temporarily set `soft_label_alpha = 0` to focus value on win/loss.
 - Reduce move limit or add a small win bonus to reduce draws.
-
