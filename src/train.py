@@ -650,6 +650,7 @@ def train_pipeline(
                         verbose=eval_verbose,
                         game_verbose=eval_game_verbose,
                         mcts_verbose=eval_mcts_verbose,
+                        sample_moves=True,
                     )
                 else:
                     best_model_checkpoint = torch.load(best_model_path, map_location=device)
@@ -658,6 +659,16 @@ def train_pipeline(
                     best_model_eval.to(device)
                     best_model_eval.eval()
 
+                    challenger_agent_best = MCTSAgent(
+                        current_model,
+                        mcts_simulations=mcts_sims_eval,
+                        temperature=eval_temperature,
+                        device=device,
+                        add_dirichlet_noise=eval_add_dirichlet,
+                        verbose=eval_verbose,
+                        mcts_verbose=eval_mcts_verbose,
+                        sample_moves=True,
+                    )
                     best_agent_opponent = MCTSAgent(
                         best_model_eval,
                         mcts_simulations=mcts_sims_eval,
@@ -666,10 +677,11 @@ def train_pipeline(
                         add_dirichlet_noise=eval_add_dirichlet,
                         verbose=eval_verbose,
                         mcts_verbose=eval_mcts_verbose,
+                        sample_moves=True,
                     )
 
                     stats_vs_best_model = evaluate_against_agent(
-                        challenger_agent,
+                        challenger_agent_best,
                         best_agent_opponent,
                         eval_games_vs_best,
                         device,

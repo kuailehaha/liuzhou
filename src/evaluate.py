@@ -105,6 +105,7 @@ def _eval_worker(
     mcts_verbose: Optional[bool],
     seed: int,
     threads_per_worker: int,
+    sample_moves: bool,
 ) -> Tuple[int, int, int]:
     torch.set_num_threads(max(1, int(threads_per_worker)))
     _seed_worker(seed + worker_id)
@@ -122,6 +123,7 @@ def _eval_worker(
         add_dirichlet_noise=add_dirichlet_noise,
         verbose=False,
         mcts_verbose=mcts_verbose,
+        sample_moves=sample_moves,
     )
 
     if opponent_checkpoint:
@@ -134,6 +136,7 @@ def _eval_worker(
             add_dirichlet_noise=add_dirichlet_noise,
             verbose=False,
             mcts_verbose=mcts_verbose,
+            sample_moves=sample_moves,
         )
     else:
         opponent_agent = RandomAgent()
@@ -161,6 +164,7 @@ def _eval_worker_v0(
     torchscript_dtype: Optional[str],
     inference_batch_size: int,
     inference_warmup_iters: int,
+    sample_moves: bool,
 ) -> Tuple[int, int, int]:
     torch.set_num_threads(max(1, int(threads_per_worker)))
     _seed_worker(seed + worker_id)
@@ -184,6 +188,7 @@ def _eval_worker_v0(
         torchscript_dtype=torchscript_dtype,
         inference_batch_size=inference_batch_size,
         inference_warmup_iters=inference_warmup_iters,
+        sample_moves=sample_moves,
     )
 
     if opponent_checkpoint:
@@ -202,6 +207,7 @@ def _eval_worker_v0(
             torchscript_dtype=torchscript_dtype,
             inference_batch_size=inference_batch_size,
             inference_warmup_iters=inference_warmup_iters,
+            sample_moves=sample_moves,
         )
     else:
         opponent_agent = RandomAgent()
@@ -243,6 +249,7 @@ class MCTSAgent:
         add_dirichlet_noise: bool = False,
         verbose: bool = False,
         mcts_verbose: Optional[bool] = None,
+        sample_moves: bool = False,
     ):
         self.model = model
         self.model.eval()  # Keep the model in inference mode during evaluation
@@ -252,6 +259,7 @@ class MCTSAgent:
         self.verbose = verbose
         if mcts_verbose is None:
             mcts_verbose = verbose
+        self.sample_moves = bool(sample_moves)
         self.mcts = MCTS(
             model=self.model,
             num_simulations=self.mcts_simulations,
@@ -273,8 +281,16 @@ class MCTSAgent:
             # print(f"MCTSAgent: MCTS search returned no moves for state:\n{state}")
             raise ValueError("MCTSAgent: MCTS search returned no moves.")
         
-        # In evaluation we simply pick the move with the highest visit probability
-        move_idx = np.argmax(policy)
+        policy = np.asarray(policy, dtype=float)
+        if self.sample_moves:
+            if not np.all(np.isfinite(policy)) or policy.sum() <= 0:
+                policy = np.ones_like(policy, dtype=float) / len(policy)
+            else:
+                policy = policy / policy.sum()
+            move_idx = int(np.random.choice(len(moves), p=policy))
+        else:
+            # In evaluation we simply pick the move with the highest visit probability
+            move_idx = int(np.argmax(policy))
         chosen_move = moves[move_idx]
         self.mcts.advance_root(chosen_move)
         return chosen_move
@@ -298,6 +314,7 @@ class V0MCTSAgent:
         torchscript_dtype: Optional[str] = None,
         inference_batch_size: int = 512,
         inference_warmup_iters: int = 5,
+        sample_moves: bool = False,
     ):
         self.model = model
         self.model.eval()
@@ -307,6 +324,7 @@ class V0MCTSAgent:
         self.verbose = verbose
         if mcts_verbose is None:
             mcts_verbose = verbose
+        self.sample_moves = bool(sample_moves)
         V0MCTS = _load_v0_mcts()
         self.mcts = V0MCTS(
             model=self.model,
@@ -333,7 +351,15 @@ class V0MCTSAgent:
         if not moves:
             raise ValueError("V0MCTSAgent: MCTS search returned no moves.")
 
-        move_idx = np.argmax(policy)
+        policy = np.asarray(policy, dtype=float)
+        if self.sample_moves:
+            if not np.all(np.isfinite(policy)) or policy.sum() <= 0:
+                policy = np.ones_like(policy, dtype=float) / len(policy)
+            else:
+                policy = policy / policy.sum()
+            move_idx = int(np.random.choice(len(moves), p=policy))
+        else:
+            move_idx = int(np.argmax(policy))
         chosen_move = moves[move_idx]
         self.mcts.advance_root(chosen_move)
         return chosen_move
@@ -437,6 +463,7 @@ def evaluate_against_agent_parallel(
     verbose: bool = False,
     game_verbose: Optional[bool] = None,
     mcts_verbose: Optional[bool] = None,
+    sample_moves: bool = False,
 ) -> EvaluationStats:
     """Parallel evaluation using multiple worker processes."""
     log = print if verbose else (lambda *args, **kwargs: None)
@@ -458,6 +485,7 @@ def evaluate_against_agent_parallel(
             add_dirichlet_noise=add_dirichlet_noise,
             verbose=verbose,
             mcts_verbose=mcts_verbose,
+            sample_moves=sample_moves,
         )
         if opponent_checkpoint:
             opponent_model = _load_model_from_checkpoint(opponent_checkpoint, device)
@@ -469,6 +497,7 @@ def evaluate_against_agent_parallel(
                 add_dirichlet_noise=add_dirichlet_noise,
                 verbose=verbose,
                 mcts_verbose=mcts_verbose,
+                sample_moves=sample_moves,
             )
         else:
             opponent_agent = RandomAgent()
@@ -508,6 +537,7 @@ def evaluate_against_agent_parallel(
                     mcts_verbose,
                     base_seed,
                     threads_per_worker,
+                    sample_moves,
                 )
                 for worker_id in range(len(chunks))
             ],
@@ -537,6 +567,7 @@ def evaluate_against_agent_parallel_v0(
     torchscript_dtype: Optional[str] = None,
     inference_batch_size: int = 512,
     inference_warmup_iters: int = 5,
+    sample_moves: bool = False,
 ) -> EvaluationStats:
     """Parallel evaluation using v0 C++ MCTS workers."""
     log = print if verbose else (lambda *args, **kwargs: None)
@@ -568,6 +599,7 @@ def evaluate_against_agent_parallel_v0(
             torchscript_dtype=torchscript_dtype,
             inference_batch_size=inference_batch_size,
             inference_warmup_iters=inference_warmup_iters,
+            sample_moves=sample_moves,
         )
         if opponent_checkpoint:
             opponent_model = _load_model_from_checkpoint(opponent_checkpoint, device)
@@ -585,6 +617,7 @@ def evaluate_against_agent_parallel_v0(
                 torchscript_dtype=torchscript_dtype,
                 inference_batch_size=inference_batch_size,
                 inference_warmup_iters=inference_warmup_iters,
+                sample_moves=sample_moves,
             )
         else:
             opponent_agent = RandomAgent()
@@ -630,6 +663,7 @@ def evaluate_against_agent_parallel_v0(
                     torchscript_dtype,
                     inference_batch_size,
                     inference_warmup_iters,
+                    sample_moves,
                 )
                 for worker_id in range(len(chunks))
             ],

@@ -576,7 +576,7 @@ def train_pipeline_v0(
             "inference_warmup_iters": eval_inference_warmup_iters,
         }
 
-        def _make_eval_agent(model: ChessNet):
+        def _make_eval_agent(model: ChessNet, sample_moves: bool = False):
             if eval_backend == "v0":
                 return V0MCTSAgent(
                     model,
@@ -586,6 +586,7 @@ def train_pipeline_v0(
                     add_dirichlet_noise=eval_add_dirichlet,
                     verbose=eval_verbose,
                     mcts_verbose=eval_mcts_verbose,
+                    sample_moves=sample_moves,
                     **v0_eval_kwargs,
                 )
             return MCTSAgent(
@@ -596,6 +597,7 @@ def train_pipeline_v0(
                 add_dirichlet_noise=eval_add_dirichlet,
                 verbose=eval_verbose,
                 mcts_verbose=eval_mcts_verbose,
+                sample_moves=sample_moves,
             )
 
         print(f"Evaluating challenger against RandomAgent ({eval_games_vs_random} games)...")
@@ -676,6 +678,7 @@ def train_pipeline_v0(
                             verbose=eval_verbose,
                             game_verbose=eval_game_verbose,
                             mcts_verbose=eval_mcts_verbose,
+                            sample_moves=True,
                             **v0_eval_kwargs,
                         )
                     else:
@@ -691,6 +694,7 @@ def train_pipeline_v0(
                             verbose=eval_verbose,
                             game_verbose=eval_game_verbose,
                             mcts_verbose=eval_mcts_verbose,
+                            sample_moves=True,
                         )
                 else:
                     best_model_checkpoint = torch.load(best_model_path, map_location=device)
@@ -699,10 +703,11 @@ def train_pipeline_v0(
                     best_model_eval.to(device)
                     best_model_eval.eval()
 
-                    best_agent_opponent = _make_eval_agent(best_model_eval)
+                    challenger_agent_best = _make_eval_agent(current_model, sample_moves=True)
+                    best_agent_opponent = _make_eval_agent(best_model_eval, sample_moves=True)
 
                     stats_vs_best_model = evaluate_against_agent(
-                        challenger_agent,
+                        challenger_agent_best,
                         best_agent_opponent,
                         eval_games_vs_best,
                         device,
