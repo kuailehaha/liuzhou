@@ -34,11 +34,11 @@ python -m v0.train \
   --epochs 5 \
   --value_draw_weight 0.1 \
   --policy_draw_weight 0.3 \
-  --batch_size 2048 \
+  --batch_size 512 \
   --device cuda \
   --eval_games_vs_random 200 \
   --eval_games_vs_best 200 \
   --mcts_sims_eval 256 \
   --eval_backend v0 \
   --checkpoint_dir ./checkpoints_v0 \
-  --load_checkpoint ./checkpoints_v0/best_model.pt
+  --load_checkpoint ./checkpoints_v0/model_iter_6.pt
