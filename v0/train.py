@@ -49,6 +49,67 @@ def _normalize_eval_backend(value: Optional[str]) -> str:
     raise ValueError(f"Unsupported eval backend: {value}")
 
 
+def _coerce_device_list(value: Optional[object], fallback: str) -> List[str]:
+    if value is None:
+        return [fallback]
+    if isinstance(value, (list, tuple)):
+        tokens = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        text = str(value).strip()
+        if not text:
+            return [fallback]
+        key = text.lower()
+        if key in ("auto", "all", "visible", "available"):
+            if torch.cuda.is_available():
+                count = torch.cuda.device_count()
+                if count > 0:
+                    return [f"cuda:{i}" for i in range(count)]
+            return [fallback]
+        tokens = [item.strip() for item in text.split(",") if item.strip()]
+
+    devices: List[str] = []
+    for token in tokens:
+        lower = token.lower()
+        if lower == "cuda":
+            devices.append("cuda:0")
+        elif lower in ("cpu", "mps"):
+            devices.append(lower)
+        elif lower.startswith(("cuda:", "mps", "cpu")):
+            devices.append(token)
+        elif token.isdigit():
+            devices.append(f"cuda:{token}")
+        else:
+            devices.append(token)
+
+    seen = set()
+    normalized: List[str] = []
+    for dev in devices:
+        if dev not in seen:
+            normalized.append(dev)
+            seen.add(dev)
+    return normalized or [fallback]
+
+
+def _cuda_device_ids(devices: Sequence[str]) -> List[int]:
+    ids: List[int] = []
+    for dev in devices:
+        try:
+            device_obj = torch.device(dev)
+        except (TypeError, ValueError):
+            continue
+        if device_obj.type != "cuda":
+            continue
+        idx = 0 if device_obj.index is None else int(device_obj.index)
+        ids.append(idx)
+    seen = set()
+    unique_ids: List[int] = []
+    for idx in ids:
+        if idx not in seen:
+            unique_ids.append(idx)
+            seen.add(idx)
+    return unique_ids
+
+
 def train_pipeline_v0(
     iterations: int = 10,
     num_mcts_simulations: int = 800,
@@ -79,6 +140,9 @@ def train_pipeline_v0(
     eval_backend: str = "legacy",
     checkpoint_dir: str = "./checkpoints_v0",
     device: str = "cpu",
+    self_play_devices: Optional[Sequence[str]] = None,
+    train_devices: Optional[Sequence[str]] = None,
+    eval_devices: Optional[Sequence[str]] = None,
     runtime_config: Optional[Dict[str, Any]] = None,
     self_play_batch_leaves: int = 256,
     self_play_dirichlet_alpha: float = 0.3,
@@ -210,6 +274,22 @@ def train_pipeline_v0(
     if eval_workers <= 0:
         eval_workers = sp_workers
     eval_workers = max(1, eval_workers)
+
+    device = str(device)
+    fallback_device = "cuda:0" if device == "cuda" else device
+    train_cfg = runtime_config.get("train", {})
+    self_play_devices_list = _coerce_device_list(self_play_cfg.get("devices", self_play_devices), fallback_device)
+    train_devices_list = _coerce_device_list(train_cfg.get("devices", train_devices), fallback_device)
+    eval_devices_list = _coerce_device_list(evaluation_cfg.get("devices", eval_devices), fallback_device)
+
+    self_play_device = self_play_devices_list[0]
+    train_device = train_devices_list[0]
+    eval_device = eval_devices_list[0]
+    train_device_ids = _cuda_device_ids(train_devices_list)
+    use_data_parallel = torch.cuda.is_available() and len(train_device_ids) > 1
+
+    if use_data_parallel:
+        print(f"DataParallel enabled on devices: {train_devices_list}")
 
     soft_value_cfg = runtime_config.get("soft_value_labels", {})
     try:
@@ -357,7 +437,7 @@ def train_pipeline_v0(
     # Load checkpoint if provided
     if load_checkpoint and os.path.exists(load_checkpoint):
         print(f"Loading model checkpoint from: {load_checkpoint}")
-        checkpoint = torch.load(load_checkpoint, map_location=device)
+        checkpoint = torch.load(load_checkpoint, map_location=train_device)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         current_model.load_state_dict(state_dict)
         loaded_iteration = checkpoint.get("iteration", 0)
@@ -368,7 +448,7 @@ def train_pipeline_v0(
         else:
             print("No checkpoint specified, starting with random model.")
     
-    current_model.to(device)
+    current_model.to(train_device)
 
     best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
 
@@ -398,6 +478,10 @@ def train_pipeline_v0(
                 "value_draw_weight": value_draw_weight,
                 "policy_draw_weight": policy_draw_weight,
                 "eval_backend": eval_backend,
+                "self_play_devices": list(self_play_devices_list),
+                "train_devices": list(train_devices_list),
+                "eval_devices": list(eval_devices_list),
+                "train_data_parallel": use_data_parallel,
             }
 
         if soft_alpha_anneal_iters <= 0:
@@ -452,7 +536,7 @@ def train_pipeline_v0(
                 temperature_final=temperature_final,
                 temperature_threshold=temperature_threshold,
                 exploration_weight=exploration_weight,
-                device=device,
+                device=self_play_device,
                 add_dirichlet_noise=self_play_add_dirichlet,
                 dirichlet_alpha=sp_dirichlet_alpha,
                 dirichlet_epsilon=sp_dirichlet_epsilon,
@@ -473,6 +557,7 @@ def train_pipeline_v0(
                 torchscript_dtype=sp_torchscript_dtype,
                 inference_batch_size=sp_inference_batch_size,
                 inference_warmup_iters=sp_inference_warmup_iters,
+                devices=self_play_devices_list,
             )
             training_data = training_data or []
             if decisive_only:
@@ -509,9 +594,17 @@ def train_pipeline_v0(
             )
         else:
             print(f"{train_label}: {len(examples)} examples, {epochs} epochs...")
+            current_model.to(train_device)
             current_model.train()
-            current_model, train_metrics_data = baseline_train.train_network(
-                model=current_model,
+            train_model = current_model
+            if use_data_parallel:
+                train_model = torch.nn.DataParallel(
+                    current_model,
+                    device_ids=train_device_ids,
+                    output_device=train_device_ids[0],
+                )
+            train_model, train_metrics_data = baseline_train.train_network(
+                model=train_model,
                 examples=examples,
                 batch_size=batch_size,
                 epochs=epochs,
@@ -520,9 +613,13 @@ def train_pipeline_v0(
                 soft_label_alpha=current_alpha,
                 value_draw_weight=value_draw_weight,
                 policy_draw_weight=policy_draw_weight,
-                device=device,
+                device=train_device,
                 board_size=board_size,
             )
+            if isinstance(train_model, torch.nn.DataParallel):
+                current_model = train_model.module
+            else:
+                current_model = train_model
             train_time = baseline_train._stage_finish(
                 "train", train_label, train_start_time, stage_history
             )
@@ -564,6 +661,7 @@ def train_pipeline_v0(
         print("\nEvaluation phase...")
         eval_label = "Evaluation phase"
         baseline_train._stage_banner("eval", eval_label, iteration, iterations, stage_history)
+        current_model.to(eval_device)
         current_model.eval()
         eval_start_time = time.perf_counter()
 
@@ -582,7 +680,7 @@ def train_pipeline_v0(
                     model,
                     mcts_simulations=mcts_sims_eval,
                     temperature=eval_temperature,
-                    device=device,
+                    device=eval_device,
                     add_dirichlet_noise=eval_add_dirichlet,
                     verbose=eval_verbose,
                     mcts_verbose=eval_mcts_verbose,
@@ -593,7 +691,7 @@ def train_pipeline_v0(
                 model,
                 mcts_simulations=mcts_sims_eval,
                 temperature=eval_temperature,
-                device=device,
+                device=eval_device,
                 add_dirichlet_noise=eval_add_dirichlet,
                 verbose=eval_verbose,
                 mcts_verbose=eval_mcts_verbose,
@@ -607,11 +705,12 @@ def train_pipeline_v0(
                     challenger_checkpoint=iter_model_path,
                     opponent_checkpoint=None,
                     num_games=eval_games_vs_random,
-                    device=device,
+                    device=eval_device,
                     mcts_simulations=mcts_sims_eval,
                     temperature=eval_temperature,
                     add_dirichlet_noise=eval_add_dirichlet,
                     num_workers=eval_workers,
+                    devices=eval_devices_list,
                     verbose=eval_verbose,
                     game_verbose=eval_game_verbose,
                     mcts_verbose=eval_mcts_verbose,
@@ -622,11 +721,12 @@ def train_pipeline_v0(
                     challenger_checkpoint=iter_model_path,
                     opponent_checkpoint=None,
                     num_games=eval_games_vs_random,
-                    device=device,
+                    device=eval_device,
                     mcts_simulations=mcts_sims_eval,
                     temperature=eval_temperature,
                     add_dirichlet_noise=eval_add_dirichlet,
                     num_workers=eval_workers,
+                    devices=eval_devices_list,
                     verbose=eval_verbose,
                     game_verbose=eval_game_verbose,
                     mcts_verbose=eval_mcts_verbose,
@@ -638,7 +738,7 @@ def train_pipeline_v0(
                 challenger_agent,
                 random_opponent,
                 eval_games_vs_random,
-                device,
+                eval_device,
                 verbose=eval_verbose,
                 game_verbose=eval_game_verbose,
             )
@@ -670,11 +770,12 @@ def train_pipeline_v0(
                             challenger_checkpoint=iter_model_path,
                             opponent_checkpoint=best_model_path,
                             num_games=eval_games_vs_best,
-                            device=device,
+                            device=eval_device,
                             mcts_simulations=mcts_sims_eval,
                             temperature=eval_temperature,
                             add_dirichlet_noise=eval_add_dirichlet,
                             num_workers=eval_workers,
+                            devices=eval_devices_list,
                             verbose=eval_verbose,
                             game_verbose=eval_game_verbose,
                             mcts_verbose=eval_mcts_verbose,
@@ -686,21 +787,22 @@ def train_pipeline_v0(
                             challenger_checkpoint=iter_model_path,
                             opponent_checkpoint=best_model_path,
                             num_games=eval_games_vs_best,
-                            device=device,
+                            device=eval_device,
                             mcts_simulations=mcts_sims_eval,
                             temperature=eval_temperature,
                             add_dirichlet_noise=eval_add_dirichlet,
                             num_workers=eval_workers,
+                            devices=eval_devices_list,
                             verbose=eval_verbose,
                             game_verbose=eval_game_verbose,
                             mcts_verbose=eval_mcts_verbose,
                             sample_moves=True,
                         )
                 else:
-                    best_model_checkpoint = torch.load(best_model_path, map_location=device)
+                    best_model_checkpoint = torch.load(best_model_path, map_location=eval_device)
                     best_model_eval = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
                     best_model_eval.load_state_dict(best_model_checkpoint["model_state_dict"])
-                    best_model_eval.to(device)
+                    best_model_eval.to(eval_device)
                     best_model_eval.eval()
 
                     challenger_agent_best = _make_eval_agent(current_model, sample_moves=True)
@@ -710,7 +812,7 @@ def train_pipeline_v0(
                         challenger_agent_best,
                         best_agent_opponent,
                         eval_games_vs_best,
-                        device,
+                        eval_device,
                         verbose=eval_verbose,
                         game_verbose=eval_game_verbose,
                     )
@@ -795,6 +897,24 @@ if __name__ == "__main__":
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Training device (e.g., cuda or cpu).",
+    )
+    parser.add_argument(
+        "--self_play_devices",
+        type=str,
+        default=None,
+        help="Comma-separated device list for self-play (e.g., cuda:0,cuda:1) or 'auto'.",
+    )
+    parser.add_argument(
+        "--train_devices",
+        type=str,
+        default=None,
+        help="Comma-separated device list for training/DataParallel or 'auto'.",
+    )
+    parser.add_argument(
+        "--eval_devices",
+        type=str,
+        default=None,
+        help="Comma-separated device list for evaluation or 'auto'.",
     )
     parser.add_argument(
         "--self_play_workers", type=int, default=1, help="Number of parallel self-play worker processes."
@@ -1003,6 +1123,9 @@ if __name__ == "__main__":
         mcts_sims_eval=args.mcts_sims_eval,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
+        self_play_devices=args.self_play_devices,
+        train_devices=args.train_devices,
+        eval_devices=args.eval_devices,
         runtime_config=runtime_config,
         self_play_batch_leaves=args.self_play_batch_leaves,
         self_play_dirichlet_alpha=args.self_play_dirichlet_alpha,

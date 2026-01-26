@@ -10,7 +10,7 @@ import random
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -28,9 +28,13 @@ __all__ = [
 ]
 
 
+def _unwrap_model(model: ChessNet) -> ChessNet:
+    return model.module if hasattr(model, "module") else model
+
+
 def _serialize_model_state(model: ChessNet) -> bytes:
     buffer = io.BytesIO()
-    torch.save(model.state_dict(), buffer)
+    torch.save(_unwrap_model(model).state_dict(), buffer)
     return buffer.getvalue()
 
 
@@ -60,7 +64,7 @@ def _export_torchscript(
     dtype = _dtype_from_string(dtype_str)
     if device.type == "cpu" and dtype == torch.float16:
         raise ValueError("float16 export is not supported on CPU.")
-    model_copy = copy.deepcopy(model)
+    model_copy = copy.deepcopy(_unwrap_model(model))
     model_copy.to(device=device, dtype=dtype)
     model_copy.eval()
     inputs = torch.zeros(
@@ -428,12 +432,23 @@ def self_play_v0(
     torchscript_dtype: Optional[str] = None,
     inference_batch_size: int = 512,
     inference_warmup_iters: int = 5,
+    devices: Optional[Sequence[str]] = None,
 ) -> List[Tuple[List[GameState], List[np.ndarray], float, float]]:
     model.eval()
 
+    devices_list: List[str] = []
+    if devices:
+        if isinstance(devices, str):
+            devices_list = [item.strip() for item in devices.split(",") if item.strip()]
+        else:
+            devices_list = [str(item) for item in devices if str(item).strip()]
+    if not devices_list:
+        devices_list = [str(device)]
+    single_device = devices_list[0]
+
     backend = str(inference_backend).lower()
     if backend != "py" and not torchscript_path:
-        device_obj = torch.device(device)
+        device_obj = torch.device(single_device)
         dtype_str = torchscript_dtype or _default_torchscript_dtype(device_obj)
         if dtype_str.strip().lower() in ("auto", "none"):
             dtype_str = _default_torchscript_dtype(device_obj)
@@ -467,7 +482,7 @@ def self_play_v0(
                     temperature_final=temperature_final,
                     temperature_threshold=temperature_threshold,
                     exploration_weight=exploration_weight,
-                    device=device,
+                    device=single_device,
                     add_dirichlet_noise=add_dirichlet_noise,
                     dirichlet_alpha=dirichlet_alpha,
                     dirichlet_epsilon=dirichlet_epsilon,
@@ -512,7 +527,6 @@ def self_play_v0(
         "temperature_final": temperature_final,
         "temperature_threshold": temperature_threshold,
         "exploration_weight": exploration_weight,
-        "device": device,
         "add_dirichlet_noise": add_dirichlet_noise,
         "dirichlet_alpha": dirichlet_alpha,
         "dirichlet_epsilon": dirichlet_epsilon,
@@ -540,6 +554,7 @@ def self_play_v0(
     try:
         for worker_id in range(num_workers):
             worker_cfg = dict(common_cfg)
+            worker_cfg["device"] = devices_list[worker_id % len(devices_list)]
             worker_cfg["worker_seed"] = base_seed + 1000003 * worker_id
             process = ctx.Process(
                 target=_v0_self_play_worker,

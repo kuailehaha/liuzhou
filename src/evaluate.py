@@ -3,7 +3,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -23,6 +23,16 @@ def _normalize_eval_games(num_games: int, log) -> int:
         log("Warning: num_games for evaluation should be even for fair comparison. Adjusting...")
         num_games = adjusted
     return num_games
+
+
+def _coerce_devices(devices: Optional[Sequence[str]], fallback: str) -> List[str]:
+    if devices is None:
+        return [fallback]
+    if isinstance(devices, str):
+        parsed = [item.strip() for item in devices.split(",") if item.strip()]
+        return parsed or [fallback]
+    parsed = [str(item) for item in devices if str(item).strip()]
+    return parsed or [fallback]
 
 
 def _split_game_indices(num_games: int, num_workers: int) -> List[List[int]]:
@@ -460,6 +470,7 @@ def evaluate_against_agent_parallel(
     temperature: float = 0.05,
     add_dirichlet_noise: bool = False,
     num_workers: int = 1,
+    devices: Optional[Sequence[str]] = None,
     verbose: bool = False,
     game_verbose: Optional[bool] = None,
     mcts_verbose: Optional[bool] = None,
@@ -474,6 +485,9 @@ def evaluate_against_agent_parallel(
     num_workers = max(1, int(num_workers))
     if num_games == 0:
         return EvaluationStats(wins=0, losses=0, draws=0, total_games=0)
+
+    devices_list = _coerce_devices(devices, device)
+    device = devices_list[0]
 
     if num_workers == 1:
         challenger_model = _load_model_from_checkpoint(challenger_checkpoint, device)
@@ -527,7 +541,7 @@ def evaluate_against_agent_parallel(
                     worker_id,
                     chunks[worker_id],
                     num_games,
-                    device,
+                    devices_list[worker_id % len(devices_list)],
                     mcts_simulations,
                     temperature,
                     add_dirichlet_noise,
@@ -558,6 +572,7 @@ def evaluate_against_agent_parallel_v0(
     temperature: float = 0.05,
     add_dirichlet_noise: bool = False,
     num_workers: int = 1,
+    devices: Optional[Sequence[str]] = None,
     verbose: bool = False,
     game_verbose: Optional[bool] = None,
     mcts_verbose: Optional[bool] = None,
@@ -582,6 +597,9 @@ def evaluate_against_agent_parallel_v0(
     batch_leaves = max(1, int(batch_leaves))
     inference_batch_size = max(1, int(inference_batch_size))
     inference_warmup_iters = max(0, int(inference_warmup_iters))
+
+    devices_list = _coerce_devices(devices, device)
+    device = devices_list[0]
 
     if num_workers == 1:
         challenger_model = _load_model_from_checkpoint(challenger_checkpoint, device)
@@ -647,7 +665,7 @@ def evaluate_against_agent_parallel_v0(
                     worker_id,
                     chunks[worker_id],
                     num_games,
-                    device,
+                    devices_list[worker_id % len(devices_list)],
                     mcts_simulations,
                     temperature,
                     add_dirichlet_noise,
