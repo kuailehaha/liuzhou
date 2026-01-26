@@ -203,7 +203,7 @@ def self_play_single_game_v0(
     inference_batch_size: int = 512,
     inference_warmup_iters: int = 5,
     eval_stats_sink: Optional[Callable[[Dict[str, object]], None]] = None,
-) -> Tuple[List[GameState], List[np.ndarray], float, float]:
+) -> Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]:
     rng = np.random.default_rng(seed)
     mcts = FastMCTS(
         model=model,
@@ -230,11 +230,12 @@ def self_play_single_game_v0(
     def _finalize(result: float, soft_value: float):
         if eval_stats_sink is not None:
             eval_stats_sink(mcts.get_eval_stats())
-        return game_states, game_policies, result, soft_value
+        return game_states, game_policies, game_legal_moves, result, soft_value
 
     state = GameState()
     game_states: List[GameState] = []
     game_policies: List[np.ndarray] = []
+    game_legal_moves: List[List[dict]] = []  # Store legal moves for training
     move_count = 0
     opening_random_moves = max(0, int(opening_random_moves))
     resign_threshold = float(resign_threshold)
@@ -262,6 +263,7 @@ def self_play_single_game_v0(
 
         game_states.append(state.copy())
         game_policies.append(policy.copy())
+        game_legal_moves.append(list(moves))  # Save legal moves for training
 
         if not moves:
             winner = state.get_winner()

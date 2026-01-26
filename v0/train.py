@@ -562,7 +562,8 @@ def train_pipeline_v0(
             training_data = training_data or []
             if decisive_only:
                 before_games = len(training_data)
-                training_data = [game for game in training_data if game[2] != 0.0]
+                # Result is at index 3 in new 5-tuple: (states, policies, legal_moves, result, soft)
+                training_data = [game for game in training_data if game[3] != 0.0]
                 iteration_metrics["decisive_games_dropped"] = before_games - len(training_data)
             num_games_generated = len(training_data)
             flattened_samples = list(flatten_training_games(training_data))

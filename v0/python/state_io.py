@@ -22,7 +22,8 @@ __all__ = [
 
 
 Coord = Tuple[int, int]
-SampleTuple = Tuple[GameState, np.ndarray, float, float]
+# 5-tuple: (GameState, policy, legal_moves, value, soft_value)
+SampleTuple = Tuple[GameState, np.ndarray, List[dict], float, float]
 
 
 def _marks_to_list(marks: Iterable[Coord]) -> List[Tuple[int, int]]:
@@ -67,31 +68,39 @@ def state_from_dict(data: Dict) -> GameState:
     )
 
 
-def sample_to_record(state: GameState, policy: np.ndarray, value: float, soft_value: float) -> Dict:
+def sample_to_record(
+    state: GameState, 
+    policy: np.ndarray, 
+    legal_moves: List[dict],
+    value: float, 
+    soft_value: float
+) -> Dict:
     """Convert a training tuple into a JSON-serializable record."""
     return {
         "state": state_to_dict(state),
         "policy": policy.astype(float).tolist(),
+        "legal_moves": legal_moves,  # Already JSON-serializable dicts
         "value": float(value),
         "soft_value": float(soft_value),
     }
 
 
 def flatten_training_games(
-    training_games: Iterable[Tuple[List[GameState], List[np.ndarray], float, float]]
+    training_games: Iterable[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]]
 ) -> Iterator[SampleTuple]:
     """
     Expand raw self-play outputs into per-position training tuples.
 
     Each yielded tuple matches the input expected by ``train_network``:
-    ``(GameState, np.ndarray, value, soft_value)``.
+    ``(GameState, np.ndarray, List[dict], value, soft_value)``.
     """
-    for game_states, game_policies, result, soft_value in training_games:
-        for state, policy in zip(game_states, game_policies):
+    for game_states, game_policies, game_legal_moves, result, soft_value in training_games:
+        for state, policy, legal_moves in zip(game_states, game_policies, game_legal_moves):
             sign = 1.0 if state.current_player == Player.BLACK else -1.0
             yield (
                 state.copy(),
                 np.asarray(policy, dtype=float),
+                list(legal_moves),
                 sign * result,
                 sign * soft_value,
             )
@@ -124,9 +133,11 @@ def iter_sample_records(path: str) -> Iterator[Dict]:
 def _record_to_sample(record: Dict) -> SampleTuple:
     state = state_from_dict(record["state"])
     policy = np.asarray(record["policy"], dtype=float)
+    # Handle legacy records without legal_moves
+    legal_moves = record.get("legal_moves", [])
     value = float(record.get("value") if "value" in record else record.get("result"))
     soft_value = float(record.get("soft_value", value))
-    return state, policy, value, soft_value
+    return state, policy, legal_moves, value, soft_value
 
 
 def load_examples_from_files(paths: Sequence[str]) -> List[SampleTuple]:

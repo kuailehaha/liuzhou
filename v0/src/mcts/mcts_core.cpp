@@ -722,6 +722,67 @@ std::vector<std::pair<int, double>> MCTSCore::GetPolicy(double temperature) cons
     return result;
 }
 
+void MCTSCore::CompactTree(int new_root) {
+    // Rebuild the nodes_ vector keeping only nodes reachable from new_root.
+    // This is O(N) where N is the number of reachable nodes.
+    if (new_root < 0 || new_root >= static_cast<int>(nodes_.size())) {
+        Reset();
+        return;
+    }
+
+    // BFS to collect all reachable node indices from new_root
+    std::vector<int> reachable;
+    reachable.reserve(nodes_.size());
+    std::vector<int> queue;
+    queue.push_back(new_root);
+    
+    while (!queue.empty()) {
+        int idx = queue.back();
+        queue.pop_back();
+        reachable.push_back(idx);
+        
+        const Node& node = nodes_[idx];
+        for (int child_idx : node.children) {
+            queue.push_back(child_idx);
+        }
+    }
+
+    // Build new nodes vector and mapping from old index to new index
+    std::vector<int> old_to_new(nodes_.size(), -1);
+    std::vector<Node> new_nodes;
+    new_nodes.reserve(reachable.size());
+    
+    for (int old_idx : reachable) {
+        int new_idx = static_cast<int>(new_nodes.size());
+        old_to_new[old_idx] = new_idx;
+        new_nodes.push_back(std::move(nodes_[old_idx]));
+    }
+    
+    // Update parent and children indices in new nodes
+    for (Node& node : new_nodes) {
+        if (node.parent >= 0 && node.parent < static_cast<int>(old_to_new.size())) {
+            node.parent = old_to_new[node.parent];
+        } else {
+            node.parent = -1;
+        }
+        
+        for (int& child_idx : node.children) {
+            if (child_idx >= 0 && child_idx < static_cast<int>(old_to_new.size())) {
+                child_idx = old_to_new[child_idx];
+            }
+        }
+    }
+    
+    // Replace nodes_ with compacted version
+    nodes_ = std::move(new_nodes);
+    root_index_ = 0;  // new_root is now at index 0
+    
+    // Clear parent of root
+    if (!nodes_.empty()) {
+        nodes_[0].parent = -1;
+    }
+}
+
 void MCTSCore::AdvanceRoot(int action_index) {
     if (root_index_ < 0) {
         return;
@@ -729,12 +790,14 @@ void MCTSCore::AdvanceRoot(int action_index) {
     Node& root = nodes_[root_index_];
     for (int child_idx : root.children) {
         if (nodes_[child_idx].action_index == action_index) {
-            nodes_[child_idx].parent = -1;
-            root_index_ = child_idx;
+            // Found the child - compact the tree to keep only this subtree
+            CompactTree(child_idx);
             return;
         }
     }
+    // Child not found - reset the tree
     Reset();
 }
 
 }  // namespace v0
+

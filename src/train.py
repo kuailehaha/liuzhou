@@ -69,13 +69,14 @@ class ChessDataset(Dataset):
     """
     用于训练神经网络的数据集。
     """
-    def __init__(self, examples: List[Tuple[GameState, np.ndarray, float, float]]):
+    def __init__(self, examples: List[Tuple[GameState, np.ndarray, List[dict], float, float]]):
         """
         初始化数据集。
         
         Args:
-            examples: 一个列表，每个元素是一个元组 (GameState, mcts_policy_array, value)。
+            examples: 一个列表，每个元素是一个元组 (GameState, mcts_policy_array, legal_moves, value, soft_value)。
                       mcts_policy_array 是对应 GameState 所有合法走法的MCTS搜索概率。
+                      legal_moves 是预计算的合法走法列表。
         """
         self.examples = examples
     
@@ -83,7 +84,7 @@ class ChessDataset(Dataset):
         return len(self.examples)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor, torch.Tensor]:
-        state_obj, mcts_policy, value, soft_value = self.examples[idx]
+        state_obj, mcts_policy, legal_moves, value, soft_value = self.examples[idx]
         
         # 将状态转换为张量
         state_tensor = state_to_tensor(state_obj, state_obj.current_player).squeeze(0)
@@ -95,22 +96,19 @@ class ChessDataset(Dataset):
         value_tensor = torch.FloatTensor([value])
         soft_tensor = torch.FloatTensor([soft_value])
         
-        # 获取当前状态的合法走法，MCTS策略是针对这些走法的
-        # 必须保证 generate_all_legal_moves 的顺序与 MCTS 生成策略时的顺序一致
-        legal_moves = generate_all_legal_moves(state_obj)
+        # 使用预计算的 legal_moves（如果可用），否则回退到重新生成
+        if legal_moves:
+            # 已有预计算的 legal_moves
+            pass
+        else:
+            # 兼容旧数据：如果没有预计算的 legal_moves，需要重新生成
+            legal_moves = generate_all_legal_moves(state_obj)
 
         # 安全检查：确保MCTS策略的长度与合法走法的数量一致
         if len(legal_moves) != len(mcts_policy_tensor):
-            # 这种情况通常不应该发生，如果发生了，说明 self_play 或 MCTS 中存在问题
-            # 例如，对于没有合法走法的状态，MCTS可能返回空策略
-            # 这里可以添加更复杂的错误处理或日志记录
-            # print(f"Warning: Mismatch in legal_moves ({len(legal_moves)}) and mcts_policy ({len(mcts_policy_tensor)}) for a state.")
-            # 为了简单起见，如果发生这种情况，可以返回空的legal_moves和policy，训练循环中会跳过它
-            if not legal_moves and len(mcts_policy_tensor) == 0: # 无合法走法，空策略，正常
+            if not legal_moves and len(mcts_policy_tensor) == 0:
                 pass
-            else: # 长度不匹配，但至少一方非空，这是个问题
-                # For now, let's allow it to proceed, train_network will skip if shapes mismatch later.
-                # A robust solution might involve filtering these samples or raising an error.
+            else:
                 print(f"Critical Warning: Mismatch len(legal_moves)={len(legal_moves)} vs len(mcts_policy)={len(mcts_policy_tensor)}")
 
 
@@ -165,7 +163,16 @@ def train_network(
     
     # 创建数据集和数据加载器
     dataset = ChessDataset(examples)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=mcts_collate_fn)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=mcts_collate_fn,
+        num_workers=4,       # Enable parallel data loading
+        pin_memory=True,     # Accelerate CPU->GPU transfer
+        prefetch_factor=2,   # Prefetch 2 batches per worker
+        persistent_workers=True,  # Keep workers alive between epochs
+    )
     
     # 创建优化器
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)

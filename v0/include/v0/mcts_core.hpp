@@ -94,6 +94,9 @@ class MCTSCore {
 
     void ExpandBatch(const std::vector<int>& leaves, const std::vector<std::vector<int>>& paths);
     void RecordEvalStats(int64_t n_valid);
+    
+    // Node pruning: rebuild tree keeping only subtree rooted at new_root
+    void CompactTree(int new_root);
 
     std::vector<double> SampleDirichlet(int count, double alpha);
 
