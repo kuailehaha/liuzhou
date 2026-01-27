@@ -2,7 +2,6 @@
 set -euo pipefail
 
 cd /home/ubuntu/.cache/liuzhou
-# export PYTHONPATH=/home/ubuntu/.cache/liuzhou:/home/ubuntu/.cache/liuzhou/v0/build/src:$PYTHONPATH
 export PYTHONPATH="/home/ubuntu/.cache/liuzhou:/home/ubuntu/.cache/liuzhou/v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # v0 版训练脚本
@@ -14,8 +13,8 @@ python -m v0.train \
   --self_play_batch_leaves 512 \
   --self_play_inference_batch_size 512 \
   --self_play_opening_random_moves 8 \
-  --self_play_resign_threshold -0.8 \
-  --self_play_resign_min_moves 10 \
+  --self_play_resign_threshold -0.9 \
+  --self_play_resign_min_moves 100 \
   --self_play_resign_consecutive 3 \
   --epochs 5 \
   --value_draw_weight 0.1 \
@@ -30,4 +29,4 @@ python -m v0.train \
   --mcts_sims_eval 256 \
   --eval_backend v0 \
   --checkpoint_dir ./checkpoints_v0 \
-  --load_checkpoint ./checkpoints_v0/model_iter_6.pt
+  
