@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -23,7 +23,60 @@ __all__ = [
 
 Coord = Tuple[int, int]
 # 5-tuple: (GameState, policy, legal_moves, value, soft_value)
-SampleTuple = Tuple[GameState, np.ndarray, List[dict], float, float]
+SampleTuple = Tuple[GameState, np.ndarray, Optional[List[dict]], float, float]
+
+
+_LEGAL_MOVE_POSITION_KEYS = ("position", "from_position", "to_position")
+
+
+def _serialize_legal_move(move: Dict) -> Dict:
+    """Convert a legal move dict into a JSON-safe form."""
+    serialized = dict(move)
+    phase = serialized.get("phase")
+    if isinstance(phase, Phase):
+        serialized["phase"] = int(phase.value)
+    elif isinstance(phase, (int, np.integer)):
+        serialized["phase"] = int(phase)
+    for key in _LEGAL_MOVE_POSITION_KEYS:
+        if key not in serialized:
+            continue
+        pos = serialized[key]
+        if pos is None:
+            continue
+        if isinstance(pos, (list, tuple)) and len(pos) == 2:
+            serialized[key] = [int(pos[0]), int(pos[1])]
+    return serialized
+
+
+def _serialize_legal_moves(legal_moves: Optional[List[dict]]) -> Optional[List[dict]]:
+    if legal_moves is None:
+        return None
+    return [_serialize_legal_move(move) for move in legal_moves]
+
+
+def _deserialize_legal_move(move: Dict) -> Dict:
+    """Convert a JSON-loaded legal move dict back into runtime types."""
+    restored = dict(move)
+    phase = restored.get("phase")
+    if isinstance(phase, Phase):
+        restored["phase"] = phase
+    elif isinstance(phase, (int, np.integer)):
+        restored["phase"] = Phase(int(phase))
+    for key in _LEGAL_MOVE_POSITION_KEYS:
+        if key not in restored:
+            continue
+        pos = restored[key]
+        if pos is None:
+            continue
+        if isinstance(pos, (list, tuple)) and len(pos) == 2:
+            restored[key] = (int(pos[0]), int(pos[1]))
+    return restored
+
+
+def _deserialize_legal_moves(legal_moves: Optional[Iterable[Dict]]) -> Optional[List[dict]]:
+    if legal_moves is None:
+        return None
+    return [_deserialize_legal_move(move) for move in legal_moves]
 
 
 def _marks_to_list(marks: Iterable[Coord]) -> List[Tuple[int, int]]:
@@ -71,7 +124,7 @@ def state_from_dict(data: Dict) -> GameState:
 def sample_to_record(
     state: GameState, 
     policy: np.ndarray, 
-    legal_moves: List[dict],
+    legal_moves: Optional[List[dict]],
     value: float, 
     soft_value: float
 ) -> Dict:
@@ -79,7 +132,7 @@ def sample_to_record(
     return {
         "state": state_to_dict(state),
         "policy": policy.astype(float).tolist(),
-        "legal_moves": legal_moves,  # Already JSON-serializable dicts
+        "legal_moves": _serialize_legal_moves(legal_moves),
         "value": float(value),
         "soft_value": float(soft_value),
     }
@@ -134,7 +187,8 @@ def _record_to_sample(record: Dict) -> SampleTuple:
     state = state_from_dict(record["state"])
     policy = np.asarray(record["policy"], dtype=float)
     # Handle legacy records without legal_moves
-    legal_moves = record.get("legal_moves", [])
+    raw_legal_moves = record.get("legal_moves")
+    legal_moves = _deserialize_legal_moves(raw_legal_moves)
     value = float(record.get("value") if "value" in record else record.get("result"))
     soft_value = float(record.get("soft_value", value))
     return state, policy, legal_moves, value, soft_value

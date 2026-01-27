@@ -65,11 +65,39 @@ def _stage_finish(
     print(f"[{now_text}] {label} finished in {_format_eta(duration)}")
     return duration
 
+
+def _summarize_legal_moves_cache(
+    examples: List[Tuple[GameState, np.ndarray, Optional[List[dict]], float, float]]
+) -> Dict[str, int]:
+    stats = {
+        "cached": 0,
+        "empty": 0,
+        "missing": 0,
+        "empty_with_policy": 0,
+        "total": len(examples),
+    }
+    for ex in examples:
+        if len(ex) < 3:
+            stats["missing"] += 1
+            continue
+        policy = ex[1] if len(ex) > 1 else []
+        legal_moves = ex[2]
+        if legal_moves is None:
+            stats["missing"] += 1
+            continue
+        if len(legal_moves) == 0:
+            stats["empty"] += 1
+            if len(policy) > 0:
+                stats["empty_with_policy"] += 1
+        else:
+            stats["cached"] += 1
+    return stats
+
 class ChessDataset(Dataset):
     """
     用于训练神经网络的数据集。
     """
-    def __init__(self, examples: List[Tuple[GameState, np.ndarray, List[dict], float, float]]):
+    def __init__(self, examples: List[Tuple[GameState, np.ndarray, Optional[List[dict]], float, float]]):
         """
         初始化数据集。
         
@@ -82,35 +110,32 @@ class ChessDataset(Dataset):
     
     def __len__(self):
         return len(self.examples)
-    
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor, torch.Tensor]:
         state_obj, mcts_policy, legal_moves, value, soft_value = self.examples[idx]
-        
-        # 将状态转换为张量
+
+        # Convert state to tensor.
         state_tensor = state_to_tensor(state_obj, state_obj.current_player).squeeze(0)
-        
-        # MCTS策略已经是numpy数组，转换为张量
+
+        # Convert policy to tensor.
         mcts_policy_tensor = torch.FloatTensor(mcts_policy)
-        
-        # 价值转换为张量
+
+        # Convert values to tensors.
         value_tensor = torch.FloatTensor([value])
         soft_tensor = torch.FloatTensor([soft_value])
-        
-        # 使用预计算的 legal_moves（如果可用），否则回退到重新生成
-        if legal_moves:
-            # 已有预计算的 legal_moves
-            pass
-        else:
-            # 兼容旧数据：如果没有预计算的 legal_moves，需要重新生成
+
+        # Use cached legal moves unless missing, or empty while policy is non-empty.
+        policy_len = int(mcts_policy_tensor.numel())
+        if legal_moves is None or (len(legal_moves) == 0 and policy_len > 0):
+            # Legacy data or missing cache: regenerate to match policy ordering.
             legal_moves = generate_all_legal_moves(state_obj)
 
-        # 安全检查：确保MCTS策略的长度与合法走法的数量一致
+        # Ensure policy length matches legal moves.
         if len(legal_moves) != len(mcts_policy_tensor):
             if not legal_moves and len(mcts_policy_tensor) == 0:
                 pass
             else:
                 print(f"Critical Warning: Mismatch len(legal_moves)={len(legal_moves)} vs len(mcts_policy)={len(mcts_policy_tensor)}")
-
 
         return state_tensor, legal_moves, mcts_policy_tensor, value_tensor, soft_tensor
 
@@ -129,7 +154,7 @@ def mcts_collate_fn(batch: List[Tuple[torch.Tensor, List[MoveType], torch.Tensor
 
 def train_network(
     model: ChessNet,
-    examples: List[Tuple[GameState, np.ndarray, float, float]],
+    examples: List[Tuple[GameState, np.ndarray, Optional[List[dict]], float, float]],
     batch_size: int = 32,
     epochs: int = 10,
     lr: float = 0.001,
@@ -160,6 +185,14 @@ def train_network(
     """
     model.to(device)
     model.train()
+
+    if os.environ.get("LIUZHOU_DEBUG_LEGAL_MOVES"):
+        stats = _summarize_legal_moves_cache(examples)
+        print(
+            "[legal_moves] cached={cached} empty={empty} missing={missing} "
+            "empty_with_policy={empty_with_policy} total={total}".format(**stats)
+        )
+
     
     # 创建数据集和数据加载器
     dataset = ChessDataset(examples)

@@ -435,7 +435,7 @@ def self_play_v0(
     inference_batch_size: int = 512,
     inference_warmup_iters: int = 5,
     devices: Optional[Sequence[str]] = None,
-) -> List[Tuple[List[GameState], List[np.ndarray], float, float]]:
+) -> List[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]]:
     model.eval()
 
     devices_list: List[str] = []
@@ -466,7 +466,7 @@ def self_play_v0(
 
     if num_workers <= 1:
         rng = random.Random(base_seed or int(time.time() * 1e6))
-        games: List[Tuple[List[GameState], List[np.ndarray], float, float]] = []
+        games: List[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]] = []
         run_stats = _empty_eval_stats() if eval_stats_enabled else None
 
         def _sink(stats: Dict[str, object]) -> None:
@@ -520,7 +520,7 @@ def self_play_v0(
     return_queue: "mp.Queue" = ctx.Queue()
     model_bytes = _serialize_model_state(model)
     workers: List[mp.Process] = []
-    games: List[Tuple[List[GameState], List[np.ndarray], float, float]] = []
+    games: List[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]] = []
     summary_stats = _empty_eval_stats() if eval_stats_enabled else None
 
     common_cfg = {

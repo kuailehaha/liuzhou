@@ -511,7 +511,7 @@ def train_pipeline_v0(
             examples = _next_offline_batch()
             if decisive_only:
                 before = len(examples)
-                examples = [ex for ex in examples if abs(ex[2]) > 0.0]
+                examples = [ex for ex in examples if abs(ex[3]) > 0.0]
                 dropped = before - len(examples)
                 iteration_metrics["decisive_samples_dropped"] = dropped
             self_play_time = baseline_train._stage_finish(
