@@ -38,6 +38,53 @@ def _serialize_model_state(model: ChessNet) -> bytes:
     return buffer.getvalue()
 
 
+def _normalize_device_list(devices: Optional[Sequence[str]], fallback: str) -> List[str]:
+    if devices is None:
+        return [fallback]
+    if isinstance(devices, str):
+        text = devices.strip()
+        if not text:
+            return [fallback]
+        key = text.lower()
+        if key in ("auto", "all", "visible", "available"):
+            if torch.cuda.is_available():
+                count = torch.cuda.device_count()
+                if count > 0:
+                    return [f"cuda:{i}" for i in range(count)]
+            return [fallback]
+        tokens = [item.strip() for item in text.split(",") if item.strip()]
+    else:
+        tokens = []
+        for item in devices:
+            if item is None:
+                continue
+            token = str(item).strip()
+            if token:
+                tokens.append(token)
+
+    normalized: List[str] = []
+    for token in tokens:
+        lower = token.lower()
+        if lower == "cuda":
+            normalized.append("cuda:0")
+        elif lower in ("cpu", "mps"):
+            normalized.append(lower)
+        elif lower.startswith(("cuda:", "cpu", "mps")):
+            normalized.append(token)
+        elif token.isdigit():
+            normalized.append(f"cuda:{token}")
+        else:
+            normalized.append(token)
+
+    seen = set()
+    unique: List[str] = []
+    for dev in normalized:
+        if dev not in seen:
+            unique.append(dev)
+            seen.add(dev)
+    return unique or [fallback]
+
+
 def _dtype_from_string(value: str) -> torch.dtype:
     key = value.strip().lower()
     if key in ("float32", "fp32", "f32"):
@@ -351,7 +398,7 @@ def _v0_self_play_worker(
                 return
             _merge_eval_stats(worker_stats, stats)
 
-        games: List[Tuple[List[GameState], List[np.ndarray], float, float]] = []
+        games: List[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]] = []
         base_seed = worker_seed
 
         for game_idx in range(cfg["games_per_worker"]):
@@ -438,29 +485,36 @@ def self_play_v0(
 ) -> List[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]]:
     model.eval()
 
-    devices_list: List[str] = []
-    if devices:
-        if isinstance(devices, str):
-            devices_list = [item.strip() for item in devices.split(",") if item.strip()]
-        else:
-            devices_list = [str(item) for item in devices if str(item).strip()]
-    if not devices_list:
-        devices_list = [str(device)]
+    devices_list = _normalize_device_list(devices, str(device))
     single_device = devices_list[0]
 
     backend = str(inference_backend).lower()
     if backend != "py" and not torchscript_path:
-        device_obj = torch.device(single_device)
-        dtype_str = torchscript_dtype or _default_torchscript_dtype(device_obj)
-        if dtype_str.strip().lower() in ("auto", "none"):
-            dtype_str = _default_torchscript_dtype(device_obj)
-        torchscript_path = _export_torchscript(
-            model=model,
-            device=device_obj,
-            dtype_str=dtype_str,
-            batch_size=max(1, int(inference_batch_size)),
-        )
-        torchscript_dtype = dtype_str
+        device_types = set()
+        for dev in devices_list:
+            try:
+                device_obj = torch.device(dev)
+                device_types.add(device_obj.type)
+            except (TypeError, ValueError):
+                device_types.add("unknown")
+        shared_torchscript = len(device_types) == 1 and "unknown" not in device_types
+
+        if shared_torchscript:
+            device_obj = torch.device(single_device)
+            dtype_str = torchscript_dtype or _default_torchscript_dtype(device_obj)
+            if dtype_str.strip().lower() in ("auto", "none"):
+                dtype_str = _default_torchscript_dtype(device_obj)
+            torchscript_path = _export_torchscript(
+                model=model,
+                device=device_obj,
+                dtype_str=dtype_str,
+                batch_size=max(1, int(inference_batch_size)),
+            )
+            torchscript_dtype = dtype_str
+        else:
+            torchscript_path = None
+            if torchscript_dtype is not None and torchscript_dtype.strip().lower() in ("auto", "none"):
+                torchscript_dtype = None
 
     eval_stats_enabled = _eval_stats_enabled()
 
