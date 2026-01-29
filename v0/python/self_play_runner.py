@@ -96,6 +96,34 @@ def _dtype_from_string(value: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {value}")
 
 
+def _maybe_clear_cuda_cache(device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    threshold_env = os.environ.get("V0_SELF_PLAY_CACHE_THRESHOLD", "")
+    force_clear = os.environ.get("V0_SELF_PLAY_CLEAR_CUDA_CACHE", "")
+    if not threshold_env and not force_clear:
+        return
+    if force_clear and force_clear not in ("0", "false", "False"):
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        return
+
+    if not threshold_env:
+        return
+    try:
+        threshold = float(threshold_env)
+    except (TypeError, ValueError):
+        threshold = 0.92
+    if threshold <= 0 or threshold >= 1:
+        return
+
+    total = torch.cuda.get_device_properties(device).total_memory
+    reserved = torch.cuda.memory_reserved(device)
+    if total > 0 and reserved / total >= threshold:
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
 def _default_torchscript_dtype(device: torch.device) -> str:
     if device.type == "cuda":
         return "float16"
@@ -433,6 +461,7 @@ def _v0_self_play_worker(
                     eval_stats_sink=_sink if eval_stats_enabled else None,
                 )
             )
+            _maybe_clear_cuda_cache(device)
 
         stats_raw = None
         if eval_stats_enabled and worker_stats is not None:
@@ -487,6 +516,10 @@ def self_play_v0(
 
     devices_list = _normalize_device_list(devices, str(device))
     single_device = devices_list[0]
+    try:
+        single_device_obj = torch.device(single_device)
+    except (TypeError, ValueError):
+        single_device_obj = torch.device("cpu")
 
     backend = str(inference_backend).lower()
     if backend != "py" and not torchscript_path:
@@ -560,6 +593,7 @@ def self_play_v0(
                     eval_stats_sink=_sink if eval_stats_enabled else None,
                 )
             )
+            _maybe_clear_cuda_cache(single_device_obj)
         if eval_stats_enabled and run_stats is not None:
             payload = _format_eval_stats(run_stats, inference_batch_size, batch_leaves)
             payload["scope"] = "run"

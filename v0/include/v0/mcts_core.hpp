@@ -23,6 +23,7 @@ struct MCTSConfig {
     double dirichlet_alpha{0.3};
     double dirichlet_epsilon{0.25};
     int batch_size{16};
+    int max_actions_per_batch{0};
     double virtual_loss{1.0};
     torch::Device device{torch::kCPU};
     uint64_t seed{0xC0FFEE};

@@ -8,6 +8,7 @@ all tree selection/expansion/backprop runs inside `v0_core.MCTSCore`.
 from __future__ import annotations
 
 import copy
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -125,6 +126,7 @@ class MCTSParams:
     exploration_weight: float = 1.0
     temperature: float = 1.0
     batch_leaves: int = 16
+    max_actions_per_batch: int = 0
     add_dirichlet_noise: bool = False
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -157,6 +159,7 @@ class MCTS:
         torchscript_dtype: Optional[str] = None,
         inference_batch_size: int = 512,
         inference_warmup_iters: int = 5,
+        max_actions_per_batch: int = 0,
     ) -> None:
         self.model = model
         self.spec: ActionEncodingSpec = DEFAULT_ACTION_SPEC
@@ -166,11 +169,23 @@ class MCTS:
         self._torchscript_path: Optional[Path] = None
         self._torchscript_runner = None
         self._inference_engine = None
+        max_actions = int(max_actions_per_batch) if max_actions_per_batch is not None else 0
+        if max_actions <= 0:
+            env_max_actions = os.environ.get("V0_MAX_ACTIONS_PER_BATCH")
+            if env_max_actions:
+                try:
+                    max_actions = int(env_max_actions)
+                except (TypeError, ValueError):
+                    max_actions = 0
+        if max_actions < 0:
+            max_actions = 0
+
         self.params = MCTSParams(
             num_simulations=num_simulations,
             exploration_weight=exploration_weight,
             temperature=temperature,
             batch_leaves=batch_K,
+            max_actions_per_batch=max_actions,
             add_dirichlet_noise=add_dirichlet_noise,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_epsilon=dirichlet_epsilon,
@@ -184,6 +199,7 @@ class MCTS:
         cfg.exploration_weight = self.params.exploration_weight
         cfg.temperature = self.params.temperature
         cfg.batch_size = self.params.batch_leaves
+        cfg.max_actions_per_batch = int(self.params.max_actions_per_batch)
         cfg.add_dirichlet_noise = self.params.add_dirichlet_noise
         cfg.dirichlet_alpha = self.params.dirichlet_alpha
         cfg.dirichlet_epsilon = self.params.dirichlet_epsilon

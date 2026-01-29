@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <iterator>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -474,57 +475,76 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
 
         std::vector<GameState> child_states;
         if (!action_codes.empty()) {
-            torch::Tensor action_tensor = torch::empty({static_cast<int64_t>(action_codes.size()), 4}, IntCPU());
-            auto action_ptr = action_tensor.data_ptr<int32_t>();
-            for (size_t i = 0; i < action_codes.size(); ++i) {
-                for (int k = 0; k < 4; ++k) {
-                    action_ptr[i * 4 + k] = action_codes[i][k];
-                }
+            const size_t total_actions_sz = action_codes.size();
+            int max_actions = config_.max_actions_per_batch;
+            if (max_actions <= 0) {
+                max_actions = static_cast<int>(total_actions_sz);
             }
-            torch::Tensor parent_tensor = torch::empty(
-                {static_cast<int64_t>(parent_indices.size())}, LongCPU());
-            auto parent_ptr = parent_tensor.data_ptr<int64_t>();
-            for (size_t i = 0; i < parent_indices.size(); ++i) {
-                parent_ptr[i] = parent_indices[i];
-            }
+            const size_t chunk_size = static_cast<size_t>(std::max(1, max_actions));
+            child_states.reserve(total_actions_sz);
 
-            DebugLog("ExpandBatch: applying moves for total_actions=" + std::to_string(action_codes.size()));
+            DebugLog("ExpandBatch: applying moves for total_actions=" + std::to_string(total_actions_sz) +
+                ", chunk_size=" + std::to_string(chunk_size));
+
             const auto tensor_device = batch_device.board.device();
-            torch::Tensor action_tensor_device =
-                tensor_device.is_cpu() ? action_tensor : action_tensor.to(tensor_device);
-            torch::Tensor parent_tensor_device =
-                tensor_device.is_cpu() ? parent_tensor : parent_tensor.to(tensor_device);
-            auto next_batch = batch_apply_moves(
-                batch_device.board,
-                batch_device.marks_black,
-                batch_device.marks_white,
-                batch_device.phase,
-                batch_device.current_player,
-                batch_device.pending_marks_required,
-                batch_device.pending_marks_remaining,
-                batch_device.pending_captures_required,
-                batch_device.pending_captures_remaining,
-                batch_device.forced_removals_done,
-                batch_device.move_count,
-                action_tensor_device,
-                parent_tensor_device);
+            for (size_t offset = 0; offset < total_actions_sz; offset += chunk_size) {
+                const size_t count = std::min(chunk_size, total_actions_sz - offset);
+                torch::Tensor action_tensor = torch::empty({static_cast<int64_t>(count), 4}, IntCPU());
+                auto action_ptr = action_tensor.data_ptr<int32_t>();
+                for (size_t i = 0; i < count; ++i) {
+                    const auto& code = action_codes[offset + i];
+                    for (int k = 0; k < 4; ++k) {
+                        action_ptr[i * 4 + k] = code[k];
+                    }
+                }
+                torch::Tensor parent_tensor = torch::empty(
+                    {static_cast<int64_t>(count)}, LongCPU());
+                auto parent_ptr = parent_tensor.data_ptr<int64_t>();
+                for (size_t i = 0; i < count; ++i) {
+                    parent_ptr[i] = parent_indices[offset + i];
+                }
 
-            TensorStateBatch child_batch{
-                std::get<0>(next_batch),
-                std::get<1>(next_batch).to(torch::kBool),
-                std::get<2>(next_batch).to(torch::kBool),
-                std::get<3>(next_batch),
-                std::get<4>(next_batch),
-                std::get<5>(next_batch),
-                std::get<6>(next_batch),
-                std::get<7>(next_batch),
-                std::get<8>(next_batch),
-                std::get<9>(next_batch),
-                std::get<10>(next_batch),
-                torch::ones(std::get<0>(next_batch).size(0), BoolCPU()),
-                batch_cpu.board_size};
+                torch::Tensor action_tensor_device =
+                    tensor_device.is_cpu() ? action_tensor : action_tensor.to(tensor_device);
+                torch::Tensor parent_tensor_device =
+                    tensor_device.is_cpu() ? parent_tensor : parent_tensor.to(tensor_device);
+                auto next_batch = batch_apply_moves(
+                    batch_device.board,
+                    batch_device.marks_black,
+                    batch_device.marks_white,
+                    batch_device.phase,
+                    batch_device.current_player,
+                    batch_device.pending_marks_required,
+                    batch_device.pending_marks_remaining,
+                    batch_device.pending_captures_required,
+                    batch_device.pending_captures_remaining,
+                    batch_device.forced_removals_done,
+                    batch_device.move_count,
+                    action_tensor_device,
+                    parent_tensor_device);
 
-            child_states = ToGameStates(child_batch);
+                TensorStateBatch child_batch{
+                    std::get<0>(next_batch),
+                    std::get<1>(next_batch).to(torch::kBool),
+                    std::get<2>(next_batch).to(torch::kBool),
+                    std::get<3>(next_batch),
+                    std::get<4>(next_batch),
+                    std::get<5>(next_batch),
+                    std::get<6>(next_batch),
+                    std::get<7>(next_batch),
+                    std::get<8>(next_batch),
+                    std::get<9>(next_batch),
+                    std::get<10>(next_batch),
+                    torch::ones(std::get<0>(next_batch).size(0), BoolCPU()),
+                    batch_cpu.board_size};
+
+                auto chunk_states = ToGameStates(child_batch);
+                child_states.insert(
+                    child_states.end(),
+                    std::make_move_iterator(chunk_states.begin()),
+                    std::make_move_iterator(chunk_states.end()));
+            }
+
             DebugLog("ExpandBatch: child_states size=" + std::to_string(child_states.size()));
         }
 

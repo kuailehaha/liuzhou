@@ -468,6 +468,7 @@ PYBIND11_MODULE(v0_core, m) {
         .def_readwrite("dirichlet_alpha", &v0::MCTSConfig::dirichlet_alpha)
         .def_readwrite("dirichlet_epsilon", &v0::MCTSConfig::dirichlet_epsilon)
         .def_readwrite("batch_size", &v0::MCTSConfig::batch_size)
+        .def_readwrite("max_actions_per_batch", &v0::MCTSConfig::max_actions_per_batch)
         .def_readwrite("virtual_loss", &v0::MCTSConfig::virtual_loss)
         .def_readwrite("seed", &v0::MCTSConfig::seed)
         .def_property(
