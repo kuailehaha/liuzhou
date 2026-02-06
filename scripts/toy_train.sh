@@ -3,7 +3,7 @@ set -euo pipefail
 export PYTHONPATH="./:./v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # v0 版训练脚本
-CUDA_VISIBLE_DEVICES=4,5,6,7 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 python -m v0.train \
   --iterations 40 \
   --self_play_workers 200\

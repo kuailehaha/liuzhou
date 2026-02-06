@@ -674,28 +674,10 @@ def self_play_v0(
     if games_per_worker is None or games_per_worker <= 0:
         raise ValueError("games_per_worker must be provided when num_workers > 1.")
 
-    # --- KEY FIX: limit concurrent processes per GPU to avoid OOM ---
-    # Each process loads its own model + creates an InferenceEngine (CUDA
-    # Graph) which pins substantial VRAM.  Spawning all workers at once
-    # (e.g. 200 on 4 GPUs = 50 / GPU) easily exhausts GPU memory.
-    #
-    # We cap the number of simultaneously active processes.  The env var
-    # V0_MAX_CONCURRENT_WORKERS allows manual tuning; the default is
-    # 2 × number-of-devices which is conservative but safe.
-    _max_env = os.environ.get("V0_MAX_CONCURRENT_WORKERS", "")
-    if _max_env:
-        try:
-            max_concurrent = max(1, int(_max_env))
-        except (TypeError, ValueError):
-            max_concurrent = len(devices_list) * 2
-    else:
-        max_concurrent = len(devices_list) * 2
-    max_concurrent = min(max_concurrent, num_workers)
-
     ctx = mp.get_context("spawn")
     return_queue: "mp.Queue" = ctx.Queue()
     model_bytes = _serialize_model_state(model)
-    active_workers: List[mp.Process] = []
+    workers: List[mp.Process] = []
     games: List[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]] = []
     summary_stats = _empty_eval_stats() if eval_stats_enabled else None
 
@@ -729,34 +711,21 @@ def self_play_v0(
 
     base_seed = base_seed or random.randint(1, 10**9)
 
-    if max_concurrent < num_workers:
-        print(
-            f"[self_play_v0] Limiting concurrent workers to {max_concurrent} "
-            f"(total {num_workers}, {len(devices_list)} GPU(s)). "
-            f"Set V0_MAX_CONCURRENT_WORKERS to override."
-        )
-
     try:
-        launched = 0
+        for worker_id in range(num_workers):
+            worker_cfg = dict(common_cfg)
+            worker_cfg["device"] = devices_list[worker_id % len(devices_list)]
+            worker_cfg["worker_seed"] = base_seed + 1000003 * worker_id
+            process = ctx.Process(
+                target=_v0_self_play_worker,
+                args=(worker_id, worker_cfg, model_bytes, return_queue),
+                daemon=False,
+            )
+            process.start()
+            workers.append(process)
+
         finished = 0
         while finished < num_workers:
-            # Launch workers up to the concurrency cap.
-            while launched < num_workers and (launched - finished) < max_concurrent:
-                worker_id = launched
-                worker_cfg = dict(common_cfg)
-                worker_cfg["device"] = devices_list[worker_id % len(devices_list)]
-                worker_cfg["worker_seed"] = base_seed + 1000003 * worker_id
-                process = ctx.Process(
-                    target=_v0_self_play_worker,
-                    args=(worker_id, worker_cfg, model_bytes, return_queue),
-                    daemon=False,
-                )
-                process.start()
-                active_workers.append(process)
-                launched += 1
-
-            # Collect one result – this blocks until a worker finishes,
-            # making room for the next one to be launched.
             status, wid, payload, stats_raw = return_queue.get()
             if status == "ok":
                 games.extend(payload)
@@ -765,19 +734,10 @@ def self_play_v0(
                 finished += 1
             else:
                 raise RuntimeError(f"Self-play worker {wid} failed: {payload}")
-
-            # Reap completed processes so we don't leak zombie PIDs.
-            still_alive: List[mp.Process] = []
-            for proc in active_workers:
-                if proc.is_alive():
-                    still_alive.append(proc)
-                else:
-                    proc.join(timeout=0.5)
-            active_workers = still_alive
     finally:
-        for process in active_workers:
+        for process in workers:
             if process.is_alive():
-                process.join(timeout=1.0)
+                process.join(timeout=0.1)
                 if process.is_alive():
                     process.terminate()
         return_queue.close()
