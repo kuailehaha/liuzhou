@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import io
 import json
 import os
@@ -96,32 +97,25 @@ def _dtype_from_string(value: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {value}")
 
 
-def _maybe_clear_cuda_cache(device: torch.device) -> None:
+def _cleanup_cuda_memory(device: torch.device) -> None:
+    """Aggressively release unused CUDA memory back to the system.
+
+    This runs ``gc.collect()`` to ensure Python destructs C++ extension
+    objects (e.g. InferenceEngine / CUDAGraph) before calling
+    ``torch.cuda.empty_cache()`` so the allocator actually returns the
+    blocks.  Called between games and between pipeline phases to prevent
+    gradual VRAM accumulation that leads to OOM.
+    """
     if device.type != "cuda" or not torch.cuda.is_available():
         return
-    threshold_env = os.environ.get("V0_SELF_PLAY_CACHE_THRESHOLD", "")
-    force_clear = os.environ.get("V0_SELF_PLAY_CLEAR_CUDA_CACHE", "")
-    if not threshold_env and not force_clear:
-        return
-    if force_clear and force_clear not in ("0", "false", "False"):
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
-    if not threshold_env:
-        return
-    try:
-        threshold = float(threshold_env)
-    except (TypeError, ValueError):
-        threshold = 0.92
-    if threshold <= 0 or threshold >= 1:
-        return
 
-    total = torch.cuda.get_device_properties(device).total_memory
-    reserved = torch.cuda.memory_reserved(device)
-    if total > 0 and reserved / total >= threshold:
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+def _maybe_clear_cuda_cache(device: torch.device) -> None:
+    """Legacy helper – now always delegates to ``_cleanup_cuda_memory``."""
+    _cleanup_cuda_memory(device)
 
 
 def _default_torchscript_dtype(device: torch.device) -> str:
@@ -278,27 +272,41 @@ def self_play_single_game_v0(
     inference_batch_size: int = 512,
     inference_warmup_iters: int = 5,
     eval_stats_sink: Optional[Callable[[Dict[str, object]], None]] = None,
+    mcts_instance: Optional[FastMCTS] = None,
 ) -> Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]:
+    """Play a single self-play game.
+
+    When *mcts_instance* is supplied the function reuses that object (and
+    its already-allocated InferenceEngine / CUDA Graph) instead of
+    creating a new one.  This avoids the main source of VRAM accumulation
+    that previously caused OOM.
+    """
     rng = np.random.default_rng(seed)
-    mcts = FastMCTS(
-        model=model,
-        num_simulations=mcts_simulations,
-        exploration_weight=exploration_weight,
-        temperature=temperature_init,
-        device=device,
-        add_dirichlet_noise=add_dirichlet_noise,
-        dirichlet_alpha=dirichlet_alpha,
-        dirichlet_epsilon=dirichlet_epsilon,
-        batch_K=batch_leaves,
-        virtual_loss=virtual_loss,
-        seed=seed,
-        verbose=mcts_verbose,
-        inference_backend=inference_backend,
-        torchscript_path=torchscript_path,
-        torchscript_dtype=torchscript_dtype,
-        inference_batch_size=inference_batch_size,
-        inference_warmup_iters=inference_warmup_iters,
-    )
+    if mcts_instance is not None:
+        mcts = mcts_instance
+        # Reset the tree but keep the InferenceEngine / CUDA Graph alive.
+        mcts.reset()
+        mcts.set_temperature(temperature_init)
+    else:
+        mcts = FastMCTS(
+            model=model,
+            num_simulations=mcts_simulations,
+            exploration_weight=exploration_weight,
+            temperature=temperature_init,
+            device=device,
+            add_dirichlet_noise=add_dirichlet_noise,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon,
+            batch_K=batch_leaves,
+            virtual_loss=virtual_loss,
+            seed=seed,
+            verbose=mcts_verbose,
+            inference_backend=inference_backend,
+            torchscript_path=torchscript_path,
+            torchscript_dtype=torchscript_dtype,
+            inference_batch_size=inference_batch_size,
+            inference_warmup_iters=inference_warmup_iters,
+        )
     if eval_stats_sink is not None:
         mcts.reset_eval_stats()
 
@@ -391,6 +399,8 @@ def _v0_self_play_worker(
     model_state_bytes: bytes,
     return_queue: "mp.Queue",
 ) -> None:
+    mcts_obj: Optional[FastMCTS] = None
+    model: Optional[ChessNet] = None
     try:
         try:
             cpu_total = os.cpu_count() or 1
@@ -426,6 +436,29 @@ def _v0_self_play_worker(
                 return
             _merge_eval_stats(worker_stats, stats)
 
+        # --- KEY FIX: create MCTS once and reuse across all games ---
+        # This avoids re-creating InferenceEngine / CUDA Graph per game,
+        # which is the primary source of VRAM accumulation.
+        mcts_obj = FastMCTS(
+            model=model,
+            num_simulations=cfg["mcts_simulations"],
+            exploration_weight=cfg["exploration_weight"],
+            temperature=cfg["temperature_init"],
+            device=cfg["device"],
+            add_dirichlet_noise=cfg["add_dirichlet_noise"],
+            dirichlet_alpha=cfg["dirichlet_alpha"],
+            dirichlet_epsilon=cfg["dirichlet_epsilon"],
+            batch_K=cfg["batch_leaves"],
+            virtual_loss=cfg["virtual_loss"],
+            seed=worker_seed,
+            verbose=bool(cfg.get("mcts_verbose", False)),
+            inference_backend=cfg.get("inference_backend", "graph"),
+            torchscript_path=cfg.get("torchscript_path"),
+            torchscript_dtype=cfg.get("torchscript_dtype"),
+            inference_batch_size=cfg.get("inference_batch_size", 512),
+            inference_warmup_iters=cfg.get("inference_warmup_iters", 5),
+        )
+
         games: List[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]] = []
         base_seed = worker_seed
 
@@ -459,9 +492,9 @@ def _v0_self_play_worker(
                     inference_batch_size=cfg.get("inference_batch_size", 512),
                     inference_warmup_iters=cfg.get("inference_warmup_iters", 5),
                     eval_stats_sink=_sink if eval_stats_enabled else None,
+                    mcts_instance=mcts_obj,
                 )
             )
-            _maybe_clear_cuda_cache(device)
 
         stats_raw = None
         if eval_stats_enabled and worker_stats is not None:
@@ -479,6 +512,17 @@ def _v0_self_play_worker(
         return_queue.put(("ok", worker_id, games, stats_raw))
     except Exception as exc:
         return_queue.put(("err", worker_id, repr(exc), None))
+    finally:
+        # --- KEY FIX: explicit cleanup to release VRAM ---
+        # Python GC does not reliably destroy C++ extension objects (CUDA
+        # graphs, TorchScript modules) promptly.  Explicit deletion followed
+        # by gc.collect + empty_cache ensures the GPU memory is returned.
+        if mcts_obj is not None:
+            mcts_obj.reset()
+            del mcts_obj
+        if model is not None:
+            del model
+        _cleanup_cuda_memory(device)
 
 
 def self_play_v0(
@@ -561,6 +605,27 @@ def self_play_v0(
                 return
             _merge_eval_stats(run_stats, stats)
 
+        # Create MCTS once and reuse across all games (single-process mode).
+        single_mcts = FastMCTS(
+            model=model,
+            num_simulations=mcts_simulations,
+            exploration_weight=exploration_weight,
+            temperature=temperature_init,
+            device=single_device,
+            add_dirichlet_noise=add_dirichlet_noise,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon,
+            batch_K=batch_leaves,
+            virtual_loss=virtual_loss,
+            seed=rng.randint(0, 2**31 - 1),
+            verbose=mcts_verbose,
+            inference_backend=inference_backend,
+            torchscript_path=torchscript_path,
+            torchscript_dtype=torchscript_dtype,
+            inference_batch_size=inference_batch_size,
+            inference_warmup_iters=inference_warmup_iters,
+        )
+
         for _ in range(num_games):
             seed = rng.randint(0, 2**31 - 1)
             games.append(
@@ -591,9 +656,14 @@ def self_play_v0(
                     inference_batch_size=inference_batch_size,
                     inference_warmup_iters=inference_warmup_iters,
                     eval_stats_sink=_sink if eval_stats_enabled else None,
+                    mcts_instance=single_mcts,
                 )
             )
-            _maybe_clear_cuda_cache(single_device_obj)
+        # Cleanup: release MCTS / InferenceEngine VRAM
+        single_mcts.reset()
+        del single_mcts
+        _cleanup_cuda_memory(single_device_obj)
+
         if eval_stats_enabled and run_stats is not None:
             payload = _format_eval_stats(run_stats, inference_batch_size, batch_leaves)
             payload["scope"] = "run"
@@ -604,10 +674,28 @@ def self_play_v0(
     if games_per_worker is None or games_per_worker <= 0:
         raise ValueError("games_per_worker must be provided when num_workers > 1.")
 
+    # --- KEY FIX: limit concurrent processes per GPU to avoid OOM ---
+    # Each process loads its own model + creates an InferenceEngine (CUDA
+    # Graph) which pins substantial VRAM.  Spawning all workers at once
+    # (e.g. 200 on 4 GPUs = 50 / GPU) easily exhausts GPU memory.
+    #
+    # We cap the number of simultaneously active processes.  The env var
+    # V0_MAX_CONCURRENT_WORKERS allows manual tuning; the default is
+    # 2 × number-of-devices which is conservative but safe.
+    _max_env = os.environ.get("V0_MAX_CONCURRENT_WORKERS", "")
+    if _max_env:
+        try:
+            max_concurrent = max(1, int(_max_env))
+        except (TypeError, ValueError):
+            max_concurrent = len(devices_list) * 2
+    else:
+        max_concurrent = len(devices_list) * 2
+    max_concurrent = min(max_concurrent, num_workers)
+
     ctx = mp.get_context("spawn")
     return_queue: "mp.Queue" = ctx.Queue()
     model_bytes = _serialize_model_state(model)
-    workers: List[mp.Process] = []
+    active_workers: List[mp.Process] = []
     games: List[Tuple[List[GameState], List[np.ndarray], List[List[dict]], float, float]] = []
     summary_stats = _empty_eval_stats() if eval_stats_enabled else None
 
@@ -641,33 +729,55 @@ def self_play_v0(
 
     base_seed = base_seed or random.randint(1, 10**9)
 
-    try:
-        for worker_id in range(num_workers):
-            worker_cfg = dict(common_cfg)
-            worker_cfg["device"] = devices_list[worker_id % len(devices_list)]
-            worker_cfg["worker_seed"] = base_seed + 1000003 * worker_id
-            process = ctx.Process(
-                target=_v0_self_play_worker,
-                args=(worker_id, worker_cfg, model_bytes, return_queue),
-                daemon=False,
-            )
-            process.start()
-            workers.append(process)
+    if max_concurrent < num_workers:
+        print(
+            f"[self_play_v0] Limiting concurrent workers to {max_concurrent} "
+            f"(total {num_workers}, {len(devices_list)} GPU(s)). "
+            f"Set V0_MAX_CONCURRENT_WORKERS to override."
+        )
 
+    try:
+        launched = 0
         finished = 0
         while finished < num_workers:
-            status, worker_id, payload, stats_raw = return_queue.get()
+            # Launch workers up to the concurrency cap.
+            while launched < num_workers and (launched - finished) < max_concurrent:
+                worker_id = launched
+                worker_cfg = dict(common_cfg)
+                worker_cfg["device"] = devices_list[worker_id % len(devices_list)]
+                worker_cfg["worker_seed"] = base_seed + 1000003 * worker_id
+                process = ctx.Process(
+                    target=_v0_self_play_worker,
+                    args=(worker_id, worker_cfg, model_bytes, return_queue),
+                    daemon=False,
+                )
+                process.start()
+                active_workers.append(process)
+                launched += 1
+
+            # Collect one result – this blocks until a worker finishes,
+            # making room for the next one to be launched.
+            status, wid, payload, stats_raw = return_queue.get()
             if status == "ok":
                 games.extend(payload)
                 if eval_stats_enabled and summary_stats is not None and stats_raw:
                     _merge_eval_stats(summary_stats, stats_raw)
                 finished += 1
             else:
-                raise RuntimeError(f"Self-play worker {worker_id} failed: {payload}")
+                raise RuntimeError(f"Self-play worker {wid} failed: {payload}")
+
+            # Reap completed processes so we don't leak zombie PIDs.
+            still_alive: List[mp.Process] = []
+            for proc in active_workers:
+                if proc.is_alive():
+                    still_alive.append(proc)
+                else:
+                    proc.join(timeout=0.5)
+            active_workers = still_alive
     finally:
-        for process in workers:
+        for process in active_workers:
             if process.is_alive():
-                process.join(timeout=0.1)
+                process.join(timeout=1.0)
                 if process.is_alive():
                     process.terminate()
         return_queue.close()

@@ -5,6 +5,7 @@ AlphaZero-style loop.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -431,6 +432,20 @@ def train_pipeline_v0(
         offline_cursor = end % total
         return list(batch)
 
+    def _cleanup_gpu():
+        """Release unreferenced CUDA memory between pipeline phases.
+
+        This is essential to prevent VRAM accumulation across self-play,
+        training and evaluation phases.  C++ extension objects (CUDA
+        graphs, TorchScript modules, MCTS trees) may not be promptly
+        freed by Python's reference-counting GC; an explicit cycle
+        collection followed by ``empty_cache`` reclaims the memory.
+        """
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
     board_size = GameState.BOARD_SIZE
     current_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
     
@@ -584,6 +599,10 @@ def train_pipeline_v0(
                 saved = write_records_to_jsonl(record_iter, dump_path)
                 print(f"Saved {saved} samples to {dump_path}")
 
+        # Release self-play VRAM (inference engines, CUDA graphs, etc.)
+        # before the training phase allocates its own GPU memory.
+        _cleanup_gpu()
+
         train_label = "Training phase"
         baseline_train._stage_banner("train", train_label, iteration, iterations, stage_history)
         train_start_time = time.perf_counter()
@@ -658,6 +677,10 @@ def train_pipeline_v0(
         )
         print(f"Model for iteration {iteration + 1} saved to {iter_model_path}")
         iteration_metrics["checkpoint_path"] = iter_model_path
+
+        # Release training VRAM (optimizer states, DataParallel buffers)
+        # before the evaluation phase allocates its own GPU memory.
+        _cleanup_gpu()
 
         print("\nEvaluation phase...")
         eval_label = "Evaluation phase"
@@ -743,6 +766,9 @@ def train_pipeline_v0(
                 verbose=eval_verbose,
                 game_verbose=eval_game_verbose,
             )
+            # Release eval agent MCTS to free VRAM before next eval round.
+            del challenger_agent, random_opponent
+            _cleanup_gpu()
         print(f"Challenger win rate vs RandomAgent: {stats_vs_rnd.win_rate:.2%}")
         print(
             "Challenger record vs RandomAgent: "
@@ -817,6 +843,10 @@ def train_pipeline_v0(
                         verbose=eval_verbose,
                         game_verbose=eval_game_verbose,
                     )
+                    # Release eval models / MCTS agents to free VRAM
+                    del challenger_agent_best, best_agent_opponent
+                    del best_model_eval, best_model_checkpoint
+                    _cleanup_gpu()
                 win_rate_vs_best_model = stats_vs_best_model.win_rate
                 print(f"Challenger win rate vs BestModel: {win_rate_vs_best_model:.2%}")
                 print(
@@ -846,6 +876,10 @@ def train_pipeline_v0(
             iteration_metrics["draw_rate_vs_best"] = stats_vs_best_model.draw_rate
         iteration_metrics["best_model_updated"] = best_model_updated
         iteration_metrics["win_rate_threshold"] = win_rate_threshold
+
+        # Release evaluation VRAM (eval agents, best_model copies, MCTS
+        # instances) before the next iteration starts fresh.
+        _cleanup_gpu()
 
         total_iter_time = time.perf_counter() - iter_start_time
         iteration_metrics["iteration_time_sec"] = total_iter_time

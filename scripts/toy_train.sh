@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-cd /home/ubuntu/.cache/liuzhou
-export PYTHONPATH="/home/ubuntu/.cache/liuzhou:/home/ubuntu/.cache/liuzhou/v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="./:./v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # v0 版训练脚本
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
 python -m v0.train \
   --iterations 40 \
-  --self_play_workers 12 \
-  --self_play_games_per_worker 80 \
-  --mcts_simulations 1024 \
+  --self_play_workers 200\
+  --self_play_games_per_worker 1 \
+  --mcts_simulations 4096 \
   --self_play_batch_leaves 512 \
   --self_play_inference_batch_size 512 \
-  --self_play_opening_random_moves 8 \
+  --self_play_opening_random_moves 1 \
   --self_play_resign_threshold -0.9 \
   --self_play_resign_min_moves 100 \
   --self_play_resign_consecutive 3 \
   --epochs 5 \
   --value_draw_weight 0.1 \
   --policy_draw_weight 0.3 \
-  --batch_size 512 \
+  --batch_size 256 \
   --device cuda \
   --self_play_devices auto \
   --train_devices auto \
@@ -28,5 +27,4 @@ python -m v0.train \
   --eval_games_vs_best 200 \
   --mcts_sims_eval 256 \
   --eval_backend v0 \
-  --checkpoint_dir ./checkpoints_v0 \
-  
+  --checkpoint_dir ./checkpoints_v0
