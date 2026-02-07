@@ -58,8 +58,10 @@
 - **学习率与 batch**  
   若对上一迭代胜率波动大或长期不升，可尝试略降学习率（如 `--lr 0.001`）或适当增大 batch，观察几轮再调。
 
-- **best 的更新条件**  
-  保持现有逻辑即可：对 Random 超过阈值后再和 best 比；若希望更保守，可提高 `win_rate_threshold`（如 0.58），减少 best 被弱模型替换的概率。
+- **best 的更新条件（当前实现）**  
+  - 对 Random 胜率 **≥ 55%**（`--win_rate_threshold 0.55`，胜率 = wins/all）才进入“和 best 比较”的流程。  
+  - 晋升为 best 需同时满足：对 Random ≥55%；对 **previous** 胜率 > 败率（即 wins/all > losses/all，有大量和局时只要赢的局数多于输的即可）；对 **best** 同样要求胜率 > 败率。  
+  - 这样既保证 best 一定强于 Random，又避免“对 best 必须 55%”过难；和局多时只要赢多输少即可晋升。
 
 ## 4. 小结
 

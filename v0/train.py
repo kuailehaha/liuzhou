@@ -137,6 +137,7 @@ def train_pipeline_v0(
     eval_games_vs_best: int = 20,
     eval_games_vs_previous: int = 0,
     win_rate_threshold: float = 0.55,
+    promotion_vs_opponent_threshold: float = 0.5,
     mcts_sims_eval: int = 100,
     eval_workers: int = 0,
     eval_backend: str = "legacy",
@@ -269,6 +270,9 @@ def train_pipeline_v0(
     eval_games_vs_random = evaluation_cfg.get("games_vs_random", eval_games_vs_random)
     eval_games_vs_best = evaluation_cfg.get("games_vs_best", eval_games_vs_best)
     eval_games_vs_previous = evaluation_cfg.get("games_vs_previous", eval_games_vs_previous)
+    promotion_vs_opponent_threshold = float(
+        evaluation_cfg.get("promotion_vs_opponent_threshold", promotion_vs_opponent_threshold)
+    )
     eval_workers_cfg = evaluation_cfg.get("workers", evaluation_cfg.get("num_workers", eval_workers))
     try:
         eval_workers = int(eval_workers_cfg) if eval_workers_cfg is not None else 0
@@ -794,6 +798,7 @@ def train_pipeline_v0(
         )
 
         win_rate_vs_previous = None
+        loss_rate_vs_previous = None
         if eval_games_vs_previous > 0 and iteration >= 1:
             previous_model_path = os.path.join(checkpoint_dir, f"model_iter_{iteration}.pt")
             if os.path.exists(previous_model_path):
@@ -851,22 +856,36 @@ def train_pipeline_v0(
                     del challenger_agent_prev, prev_agent, prev_model, prev_checkpoint
                     _cleanup_gpu()
                 win_rate_vs_previous = stats_vs_prev.win_rate
+                loss_rate_vs_previous = stats_vs_prev.loss_rate
                 print(
                     f"Challenger win rate vs previous iter: {win_rate_vs_previous:.2%} "
                     f"({stats_vs_prev.wins}-{stats_vs_prev.losses}-{stats_vs_prev.draws})"
                 )
+            else:
+                loss_rate_vs_previous = None
+        else:
+            loss_rate_vs_previous = None
 
         win_rate_vs_best_model = None
         stats_vs_best_model = None
         best_model_updated = False
 
-        if stats_vs_rnd.win_rate > win_rate_threshold:
-            print(f"Challenger passed RandomAgent threshold ({win_rate_threshold:.0%}). Comparing to best model...")
+        if stats_vs_rnd.win_rate >= win_rate_threshold:
+            print(f"Challenger passed RandomAgent threshold (>= {win_rate_threshold:.0%}). Comparing to best model...")
+            beats_previous = (
+                win_rate_vs_previous is None
+                or win_rate_vs_previous > (loss_rate_vs_previous or 0)
+            )
             if not os.path.exists(best_model_path):
-                print("No existing best_model.pt. Current model becomes the best.")
-                shutil.copy(iter_model_path, best_model_path)
-                print(f"Best model updated: {best_model_path}")
-                best_model_updated = True
+                if beats_previous:
+                    print("No existing best_model.pt. Current model becomes the best.")
+                    shutil.copy(iter_model_path, best_model_path)
+                    print(f"Best model updated: {best_model_path}")
+                    best_model_updated = True
+                else:
+                    print(
+                        "Challenger did not beat previous iteration (win rate <= loss rate). Not promoting."
+                    )
             else:
                 print("Loading best_model.pt for comparison...")
 
@@ -935,13 +954,25 @@ def train_pipeline_v0(
                     f"(win {stats_vs_best_model.win_rate:.2%} / loss {stats_vs_best_model.loss_rate:.2%} / draw {stats_vs_best_model.draw_rate:.2%})"
                 )
 
-                if stats_vs_best_model.win_rate > win_rate_threshold:
-                    print("Challenger beat the BestModel. Promoting new best model.")
+                beats_best = (
+                    stats_vs_best_model.win_rate > stats_vs_best_model.loss_rate
+                )
+                if beats_previous and beats_best:
+                    print(
+                        "Challenger beat previous and BestModel (win/all > loss/all). Promoting new best model."
+                    )
                     shutil.copy(iter_model_path, best_model_path)
                     print(f"Best model updated: {best_model_path}")
                     best_model_updated = True
                 else:
-                    print("Challenger did not surpass BestModel.")
+                    if not beats_previous:
+                        print(
+                            "Challenger did not beat previous (win rate <= loss rate)."
+                        )
+                    if not beats_best:
+                        print(
+                            "Challenger did not beat BestModel (win rate <= loss rate)."
+                        )
         else:
             print("Challenger did not pass RandomAgent threshold.")
 
@@ -957,6 +988,7 @@ def train_pipeline_v0(
             iteration_metrics["draw_rate_vs_best"] = stats_vs_best_model.draw_rate
         iteration_metrics["best_model_updated"] = best_model_updated
         iteration_metrics["win_rate_threshold"] = win_rate_threshold
+        iteration_metrics["promotion_vs_opponent_threshold"] = promotion_vs_opponent_threshold
 
         # Release evaluation VRAM (eval agents, best_model copies, MCTS
         # instances) before the next iteration starts fresh.
@@ -1168,7 +1200,18 @@ if __name__ == "__main__":
         default="legacy",
         help="Evaluation MCTS backend (legacy or v0).",
     )
-    parser.add_argument("--win_rate_threshold", type=float, default=0.55, help="Win-rate threshold.")
+    parser.add_argument(
+        "--win_rate_threshold",
+        type=float,
+        default=0.55,
+        help="Min win rate vs Random to consider for best (e.g. 0.55 = 55%%).",
+    )
+    parser.add_argument(
+        "--promotion_vs_opponent_threshold",
+        type=float,
+        default=0.5,
+        help="Unused; promotion uses win/all > loss/all (win rate > loss rate) for vs previous/best.",
+    )
     parser.add_argument(
         "--mcts_sims_eval", type=int, default=100, help="MCTS simulations for evaluation agents."
     )
@@ -1243,6 +1286,7 @@ if __name__ == "__main__":
         eval_workers=args.eval_workers,
         eval_backend=args.eval_backend,
         win_rate_threshold=args.win_rate_threshold,
+        promotion_vs_opponent_threshold=args.promotion_vs_opponent_threshold,
         mcts_sims_eval=args.mcts_sims_eval,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
