@@ -21,7 +21,7 @@ python3 -c "import torch; print(torch.__version__); print(torch.utils.cmake_pref
 
 ```bash
 # Linux
-sudo apt install cmake ninja-build pybind11-dev
+conda install -c conda-forge cmake ninja pybind11 -y
 
 # Windows: 安装 Visual Studio 2022 + MSVC + Ninja
 ```
@@ -54,29 +54,28 @@ $env:PYTHONPATH = "D:\CODES\liuzhou;D:\CODES\liuzhou\build\v0\src"
 
 ```bash
 # 进入仓库根目录
-cd /home/ubuntu/.cache/liuzhou
+cd liuzhou
 
-# 纯 CPU
-cmake -S v0 -B v0/build \
-  -DUSE_CUDA=OFF \
-  -DPython3_EXECUTABLE=$(which python3) \
-  -DTorch_DIR=/path/to/libtorch/share/cmake/Torch
+export CUDACXX=/usr/local/cuda/bin/nvcc
 
-# 或 启用 CUDA（H20/Hopper）
+PY=$CONDA_PREFIX/bin/python
 cmake -S v0 -B v0/build \
   -G Ninja \
   -DUSE_CUDA=ON \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
   -DCMAKE_CUDA_ARCHITECTURES=90 \
-  -DPython3_EXECUTABLE=$(which python3) \
+  -DPython3_EXECUTABLE=$PY \
+  -DPython3_INCLUDE_DIR=$CONDA_PREFIX/include/python3.13 \
+  -DPython3_LIBRARY=$CONDA_PREFIX/lib/libpython3.13.so \
+  -Dpybind11_DIR="$($PY -c 'import pybind11; print(pybind11.get_cmake_dir())')" \
   -DCUDAToolkit_ROOT=/usr/local/cuda \
-  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"
-
+  -DCMAKE_PREFIX_PATH="$CONDA_PREFIX;$($PY -c 'import torch; print(torch.utils.cmake_prefix_path)')"
 
 # 构建
 cmake --build v0/build -j$(nproc)
 
 # 运行 Python 时可选设置 PYTHONPATH 指向源码与生成的扩展
-export PYTHONPATH=/home/ubuntu/.cache/liuzhou:/home/ubuntu/.cache/liuzhou/v0/build/src:$PYTHONPATH
+export PYTHONPATH=./liuzhou:./liuzhou/v0/build/src:$PYTHONPATH
 ```
 
 注意：
