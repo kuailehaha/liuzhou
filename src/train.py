@@ -19,6 +19,13 @@ from src.mcts import self_play
 from src.evaluate import MCTSAgent, RandomAgent, evaluate_against_agent, evaluate_against_agent_parallel
 from src.random_agent import RandomAgent
 from src.move_generator import MoveType, generate_all_legal_moves
+from src.policy_batch import (
+    TOTAL_DIM,
+    legal_mask_and_target_dense,
+    build_combined_logits,
+    masked_log_softmax,
+    batched_policy_loss,
+)
 
 
 def _format_eta(seconds: float) -> str:
@@ -97,21 +104,19 @@ class ChessDataset(Dataset):
     """
     用于训练神经网络的数据集。
     支持预计算状态张量以加速多 epoch 数据加载。
+    use_batched_policy=True 时返回 (state_tensor, legal_mask, target_dense, value, soft)，用于批量化策略损失。
     """
     def __init__(self, examples: List[Tuple[GameState, np.ndarray, Optional[List[dict]], float, float]],
-                 precompute_tensors: bool = True):
+                 precompute_tensors: bool = True,
+                 use_batched_policy: bool = False):
         """
-        初始化数据集。
-        
         Args:
-            examples: 一个列表，每个元素是一个元组 (GameState, mcts_policy_array, legal_moves, value, soft_value)。
-                      mcts_policy_array 是对应 GameState 所有合法走法的MCTS搜索概率。
-                      legal_moves 是预计算的合法走法列表。
-            precompute_tensors: 是否预先将所有 GameState 转为张量（trade CPU time for faster epochs）。
+            use_batched_policy: 若 True，__getitem__ 返回 (state, legal_mask, target_dense, value, soft) 供批量化策略损失。
         """
         self.examples = examples
         self._precomputed: Optional[List[torch.Tensor]] = None
         self._legal_moves_cache: Optional[List[List[MoveType]]] = None
+        self.use_batched_policy = use_batched_policy
 
         if precompute_tensors and examples:
             print(f"[ChessDataset] Pre-computing {len(examples)} state tensors...")
@@ -134,23 +139,18 @@ class ChessDataset(Dataset):
     def __len__(self):
         return len(self.examples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         state_obj, mcts_policy, legal_moves, value, soft_value = self.examples[idx]
 
-        # Use pre-computed tensor if available, otherwise compute on the fly.
         if self._precomputed is not None:
             state_tensor = self._precomputed[idx]
         else:
             state_tensor = state_to_tensor(state_obj, state_obj.current_player).squeeze(0)
 
-        # Convert policy to tensor.
         mcts_policy_tensor = torch.FloatTensor(mcts_policy)
-
-        # Convert values to tensors.
         value_tensor = torch.FloatTensor([value])
         soft_tensor = torch.FloatTensor([soft_value])
 
-        # Use cached legal moves.
         if self._legal_moves_cache is not None:
             legal_moves = self._legal_moves_cache[idx]
         else:
@@ -158,27 +158,43 @@ class ChessDataset(Dataset):
             if legal_moves is None or (len(legal_moves) == 0 and policy_len > 0):
                 legal_moves = generate_all_legal_moves(state_obj)
 
-        # Ensure policy length matches legal moves.
         if len(legal_moves) != len(mcts_policy_tensor):
             if not legal_moves and len(mcts_policy_tensor) == 0:
                 pass
             else:
                 print(f"Critical Warning: Mismatch len(legal_moves)={len(legal_moves)} vs len(mcts_policy)={len(mcts_policy_tensor)}")
 
+        if self.use_batched_policy:
+            legal_mask, target_dense = legal_mask_and_target_dense(
+                legal_moves, mcts_policy_tensor, GameState.BOARD_SIZE
+            )
+            return state_tensor, legal_mask, target_dense, value_tensor, soft_tensor
         return state_tensor, legal_moves, mcts_policy_tensor, value_tensor, soft_tensor
+
 
 def mcts_collate_fn(batch: List[Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor, torch.Tensor]]) \
     -> Tuple[torch.Tensor, List[List[MoveType]], List[torch.Tensor], torch.Tensor, torch.Tensor]:
     """
-    自定义的collate_fn，用于处理包含legal_moves列表的批次。
+    自定义的collate_fn，用于处理包含legal_moves列表的批次（use_batched_policy=False）。
     """
     state_tensors = torch.stack([item[0] for item in batch])
-    list_of_legal_moves = [item[1] for item in batch]  # list of lists of dicts
-    target_policies_list = [item[2] for item in batch] # list of Tensors
+    list_of_legal_moves = [item[1] for item in batch]
+    target_policies_list = [item[2] for item in batch]
     value_tensors = torch.stack([item[3] for item in batch])
     soft_tensors = torch.stack([item[4] for item in batch])
-
     return state_tensors, list_of_legal_moves, target_policies_list, value_tensors, soft_tensors
+
+
+def mcts_collate_batched_policy(batch):
+    """
+    Collate when use_batched_policy=True: item[1]=legal_mask (1,TOTAL_DIM), item[2]=target_dense (1,TOTAL_DIM).
+    """
+    state_tensors = torch.stack([item[0] for item in batch])
+    legal_masks = torch.cat([item[1] for item in batch], dim=0)
+    target_denses = torch.cat([item[2] for item in batch], dim=0)
+    value_tensors = torch.stack([item[3] for item in batch])
+    soft_tensors = torch.stack([item[4] for item in batch])
+    return state_tensors, legal_masks, target_denses, value_tensors, soft_tensors
 
 def train_network(
     model: ChessNet,
@@ -195,6 +211,7 @@ def train_network(
     use_amp: bool = True,
     num_workers: Optional[int] = None,
     prefetch_factor: Optional[int] = None,
+    use_batched_policy: bool = True,
 ) -> Tuple[ChessNet, Dict[str, Any]]:
     """
     使用生成的训练数据训练神经网络。
@@ -226,7 +243,8 @@ def train_network(
 
     
     # 创建数据集和数据加载器
-    dataset = ChessDataset(examples, precompute_tensors=True)
+    dataset = ChessDataset(examples, precompute_tensors=True, use_batched_policy=use_batched_policy)
+    collate_fn = mcts_collate_batched_policy if use_batched_policy else mcts_collate_fn
     _on_cuda = str(device) != 'cpu' and torch.cuda.is_available()
     if num_workers is not None:
         _num_workers = max(0, int(num_workers))
@@ -241,7 +259,7 @@ def train_network(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=mcts_collate_fn,
+        collate_fn=collate_fn,
         num_workers=_num_workers,
         pin_memory=_on_cuda,
         prefetch_factor=_prefetch if _num_workers > 0 else None,
@@ -270,7 +288,8 @@ def train_network(
 
     print(f"[train] batch_size={batch_size}, steps/epoch={len(dataloader)}, "
           f"total_steps={total_train_steps}, num_workers={_num_workers}, "
-          f"prefetch_factor={_prefetch}, AMP={'ON' if _use_amp else 'OFF'}, device={device}")
+          f"prefetch_factor={_prefetch}, batched_policy={use_batched_policy}, "
+          f"AMP={'ON' if _use_amp else 'OFF'}, device={device}")
     
     # 创建损失函数
     value_draw_weight = max(0.0, float(value_draw_weight))
@@ -291,107 +310,107 @@ def train_network(
         mix_abs_epoch = 0.0
         soft_batches = 0
         
-        for batch_idx, (states_tensor_batch, batch_legal_moves, batch_target_policies, target_values_batch, soft_values_batch) in enumerate(dataloader):
-            states_tensor_batch = states_tensor_batch.to(device, non_blocking=True)
-            target_values_batch = target_values_batch.to(device, non_blocking=True)
-            soft_values_batch = soft_values_batch.to(device, non_blocking=True)
-            # Pre-move all target policy tensors to device once (avoids 4k+ .to(device) in loop)
-            batch_target_policies = [p.to(device, non_blocking=True) for p in batch_target_policies]
+        for batch_idx, batch in enumerate(dataloader):
+            states_tensor_batch = batch[0].to(device, non_blocking=True)
+            target_values_batch = batch[3].to(device, non_blocking=True)
+            soft_values_batch = batch[4].to(device, non_blocking=True)
+
+            if use_batched_policy:
+                legal_mask_batch = batch[1].to(device, non_blocking=True)
+                target_dense_batch = batch[2].to(device, non_blocking=True)
+            else:
+                batch_legal_moves = batch[1]
+                batch_target_policies = [p.to(device, non_blocking=True) for p in batch[2]]
 
             optimizer.zero_grad(set_to_none=True)
-            
-            # 前向传播 (整个批次) with AMP autocast
+
             with torch.amp.autocast('cuda', enabled=_use_amp):
                 log_p1_batch, log_p2_batch, log_pmc_batch, value_pred_batch = model(states_tensor_batch)
-            
-            current_batch_policy_loss = torch.tensor(0.0, device=device)
-            y_mix = (1.0 - soft_label_alpha) * target_values_batch + soft_label_alpha * soft_values_batch
 
+            y_mix = (1.0 - soft_label_alpha) * target_values_batch + soft_label_alpha * soft_values_batch
             draw_weight = target_values_batch.new_full((), value_draw_weight)
             one_weight = target_values_batch.new_ones(())
             draw_mask = target_values_batch.abs() < 1e-8
             weights = torch.where(draw_mask, draw_weight, one_weight)
-            weighted_sq = (value_pred_batch - y_mix) ** 2 * weights
             weight_sum = weights.sum()
             if weight_sum.item() > 0:
-                current_batch_value_loss = weighted_sq.sum() / weight_sum
+                current_batch_value_loss = (weights * (value_pred_batch - y_mix) ** 2).sum() / weight_sum
             else:
                 current_batch_value_loss = torch.tensor(0.0, device=device)
             soft_abs_epoch += soft_values_batch.abs().mean().item()
             mix_abs_epoch += y_mix.abs().mean().item()
             soft_batches += 1
-            
-            valid_policy_samples_in_batch = 0
-            policy_weight_sum_in_batch = 0.0
 
-            # 处理批次中的每个样本以计算策略损失
-            for i in range(states_tensor_batch.size(0)):
-                log_p1_sample = log_p1_batch[i]
-                log_p2_sample = log_p2_batch[i]
-                log_pmc_sample = log_pmc_batch[i]
-                
-                legal_moves_sample = batch_legal_moves[i]
-                target_policy_sample = batch_target_policies[i]  # already on device
-
-                if not legal_moves_sample or target_policy_sample.nelement() == 0:
-                    # 如果没有合法走法或MCTS策略为空，则跳过此样本的策略损失计算
-                    continue
-
-                # 使用 get_move_probabilities 获取网络对这些合法走法的原始对数概率(组合形式)
-                # get_move_probabilities returns (probs_after_softmax, raw_combined_log_probs_before_softmax)
-                _, net_raw_log_probs_for_moves = get_move_probabilities(
-                    log_policy_pos1=log_p1_sample,
-                    log_policy_pos2=log_p2_sample,
-                    log_policy_mark_capture=log_pmc_sample,
-                    legal_moves=legal_moves_sample,
-                    board_size=board_size, # board_size is needed
-                    device=device
+            if use_batched_policy:
+                combined_logits = build_combined_logits(
+                    log_p1_batch.view(log_p1_batch.size(0), -1),
+                    log_p2_batch.view(log_p2_batch.size(0), -1),
+                    log_pmc_batch.view(log_pmc_batch.size(0), -1),
+                    board_size,
                 )
-
-                if net_raw_log_probs_for_moves.nelement() == 0:
-                    # 这不应该发生，如果legal_moves_sample非空
-                    # print(f"Warning: net_raw_log_probs_for_moves is empty for a sample with legal moves.")
-                    continue
-                
-                # KLDivLoss 需要对数概率作为输入, 目标是概率分布
-                # net_raw_log_probs_for_moves 是组合后的原始分数，需要进行 log_softmax
-                network_log_softmax_for_moves = torch.nn.functional.log_softmax(net_raw_log_probs_for_moves, dim=0)
-
-                # 确保形状匹配
-                if network_log_softmax_for_moves.shape != target_policy_sample.shape:
-                    # print(f"Warning: Shape mismatch for policy loss. Net: {network_log_softmax_for_moves.shape}, Target: {target_policy_sample.shape}. Skipping sample.")
-                    continue
-
-                value_abs = float(target_values_batch[i].abs().item())
-                policy_weight = policy_draw_weight if value_abs < 1e-8 else 1.0
-                sample_policy_loss = policy_loss_fn(network_log_softmax_for_moves, target_policy_sample)
-                current_batch_policy_loss += sample_policy_loss * policy_weight
-                valid_policy_samples_in_batch += 1
-                policy_weight_sum_in_batch += policy_weight
-            
-            if policy_weight_sum_in_batch > 0:
-                # 平均每个有效样本的策略损失 (因为KLDivLoss(reduction='sum')是对单个策略求和)
-                averaged_batch_policy_loss = current_batch_policy_loss / policy_weight_sum_in_batch
+                log_probs_batch = masked_log_softmax(combined_logits, legal_mask_batch, dim=1)
+                averaged_batch_policy_loss = batched_policy_loss(
+                    log_probs_batch,
+                    target_dense_batch,
+                    legal_mask_batch,
+                    target_values_batch,
+                    policy_draw_weight,
+                )
+                valid_policy_samples_in_batch = (target_dense_batch.sum(dim=1) > 1e-8).sum().item()
+                _policy_weights = torch.where(
+                    draw_mask.squeeze(1),
+                    target_dense_batch.new_full((), policy_draw_weight),
+                    target_dense_batch.new_ones(()),
+                )
+                policy_weight_sum_in_batch = _policy_weights.sum().item()
             else:
-                # 如果批次中没有有效的策略样本，则策略损失为0
-                averaged_batch_policy_loss = torch.tensor(0.0, device=device, requires_grad=True) 
+                current_batch_policy_loss = torch.tensor(0.0, device=device)
+                valid_policy_samples_in_batch = 0
+                policy_weight_sum_in_batch = 0.0
+                for i in range(states_tensor_batch.size(0)):
+                    log_p1_sample = log_p1_batch[i]
+                    log_p2_sample = log_p2_batch[i]
+                    log_pmc_sample = log_pmc_batch[i]
+                    legal_moves_sample = batch_legal_moves[i]
+                    target_policy_sample = batch_target_policies[i]
+                    if not legal_moves_sample or target_policy_sample.nelement() == 0:
+                        continue
+                    _, net_raw_log_probs_for_moves = get_move_probabilities(
+                        log_policy_pos1=log_p1_sample,
+                        log_policy_pos2=log_p2_sample,
+                        log_policy_mark_capture=log_pmc_sample,
+                        legal_moves=legal_moves_sample,
+                        board_size=board_size,
+                        device=device,
+                    )
+                    if net_raw_log_probs_for_moves.nelement() == 0:
+                        continue
+                    network_log_softmax_for_moves = torch.nn.functional.log_softmax(net_raw_log_probs_for_moves, dim=0)
+                    if network_log_softmax_for_moves.shape != target_policy_sample.shape:
+                        continue
+                    value_abs = float(target_values_batch[i].abs().item())
+                    policy_weight = policy_draw_weight if value_abs < 1e-8 else 1.0
+                    sample_policy_loss = policy_loss_fn(network_log_softmax_for_moves, target_policy_sample)
+                    current_batch_policy_loss += sample_policy_loss * policy_weight
+                    valid_policy_samples_in_batch += 1
+                    policy_weight_sum_in_batch += policy_weight
+                if policy_weight_sum_in_batch > 0:
+                    averaged_batch_policy_loss = current_batch_policy_loss / policy_weight_sum_in_batch
+                else:
+                    averaged_batch_policy_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-            # 总损失
-            loss = averaged_batch_policy_loss + current_batch_value_loss # current_batch_value_loss is already averaged by MSELoss (default reduction='mean')
-            
-            if valid_policy_samples_in_batch > 0 or current_batch_value_loss.requires_grad : # Ensure there's something to backprop
-                # 反向传播 (with AMP scaler + gradient clipping)
+            loss = averaged_batch_policy_loss + current_batch_value_loss
+            if (use_batched_policy and (target_dense_batch.sum() > 1e-8)) or (not use_batched_policy and valid_policy_samples_in_batch > 0) or current_batch_value_loss.requires_grad:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             scheduler.step()
-            
-            # 累积损失 (用于打印)
-            total_loss_epoch += loss.item() * states_tensor_batch.size(0) # Weighted by batch size if some were skipped
+
+            total_loss_epoch += loss.item() * states_tensor_batch.size(0)
             policy_loss_epoch += averaged_batch_policy_loss.item() * policy_weight_sum_in_batch
-            value_loss_epoch += current_batch_value_loss.item() * states_tensor_batch.size(0) # MSE is already mean
+            value_loss_epoch += current_batch_value_loss.item() * states_tensor_batch.size(0)
             num_samples_processed += states_tensor_batch.size(0)
             total_valid_policy_samples += valid_policy_samples_in_batch
             policy_weight_sum_epoch += policy_weight_sum_in_batch

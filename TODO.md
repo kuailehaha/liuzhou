@@ -150,7 +150,48 @@ TODO以产生时间为准。
 **现象 2：训练时 GPU 利用率低**
 - 现状：GPU 功耗 132W/500W，显存占用 1201MiB，GPU-Util 仅 11%
 - 疑点：训练效率极低，GPU 大部分时间在等待数据或 CPU 计算
-- [ ] 使用 profiler 定位训练瓶颈（数据加载 / CPU 预处理 / GPU 计算）
-- [ ] 排查 DataLoader 配置：num_workers、prefetch_factor、pin_memory
+- [x] 使用 profiler 定位训练瓶颈（数据加载 / CPU 预处理 / GPU 计算）→ 策略损失为逐样本 Python 循环
+- [x] 排查 DataLoader 配置：num_workers、prefetch_factor、pin_memory
 - [ ] 优化 batch size 和梯度累积策略
 - [ ] 检查是否存在不必要的 CPU-GPU 同步操作
+- [x] **策略损失批量化**（见下方「策略损失批量化重构方案」）
+---
+
+### 策略损失批量化重构方案（高效训练必要保证）
+
+**目标**：去掉训练阶段「对 batch 内每个样本 for 循环 + 逐样本调用 `get_move_probabilities`」的瓶颈，改为在 GPU 上对整批做一次 combined logits 构建 + 掩码 log_softmax + 批量化 KL 损失，从而提升 GPU 利用率与训练吞吐。
+
+**现状简述**：
+- 策略头输出：`log_p1`(B,36)、`log_p2`(B,36)、`log_pmc`(B,36)，与 v0 的 placement / movement-from / selection 语义一致。
+- 当前：对每个样本 i 调用 `get_move_probabilities(log_p1[i], log_p2[i], log_pmc[i], legal_moves[i], ...)`，在 Python 里按合法着法循环求 score 再 `stack`，再对整批做逐样本 KL。batch=4096 即 4096 次 Python 循环，GPU 大量空闲。
+- v0 已有：`project_policy_logits_fast`（C++）按 (placement_dim, movement_dim, selection_dim, auxiliary_dim) 从 log_p1/log_p2/log_pmc 构建 combined logits (B, total_dim)，并在 legal_mask 上做 masked softmax；`v0/python/move_encoder.py` 有 `action_to_index(move, board_size, spec)` 将 legacy 的 move 字典映射到 flat 索引，与 v0 动作空间一致。
+
+**不变量**：
+- 规则与阶段语义以 `README_zh.md`、`rule_description.md` 为准。
+- 动作索引与 v0 的 `ActionEncodingSpec`（placement_dim=36, movement_dim=144, selection_dim=36, auxiliary_dim=4, total_dim=220）保持一致，便于日后与 v0 推理/自博弈共用或对拍。
+- 策略损失仍为「仅在合法动作上的 KL」，draw 样本的 policy 权重（policy_draw_weight）与 value 权重（value_draw_weight）逻辑不变。
+
+**重构步骤（细化）**
+
+1. **动作空间与索引约定**
+   - [x] 在 `src` 中引入与 v0 一致的「单动作 → flat 索引」约定（`src/policy_batch.py`：`action_to_index`、TOTAL_DIM 等），保证 placement / movement(dir-major) / selection / process_removal 与 v0 C++ 一致。
+   - [x] 在文档或注释中写明：训练用的 flat 索引与 v0 自博弈/推理的 `legal_mask`、`project_policy_logits_fast` 使用同一套 spec，避免两套编码。
+
+2. **数据侧：legal_mask + target_dense**
+   - [x] 定义「每样本」产出：`legal_mask_i` (1, total_dim) bool，`target_dense_i` (1, total_dim) float；实现 `legal_mask_and_target_dense()`。
+   - [x] 集成到 `ChessDataset`：`use_batched_policy=True` 时返回 `(state_tensor, legal_mask, target_dense, value, soft_value)`；保留旧路径，collate 支持两种形状（`mcts_collate_fn` / `mcts_collate_batched_policy`）。
+
+3. **模型侧：batch combined logits**
+   - [x] Python 实现 `build_combined_logits(log_p1, log_p2, log_pmc, board_size)`，逻辑与 v0 C++ 一致（placement / movement / selection / auxiliary）。
+
+4. **损失侧：masked log_softmax + 批量化 KL**
+   - [x] 实现 `masked_log_softmax(logits, mask, dim)`、`batched_policy_loss(...)`，按样本 policy_draw_weight 加权平均；value 损失与总损失形式不变。
+
+5. **训练入口与开关**
+   - [x] `train_network(..., use_batched_policy=True)`，True 时走批量化路径，False 时保留逐样本 `get_move_probabilities` 循环。
+   - [x] 单测：`tests/test_batched_policy_loss.py`（action_to_index、build_combined_logits、masked_log_softmax、batched_policy_loss 梯度、与 legacy 的 log-prob 一致性及损失量级）。
+
+6. **验证与收尾**
+   - [x] 用现有 `tests/` 或小规模训练跑 1 个 iteration，确认 loss 曲线与旧实现同量级、无 NaN（已跑 smoke：batched_policy=True，Avg Policy Loss 有限）。
+   - [x] 在 AGENTS.md 中注明：训练策略损失已批量化（`src/policy_batch.py`），与 v0 动作编码一致；若修改动作空间或 spec，需同步更新此处与 v0。
+   - [x] 更新本 TODO：将「策略损失批量化」项勾选完成，并保留上述步骤为历史记录。

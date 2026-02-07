@@ -1,13 +1,15 @@
 # Agent Guide
 
 本文件用于指导在本项目中进行快速迭代式开发。
-目标是保持规则一致性，高效定位、修改、验证并交付功能。在开发过程中，应当充分发挥主观能动性进行深入理解。你不需要执行训练。在每次coding或bugfix后，你始终以简洁英文给出git commit的建议。你应当保持简洁的设计准则，如无必要，不增加开关和参数传递。
+目标是保持规则一致性，高效定位、修改、验证并交付功能。在开发过程中，应当充分发挥主观能动性进行深入理解。你不需要执行训练。在每次coding或bugfix后，你始终以简洁英文给出git commit的建议：feature/bugfix/..(selfplay/train/eval/..): `message`。你应当保持简洁的设计准则，如无必要，不增加开关和参数传递。
+
 ## 资源和环境
 
-项目本身可用4张H20（CUDA_VISIBLE_DEVICES=0,1,2,3），256核CPU
+项目可用4张H20（CUDA_VISIBLE_DEVICES=0,1,2,3），256核CPU。
 项目环境在/2023533024/users/zhangmq/condaenvs/naivetorch
 项目训练一般使用./scripts/toy_train.sh
 我们谈及优化，一般都是针对于v0 pipeline进行的。legacy只作功能性验证。
+如需测试运行速度，为保证准确性，应当先查看当前系统中有无正在运行的任务。你可以选择低占用资源进行测试。
 
 ## 项目速览
 
@@ -24,6 +26,7 @@
   - `rule_engine.py`：阶段规则（落子/标记/移除/走子/提吃等）
   - `move_generator.py`：合法动作生成与落子/走子应用
   - `mcts.py`、`neural_network.py`、`train.py`、`evaluate.py`
+  - `policy_batch.py`：训练阶段策略损失批量化（legal_mask/target_dense、combined logits、masked log_softmax），与 v0 动作编码一致；修改动作空间或 spec 时需同步 v0。
 - `v0/`：C++/CUDA 版本核心与训练/数据脚本
 - `backend/`：服务端（人机对战/推理接口）
 - `web_ui/`：前端界面
