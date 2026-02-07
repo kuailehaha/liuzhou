@@ -557,6 +557,7 @@ __global__ void BatchApplyMovesKernel(
     const int64_t* pending_captures_remaining,
     const int64_t* forced_removals_done,
     const int64_t* move_count,
+    const int64_t* moves_since_capture,
     const int32_t* action_codes,
     const int64_t* parent_indices,
     int64_t batch_size,
@@ -573,7 +574,8 @@ __global__ void BatchApplyMovesKernel(
     int64_t* out_pending_captures_required,
     int64_t* out_pending_captures_remaining,
     int64_t* out_forced_removals_done,
-    int64_t* out_move_count) {
+    int64_t* out_move_count,
+    int64_t* out_moves_since_capture) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_actions) {
         return;
@@ -609,6 +611,7 @@ __global__ void BatchApplyMovesKernel(
     out_pending_captures_remaining[idx] = pending_captures_remaining[parent];
     out_forced_removals_done[idx] = forced_removals_done[parent];
     out_move_count[idx] = move_count[parent];
+    out_moves_since_capture[idx] = moves_since_capture[parent];
 
     int64_t* phase_ptr = out_phase + idx;
     int64_t* current_ptr = out_current_player + idx;
@@ -618,6 +621,7 @@ __global__ void BatchApplyMovesKernel(
     int64_t* captures_rem_ptr = out_pending_captures_remaining + idx;
     int64_t* forced_ptr = out_forced_removals_done + idx;
     int64_t* move_count_ptr = out_move_count + idx;
+    int64_t phase_before = *phase_ptr;
 
     int32_t kind = action_codes[idx * 4 + 0];
     int32_t primary = action_codes[idx * 4 + 1];
@@ -720,11 +724,29 @@ __global__ void BatchApplyMovesKernel(
         default:
             break;
     }
+
+    // Track moves_since_capture for no-capture draw detection
+    if (phase_before == kPhasePlacement || phase_before == kPhaseMarkSelection) {
+        out_moves_since_capture[idx] = 0;
+    } else {
+        const int8_t* parent_board_ptr = board + parent * cell_count;
+        int old_total = 0, new_total = 0;
+        for (int i = 0; i < cell_count; ++i) {
+            if (parent_board_ptr[i] != 0) ++old_total;
+            if (child_board[i] != 0) ++new_total;
+        }
+        if (new_total < old_total) {
+            out_moves_since_capture[idx] = 0;
+        } else {
+            out_moves_since_capture[idx] = moves_since_capture[parent] + 1;
+        }
+    }
 }
 
 }  // namespace
 
 std::tuple<
+    torch::Tensor,
     torch::Tensor,
     torch::Tensor,
     torch::Tensor,
@@ -748,6 +770,7 @@ batch_apply_moves_cuda(
     torch::Tensor pending_captures_remaining,
     torch::Tensor forced_removals_done,
     torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
     torch::Tensor action_codes,
     torch::Tensor parent_indices) {
     TORCH_CHECK(board.device().is_cuda(), "batch_apply_moves_cuda requires CUDA tensors.");
@@ -765,6 +788,7 @@ batch_apply_moves_cuda(
     pending_captures_remaining = pending_captures_remaining.contiguous();
     forced_removals_done = forced_removals_done.contiguous();
     move_count = move_count.contiguous();
+    moves_since_capture = moves_since_capture.contiguous();
     action_codes = action_codes.contiguous();
     parent_indices = parent_indices.contiguous();
 
@@ -794,6 +818,7 @@ batch_apply_moves_cuda(
     torch::Tensor out_pending_captures_remaining = torch::empty({num_actions}, options_long);
     torch::Tensor out_forced_removals_done = torch::empty({num_actions}, options_long);
     torch::Tensor out_move_count = torch::empty({num_actions}, options_long);
+    torch::Tensor out_moves_since_capture = torch::empty({num_actions}, options_long);
 
     if (num_actions == 0) {
         return {
@@ -808,6 +833,7 @@ batch_apply_moves_cuda(
             out_pending_captures_remaining,
             out_forced_removals_done,
             out_move_count,
+            out_moves_since_capture,
         };
     }
 
@@ -825,6 +851,7 @@ batch_apply_moves_cuda(
         pending_captures_remaining.data_ptr<int64_t>(),
         forced_removals_done.data_ptr<int64_t>(),
         move_count.data_ptr<int64_t>(),
+        moves_since_capture.data_ptr<int64_t>(),
         action_codes.data_ptr<int32_t>(),
         parent_indices.data_ptr<int64_t>(),
         B,
@@ -841,7 +868,8 @@ batch_apply_moves_cuda(
         out_pending_captures_required.data_ptr<int64_t>(),
         out_pending_captures_remaining.data_ptr<int64_t>(),
         out_forced_removals_done.data_ptr<int64_t>(),
-        out_move_count.data_ptr<int64_t>());
+        out_move_count.data_ptr<int64_t>(),
+        out_moves_since_capture.data_ptr<int64_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {
@@ -856,6 +884,7 @@ batch_apply_moves_cuda(
         out_pending_captures_remaining,
         out_forced_removals_done,
         out_move_count,
+        out_moves_since_capture,
     };
 }
 

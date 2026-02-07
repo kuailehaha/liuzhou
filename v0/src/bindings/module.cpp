@@ -626,6 +626,7 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("pending_captures_remaining"),
         py::arg("forced_removals_done"),
         py::arg("move_count"),
+        py::arg("moves_since_capture"),
         py::arg("action_codes"),
         py::arg("parent_indices"));
     m.def(

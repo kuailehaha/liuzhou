@@ -20,6 +20,7 @@ struct TensorStateBatch {
     torch::Tensor pending_captures_remaining;
     torch::Tensor forced_removals_done;
     torch::Tensor move_count;
+    torch::Tensor moves_since_capture;
     torch::Tensor mask_alive;
     int64_t board_size{kBoardSize};
 

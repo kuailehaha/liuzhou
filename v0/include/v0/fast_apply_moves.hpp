@@ -16,6 +16,7 @@ std::tuple<
     torch::Tensor,
     torch::Tensor,
     torch::Tensor,
+    torch::Tensor,
     torch::Tensor>
 batch_apply_moves(
     torch::Tensor board,
@@ -29,6 +30,7 @@ batch_apply_moves(
     torch::Tensor pending_captures_remaining,
     torch::Tensor forced_removals_done,
     torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
     torch::Tensor action_codes,
     torch::Tensor parent_indices);
 

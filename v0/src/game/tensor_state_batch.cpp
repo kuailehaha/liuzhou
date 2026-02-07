@@ -41,6 +41,7 @@ TensorStateBatch TensorStateBatch::To(const torch::Device& device) const {
     out.pending_captures_remaining = pending_captures_remaining.to(norm_device);
     out.forced_removals_done = forced_removals_done.to(norm_device);
     out.move_count = move_count.to(norm_device);
+    out.moves_since_capture = moves_since_capture.to(norm_device);
     out.mask_alive = mask_alive.to(norm_device);
     out.board_size = board_size;
     return out;
@@ -59,6 +60,7 @@ TensorStateBatch TensorStateBatch::Clone() const {
     out.pending_captures_remaining = pending_captures_remaining.clone();
     out.forced_removals_done = forced_removals_done.clone();
     out.move_count = move_count.clone();
+    out.moves_since_capture = moves_since_capture.clone();
     out.mask_alive = mask_alive.clone();
     out.board_size = board_size;
     return out;
@@ -97,6 +99,7 @@ TensorStateBatch FromGameStates(
     auto pending_captures_remaining = torch::empty(batch_size, cpu_options(torch::kInt64));
     auto forced_removals_done = torch::empty(batch_size, cpu_options(torch::kInt64));
     auto move_count = torch::empty(batch_size, cpu_options(torch::kInt64));
+    auto moves_since_capture = torch::empty(batch_size, cpu_options(torch::kInt64));
     auto mask_alive = torch::ones(batch_size, cpu_options(torch::kBool));
 
     auto board_ptr = board.data_ptr<int8_t>();
@@ -110,6 +113,7 @@ TensorStateBatch FromGameStates(
     auto pending_captures_remaining_ptr = pending_captures_remaining.data_ptr<int64_t>();
     auto forced_removals_ptr = forced_removals_done.data_ptr<int64_t>();
     auto move_count_ptr = move_count.data_ptr<int64_t>();
+    auto moves_since_capture_ptr = moves_since_capture.data_ptr<int64_t>();
 
     for (int64_t b = 0; b < batch_size; ++b) {
         const GameState& state = states[b];
@@ -130,6 +134,7 @@ TensorStateBatch FromGameStates(
         pending_captures_remaining_ptr[b] = state.pending_captures_remaining;
         forced_removals_ptr[b] = state.forced_removals_done;
         move_count_ptr[b] = state.move_count;
+        moves_since_capture_ptr[b] = state.moves_since_capture;
     }
 
     TensorStateBatch host_batch{
@@ -144,6 +149,7 @@ TensorStateBatch FromGameStates(
         pending_captures_remaining,
         forced_removals_done,
         move_count,
+        moves_since_capture,
         mask_alive,
         kBoardSize};
 
@@ -163,6 +169,7 @@ TensorStateBatch FromGameStates(
     device_batch.pending_captures_remaining = host_batch.pending_captures_remaining.to(norm_device, true);
     device_batch.forced_removals_done = host_batch.forced_removals_done.to(norm_device, true);
     device_batch.move_count = host_batch.move_count.to(norm_device, true);
+    device_batch.moves_since_capture = host_batch.moves_since_capture.to(norm_device, true);
     device_batch.mask_alive = host_batch.mask_alive.to(norm_device, true);
     device_batch.board_size = host_batch.board_size;
     return device_batch;
@@ -199,6 +206,7 @@ std::vector<GameState> ToGameStates(const TensorStateBatch& batch) {
     auto pending_captures_remaining_cpu = to_cpu(batch.pending_captures_remaining, torch::kInt64);
     auto forced_removals_cpu = to_cpu(batch.forced_removals_done, torch::kInt64);
     auto move_count_cpu = to_cpu(batch.move_count, torch::kInt64);
+    auto moves_since_capture_cpu = to_cpu(batch.moves_since_capture, torch::kInt64);
 
     const int8_t* board_ptr = board_cpu.data_ptr<int8_t>();
     const bool* marks_black_ptr = marks_black_cpu.data_ptr<bool>();
@@ -211,6 +219,7 @@ std::vector<GameState> ToGameStates(const TensorStateBatch& batch) {
     const int64_t* pending_captures_remaining_ptr = pending_captures_remaining_cpu.data_ptr<int64_t>();
     const int64_t* forced_removals_ptr = forced_removals_cpu.data_ptr<int64_t>();
     const int64_t* move_count_ptr = move_count_cpu.data_ptr<int64_t>();
+    const int64_t* moves_since_capture_ptr = moves_since_capture_cpu.data_ptr<int64_t>();
 
     std::vector<GameState> states;
     states.reserve(batch_size);
@@ -240,6 +249,7 @@ std::vector<GameState> ToGameStates(const TensorStateBatch& batch) {
         state.pending_captures_remaining = static_cast<int>(pending_captures_remaining_ptr[b]);
         state.forced_removals_done = static_cast<int>(forced_removals_ptr[b]);
         state.move_count = static_cast<int>(move_count_ptr[b]);
+        state.moves_since_capture = static_cast<int>(moves_since_capture_ptr[b]);
 
         states.push_back(state);
     }

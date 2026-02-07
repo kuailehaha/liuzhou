@@ -131,7 +131,7 @@ TODO以产生时间为准。
 - [x] `evaluate.play_single_game` 使用 `is_game_over()` 统一判终
 - [x] C++ `GameState` 添加 `moves_since_capture` 和 `kNoCaptureDrawLimit`
 - [x] `state_io.py` 序列化/反序列化兼容
-- [ ] C++ tensor-level batch apply (CPU/CUDA) 添加 `moves_since_capture` 追踪——需修改 `BatchInputs`/`BatchOutputs`、所有函数签名、CUDA kernel 参数和 Python 绑定
+- [x] C++ tensor-level batch apply (CPU/CUDA) 添加 `moves_since_capture` 追踪——已修改 `BatchInputs`/`BatchOutputs`、所有函数签名、CUDA kernel 参数和 Python 绑定
 
 ### 2026.01.27
 

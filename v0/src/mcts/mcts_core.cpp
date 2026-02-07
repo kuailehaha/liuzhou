@@ -520,6 +520,7 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
                     batch_device.pending_captures_remaining,
                     batch_device.forced_removals_done,
                     batch_device.move_count,
+                    batch_device.moves_since_capture,
                     action_tensor_device,
                     parent_tensor_device);
 
@@ -535,6 +536,7 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
                     std::get<8>(next_batch),
                     std::get<9>(next_batch),
                     std::get<10>(next_batch),
+                    std::get<11>(next_batch),
                     torch::ones(std::get<0>(next_batch).size(0), BoolCPU()),
                     batch_cpu.board_size};
 

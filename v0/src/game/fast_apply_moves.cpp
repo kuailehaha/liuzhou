@@ -25,6 +25,7 @@ struct BatchInputs {
     const int64_t* pending_captures_remaining;
     const int64_t* forced_removals_done;
     const int64_t* move_count;
+    const int64_t* moves_since_capture;
 };
 
 struct BatchOutputs {
@@ -39,6 +40,7 @@ struct BatchOutputs {
     int64_t* pending_captures_remaining;
     int64_t* forced_removals_done;
     int64_t* move_count;
+    int64_t* moves_since_capture;
 };
 
 struct ActionEntry {
@@ -619,6 +621,7 @@ void apply_action(
     out.pending_captures_remaining[out_index] = in.pending_captures_remaining[parent];
     out.forced_removals_done[out_index] = in.forced_removals_done[parent];
     out.move_count[out_index] = in.move_count[parent];
+    out.moves_since_capture[out_index] = in.moves_since_capture[parent];
 
     int64_t& phase = out.phase[out_index];
     int64_t& current_player = out.current_player[out_index];
@@ -628,6 +631,8 @@ void apply_action(
     int64_t& pending_captures_remaining = out.pending_captures_remaining[out_index];
     int64_t& forced_removals_done = out.forced_removals_done[out_index];
     int64_t& move_count = out.move_count[out_index];
+    int64_t& moves_since_capture = out.moves_since_capture[out_index];
+    int64_t phase_before = phase;
 
     switch (action.kind) {
         case kActionPlacement:
@@ -726,12 +731,31 @@ void apply_action(
         default:
             TORCH_CHECK(false, "Unsupported action kind: ", action.kind);
     }
+
+    // Track moves_since_capture for no-capture draw detection
+    if (phase_before == kPhasePlacement || phase_before == kPhaseMarkSelection) {
+        moves_since_capture = 0;
+    } else {
+        // Compare total piece count before and after to detect captures
+        const int8_t* parent_board = in.board + parent * cell_count;
+        int old_total = 0, new_total = 0;
+        for (int i = 0; i < cell_count; ++i) {
+            if (parent_board[i] != 0) ++old_total;
+            if (board_out[i] != 0) ++new_total;
+        }
+        if (new_total < old_total) {
+            moves_since_capture = 0;
+        } else {
+            moves_since_capture = in.moves_since_capture[parent] + 1;
+        }
+    }
 }
 
 }  // namespace
 
 #if defined(V0_HAS_CUDA_APPLY_MOVES)
 std::tuple<
+    torch::Tensor,
     torch::Tensor,
     torch::Tensor,
     torch::Tensor,
@@ -755,11 +779,13 @@ batch_apply_moves_cuda(
     torch::Tensor pending_captures_remaining,
     torch::Tensor forced_removals_done,
     torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
     torch::Tensor action_codes,
     torch::Tensor parent_indices);
 #endif
 
 std::tuple<
+    torch::Tensor,
     torch::Tensor,
     torch::Tensor,
     torch::Tensor,
@@ -783,6 +809,7 @@ batch_apply_moves_cpu(
     torch::Tensor pending_captures_remaining,
     torch::Tensor forced_removals_done,
     torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
     torch::Tensor action_codes,
     torch::Tensor parent_indices) {
     TORCH_CHECK(board.device().is_cpu(), "batch_apply_moves currently supports CPU tensors only.");
@@ -800,6 +827,7 @@ batch_apply_moves_cpu(
     pending_captures_remaining = pending_captures_remaining.contiguous();
     forced_removals_done = forced_removals_done.contiguous();
     move_count = move_count.contiguous();
+    moves_since_capture = moves_since_capture.contiguous();
     action_codes = action_codes.contiguous();
     parent_indices = parent_indices.contiguous();
 
@@ -829,6 +857,7 @@ batch_apply_moves_cpu(
     torch::Tensor out_pending_captures_remaining = torch::empty({num_actions}, options_long);
     torch::Tensor out_forced_removals_done = torch::empty({num_actions}, options_long);
     torch::Tensor out_move_count = torch::empty({num_actions}, options_long);
+    torch::Tensor out_moves_since_capture = torch::empty({num_actions}, options_long);
 
     BatchInputs in{
         board.data_ptr<int8_t>(),
@@ -842,6 +871,7 @@ batch_apply_moves_cpu(
         pending_captures_remaining.data_ptr<int64_t>(),
         forced_removals_done.data_ptr<int64_t>(),
         move_count.data_ptr<int64_t>(),
+        moves_since_capture.data_ptr<int64_t>(),
     };
 
     BatchOutputs out{
@@ -856,6 +886,7 @@ batch_apply_moves_cpu(
         out_pending_captures_remaining.data_ptr<int64_t>(),
         out_forced_removals_done.data_ptr<int64_t>(),
         out_move_count.data_ptr<int64_t>(),
+        out_moves_since_capture.data_ptr<int64_t>(),
     };
 
     const auto* action_ptr = action_codes.data_ptr<int32_t>();
@@ -885,10 +916,12 @@ batch_apply_moves_cpu(
         out_pending_captures_remaining,
         out_forced_removals_done,
         out_move_count,
+        out_moves_since_capture,
     };
 }
 
 std::tuple<
+    torch::Tensor,
     torch::Tensor,
     torch::Tensor,
     torch::Tensor,
@@ -912,6 +945,7 @@ batch_apply_moves(
     torch::Tensor pending_captures_remaining,
     torch::Tensor forced_removals_done,
     torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
     torch::Tensor action_codes,
     torch::Tensor parent_indices) {
     if (board.device().is_cuda()) {
@@ -928,6 +962,7 @@ batch_apply_moves(
             std::move(pending_captures_remaining),
             std::move(forced_removals_done),
             std::move(move_count),
+            std::move(moves_since_capture),
             std::move(action_codes),
             std::move(parent_indices));
 #else
@@ -950,6 +985,7 @@ batch_apply_moves(
         std::move(pending_captures_remaining),
         std::move(forced_removals_done),
         std::move(move_count),
+        std::move(moves_since_capture),
         std::move(action_codes),
         std::move(parent_indices));
 }

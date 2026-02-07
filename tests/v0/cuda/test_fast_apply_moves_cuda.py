@@ -107,6 +107,7 @@ def _state_tensors() -> Tuple[torch.Tensor, ...]:
     pending_captures_remaining = torch.tensor(0, dtype=torch.int64, device=device)
     forced_removals_done = torch.tensor(0, dtype=torch.int64, device=device)
     move_count = torch.tensor(0, dtype=torch.int64, device=device)
+    moves_since_capture = torch.tensor(0, dtype=torch.int64, device=device)
     return (
         board,
         marks_black,
@@ -119,6 +120,7 @@ def _state_tensors() -> Tuple[torch.Tensor, ...]:
         pending_captures_remaining,
         forced_removals_done,
         move_count,
+        moves_since_capture,
     )
 
 
@@ -135,6 +137,7 @@ def _sample_action_state(kind: int) -> Tuple[Tuple[torch.Tensor, ...], Tuple[int
         pending_captures_remaining,
         forced_removals_done,
         move_count,
+        moves_since_capture,
     ) = _state_tensors()
 
     def rand_cell() -> int:
@@ -235,6 +238,7 @@ def _sample_action_state(kind: int) -> Tuple[Tuple[torch.Tensor, ...], Tuple[int
         pending_captures_remaining,
         forced_removals_done,
         move_count,
+        moves_since_capture,
     )
     return tensors, action
 
@@ -255,6 +259,7 @@ def _random_apply_batch(num_actions: int) -> Tuple[torch.Tensor, ...]:
     pending_captures_remaining: List[torch.Tensor] = []
     forced_removals_done: List[torch.Tensor] = []
     move_count: List[torch.Tensor] = []
+    moves_since_capture: List[torch.Tensor] = []
     actions: List[torch.Tensor] = []
 
     kinds = [
@@ -282,6 +287,7 @@ def _random_apply_batch(num_actions: int) -> Tuple[torch.Tensor, ...]:
             pc_rem,
             forced,
             moves,
+            msc,
         ) = tensors
 
         boards.append(board)
@@ -295,6 +301,7 @@ def _random_apply_batch(num_actions: int) -> Tuple[torch.Tensor, ...]:
         pending_captures_remaining.append(pc_rem)
         forced_removals_done.append(forced)
         move_count.append(moves)
+        moves_since_capture.append(msc)
         actions.append(torch.tensor(action, dtype=torch.int32))
 
     parent_indices = torch.arange(num_actions, dtype=torch.int64)
@@ -311,6 +318,7 @@ def _random_apply_batch(num_actions: int) -> Tuple[torch.Tensor, ...]:
         torch.stack(pending_captures_remaining, dim=0),
         torch.stack(forced_removals_done, dim=0),
         torch.stack(move_count, dim=0),
+        torch.stack(moves_since_capture, dim=0),
         torch.stack(actions, dim=0),
         parent_indices,
     )
