@@ -193,6 +193,8 @@ def train_network(
     device: str = 'cpu',
     board_size: int = GameState.BOARD_SIZE,
     use_amp: bool = True,
+    num_workers: Optional[int] = None,
+    prefetch_factor: Optional[int] = None,
 ) -> Tuple[ChessNet, Dict[str, Any]]:
     """
     使用生成的训练数据训练神经网络。
@@ -226,15 +228,23 @@ def train_network(
     # 创建数据集和数据加载器
     dataset = ChessDataset(examples, precompute_tensors=True)
     _on_cuda = str(device) != 'cpu' and torch.cuda.is_available()
-    _num_workers = min(os.cpu_count() or 4, 16) if len(examples) > 1000 else 2
+    if num_workers is not None:
+        _num_workers = max(0, int(num_workers))
+    elif len(examples) > 10000:
+        _num_workers = min(os.cpu_count() or 4, 32)
+    elif len(examples) > 1000:
+        _num_workers = min(os.cpu_count() or 4, 16)
+    else:
+        _num_workers = 2
+    _prefetch = prefetch_factor if prefetch_factor is not None else (8 if (_num_workers >= 8 and batch_size >= 1024) else 2)
     dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
         collate_fn=mcts_collate_fn,
         num_workers=_num_workers,
         pin_memory=_on_cuda,
-        prefetch_factor=2,
+        prefetch_factor=_prefetch if _num_workers > 0 else None,
         persistent_workers=(_num_workers > 0),
         drop_last=True,      # Ensure even batch sizes for DataParallel
     )
@@ -260,7 +270,7 @@ def train_network(
 
     print(f"[train] batch_size={batch_size}, steps/epoch={len(dataloader)}, "
           f"total_steps={total_train_steps}, num_workers={_num_workers}, "
-          f"AMP={'ON' if _use_amp else 'OFF'}, device={device}")
+          f"prefetch_factor={_prefetch}, AMP={'ON' if _use_amp else 'OFF'}, device={device}")
     
     # 创建损失函数
     value_draw_weight = max(0.0, float(value_draw_weight))
@@ -282,10 +292,11 @@ def train_network(
         soft_batches = 0
         
         for batch_idx, (states_tensor_batch, batch_legal_moves, batch_target_policies, target_values_batch, soft_values_batch) in enumerate(dataloader):
-            states_tensor_batch = states_tensor_batch.to(device)
-            target_values_batch = target_values_batch.to(device)
-            soft_values_batch = soft_values_batch.to(device)
-            # batch_target_policies is a list of tensors, they will be moved to device inside the loop
+            states_tensor_batch = states_tensor_batch.to(device, non_blocking=True)
+            target_values_batch = target_values_batch.to(device, non_blocking=True)
+            soft_values_batch = soft_values_batch.to(device, non_blocking=True)
+            # Pre-move all target policy tensors to device once (avoids 4k+ .to(device) in loop)
+            batch_target_policies = [p.to(device, non_blocking=True) for p in batch_target_policies]
 
             optimizer.zero_grad(set_to_none=True)
             
@@ -320,7 +331,7 @@ def train_network(
                 log_pmc_sample = log_pmc_batch[i]
                 
                 legal_moves_sample = batch_legal_moves[i]
-                target_policy_sample = batch_target_policies[i].to(device) # MCTS target policy (probabilities)
+                target_policy_sample = batch_target_policies[i]  # already on device
 
                 if not legal_moves_sample or target_policy_sample.nelement() == 0:
                     # 如果没有合法走法或MCTS策略为空，则跳过此样本的策略损失计算

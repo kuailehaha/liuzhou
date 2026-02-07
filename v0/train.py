@@ -623,6 +623,8 @@ def train_pipeline_v0(
                     device_ids=train_device_ids,
                     output_device=train_device_ids[0],
                 )
+            train_num_workers = train_cfg.get("num_workers")
+            train_prefetch_factor = train_cfg.get("prefetch_factor")
             train_model, train_metrics_data = baseline_train.train_network(
                 model=train_model,
                 examples=examples,
@@ -635,6 +637,8 @@ def train_pipeline_v0(
                 policy_draw_weight=policy_draw_weight,
                 device=train_device,
                 board_size=board_size,
+                num_workers=train_num_workers,
+                prefetch_factor=train_prefetch_factor,
             )
             if isinstance(train_model, torch.nn.DataParallel):
                 current_model = train_model.module
