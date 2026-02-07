@@ -96,8 +96,10 @@ def _summarize_legal_moves_cache(
 class ChessDataset(Dataset):
     """
     用于训练神经网络的数据集。
+    支持预计算状态张量以加速多 epoch 数据加载。
     """
-    def __init__(self, examples: List[Tuple[GameState, np.ndarray, Optional[List[dict]], float, float]]):
+    def __init__(self, examples: List[Tuple[GameState, np.ndarray, Optional[List[dict]], float, float]],
+                 precompute_tensors: bool = True):
         """
         初始化数据集。
         
@@ -105,8 +107,29 @@ class ChessDataset(Dataset):
             examples: 一个列表，每个元素是一个元组 (GameState, mcts_policy_array, legal_moves, value, soft_value)。
                       mcts_policy_array 是对应 GameState 所有合法走法的MCTS搜索概率。
                       legal_moves 是预计算的合法走法列表。
+            precompute_tensors: 是否预先将所有 GameState 转为张量（trade CPU time for faster epochs）。
         """
         self.examples = examples
+        self._precomputed: Optional[List[torch.Tensor]] = None
+        self._legal_moves_cache: Optional[List[List[MoveType]]] = None
+
+        if precompute_tensors and examples:
+            print(f"[ChessDataset] Pre-computing {len(examples)} state tensors...")
+            _t0 = time.time()
+            self._precomputed = []
+            self._legal_moves_cache = []
+            for ex in examples:
+                state_obj = ex[0]
+                self._precomputed.append(
+                    state_to_tensor(state_obj, state_obj.current_player).squeeze(0)
+                )
+                legal_moves = ex[2]
+                mcts_policy = ex[1]
+                policy_len = len(mcts_policy) if mcts_policy is not None else 0
+                if legal_moves is None or (len(legal_moves) == 0 and policy_len > 0):
+                    legal_moves = generate_all_legal_moves(state_obj)
+                self._legal_moves_cache.append(legal_moves)
+            print(f"[ChessDataset] Pre-computation done in {time.time() - _t0:.1f}s")
     
     def __len__(self):
         return len(self.examples)
@@ -114,8 +137,11 @@ class ChessDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, List[MoveType], torch.Tensor, torch.Tensor, torch.Tensor]:
         state_obj, mcts_policy, legal_moves, value, soft_value = self.examples[idx]
 
-        # Convert state to tensor.
-        state_tensor = state_to_tensor(state_obj, state_obj.current_player).squeeze(0)
+        # Use pre-computed tensor if available, otherwise compute on the fly.
+        if self._precomputed is not None:
+            state_tensor = self._precomputed[idx]
+        else:
+            state_tensor = state_to_tensor(state_obj, state_obj.current_player).squeeze(0)
 
         # Convert policy to tensor.
         mcts_policy_tensor = torch.FloatTensor(mcts_policy)
@@ -124,11 +150,13 @@ class ChessDataset(Dataset):
         value_tensor = torch.FloatTensor([value])
         soft_tensor = torch.FloatTensor([soft_value])
 
-        # Use cached legal moves unless missing, or empty while policy is non-empty.
-        policy_len = int(mcts_policy_tensor.numel())
-        if legal_moves is None or (len(legal_moves) == 0 and policy_len > 0):
-            # Legacy data or missing cache: regenerate to match policy ordering.
-            legal_moves = generate_all_legal_moves(state_obj)
+        # Use cached legal moves.
+        if self._legal_moves_cache is not None:
+            legal_moves = self._legal_moves_cache[idx]
+        else:
+            policy_len = int(mcts_policy_tensor.numel())
+            if legal_moves is None or (len(legal_moves) == 0 and policy_len > 0):
+                legal_moves = generate_all_legal_moves(state_obj)
 
         # Ensure policy length matches legal moves.
         if len(legal_moves) != len(mcts_policy_tensor):
@@ -163,7 +191,8 @@ def train_network(
     value_draw_weight: float = 1.0,
     policy_draw_weight: float = 1.0,
     device: str = 'cpu',
-    board_size: int = GameState.BOARD_SIZE
+    board_size: int = GameState.BOARD_SIZE,
+    use_amp: bool = True,
 ) -> Tuple[ChessNet, Dict[str, Any]]:
     """
     使用生成的训练数据训练神经网络。
@@ -195,20 +224,43 @@ def train_network(
 
     
     # 创建数据集和数据加载器
-    dataset = ChessDataset(examples)
+    dataset = ChessDataset(examples, precompute_tensors=True)
+    _on_cuda = str(device) != 'cpu' and torch.cuda.is_available()
+    _num_workers = min(os.cpu_count() or 4, 16) if len(examples) > 1000 else 2
     dataloader = DataLoader(
         dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         collate_fn=mcts_collate_fn,
-        num_workers=4,       # Enable parallel data loading
-        pin_memory=True,     # Accelerate CPU->GPU transfer
-        prefetch_factor=2,   # Prefetch 2 batches per worker
-        persistent_workers=True,  # Keep workers alive between epochs
+        num_workers=_num_workers,
+        pin_memory=_on_cuda,
+        prefetch_factor=2,
+        persistent_workers=(_num_workers > 0),
+        drop_last=True,      # Ensure even batch sizes for DataParallel
     )
     
     # 创建优化器
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # 学习率调度器: OneCycleLR (warmup 10% + cosine annealing)
+    total_train_steps = max(1, len(dataloader) * epochs)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=total_train_steps,
+        pct_start=0.1,
+        anneal_strategy='cos',
+        div_factor=10,          # initial_lr = lr / 10
+        final_div_factor=100,   # final_lr  = initial_lr / 100
+    )
+
+    # AMP (Automatic Mixed Precision) for faster compute
+    _use_amp = use_amp and _on_cuda
+    scaler = torch.amp.GradScaler('cuda', enabled=_use_amp)
+
+    print(f"[train] batch_size={batch_size}, steps/epoch={len(dataloader)}, "
+          f"total_steps={total_train_steps}, num_workers={_num_workers}, "
+          f"AMP={'ON' if _use_amp else 'OFF'}, device={device}")
     
     # 创建损失函数
     value_draw_weight = max(0.0, float(value_draw_weight))
@@ -235,10 +287,11 @@ def train_network(
             soft_values_batch = soft_values_batch.to(device)
             # batch_target_policies is a list of tensors, they will be moved to device inside the loop
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-            # 前向传播 (整个批次)
-            log_p1_batch, log_p2_batch, log_pmc_batch, value_pred_batch = model(states_tensor_batch)
+            # 前向传播 (整个批次) with AMP autocast
+            with torch.amp.autocast('cuda', enabled=_use_amp):
+                log_p1_batch, log_p2_batch, log_pmc_batch, value_pred_batch = model(states_tensor_batch)
             
             current_batch_policy_loss = torch.tensor(0.0, device=device)
             y_mix = (1.0 - soft_label_alpha) * target_values_batch + soft_label_alpha * soft_values_batch
@@ -316,9 +369,13 @@ def train_network(
             loss = averaged_batch_policy_loss + current_batch_value_loss # current_batch_value_loss is already averaged by MSELoss (default reduction='mean')
             
             if valid_policy_samples_in_batch > 0 or current_batch_value_loss.requires_grad : # Ensure there's something to backprop
-                # 反向传播
-                loss.backward()
-                optimizer.step()
+                # 反向传播 (with AMP scaler + gradient clipping)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            scheduler.step()
             
             # 累积损失 (用于打印)
             total_loss_epoch += loss.item() * states_tensor_batch.size(0) # Weighted by batch size if some were skipped
