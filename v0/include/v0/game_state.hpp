@@ -12,6 +12,7 @@ namespace v0 {
 constexpr int kBoardSize = 6;
 constexpr int kCellCount = kBoardSize * kBoardSize;
 constexpr int kMaxMoveCount = 144;
+constexpr int kNoCaptureDrawLimit = 36;  // 18回合无吃子判和
 
 inline int CellIndex(int row, int col) {
     return row * kBoardSize + col;
@@ -105,6 +106,7 @@ class GameState {
     int32_t pending_marks_remaining{0};
     int32_t pending_captures_required{0};
     int32_t pending_captures_remaining{0};
+    int32_t moves_since_capture{0};
 
     int8_t BoardAt(int row, int col) const {
         return board[CellIndex(row, col)];
@@ -124,7 +126,8 @@ class GameState {
 
     bool IsBoardFull() const;
     bool HasReachedMoveLimit() const {
-        return move_count >= kMaxMoveCount;
+        return move_count >= kMaxMoveCount ||
+               moves_since_capture >= kNoCaptureDrawLimit;
     }
 
     int CountPlayerPieces(Player player) const;

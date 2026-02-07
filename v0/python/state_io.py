@@ -101,6 +101,7 @@ def state_to_dict(state: GameState) -> Dict:
         "pending_marks_remaining": int(state.pending_marks_remaining),
         "pending_captures_required": int(state.pending_captures_required),
         "pending_captures_remaining": int(state.pending_captures_remaining),
+        "moves_since_capture": int(state.moves_since_capture),
     }
 
 
@@ -118,6 +119,7 @@ def state_from_dict(data: Dict) -> GameState:
         pending_marks_remaining=int(data.get("pending_marks_remaining", 0)),
         pending_captures_required=int(data.get("pending_captures_required", 0)),
         pending_captures_remaining=int(data.get("pending_captures_remaining", 0)),
+        moves_since_capture=int(data.get("moves_since_capture", 0)),
     )
 
 

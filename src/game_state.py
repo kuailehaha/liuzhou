@@ -27,6 +27,7 @@ class Player(Enum):
 class GameState:
     BOARD_SIZE = 6
     MAX_MOVE_COUNT = 144
+    NO_CAPTURE_DRAW_LIMIT = 36  # 18回合无吃子判和（每回合双方各一步 = 36 actions）
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class GameState:
         pending_marks_remaining: int = 0,
         pending_captures_required: int = 0,
         pending_captures_remaining: int = 0,
+        moves_since_capture: int = 0,
     ):
         if board is None:
             board = [[0] * self.BOARD_SIZE for _ in range(self.BOARD_SIZE)]
@@ -53,6 +55,7 @@ class GameState:
         self.marked_white = marked_white if marked_white is not None else set()
         self.forced_removals_done = forced_removals_done
         self.move_count = move_count
+        self.moves_since_capture = moves_since_capture
 
         # Pending tasks created when某一步形成方/洲或触发提子。
         self.pending_marks_required = pending_marks_required
@@ -74,13 +77,15 @@ class GameState:
             pending_marks_remaining=self.pending_marks_remaining,
             pending_captures_required=self.pending_captures_required,
             pending_captures_remaining=self.pending_captures_remaining,
+            moves_since_capture=self.moves_since_capture,
         )
 
     def switch_player(self):
         self.current_player = self.current_player.opponent()
 
     def has_reached_move_limit(self) -> bool:
-        return self.move_count >= self.MAX_MOVE_COUNT
+        return (self.move_count >= self.MAX_MOVE_COUNT or
+                self.moves_since_capture >= self.NO_CAPTURE_DRAW_LIMIT)
 
     def is_board_full(self) -> bool:
         return all(cell != 0 for row in self.board for cell in row)
@@ -146,6 +151,7 @@ class GameState:
             f"Pending Captures: {self.pending_captures_remaining}/{self.pending_captures_required}"
         )
         rows.append(f"Move Count: {self.move_count}")
+        rows.append(f"Moves Since Capture: {self.moves_since_capture}")
         return "\n".join(rows)
 
     def get_winner(self) -> Optional[Player]:

@@ -120,6 +120,22 @@ def apply_move(state: GameState, move: MoveType, quiet: bool = False) -> GameSta
         raise ValueError(f"不支持的阶段: {state.phase}")
 
     new_state.move_count = state.move_count + 1
+
+    # Track "no capture" for draw detection (类似中国象棋的无吃子判和规则)
+    if state.phase in (Phase.PLACEMENT, Phase.MARK_SELECTION):
+        # 落子阶段不跟踪
+        new_state.moves_since_capture = 0
+    else:
+        # 比较走子前后棋子总数，若有棋子被移除则重置计数
+        old_total = (state.count_player_pieces(Player.BLACK)
+                     + state.count_player_pieces(Player.WHITE))
+        new_total = (new_state.count_player_pieces(Player.BLACK)
+                     + new_state.count_player_pieces(Player.WHITE))
+        if new_total < old_total:
+            new_state.moves_since_capture = 0
+        else:
+            new_state.moves_since_capture = state.moves_since_capture + 1
+
     return new_state
 
 

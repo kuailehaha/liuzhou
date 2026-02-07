@@ -386,7 +386,7 @@ def play_single_game(
     move_count = 0
     log = print if verbose else (lambda *args, **kwargs: None)
 
-    while move_count < max_moves:
+    while move_count < max_moves and not state.is_game_over():
         current_player = state.current_player
         active_agent = agent_black if current_player == Player.BLACK else agent_white
 
@@ -407,6 +407,12 @@ def play_single_game(
         winner = state.get_winner()
         if winner is not None:
             return 1.0 if winner == Player.BLACK else -1.0 if winner == Player.WHITE else 0.0
+
+        # 检查无吃子判和或总步数上限
+        if state.has_reached_move_limit():
+            log(f"Game ended: move limit reached (move_count={state.move_count}, "
+                f"moves_since_capture={state.moves_since_capture}).")
+            return 0.0
 
     return 0.0
 
