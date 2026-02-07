@@ -135,6 +135,7 @@ def train_pipeline_v0(
     policy_draw_weight: float = 0.3,
     eval_games_vs_random: int = 20,
     eval_games_vs_best: int = 20,
+    eval_games_vs_previous: int = 0,
     win_rate_threshold: float = 0.55,
     mcts_sims_eval: int = 100,
     eval_workers: int = 0,
@@ -267,6 +268,7 @@ def train_pipeline_v0(
         mcts_sims_eval = evaluation_cfg["mcts_simulations"]
     eval_games_vs_random = evaluation_cfg.get("games_vs_random", eval_games_vs_random)
     eval_games_vs_best = evaluation_cfg.get("games_vs_best", eval_games_vs_best)
+    eval_games_vs_previous = evaluation_cfg.get("games_vs_previous", eval_games_vs_previous)
     eval_workers_cfg = evaluation_cfg.get("workers", evaluation_cfg.get("num_workers", eval_workers))
     try:
         eval_workers = int(eval_workers_cfg) if eval_workers_cfg is not None else 0
@@ -575,6 +577,17 @@ def train_pipeline_v0(
                 devices=self_play_devices_list,
             )
             training_data = training_data or []
+            sp_wins = sum(1 for g in training_data if g[3] > 0)
+            sp_losses = sum(1 for g in training_data if g[3] < 0)
+            sp_draws = sum(1 for g in training_data if g[3] == 0)
+            iteration_metrics["self_play_wins"] = sp_wins
+            iteration_metrics["self_play_losses"] = sp_losses
+            iteration_metrics["self_play_draws"] = sp_draws
+            if training_data:
+                print(
+                    f"Self-play outcomes: {sp_wins} wins, {sp_losses} losses, {sp_draws} draws "
+                    f"(draw rate {sp_draws / len(training_data):.1%})"
+                )
             if decisive_only:
                 before_games = len(training_data)
                 # Result is at index 3 in new 5-tuple: (states, policies, legal_moves, result, soft)
@@ -780,6 +793,69 @@ def train_pipeline_v0(
             f"(win {stats_vs_rnd.win_rate:.2%} / loss {stats_vs_rnd.loss_rate:.2%} / draw {stats_vs_rnd.draw_rate:.2%})"
         )
 
+        win_rate_vs_previous = None
+        if eval_games_vs_previous > 0 and iteration >= 1:
+            previous_model_path = os.path.join(checkpoint_dir, f"model_iter_{iteration}.pt")
+            if os.path.exists(previous_model_path):
+                print(f"Evaluating challenger vs previous iteration ({eval_games_vs_previous} games)...")
+                if eval_workers > 1:
+                    if eval_backend == "v0":
+                        stats_vs_prev = evaluate_against_agent_parallel_v0(
+                            challenger_checkpoint=iter_model_path,
+                            opponent_checkpoint=previous_model_path,
+                            num_games=eval_games_vs_previous,
+                            device=eval_device,
+                            mcts_simulations=mcts_sims_eval,
+                            temperature=eval_temperature,
+                            add_dirichlet_noise=eval_add_dirichlet,
+                            num_workers=eval_workers,
+                            devices=eval_devices_list,
+                            verbose=eval_verbose,
+                            game_verbose=eval_game_verbose,
+                            mcts_verbose=eval_mcts_verbose,
+                            sample_moves=True,
+                            **v0_eval_kwargs,
+                        )
+                    else:
+                        stats_vs_prev = evaluate_against_agent_parallel(
+                            challenger_checkpoint=iter_model_path,
+                            opponent_checkpoint=previous_model_path,
+                            num_games=eval_games_vs_previous,
+                            device=eval_device,
+                            mcts_simulations=mcts_sims_eval,
+                            temperature=eval_temperature,
+                            add_dirichlet_noise=eval_add_dirichlet,
+                            num_workers=eval_workers,
+                            devices=eval_devices_list,
+                            verbose=eval_verbose,
+                            game_verbose=eval_game_verbose,
+                            mcts_verbose=eval_mcts_verbose,
+                            sample_moves=True,
+                        )
+                else:
+                    prev_checkpoint = torch.load(previous_model_path, map_location=eval_device)
+                    prev_model = ChessNet(board_size=board_size, num_input_channels=NUM_INPUT_CHANNELS)
+                    prev_model.load_state_dict(prev_checkpoint["model_state_dict"])
+                    prev_model.to(eval_device)
+                    prev_model.eval()
+                    challenger_agent_prev = _make_eval_agent(current_model, sample_moves=True)
+                    prev_agent = _make_eval_agent(prev_model, sample_moves=True)
+                    stats_vs_prev = evaluate_against_agent(
+                        challenger_agent_prev,
+                        prev_agent,
+                        eval_games_vs_previous,
+                        eval_device,
+                        verbose=eval_verbose,
+                        game_verbose=eval_game_verbose,
+                    )
+                    del challenger_agent_prev, prev_agent, prev_model, prev_checkpoint
+                    _cleanup_gpu()
+                win_rate_vs_previous = stats_vs_prev.win_rate
+                print(
+                    f"Challenger win rate vs previous iter: {win_rate_vs_previous:.2%} "
+                    f"({stats_vs_prev.wins}-{stats_vs_prev.losses}-{stats_vs_prev.draws})"
+                )
+
         win_rate_vs_best_model = None
         stats_vs_best_model = None
         best_model_updated = False
@@ -874,6 +950,7 @@ def train_pipeline_v0(
         iteration_metrics["win_rate_vs_random"] = stats_vs_rnd.win_rate
         iteration_metrics["loss_rate_vs_random"] = stats_vs_rnd.loss_rate
         iteration_metrics["draw_rate_vs_random"] = stats_vs_rnd.draw_rate
+        iteration_metrics["win_rate_vs_previous"] = win_rate_vs_previous
         iteration_metrics["win_rate_vs_best"] = win_rate_vs_best_model
         if stats_vs_best_model is not None:
             iteration_metrics["loss_rate_vs_best"] = stats_vs_best_model.loss_rate
@@ -1074,6 +1151,12 @@ if __name__ == "__main__":
     parser.add_argument("--eval_games_vs_random", type=int, default=4, help="Games vs RandomAgent.")
     parser.add_argument("--eval_games_vs_best", type=int, default=4, help="Games vs BestModel.")
     parser.add_argument(
+        "--eval_games_vs_previous",
+        type=int,
+        default=0,
+        help="Games vs previous iteration (0=disabled). Use to monitor steady improvement.",
+    )
+    parser.add_argument(
         "--eval_workers",
         type=int,
         default=0,
@@ -1156,6 +1239,7 @@ if __name__ == "__main__":
         policy_draw_weight=args.policy_draw_weight,
         eval_games_vs_random=args.eval_games_vs_random,
         eval_games_vs_best=args.eval_games_vs_best,
+        eval_games_vs_previous=args.eval_games_vs_previous,
         eval_workers=args.eval_workers,
         eval_backend=args.eval_backend,
         win_rate_threshold=args.win_rate_threshold,

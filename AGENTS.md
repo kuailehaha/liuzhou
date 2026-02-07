@@ -47,6 +47,7 @@
 
 - 规则改动：先更新规则文档与 Python 逻辑，再检查 v0 参考逻辑与对拍脚本。
 - 训练/评估：`src/train.py` 或 `v0/train.py`；自博弈数据在 `v0/data/`。
+- 训练稳定性与“是否训进去”的判断：见 `TRAINING_STABILITY.md`；推荐使用 `--eval_games_vs_previous` 看对上一迭代胜率。
 - 性能与回归：`tools/benchmark_*` 与 `tests/` 中的对照脚本。
 
 ## Vibe Coding 计划内容
