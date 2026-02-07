@@ -378,7 +378,7 @@ def play_single_game(
     agent_black,
     agent_white,
     initial_state: GameState = None,
-    max_moves: int = 200,
+    max_moves: int = 144,
     verbose: bool = False,
 ) -> float:
     """Play a single game and return the outcome from Black's perspective."""

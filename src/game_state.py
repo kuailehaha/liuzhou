@@ -26,7 +26,7 @@ class Player(Enum):
 
 class GameState:
     BOARD_SIZE = 6
-    MAX_MOVE_COUNT = 200
+    MAX_MOVE_COUNT = 144
 
     def __init__(
         self,

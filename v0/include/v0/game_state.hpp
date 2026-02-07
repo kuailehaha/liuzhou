@@ -11,7 +11,7 @@ namespace v0 {
 
 constexpr int kBoardSize = 6;
 constexpr int kCellCount = kBoardSize * kBoardSize;
-constexpr int kMaxMoveCount = 200;
+constexpr int kMaxMoveCount = 144;
 
 inline int CellIndex(int row, int col) {
     return row * kBoardSize + col;
