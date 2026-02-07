@@ -170,12 +170,15 @@ def batched_policy_loss(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Per-sample KL term: -sum_a target[a]*log_probs[a], then average with policy_draw_weight.
-    log_probs: (B, total_dim), target_dense: (B, total_dim), legal_mask: (B, total_dim), value_batch: (B, 1).
+    Per-sample KL(target || pred) = CE - H(target), then average with policy_draw_weight.
+    Matches legacy KLDivLoss scale (0~1 nats). Gradient equals CE gradient since H(target) is constant.
+    log_probs: (B, total_dim), target_dense: (B, total_dim), value_batch: (B, 1).
     """
     log_probs_safe = log_probs.clamp(min=-50.0)
     ce_per_sample = -(target_dense * log_probs_safe).sum(dim=1)
+    target_entropy = -(target_dense * (target_dense.clamp(min=1e-8).log())).sum(dim=1)
+    kl_per_sample = ce_per_sample - target_entropy
     draw_mask = value_batch.abs().squeeze(1) < 1e-8
     weight = torch.where(draw_mask, log_probs.new_full((), policy_draw_weight), log_probs.new_ones(()))
-    weighted = ce_per_sample * weight
+    weighted = kl_per_sample * weight
     return weighted.sum() / (weight.sum() + eps)

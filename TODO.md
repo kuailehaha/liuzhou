@@ -133,7 +133,7 @@ TODO以产生时间为准。
 - [x] `state_io.py` 序列化/反序列化兼容
 - [x] C++ tensor-level batch apply (CPU/CUDA) 添加 `moves_since_capture` 追踪——已修改 `BatchInputs`/`BatchOutputs`、所有函数签名、CUDA kernel 参数和 Python 绑定
 
-### 2026.01.27
+### 2026.02.07
 
 #### GPU 性能优化调查与改进
 

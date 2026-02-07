@@ -7,7 +7,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 python -m v0.train \
   --iterations 40 \
   --self_play_workers 200 \
-  --self_play_games_per_worker 32 \
+  --self_play_games_per_worker 64 \
   --mcts_simulations 1024 \
   --self_play_batch_leaves 512 \
   --self_play_inference_batch_size 512 \
