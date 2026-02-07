@@ -1,8 +1,8 @@
 from src.game_state import GameState, Phase, Player
 from src.rule_engine import generate_legal_moves_phase1, apply_move_phase1, process_phase2_removals, apply_forced_removal, has_legal_moves_phase3, handle_no_moves_phase3, apply_counter_removal_phase3, apply_move_phase3
 
-# 测试管理器
-class TestManager:
+# 测试管理器（不以 Test 开头，避免被 pytest 收集为测试类）
+class RuleEngineTestManager:
     def __init__(self):
         self.test_results = {}
         self.current_test = None
@@ -70,7 +70,7 @@ class TestManager:
         print("=" * 50)
 
 # 创建全局测试管理器
-test_manager = TestManager()
+test_manager = RuleEngineTestManager()
 
 def main_1():
     # 初始化游戏状态

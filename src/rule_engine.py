@@ -223,6 +223,10 @@ def apply_movement_move(
     quiet: bool = False,
 ) -> GameState:
     (r_from, c_from), (r_to, c_to) = move
+    if not (0 <= r_from < GameState.BOARD_SIZE and 0 <= c_from < GameState.BOARD_SIZE):
+        raise ValueError("起始位置超出棋盘范围")
+    if not (0 <= r_to < GameState.BOARD_SIZE and 0 <= c_to < GameState.BOARD_SIZE):
+        raise ValueError("目标位置超出棋盘范围")
     new_state = state.copy()
     if new_state.phase != Phase.MOVEMENT:
         raise ValueError("当前不是走子阶段")
@@ -612,6 +616,9 @@ def apply_move_phase3(
     quiet: bool = False,
 ) -> GameState:
     new_state = apply_movement_move(state, move, quiet=quiet)
+    if new_state.phase == Phase.CAPTURE_SELECTION:
+        if not capture_positions:
+            raise ValueError("形成方或洲时必须指定提吃目标")
     if capture_positions:
         if new_state.phase != Phase.CAPTURE_SELECTION:
             raise ValueError("当前状态不需要提子，但传入了 capture_positions")
