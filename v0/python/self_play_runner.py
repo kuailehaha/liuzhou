@@ -710,21 +710,30 @@ def self_play_v0(
     }
 
     base_seed = base_seed or random.randint(1, 10**9)
+    max_worker_retries = 3
+
+    def _make_worker_cfg(worker_id: int, retry: int = 0) -> dict:
+        cfg = dict(common_cfg)
+        cfg["device"] = devices_list[worker_id % len(devices_list)]
+        cfg["worker_seed"] = base_seed + 1000003 * worker_id + 7 * retry
+        return cfg
+
+    def _spawn_worker(worker_id: int, retry: int = 0) -> mp.Process:
+        cfg = _make_worker_cfg(worker_id, retry)
+        p = ctx.Process(
+            target=_v0_self_play_worker,
+            args=(worker_id, cfg, model_bytes, return_queue),
+            daemon=False,
+        )
+        p.start()
+        return p
 
     try:
         for worker_id in range(num_workers):
-            worker_cfg = dict(common_cfg)
-            worker_cfg["device"] = devices_list[worker_id % len(devices_list)]
-            worker_cfg["worker_seed"] = base_seed + 1000003 * worker_id
-            process = ctx.Process(
-                target=_v0_self_play_worker,
-                args=(worker_id, worker_cfg, model_bytes, return_queue),
-                daemon=False,
-            )
-            process.start()
-            workers.append(process)
+            workers.append(_spawn_worker(worker_id))
 
         finished = 0
+        retry_counts: Dict[int, int] = {}
         while finished < num_workers:
             status, wid, payload, stats_raw = return_queue.get()
             if status == "ok":
@@ -733,7 +742,20 @@ def self_play_v0(
                     _merge_eval_stats(summary_stats, stats_raw)
                 finished += 1
             else:
-                raise RuntimeError(f"Self-play worker {wid} failed: {payload}")
+                retries = retry_counts.get(wid, 0)
+                if retries < max_worker_retries:
+                    retry_counts[wid] = retries + 1
+                    delay = 2 ** retries  # 1s, 2s, 4s
+                    print(
+                        f"[self-play] Worker {wid} failed (attempt {retries + 1}/{max_worker_retries}), "
+                        f"retrying in {delay}s: {payload}"
+                    )
+                    time.sleep(delay)
+                    workers.append(_spawn_worker(wid, retries + 1))
+                else:
+                    raise RuntimeError(
+                        f"Self-play worker {wid} failed after {max_worker_retries} retries: {payload}"
+                    )
     finally:
         for process in workers:
             if process.is_alive():
