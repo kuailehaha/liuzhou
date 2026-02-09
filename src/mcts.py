@@ -9,7 +9,7 @@ import torch.multiprocessing as mp
 from typing import List, Dict, Tuple, Optional, Set, Any, Union
 from src.game_state import GameState, Player, Phase
 from src.move_generator import generate_all_legal_moves, apply_move, MoveType
-from src.neural_network import ChessNet, state_to_tensor, get_move_probabilities
+from src.neural_network import ChessNet, state_to_tensor, get_move_probabilities, wdl_to_scalar
 
 # 保证所有地方都能用到move_to_key
 
@@ -455,8 +455,8 @@ class MCTS:
 
             # ---- 1.3 批量前向 ----
             with torch.inference_mode():
-                log_p1, log_p2, log_pmc, values = self.model(batch)  # shapes: (B,HW), (B,HW), (B,HW), (B,1)
-                values = values.squeeze(1)  # (B,)
+                log_p1, log_p2, log_pmc, wdl_logits = self.model(batch)  # shapes: (B,HW), (B,HW), (B,HW), (B,3)
+                values = wdl_to_scalar(wdl_logits)  # (B,) scalar values
 
             # ---- 1.4 逐个叶子：展开 + 先验 + 回传 ----
             for bi, i_leaf in enumerate(work_idx):
@@ -606,11 +606,11 @@ class MCTS:
         # 3) 单样本前向（推理友好）
         with torch.inference_mode():  # 比 no_grad 更省开销
             inp = state_to_tensor(node.state, node.player_to_act).to(self.device, non_blocking=True)
-            log_p1, log_p2, log_pmc, value = self.model(inp)   # (1, HW), (1, HW), (1, HW), (1, 1)
+            log_p1, log_p2, log_pmc, wdl_logits = self.model(inp)   # (1, HW), (1, HW), (1, HW), (1, 3)
             log_p1 = log_p1.squeeze(0)  # (HW,)
             log_p2 = log_p2.squeeze(0)
             log_pmc = log_pmc.squeeze(0)
-            v = float(value.squeeze(0).squeeze(0).item())  # 转 python float，避免外面再 .item()
+            v = float(wdl_to_scalar(wdl_logits).squeeze(0).item())  # WDL -> P_win - P_loss
 
         # 4) 先验分布（对合法着法组合打分）
         move_probs, _ = get_move_probabilities(

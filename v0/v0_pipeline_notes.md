@@ -63,7 +63,7 @@ Conclusion: value sign is consistent; no obvious "objective reversed".
 - `v0/train.py` defaults to legacy eval; set `--eval_backend v0` to use v0 MCTS.
   - Legacy: `src.evaluate.MCTSAgent` (legacy MCTS)
   - v0: `src.evaluate.V0MCTSAgent` (v0 core MCTS)
-  - Both use `RandomAgent` and `play_single_game` with `max_moves=200` (draw if limit hit)
+  - Both use `RandomAgent` and `play_single_game` with `max_moves=144` (draw if move limit or no-capture limit hit)
 
 This means:
 - v0 self-play uses v0 MCTS + v0 core rules
@@ -110,4 +110,4 @@ Any divergence between v0 rules and legacy rules can destroy the signal.
 - Temporarily set `soft_label_alpha = 0` to focus value on win/loss.
 - Reduce move limit or add a small win bonus to reduce draws.
 - Use `--eval_games_vs_previous N` to track per-iteration strength improvement (see `TRAINING_STABILITY.md`).
-- Monitor self-play draw rate; if >70%, consider tuning `--self_play_resign_threshold` or `value_draw_weight`.
+- Monitor self-play draw rate; if >70%, consider tuning `--self_play_resign_threshold` or `--policy_draw_weight`.

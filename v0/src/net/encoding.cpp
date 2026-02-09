@@ -79,6 +79,12 @@ torch::Tensor states_to_model_input(
 }
 
 torch::Tensor postprocess_value_head(const torch::Tensor& raw_values) {
+    // WDL head: if raw_values is (..., 3), convert to scalar via softmax -> P_win - P_loss
+    if (raw_values.dim() >= 2 && raw_values.size(-1) == 3) {
+        auto wdl_probs = torch::softmax(raw_values, /*dim=*/-1);
+        return wdl_probs.select(-1, 0) - wdl_probs.select(-1, 2);
+    }
+    // Legacy scalar head: apply tanh
     return torch::tanh(raw_values);
 }
 

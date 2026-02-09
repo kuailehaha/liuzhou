@@ -159,16 +159,20 @@ def _evaluate_position(session: GameSession) -> Dict[str, Any] | None:
 
     current_player = session.state.current_player
     try:
+        from src.neural_network import wdl_to_scalar
         inputs = state_to_tensor(session.state, current_player).to(device)
         with torch.inference_mode():
-            _, _, _, value = model(inputs)
-        raw_value = float(value.squeeze().detach().to("cpu").item())
+            _, _, _, wdl_logits = model(inputs)
+        raw_value = float(wdl_to_scalar(wdl_logits).squeeze().detach().to("cpu").item())
+        wdl_probs = torch.softmax(wdl_logits, dim=-1).squeeze().detach().to("cpu").tolist()
     except Exception:
         return None
 
     return {
         "value": raw_value,
-        "winProbability": (raw_value + 1.0) / 2.0,
+        "winProbability": wdl_probs[0] if len(wdl_probs) == 3 else (raw_value + 1.0) / 2.0,
+        "drawProbability": wdl_probs[1] if len(wdl_probs) == 3 else 0.0,
+        "lossProbability": wdl_probs[2] if len(wdl_probs) == 3 else 1.0 - (raw_value + 1.0) / 2.0,
         "perspective": current_player.name,
         "range": [-1.0, 1.0],
     }

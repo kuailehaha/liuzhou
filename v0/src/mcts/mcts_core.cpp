@@ -389,6 +389,13 @@ void MCTSCore::ExpandBatch(const std::vector<int>& leaves, const std::vector<std
 
         torch::Tensor log_p1, log_p2, log_pmc, values;
         std::tie(log_p1, log_p2, log_pmc, values) = forward_cb_(inputs);
+        // WDL head: if values is (B, 3), convert to scalar (B,) via softmax -> P_win - P_loss
+        if (values.dim() == 2 && values.size(1) == 3) {
+            auto wdl_probs = torch::softmax(values, /*dim=*/1);
+            values = wdl_probs.select(1, 0) - wdl_probs.select(1, 2);
+        } else if (values.dim() == 2 && values.size(1) == 1) {
+            values = values.squeeze(1);
+        }
         DebugLog("ExpandBatch: NN outputs log_p shape " + ShapeToString(log_p1) +
             ", values shape " + ShapeToString(values));
         DebugLog("ExpandBatch: NN outputs devices log_p=" + log_p1.device().str() +

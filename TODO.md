@@ -172,7 +172,7 @@ TODO以产生时间为准。最近审查：2026.02.09
 **不变量**：
 - 规则与阶段语义以 `README.md`、`rule_description.md` 为准。
 - 动作索引与 v0 的 `ActionEncodingSpec`（placement_dim=36, movement_dim=144, selection_dim=36, auxiliary_dim=4, total_dim=220）保持一致，便于日后与 v0 推理/自博弈共用或对拍。
-- 策略损失仍为「仅在合法动作上的 KL」，draw 样本的 policy 权重（policy_draw_weight）与 value 权重（value_draw_weight）逻辑不变。
+- 策略损失仍为「仅在合法动作上的 KL」，draw 样本的 policy 权重用 `policy_draw_weight` 控制。Value loss 使用 WDL cross-entropy，和棋样本无需额外降权。
 
 **重构步骤（细化）**
 

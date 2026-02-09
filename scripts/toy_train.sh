@@ -30,12 +30,11 @@ python -m v0.train \
   --epochs 3 \
   --lr 0.0003 \
   --replay_window 4 \
-  --value_draw_weight 0.1 \
   --policy_draw_weight 0.3 \
   --batch_size 4096 \
   --device cuda \
   --self_play_devices auto \
-  --train_devices auto \
+  --train_devices cuda:0 \
   --eval_devices auto \
   --eval_games_vs_random 200 \
   --eval_games_vs_best 200 \

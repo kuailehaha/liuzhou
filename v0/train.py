@@ -132,7 +132,6 @@ def train_pipeline_v0(
     self_play_resign_min_moves: int = 10,
     self_play_resign_consecutive: int = 3,
     decisive_only: bool = False,
-    value_draw_weight: float = 0.1,
     policy_draw_weight: float = 0.3,
     eval_games_vs_random: int = 20,
     eval_games_vs_best: int = 20,
@@ -249,13 +248,6 @@ def train_pipeline_v0(
         sp_resign_consecutive = int(self_play_resign_consecutive)
     sp_resign_min_moves = max(0, sp_resign_min_moves)
     sp_resign_consecutive = max(1, sp_resign_consecutive)
-
-    try:
-        value_draw_weight = float(value_draw_weight)
-    except (TypeError, ValueError):
-        value_draw_weight = 1.0
-    if value_draw_weight < 0:
-        value_draw_weight = 0.0
 
     try:
         policy_draw_weight = float(policy_draw_weight)
@@ -502,7 +494,6 @@ def train_pipeline_v0(
                 "self_play_resign_min_moves": sp_resign_min_moves,
                 "self_play_resign_consecutive": sp_resign_consecutive,
                 "decisive_only": bool(decisive_only),
-                "value_draw_weight": value_draw_weight,
                 "policy_draw_weight": policy_draw_weight,
                 "eval_backend": eval_backend,
                 "self_play_devices": list(self_play_devices_list),
@@ -669,7 +660,6 @@ def train_pipeline_v0(
                 lr=lr,
                 weight_decay=weight_decay,
                 soft_label_alpha=current_alpha,
-                value_draw_weight=value_draw_weight,
                 policy_draw_weight=policy_draw_weight,
                 device=train_device,
                 board_size=board_size,
@@ -1134,12 +1124,6 @@ if __name__ == "__main__":
         help="Train only on decisive (win/loss) samples; drop draws regardless of soft_value.",
     )
     parser.add_argument(
-        "--value_draw_weight",
-        type=float,
-        default=0.1,
-        help="Weight for draw samples in value loss (1.0 = no downweight).",
-    )
-    parser.add_argument(
         "--policy_draw_weight",
         type=float,
         default=0.3,
@@ -1303,7 +1287,6 @@ if __name__ == "__main__":
         self_play_resign_min_moves=args.self_play_resign_min_moves,
         self_play_resign_consecutive=args.self_play_resign_consecutive,
         decisive_only=args.decisive_only,
-        value_draw_weight=args.value_draw_weight,
         policy_draw_weight=args.policy_draw_weight,
         eval_games_vs_random=args.eval_games_vs_random,
         eval_games_vs_best=args.eval_games_vs_best,

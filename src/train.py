@@ -14,7 +14,7 @@ import json
 from datetime import datetime, timedelta
 
 from src.game_state import GameState, Player, Phase
-from src.neural_network import ChessNet, state_to_tensor, NUM_INPUT_CHANNELS, get_move_probabilities
+from src.neural_network import ChessNet, state_to_tensor, NUM_INPUT_CHANNELS, get_move_probabilities, scalar_to_wdl, wdl_to_scalar
 from src.mcts import self_play
 from src.evaluate import MCTSAgent, RandomAgent, evaluate_against_agent, evaluate_against_agent_parallel
 from src.random_agent import RandomAgent
@@ -204,7 +204,6 @@ def train_network(
     lr: float = 0.001,
     weight_decay: float = 1e-4,
     soft_label_alpha: float = 0.0,
-    value_draw_weight: float = 1.0,
     policy_draw_weight: float = 1.0,
     device: str = 'cpu',
     board_size: int = GameState.BOARD_SIZE,
@@ -223,7 +222,6 @@ def train_network(
         epochs: 训练轮数。
         lr: 学习率。
         weight_decay: 权重衰减。
-        value_draw_weight: draw 样本在 value loss 中的权重（1.0=不降权）。
         policy_draw_weight: draw 样本在 policy loss 中的权重（1.0=不降权）。
         device: 训练设备。
         board_size: 棋盘大小。
@@ -292,7 +290,6 @@ def train_network(
           f"AMP={'ON' if _use_amp else 'OFF'}, device={device}")
     
     # 创建损失函数
-    value_draw_weight = max(0.0, float(value_draw_weight))
     policy_draw_weight = max(0.0, float(policy_draw_weight))
     policy_loss_fn = nn.KLDivLoss(reduction='sum')
     
@@ -325,20 +322,20 @@ def train_network(
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda', enabled=_use_amp):
-                log_p1_batch, log_p2_batch, log_pmc_batch, value_pred_batch = model(states_tensor_batch)
+                log_p1_batch, log_p2_batch, log_pmc_batch, wdl_logits_batch = model(states_tensor_batch)
 
-            y_mix = (1.0 - soft_label_alpha) * target_values_batch + soft_label_alpha * soft_values_batch
-            draw_weight = target_values_batch.new_full((), value_draw_weight)
-            one_weight = target_values_batch.new_ones(())
+            # --- WDL value loss (cross-entropy) ---
+            # Convert scalar targets to WDL distributions, then mix
+            wdl_hard = scalar_to_wdl(target_values_batch)   # (B, 3) one-hot-like
+            wdl_soft = scalar_to_wdl(soft_values_batch)     # (B, 3) soft distribution
+            wdl_target = (1.0 - soft_label_alpha) * wdl_hard + soft_label_alpha * wdl_soft
+            # CE loss: -sum(target * log_softmax(logits)) / B
+            wdl_log_probs = torch.log_softmax(wdl_logits_batch, dim=-1)
+            current_batch_value_loss = -(wdl_target * wdl_log_probs).sum(dim=-1).mean()
+            # Keep draw_mask for policy_draw_weight (still needed for policy loss)
             draw_mask = target_values_batch.abs() < 1e-8
-            weights = torch.where(draw_mask, draw_weight, one_weight)
-            weight_sum = weights.sum()
-            if weight_sum.item() > 0:
-                current_batch_value_loss = (weights * (value_pred_batch - y_mix) ** 2).sum() / weight_sum
-            else:
-                current_batch_value_loss = torch.tensor(0.0, device=device)
             soft_abs_epoch += soft_values_batch.abs().mean().item()
-            mix_abs_epoch += y_mix.abs().mean().item()
+            mix_abs_epoch += (wdl_to_scalar(wdl_target)).abs().mean().item()
             soft_batches += 1
 
             if use_batched_policy:
@@ -400,7 +397,7 @@ def train_network(
                     averaged_batch_policy_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
             loss = averaged_batch_policy_loss + current_batch_value_loss
-            if (use_batched_policy and (target_dense_batch.sum() > 1e-8)) or (not use_batched_policy and valid_policy_samples_in_batch > 0) or current_batch_value_loss.requires_grad:
+            if loss.requires_grad:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

@@ -123,6 +123,12 @@ class PolicyHead(nn.Module):
         )
 
 class ValueHead(nn.Module):
+    """WDL (Win/Draw/Loss) value head.
+
+    Outputs raw logits of shape ``(B, 3)`` representing
+    ``[win, draw, loss]`` probabilities (before softmax).
+    """
+
     def __init__(self, in_channels: int, value_channels: int, mlp_channels: int):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, value_channels, kernel_size=1, bias=False)
@@ -131,12 +137,35 @@ class ValueHead(nn.Module):
         self.gpool = GlobalPool()
         self.fc1 = nn.Linear(3 * value_channels, mlp_channels, bias=True)
         self.act2 = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(mlp_channels, 1, bias=True)
+        self.fc2 = nn.Linear(mlp_channels, 3, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return WDL logits ``(B, 3)`` — no activation applied."""
         v = self.act1(self.bn1(self.conv1(x)))
         v = self.act2(self.fc1(self.gpool(v)))
-        return torch.tanh(self.fc2(v))
+        return self.fc2(v)
+
+def wdl_to_scalar(wdl: torch.Tensor) -> torch.Tensor:
+    """Convert WDL logits ``(*, 3)`` to scalar value in ``[-1, 1]``.
+
+    Applies softmax then returns ``P_win - P_loss``.
+    """
+    probs = torch.softmax(wdl, dim=-1)
+    return probs[..., 0] - probs[..., 2]
+
+
+def scalar_to_wdl(value: torch.Tensor) -> torch.Tensor:
+    """Convert scalar value in ``[-1, 1]`` to a WDL distribution ``(*, 3)``.
+
+    Mapping: ``W = clamp(v, 0)``, ``L = clamp(-v, 0)``, ``D = 1 - W - L``.
+    This gives a valid probability distribution for any ``v in [-1, 1]``.
+    """
+    value = value.squeeze(-1) if value.dim() > 1 and value.size(-1) == 1 else value
+    w = value.clamp(min=0.0)
+    l = (-value).clamp(min=0.0)
+    d = (1.0 - w - l).clamp(min=0.0)
+    return torch.stack([w, d, l], dim=-1)
+
 
 class ChessNet(nn.Module):
     def __init__(
@@ -169,14 +198,16 @@ class ChessNet(nn.Module):
 
     def forward(self, x):
         # x: (batch_size, num_input_channels, board_size, board_size)
+        # Returns: (log_p1, log_p2, log_pmc, wdl_logits)
+        #   wdl_logits: (B, 3) raw logits for [win, draw, loss]
         x = self.stem_act(self.stem_bn(self.stem_conv(x)))
         for block in self.blocks:
             x = block(x)
         x = self.trunk_act(self.trunk_bn(x))
 
         log_policy_pos1, log_policy_pos2, log_policy_mark_capture = self.policy_head(x)
-        value = self.value_head(x)
-        return log_policy_pos1, log_policy_pos2, log_policy_mark_capture, value
+        wdl_logits = self.value_head(x)
+        return log_policy_pos1, log_policy_pos2, log_policy_mark_capture, wdl_logits
 
 def get_move_probabilities(
     log_policy_pos1: torch.Tensor,
@@ -266,12 +297,13 @@ if __name__ == '__main__':
     # ?    
     # 
     dummy_input = torch.randn(1, NUM_INPUT_CHANNELS, board_size, board_size)
-    p1, p2, pmc, v = net(dummy_input)
+    p1, p2, pmc, wdl = net(dummy_input)
     
     print("Policy_pos1 output shape:", p1.shape)
     print("Policy_pos2 output shape:", p2.shape)
     print("Policy_mark_capture output shape:", pmc.shape)
-    print("Value output shape:", v.shape) 
+    print("WDL logits shape:", wdl.shape)
+    print("WDL scalar value:", wdl_to_scalar(wdl).item())
 
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"Total trainable parameters: {total_params}")
@@ -279,8 +311,8 @@ if __name__ == '__main__':
     initial_state = GameState()
     input_tensor_black = state_to_tensor(initial_state, Player.BLACK)
     print("Input tensor shape (Black's turn):", input_tensor_black.shape)
-    p1_b, p2_b, pmc_b, v_b = net(input_tensor_black)
-    print("P1 (B):", p1_b.shape, "P2 (B):", p2_b.shape, "PMC (B):", pmc_b.shape, "V (B):", v_b.item())
+    p1_b, p2_b, pmc_b, wdl_b = net(input_tensor_black)
+    print("P1 (B):", p1_b.shape, "P2 (B):", p2_b.shape, "PMC (B):", pmc_b.shape, "WDL (B):", wdl_b.detach().tolist())
 
     # 
     initial_state.current_player = Player.WHITE # 
@@ -301,8 +333,8 @@ if __name__ == '__main__':
     # print("Channel 6 (Movement Phase):\n", input_tensor_white[0,6,:,:])
 
 
-    p1_w, p2_w, pmc_w, v_w = net(input_tensor_white)
-    print("P1 (W):", p1_w.shape, "P2 (W):", p2_w.shape, "PMC (W):", pmc_w.shape, "V (W):", v_w.item()) 
+    p1_w, p2_w, pmc_w, wdl_w = net(input_tensor_white)
+    print("P1 (W):", p1_w.shape, "P2 (W):", p2_w.shape, "PMC (W):", pmc_w.shape, "WDL (W):", wdl_w.detach().tolist())
 
     print("\n--- Testing get_move_probabilities ---")
     # Simulate network outputs (assuming batch size 1, so squeeze)
@@ -381,14 +413,15 @@ if __name__ == '__main__':
     # 3. Get network outputs
     net.eval() # Set model to evaluation mode
     with torch.no_grad(): # Disable gradient calculations for inference
-        log_p1, log_p2, log_pmc, value_estimate = net(input_tensor)
+        log_p1, log_p2, log_pmc, wdl_est = net(input_tensor)
     
     # Squeeze batch dimension as we are processing a single state
     log_p1_squeezed = log_p1.squeeze(0)
     log_p2_squeezed = log_p2.squeeze(0)
     log_pmc_squeezed = log_pmc.squeeze(0)
 
-    print(f"\nNetwork Value Estimate for {player_to_act}: {value_estimate.item():.4f}")
+    print(f"\nNetwork WDL Estimate for {player_to_act}: {torch.softmax(wdl_est, dim=-1).tolist()}"
+          f" (scalar={wdl_to_scalar(wdl_est).item():.4f})")
 
     # 4. Get legal moves
     legal_moves = generate_all_legal_moves(current_state)
@@ -461,13 +494,14 @@ if __name__ == '__main__':
 
     input_tensor_complex = state_to_tensor(current_state_complex, player_to_act_complex).to(device)
     with torch.no_grad():
-        log_p1_c, log_p2_c, log_pmc_c, value_c = net(input_tensor_complex)
+        log_p1_c, log_p2_c, log_pmc_c, wdl_c = net(input_tensor_complex)
     
     log_p1_c_s = log_p1_c.squeeze(0)
     log_p2_c_s = log_p2_c.squeeze(0)
     log_pmc_c_s = log_pmc_c.squeeze(0)
 
-    print(f"\nNetwork Value Estimate for {player_to_act_complex}: {value_c.item():.4f}")
+    print(f"\nNetwork WDL Estimate for {player_to_act_complex}: {torch.softmax(wdl_c, dim=-1).tolist()}"
+          f" (scalar={wdl_to_scalar(wdl_c).item():.4f})")
     legal_moves_complex = generate_all_legal_moves(current_state_complex)
 
     if not legal_moves_complex:

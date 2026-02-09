@@ -277,14 +277,17 @@ class MCTS:
         self._core.set_torchscript_runner(self._torchscript_runner)
 
     def _forward_callback(self, inputs: torch.Tensor):
+        from src.neural_network import wdl_to_scalar
         inputs = inputs.to(self.device, non_blocking=True)
         self.model.eval()
         if self.device.type == "cuda":
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
-                log_p1, log_p2, log_pmc, value = self.model(inputs)
+                log_p1, log_p2, log_pmc, wdl_logits = self.model(inputs)
         else:
             with torch.inference_mode():
-                log_p1, log_p2, log_pmc, value = self.model(inputs)
+                log_p1, log_p2, log_pmc, wdl_logits = self.model(inputs)
+        # Convert WDL logits (B, 3) to scalar value (B,) for C++ MCTS
+        value = wdl_to_scalar(wdl_logits)
         return log_p1, log_p2, log_pmc, value
 
     def _ensure_root(self, state: GameState):
