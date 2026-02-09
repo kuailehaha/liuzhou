@@ -1,6 +1,6 @@
 # TODOS
 
-TODO以产生时间为准。
+TODO以产生时间为准。最近审查：2026.02.09
 
 ### 2025.10.20
 
@@ -29,11 +29,11 @@ TODO以产生时间为准。
 - [x] 实现 RandomAgent 的对局，并获取胜率数据
 - [x] 合并参数：self_play_games、self_play_games_per_worker
 - [x] 整理test file
-- [ ] 张量化实现自博弈过程
-- [ ] 并行化DDP训练或实现“自对弈集群+训练服务器”模式
-- [ ] 确认代码实现逻辑
-- [ ] 模型结构和超参调优
-- [ ] 对场上棋子实现reward并检查效果（新开分支？感觉不用，可以开个选项。【感觉实现张量化自博弈之前很有必要添加啊！】）
+- [x] 张量化实现自博弈过程 —— 已由 v0 C++ 管线替代：MCTSCore (C++) 实现批量树搜索，fast_legal_mask/fast_apply_moves 提供 CPU+CUDA 内核
+- [ ] 并行化DDP训练或实现"自对弈集群+训练服务器"模式
+- [x] ~~确认代码实现逻辑~~ （早期探索性条目，已通过 tests/ 体系充分验证）
+- [ ] 模型结构和超参调优（持续性任务）
+- [ ] 对场上棋子实现reward并检查效果 —— soft_value（棋子差 tanh）已用于投降判断（`self_play_runner.py`），但尚未作为训练中间奖励信号
 
 ### 2025.10.27
 
@@ -55,12 +55,12 @@ TODO以产生时间为准。
 - [x] 实现 v1/game 张量化状态转换与规则逻辑
 - [x] 完成 v1/game/move_encoder.py 动作编码与解码
 - [x] 写出 VectorizedMCTS 主流程并替换自博弈调度
-- [ ] 打通 v1/self_play -> v1/train 张量化训练闭环
+- [x] ~~打通 v1/self_play -> v1/train 张量化训练闭环~~ （v1 已废弃删除，功能由 v0 C++ 管线承接）
 - [x] 为 v1 分支新增测试与对照验证脚本
 
 ### 2025.10.31
 
-- [ ] 对拍传统管线和新管线（MCTS部分）
+- [x] 对拍传统管线和新管线（MCTS部分） —— tests/v0/test_mcts.py (move coverage 对照)、test_actions.py (动作编码对照)、tools/benchmark_mcts.py 等已覆盖
 
 ### 2025.11.1
 
@@ -72,42 +72,43 @@ TODO以产生时间为准。
 - [x] 如有需要新增 batched gather/reshape 等张量工具函数
 - [x] 编写 cross-check 脚本对比两套管线的输入张量与动作分布
 - [x] 更新自博弈/MCTS/训练脚本调用路径切换至 v1 张量化实现
-- [ ] README/TODO 记录切换方式与验证状态
+- [x] ~~README/TODO 记录切换方式与验证状态~~ （v1 已废弃，v0 管线文档见 `v0/v0_pipeline_notes.md`）
 - [ ] Future: unify policy heads (head1=place/move-to, head2=move-from, head3=mark+all removals) and drop phase one-hot channels when legacy parity is secured.
 
 ### 2025.11.2
 
-- [ ] debug: python -m tools.cross_check_mcts --states 10 --max-random-moves 40 --num-simulations 64 --device cuda > check_log.txt  
+- [x] ~~debug: python -m tools.cross_check_mcts~~ （一次性调试任务，对拍功能已由 tests/v0/test_mcts.py、test_actions.py 覆盖）
 
-### 2025.11.3
+### 2025.11.3 — MCTS 性能优化
 
-- [ ] 对encode、pri、apply阶段做优化：[VMCTS-profile] waves=64 sel=0.67% moves=0.78% encode=11.96% fwd=3.09% pri=35.44% apply=48.05%
-- [ ] 优化 project_policy_logits 的实现，仅对合法动作做 softmax，并预先整理 movement 的索引映射
-- [ ] 在节点缓存 legal action indices 和 child state，避免重复调用 action_to_index/apply_move
-- [ ] 预热并复用 TensorStateBatch / states_to_model_input 的工作缓冲降低 encode 成本
-- [ ] 通过 pybind11、cffi、cython 等把棋规核心搬到 native。优点是保留命令式风格，同时获得编译语言的常数加速，还能在内部做更细的缓存/并行。
+> 原始 profile：waves=64 sel=0.67% moves=0.78% encode=11.96% fwd=3.09% pri=35.44% apply=48.05%
+
+- [x] 优化 project_policy_logits 的实现 —— C++ 实现 `v0/src/net/project_policy_logits_fast.cpp`，仅对合法动作做 masked softmax
+- [x] 通过 pybind11 把棋规核心搬到 native —— `v0/src/rules/rule_engine.cpp` + `v0/src/moves/move_generator.cpp` 完整 C++ 原生实现
+- [ ] 在节点缓存 legal action indices 和 child state，避免重复调用 action_to_index/apply_move（MCTSCore Node 当前仅存 GameState + children indices）
+- [ ] 预热并复用 TensorStateBatch / states_to_model_input 的工作缓冲降低 encode 成本（当前每次调用均创建新张量）
 
 ### 2025.11.09
 
-- [x] C++ 层重写 batch_apply_moves，并补充准确性测试（tests/v1/test_fast_apply_moves.py）与性能脚本（tests/v1/test_fast_apply_moves_performance.py、tools/benchmark_apply_moves.py）
+- [x] C++ 层重写 batch_apply_moves，并补充准确性测试与性能脚本
 
 ### 2025.11.10
 
-- [ ] GPU 版本重写 apply 部分，打通 fast apply kernel 的 CUDA 支持
+- [x] GPU 版本重写 apply 部分，打通 fast apply kernel 的 CUDA 支持 —— `v0/src/game/fast_apply_moves_cuda.cu` 已实现，tests/v0/cuda/test_fast_apply_moves_cuda.py 通过
 
 ### 2025.11.13
 
-- [ ] 训练时可以random训练或者是先训练后面那部分，再逐渐往前训练直至收敛
-- [ ] v0 CUDA benchmarking: the current benchmark supports specs like `tensor_device=cpu:forward_device=cuda`, but MCTSCore still assumes legal masks and logits live on the same device (`project_policy_logits_fast` requires aligned devices). To benchmark "forward on CUDA while the tree stays on CPU", we need to add device-alignment/copy logic inside `ExpandBatch`, then rerun the tool to quantify the CUDA kernels' benefit.
+- [ ] 训练时可以random训练或者是先训练后面那部分，再逐渐往前训练直至收敛（课程学习，尚未实现）
+- [ ] v0 CUDA benchmarking: MCTSCore 的 `project_policy_logits_fast` 要求 legal masks 和 logits 在同一设备，需在 `ExpandBatch` 中添加设备对齐逻辑以支持 "forward on CUDA + tree on CPU" 基准测试
 
 ### 2025.11.14
 
 - [x] 新增 `v0/data/` 目录，统一存放离线自博弈样本（JSONL + meta）。
 - [x] 实现 `python v0/generate_data.py`，可指定模型 checkpoint/算力配置批量生成样本并落盘。
 - [x] `v0/train.py` 支持 `--data_files` 离线训练模式，或用 `--save_self_play_dir` 将在线自博弈数据自动写入 `v0/data/self_play`。
-- [ ] 后续：给数据生成/训练脚本补 README 片段，写明 JSONL 结构、metadata 字段、典型命令。
-- [ ] 排查：动作空间是否相同？
-- [ ] 排查：verify_v0速度优化12倍，benchmark速度为何只优化3倍？
+- [ ] 后续：给数据生成/训练脚本补详细 README 片段（`v0/v0_pipeline_notes.md` 有基本 JSONL 格式，但缺少字段级文档和典型命令）
+- [x] 排查：动作空间是否相同？ —— `tests/v0/check_v0_policy_index_alignment.py` 已验证 legacy 与 v0 动作索引对齐
+- [x] ~~排查：verify_v0速度优化12倍，benchmark速度为何只优化3倍？~~ （早期调查已过时，README.md 显示端到端 ~4.5x 加速，符合预期）
 
 ### 2025.12.27
 
@@ -116,11 +117,11 @@ TODO以产生时间为准。
 - [x] 删除 v1 目录（已废弃的张量化方案）
 - [x] 合并 v0/TODO.md 到根目录
 - [x] 整理说明文件（MD文档）
-- [ ] 进行大规模训练
+- [ ] 进行大规模训练（当前 toy_train.sh 规模：40 iterations × 6400 games/iter）
 
 ### 2026.01.13
 
-- [ ] batching in eval phase
+- [x] batching in eval phase —— `v0/src/mcts/eval_batcher.cpp` 实现 EvalBatcher：异步批量推理、超时合并、统计直方图
 
 ### 2026.02.07
 
@@ -133,8 +134,6 @@ TODO以产生时间为准。
 - [x] `state_io.py` 序列化/反序列化兼容
 - [x] C++ tensor-level batch apply (CPU/CUDA) 添加 `moves_since_capture` 追踪——已修改 `BatchInputs`/`BatchOutputs`、所有函数签名、CUDA kernel 参数和 Python 绑定
 
-### 2026.02.07
-
 #### GPU 性能优化调查与改进
 
 观察到两个异常现象需要调查和优化：
@@ -142,7 +141,7 @@ TODO以产生时间为准。
 **现象 1：自博弈时功耗低但显存占用高**
 - 现状：GPU 功耗 185W/500W，显存占用 72500MiB/97871MiB，GPU-Util 99%
 - 疑点：功耗低表明计算密集度不足，大量显存可能仅用于存放节点缓存
-- [ ] 分析 MCTS 节点缓存的显存占用分布
+- [ ] 分析 MCTS 节点缓存的显存占用分布（`tools/analyze_node_cache.py` 已就绪，需运行分析）
 - [ ] 排查是否存在冗余的张量副本或未释放的中间结果
 - [ ] 优化节点缓存策略：考虑 LRU 淘汰、压缩存储或 CPU 卸载
 - [ ] 提升 GPU 计算密集度：增加批量推理大小或优化 kernel 并行度
@@ -155,11 +154,15 @@ TODO以产生时间为准。
 - [ ] 优化 batch size 和梯度累积策略
 - [ ] 检查是否存在不必要的 CPU-GPU 同步操作
 - [x] **策略损失批量化**（见下方「策略损失批量化重构方案」）
+
 ---
 
-### 策略损失批量化重构方案（高效训练必要保证）
+### 策略损失批量化重构方案（高效训练必要保证）—— ✅ 已完成
 
 **目标**：去掉训练阶段「对 batch 内每个样本 for 循环 + 逐样本调用 `get_move_probabilities`」的瓶颈，改为在 GPU 上对整批做一次 combined logits 构建 + 掩码 log_softmax + 批量化 KL 损失，从而提升 GPU 利用率与训练吞吐。
+
+<details>
+<summary>详细重构步骤（已全部完成，点击展开）</summary>
 
 **现状简述**：
 - 策略头输出：`log_p1`(B,36)、`log_p2`(B,36)、`log_pmc`(B,36)，与 v0 的 placement / movement-from / selection 语义一致。
@@ -167,7 +170,7 @@ TODO以产生时间为准。
 - v0 已有：`project_policy_logits_fast`（C++）按 (placement_dim, movement_dim, selection_dim, auxiliary_dim) 从 log_p1/log_p2/log_pmc 构建 combined logits (B, total_dim)，并在 legal_mask 上做 masked softmax；`v0/python/move_encoder.py` 有 `action_to_index(move, board_size, spec)` 将 legacy 的 move 字典映射到 flat 索引，与 v0 动作空间一致。
 
 **不变量**：
-- 规则与阶段语义以 `README_zh.md`、`rule_description.md` 为准。
+- 规则与阶段语义以 `README.md`、`rule_description.md` 为准。
 - 动作索引与 v0 的 `ActionEncodingSpec`（placement_dim=36, movement_dim=144, selection_dim=36, auxiliary_dim=4, total_dim=220）保持一致，便于日后与 v0 推理/自博弈共用或对拍。
 - 策略损失仍为「仅在合法动作上的 KL」，draw 样本的 policy 权重（policy_draw_weight）与 value 权重（value_draw_weight）逻辑不变。
 
@@ -195,3 +198,5 @@ TODO以产生时间为准。
    - [x] 用现有 `tests/` 或小规模训练跑 1 个 iteration，确认 loss 曲线与旧实现同量级、无 NaN（已跑 smoke：batched_policy=True，Avg Policy Loss 有限）。
    - [x] 在 AGENTS.md 中注明：训练策略损失已批量化（`src/policy_batch.py`），与 v0 动作编码一致；若修改动作空间或 spec，需同步更新此处与 v0。
    - [x] 更新本 TODO：将「策略损失批量化」项勾选完成，并保留上述步骤为历史记录。
+
+</details>
