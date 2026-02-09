@@ -5,6 +5,7 @@ AlphaZero-style loop.
 from __future__ import annotations
 
 import argparse
+import collections
 import gc
 import json
 import math
@@ -160,6 +161,7 @@ def train_pipeline_v0(
     data_shuffle: bool = False,
     save_self_play_dir: Optional[str] = None,
     load_checkpoint: Optional[str] = None,
+    replay_window: int = 1,
 ) -> None:
     """Complete v0 training pipeline (self-play -> training -> evaluation)."""
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -473,6 +475,10 @@ def train_pipeline_v0(
 
     best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
 
+    # Replay buffer: keep the last `replay_window` iterations' samples
+    replay_window_size = max(1, replay_window)
+    replay_buffer: collections.deque = collections.deque(maxlen=replay_window_size)
+
     for iteration in range(iterations):
         print(f"\n{'=' * 20} Iteration {iteration + 1}/{iterations} {'=' * 20}")
 
@@ -619,6 +625,19 @@ def train_pipeline_v0(
         # Release self-play VRAM (inference engines, CUDA graphs, etc.)
         # before the training phase allocates its own GPU memory.
         _cleanup_gpu()
+
+        # --- Replay buffer: accumulate data from recent iterations ---
+        if examples and replay_window_size > 1:
+            replay_buffer.append(list(examples))
+            combined = []
+            for chunk in replay_buffer:
+                combined.extend(chunk)
+            cur_iter_positions = len(examples)
+            examples = combined
+            print(
+                f"Replay buffer: {len(replay_buffer)}/{replay_window_size} iterations, "
+                f"current={cur_iter_positions}, total={len(examples)} examples"
+            )
 
         train_label = "Training phase"
         baseline_train._stage_banner("train", train_label, iteration, iterations, stage_history)
@@ -1251,6 +1270,12 @@ if __name__ == "__main__":
         default=None,
         help="Path to a checkpoint file to load and resume training from.",
     )
+    parser.add_argument(
+        "--replay_window",
+        type=int,
+        default=1,
+        help="Number of recent iterations to keep in replay buffer (1 = no replay, only current).",
+    )
 
     args = parser.parse_args()
 
@@ -1307,4 +1332,5 @@ if __name__ == "__main__":
         data_shuffle=args.data_shuffle,
         save_self_play_dir=args.save_self_play_dir,
         load_checkpoint=args.load_checkpoint,
+        replay_window=args.replay_window,
     )

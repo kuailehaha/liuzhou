@@ -19,7 +19,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 python -m v0.train \
   --iterations 40 \
   --self_play_workers 200 \
-  --self_play_games_per_worker 64 \
+  --self_play_games_per_worker 32 \
   --mcts_simulations 1024 \
   --self_play_batch_leaves 512 \
   --self_play_inference_batch_size 512 \
@@ -27,8 +27,9 @@ python -m v0.train \
   --self_play_resign_threshold -0.8 \
   --self_play_resign_min_moves 36 \
   --self_play_resign_consecutive 3 \
-  --epochs 8 \
-  --lr 0.001 \
+  --epochs 3 \
+  --lr 0.0003 \
+  --replay_window 4 \
   --value_draw_weight 0.1 \
   --policy_draw_weight 0.3 \
   --batch_size 4096 \
