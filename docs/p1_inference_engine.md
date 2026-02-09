@@ -16,4 +16,8 @@
 ## 范围声明
 
 - P1 覆盖：推理后端切换 + Graph 固定 batch=512
-- P1 不覆盖：EvalBatcher、多局合批、C++ self-play 主循环、encode/H2D 深度优化
+- P1 不覆盖（部分已在后续迭代中完成）：
+  - ~~EvalBatcher~~ → 已实现（`v0/src/mcts/eval_batcher.cpp`，异步批量推理 + 超时合并）
+  - ~~多局合批~~ → MCTSCore 批量搜索已支持
+  - C++ self-play 主循环（游戏循环仍在 Python，MCTS 核心在 C++）
+  - encode/H2D 深度优化（TensorStateBatch 仍为 CPU→CUDA 拷贝，未使用 pinned memory/直接 GPU 写入）

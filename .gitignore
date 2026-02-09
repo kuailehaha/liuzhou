@@ -25,6 +25,8 @@ models/
 build/
 logs/
 references/
+checkpoints_v0_smoke/
+
 
 # 例外规则：跟踪特定的 CMakeLists.txt 文件
 !**/CMakeLists.txt

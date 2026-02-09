@@ -109,3 +109,5 @@ Any divergence between v0 rules and legacy rules can destroy the signal.
   retrain; check if win rate moves.
 - Temporarily set `soft_label_alpha = 0` to focus value on win/loss.
 - Reduce move limit or add a small win bonus to reduce draws.
+- Use `--eval_games_vs_previous N` to track per-iteration strength improvement (see `TRAINING_STABILITY.md`).
+- Monitor self-play draw rate; if >70%, consider tuning `--self_play_resign_threshold` or `value_draw_weight`.

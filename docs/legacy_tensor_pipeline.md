@@ -1,6 +1,6 @@
 # Legacy Tensor Pipeline Reference
 
-This note captures the legacy (non-vectorised) inference/training pipeline so the v1 tensorised flow can stay drop-in compatible.
+This note captures the legacy (non-vectorised) inference/training pipeline as a reference for the v0 C++/CUDA implementation.
 
 ## Core domain objects
 - `GameState` (`src/game_state.py`): 6x6 board (`board: List[List[int]]`, with `Player.BLACK.value == 1`, `Player.WHITE.value == -1`), per-player marked sets (`marked_black`, `marked_white`), phase enum, counters, and `current_player`.
@@ -22,4 +22,4 @@ This note captures the legacy (non-vectorised) inference/training pipeline so th
 4. `get_move_probabilities` maps the per-head logits back onto the `legal_moves` ordering, yielding sampling probabilities and raw combined log-scores.
 5. `apply_move` executes the chosen move to obtain the successor `GameState` for the next loop iteration.
 
-Any v1 tensorised modules should preserve these contracts (shapes, devices, ordering, fallback behaviour) to remain drop-in replacements for the legacy flow.
+The v0 C++ implementation (`v0/src/`) preserves these contracts (shapes, devices, ordering, fallback behaviour) to remain compatible with the legacy flow. See `v0/cpprefactor.md` for migration status.

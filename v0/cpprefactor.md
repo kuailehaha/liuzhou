@@ -6,84 +6,82 @@ This document tracks the status of the v0 C++ rewrite and the remaining work nee
 
 1. Re-implement the runtime-critical pieces of the Python stack (state handling, rules, move generation, tensor encoders, MCTS) in C++ without changing the public APIs.
 2. Allow callers to switch between `src.*` and `v0.*` with a simple flag so we can cross-check behaviour.
-3. Keep fast kernels (`fast_apply_moves`, `fast_legal_mask`, `project_policy_logits_fast`) close to the C++ MCTS core to avoid Python �?C++ traffic.
+3. Keep fast kernels (`fast_apply_moves`, `fast_legal_mask`, `project_policy_logits_fast`) close to the C++ MCTS core to avoid Python  -- C++ traffic.
 4. Maintain exhaustive parity tests (`tools/verify_v0_*`) so every module can be validated against the legacy Python implementation.
 
 ## Directory & Build Layout
 
 ```
 v0/
-├── include/v0/�?       # headers for states, rules, moves, net, mcts
-├── src/
-�?  ├── game/            # GameState + tensor batch utilities + fast_* kernels
-�?  ├── rules/           # rule engine port
-�?  ├── moves/           # move generator + action encoding
-�?  ├── net/             # input encoding + policy projection
-�?  └── mcts/            # batched MCTSCore implementation
-└── python/
-    ├── tensor_utils.py
-    ├── state_batch.py
-    ├── rules_tensor.py
-    ├── fast_legal_mask.py
-    ├── move_encoder.py
-    └── mcts.py          # thin wrapper around v0_core.MCTSCore
+ --  --  --  include/v0/ --        # headers for states, rules, moves, net, mcts
+ --  --  --  src/
+ --    --  --  --  game/            # GameState + tensor batch utilities + fast_* kernels
+ --    --  --  --  rules/           # rule engine port
+ --    --  --  --  moves/           # move generator + action encoding
+ --    --  --  --  net/             # input encoding + policy projection
+ --    --  --  --  mcts/            # batched MCTSCore implementation
+ --  --  --  python/
+     --  --  --  tensor_utils.py
+     --  --  --  state_batch.py
+     --  --  --  rules_tensor.py
+     --  --  --  fast_legal_mask.py
+     --  --  --  move_encoder.py
+     --  --  --  mcts.py          # thin wrapper around v0_core.MCTSCore
 ```
 
-The top-level `CMakeLists.txt` builds a single `v0_core` extension that links all of the above. Call `cmake -S v0 -B build/v0 …` followed by `cmake --build build/v0 --config Release` to rebuild the module.
+The top-level `CMakeLists.txt` builds a single `v0_core` extension that links all of the above. Call `cmake -S v0 -B build/v0 �?�` followed by `cmake --build build/v0 --config Release` to rebuild the module.
 
 ## Migration Status
 
 | Stage | Description | Status |
 |-------|-------------|--------|
-| 1. State Core | `GameState`, bitset-backed mark sets, serialization, tensor batch helpers | **Done** �?`v0/include/v0/game_state.hpp` + `v0/src/game/game_state.cpp` + `tensor_state_batch.cpp`|
-| 2. Rule Engine | Forming shapes, capture/removal/movement helpers | **Done** �?`v0/src/rules/rule_engine.cpp` mirrors `src/rule_engine.py` |
-| 3. Move Generator | `MoveRecord`, `ActionCode`, legal move enumeration, C++ `apply_move` | **Done** �?exported via `v0_core` and wrapped by `v0/python/move_encoder.py` |
-| 4. Tensor / Net | `states_to_model_input`, fast projection, local fast kernels | **Done** �?fast kernels now live under `v0/src/net` / `v0/src/game` and Python copies no longer import `v1.*` |
-| 5. MCTS Core | Batched selection/expansion/backprop + PyBind wrapper | **Done** �?`v0/src/mcts/mcts_core.cpp` + `v0/python/mcts.py` (still CPU host tree, GPU forward supported) |
-| 6. Glue / CLI / Docs | Python package, toggles, benchmarking scripts, documentation | **In progress** �?`tools/verify_v0_mcts.py` supports `--fwd-device`; docs now reflect the self-contained state; remaining work tracked below |
+| 1. State Core | `GameState`, bitset-backed mark sets, serialization, tensor batch helpers | **Done**  -- `v0/include/v0/game_state.hpp` + `v0/src/game/game_state.cpp` + `tensor_state_batch.cpp`|
+| 2. Rule Engine | Forming shapes, capture/removal/movement helpers | **Done**  -- `v0/src/rules/rule_engine.cpp` mirrors `src/rule_engine.py` |
+| 3. Move Generator | `MoveRecord`, `ActionCode`, legal move enumeration, C++ `apply_move` | **Done**  -- exported via `v0_core` and wrapped by `v0/python/move_encoder.py` |
+| 4. Tensor / Net | `states_to_model_input`, fast projection, local fast kernels | **Done**  -- fast kernels now live under `v0/src/net` / `v0/src/game` and Python copies no longer import `v1.*` |
+| 5. MCTS Core | Batched selection/expansion/backprop + PyBind wrapper | **Done**  -- `v0/src/mcts/mcts_core.cpp` + `v0/python/mcts.py` (still CPU host tree, GPU forward supported) |
+| 6. Glue / CLI / Docs | Python package, toggles, benchmarking scripts, documentation | **Done** -- `v0/train.py` full pipeline; `tools/benchmark_*` scripts; docs in `v0/v0_pipeline_notes.md` and `AGENTS.md`; remaining optimizations in `TODO.md` |
 
 ## Next Steps / TODO
 
-1. **GPU legality & move kernels**  
-   - Both `fast_legal_mask` and `fast_apply_moves` now have CUDA paths (`src/game/fast_legal_mask_cuda.cu`, `src/game/fast_apply_moves_cuda.cu`) guarded by `-DBUILD_CUDA_KERNELS=ON`, with parity tests (`tests/test_fast_legal_mask_cuda.py`, `tests/test_fast_apply_moves_cuda.py`). The remaining work here is wiring these kernels through the rest of the pipeline (projected policy, TensorStateBatch, etc.) so expansion never leaves the GPU.
+1. ~~**GPU legality & move kernels**~~ **Done**  
+   - `fast_legal_mask` and `fast_apply_moves` both have CUDA paths (`src/game/fast_legal_mask_cuda.cu`, `src/game/fast_apply_moves_cuda.cu`) with parity tests (`tests/v0/cuda/test_fast_legal_mask_cuda.py`, `tests/v0/cuda/test_fast_apply_moves_cuda.py`). Remaining: wire these into full expansion path so expansion never leaves GPU.
 2. **MCTSCore pointer/index hygiene**  
    - Finish replacing all long-lived `Node&` references with index lookups (selection / virtual loss / backprop) to avoid reallocation hazards when `std::vector<Node>` grows.
 3. **Tensor batch direct-to-GPU path**  
    - `FromGameStates` still builds tensors on CPU then copies to CUDA. Add a GPU writer or serialization buffer to cut one memcpy when the forward device is GPU.
 4. **CI / tooling**  
    - Re-enable the `tools/verify_*` scripts inside automated runs, add `pytest -k v0` target, and document the VS build requirements to avoid the Windows SDK `stdlib.h` detection failure.
-5. **Documentation & README updates**  
-   - Fold these notes into the main project README / training docs so users know how to switch to `v0` (`USE_V0_CPP=1`, `--fwd-device`, etc.).
-6. **Self-play / training integration**  
-   - Wire `v0.python.mcts.MCTS` into the self-play runner, add config flags, and benchmark end-to-end training loops on both CPU and GPU forward paths.
+5. ~~**Self-play / training integration**~~ **Done**  
+   - `v0/python/self_play_runner.py` integrates v0 MCTS into self-play; `v0/train.py` orchestrates the full AlphaZero loop (self-play ? train ? eval). Config flags and multi-GPU support are in place.
 
 ### GPU/CUDA Rewrite Plan
 
-Goal: keep tensors on GPU from `FromGameStates �?NN �?legal mask �?expanded child batch` so the only unavoidable host interaction is when we convert child batches back to `GameState` for storage in `nodes_`.
+Goal: keep tensors on GPU from `FromGameStates  -- NN  -- legal mask  -- expanded child batch` so the only unavoidable host interaction is when we convert child batches back to `GameState` for storage in `nodes_`.
 
 We will tackle this in four layers. Each layer should land with parity tests mirroring the CPU path (e.g., compare CUDA kernel outputs against the existing CPU implementation on random states).
 
-#### Stage 1 �?GPU-friendly Tensor Batch Construction (`tensor_state_batch.cpp`)
+#### Stage 1 -- GPU-friendly Tensor Batch Construction (`tensor_state_batch.cpp`)
 1. **Pinned host buffer**: add an optional path where we build into pinned CPU memory (using `torch::empty_pin_memory`) and immediately issue an async `cudaMemcpyAsync` into a CUDA tensor, synchronized on the default stream. This is the low-risk stepping stone.
 2. **Direct CUDA kernel**: write a simple CUDA kernel that copies the `GameState` struct into the target tensors (board/marks/phase etc.), invoked via `at::cuda::CUDAStream`. This avoids the intermediate host tensor entirely.
 3. **API surface**: expose `tensor_batch_from_game_states(states, device)` that chooses CPU/pinned/CUDA paths automatically, and update PyBind so `v0_core.tensor_batch_from_game_states(states, "cuda")` is supported.
 
-#### Stage 2 �?CUDA Legal Mask (`fast_legal_mask`)
+#### Stage 2 -- CUDA Legal Mask (`fast_legal_mask`) **DONE**
 1. **Kernel design**: break the CPU implementation into kernels per phase (placement, movement, selections). Each kernel should read the flattened board/marks arrays and write into the same metadata layout (`(B, total_dim, 4)`).
 2. **Launch configuration**: use `(batch_size, cells)` style grids so each warp handles a subset of board cells; leverage shared memory for the 6x6 board to reduce global-memory reads.
 3. **Fallback**: keep the current CPU code behind `#ifndef FAST_LEGAL_MASK_NO_MODULE` and compile CUDA version when `TORCH_CUDA_FOUND`. At runtime choose CUDA kernel only if `board.device().is_cuda()`.
 4. **Testing**: extend `tools/verify_v0_state_batch.py` or add `tools/verify_v0_legal_mask.py` to compare CPU vs CUDA masks/metadata on random states.
 
-#### Stage 3 �?CUDA Fast Apply Moves (`fast_apply_moves`)
+#### Stage 3 -- CUDA Fast Apply Moves (`fast_apply_moves`) **DONE**
 1. **Data layout**: operate on the same `(B, H, W)` int8 board plus bool marks arrays. Each kernel should:
    - copy parent board/marks into child slots,
    - apply action-specific mutations (placement/move/selection) using thread-blocks per parent,
    - update scalar tensors (phase, current_player, pending counters).
 2. **Action metadata**: the CUDA kernel will read the `(N,4)` action tensor and parent indices exactly as the CPU version does; ensure we keep metadata in GPU memory throughout.
 3. **Housekeeping**: maintain the `BatchInputs`/`BatchOutputs` structs for the CPU fallback, but add CUDA equivalents guarded with `#ifdef __CUDACC__`.
-4. **Parity tests**: add a CUDA-aware variant of `tests/v1/test_fast_apply_moves.py` that runs both CPU and CUDA implementations and checks resulting states.
+4. **Parity tests**: add a CUDA-aware variant of `tests/v0/cuda/test_fast_apply_moves_cuda.py` that runs both CPU and CUDA implementations and checks resulting states.
 
-#### Stage 4 ??MCTSCore Integration
+#### Stage 4 -- MCTSCore Integration (partially complete)
 1. **Device plumbing** *(partially complete)*: `ExpandBatch` now builds `TensorStateBatch` directly on `config.device`, feeds the NN, CUDA legal mask, and CUDA apply-moves without round-tripping through CPU, and only copies tensors back when converting child states for the CPU tree. `TensorStateBatch::FromGameStates` also stages data in pinned host memory and performs a single non-blocking copy when the forward device is CUDA.
 2. **Remaining work**: finish eliminating the last CPU touch points (direct-to-GPU serialization / `ToGameStates`, stream guards, etc.) so only the tree/store structures stay on the host.
 3. **Stream management**: ensure `forward_cb_` (PyTorch model) and CUDA kernels share the same stream/guard (`at::cuda::CUDAGuard guard(tensor_device)`).

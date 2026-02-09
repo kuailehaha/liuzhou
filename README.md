@@ -1,4 +1,4 @@
-﻿# 基于 MCTS 的强化学习六洲棋 AI 系统实现
+# 基于 MCTS 的强化学习六洲棋 AI 系统实现
 
 本项目聚焦传统棋类“六洲棋”的智能对弈系统，涵盖规则建模、MCTS 强化学习训练与人机对战系统实现。
 
@@ -220,9 +220,11 @@ python -m tools.benchmark_self_play --num-games 2 --mcts-simulations 200 --devic
 
 ## 📂 代码结构（Code Structure）
 
+项目有两套实现：Legacy（纯 Python，`src/`）和 V0（C++/CUDA 高性能核心，`v0/`）。V0 为当前主力管线，Legacy 用于功能验证和规则参考。
+
 ---
 
-### 🧠 核心游戏逻辑（Core Game Logic）
+### 🧠 核心游戏逻辑（Core Game Logic）— Legacy (`src/`)
 
 * **`src/game_state.py`** —— 定义 `GameState` 容器、阶段枚举（phase enum）、玩家枚举（player enum）以及辅助方法（如复制、统计棋子数量、待标记/待捕获计数器等）。
   这是全局使用的**标准游戏状态快照**。
@@ -235,67 +237,74 @@ python -m tools.benchmark_self_play --num-games 2 --mcts-simulations 200 --devic
 
 ---
 
+### ⚡ C++/CUDA 高性能核心 — V0 (`v0/`)
+
+* **`v0/src/rules/rule_engine.cpp`** —— C++ 原生规则引擎，镜像 `src/rule_engine.py` 全部阶段逻辑。
+* **`v0/src/moves/move_generator.cpp`** —— C++ 动作生成器，含动作编码/解码（`ActionCode`）。
+* **`v0/src/game/`** —— `GameState` (C++)、`TensorStateBatch` 批量状态、`fast_legal_mask` / `fast_apply_moves`（CPU + CUDA 内核）。
+* **`v0/src/mcts/mcts_core.cpp`** —— 批量 MCTS 搜索核心（selection/expansion/backprop），配合 `eval_batcher.cpp` 实现异步批量推理。
+* **`v0/src/net/`** —— 网络编码（`states_to_model_input`）、`InferenceEngine`（CUDA Graph 固定 batch=512）、`project_policy_logits_fast`（C++ masked softmax）。
+* **`v0/python/`** —— Python 封装层：`mcts.py`（MCTSCore 封装）、`self_play_runner.py`（自博弈入口）、`move_encoder.py`（动作编码）、`state_batch.py` 等。
+* **`v0/train.py`** —— V0 训练主脚本（AlphaZero 循环：自博弈 → 训练 → 评估）。
+
+详细迁移状态见 `v0/cpprefactor.md`。
+
+---
+
 ### 🧩 学习与搜索（Learning & Search）
 
 * **`src/neural_network.py`** —— 实现 AlphaZero 风格的网络（包含三个策略头 + 一个价值头）：`pos1` 负责落子/移动终点选择，`pos2` 负责移动起点，`mark_capture` 统一负责各类提子/吃子/标记目标的定位。模块还提供张量转换工具与 `get_move_probabilities` 方法。
   是训练与 MCTS 搜索的核心模块。
 
-* **`src/mcts.py`** —— Monte Carlo 树搜索实现。
-  使用神经网络提供先验概率与价值估计，处理搜索模拟、日志记录，并将搜索结果转换为可执行的动作分布。
+* **`src/mcts.py`** —— Legacy Monte Carlo 树搜索实现（纯 Python）。V0 管线使用 `v0/python/mcts.py`（C++ MCTSCore 封装）。
 
-* **`src/train.py`** —— 自博弈与训练循环的调度器。
-  负责生成对局、收集 `(state, policy, value)` 样本、训练网络、管理检查点（checkpoint）并执行评估对局。
+* **`src/train.py`** —— 训练循环的核心实现（`train_network`），V0 管线通过 `v0/train.py` 调度自博弈和评估后调用此模块完成训练。
 
 * **`src/evaluate.py`** —— 工具模块，用于让模型与基线（随机代理或历史最优模型）对战进行离线评估。
 
+* **`src/policy_batch.py`** —— 训练阶段策略损失批量化，动作编码与 v0 `ActionEncodingSpec` 一致（total_dim=220）。
+
 ---
 
-### 数据流程图
+### 数据流程图（V0 管线）
 
 ```
-训练迭代开始
+训练迭代开始 (v0/train.py)
     ↓
-[自博弈阶段]
-    ├─ self_play() 
-    │   ├─ self_play_single_game() (每局)
-    │   │   ├─ 初始化: GameState(), MCTS()
+[自博弈阶段] — v0/python/self_play_runner.py
+    ├─ self_play_v0() — 多 worker 并行
+    │   ├─ self_play_single_game_v0() (每局)
+    │   │   ├─ 初始化: GameState(), FastMCTS(MCTSCore C++)
     │   │   └─ 游戏循环 (每步):
     │   │       ├─ mcts.search(state)
-    │   │       │   ├─ 建立/复用根节点
-    │   │       │   ├─ 批量模拟循环:
-    │   │       │   │   ├─ Selection (PUCT选择)
+    │   │       │   ├─ MCTSCore C++ 批量搜索:
+    │   │       │   │   ├─ Selection (PUCT)
     │   │       │   │   ├─ Expansion:
-    │   │       │   │   │   ├─ generate_all_legal_moves()
-    │   │       │   │   │   ├─ state_to_tensor()
-    │   │       │   │   │   ├─ model(batch) → (log_p1, log_p2, log_pmc, value)
-    │   │       │   │   │   ├─ get_move_probabilities()
-    │   │       │   │   │   └─ node.expand()
-    │   │       │   │   ├─ Backpropagation
+    │   │       │   │   │   ├─ C++ generate_all_legal_moves
+    │   │       │   │   │   ├─ states_to_model_input (C++ encoding)
+    │   │       │   │   │   ├─ InferenceEngine/CUDA Graph forward
+    │   │       │   │   │   ├─ project_policy_logits_fast (C++)
+    │   │       │   │   │   └─ fast_apply_moves (CPU/CUDA)
+    │   │       │   │   └─ Backpropagation
     │   │       │   └─ 提取根策略 (基于访问次数)
     │   │       ├─ 保存 (state, policy)
-    │   │       ├─ 采样动作
-    │   │       ├─ apply_move()
+    │   │       ├─ 采样动作 + apply_move()
     │   │       └─ mcts.advance_root()
-    │   │   └─ 返回 (game_states, game_policies, result, soft_value)
-    │   └─ 返回 training_data: List[Tuple[...]]
+    │   └─ 返回 training_data
     ↓
-[训练阶段]
+[训练阶段] — src/train.py (train_network)
     ├─ 数据转换: (state, policy, value, soft_value)
-    ├─ train_network():
-    │   ├─ 创建 DataLoader
-    │   └─ 训练循环 (每个epoch):
-    │       └─ 每个batch:
-    │           ├─ model(states) → (log_p1, log_p2, log_pmc, value_pred)
-    │           ├─ 计算策略损失 (KL散度)
-    │           ├─ 计算价值损失 (MSE)
-    │           └─ loss.backward() + optimizer.step()
+    ├─ 批量化策略损失 (src/policy_batch.py):
+    │   ├─ build_combined_logits → masked_log_softmax → KL
+    │   └─ legal_mask + target_dense (total_dim=220)
+    ├─ DataLoader + 训练循环
     └─ 更新模型权重
     ↓
-[评估阶段]
-    ├─ 与RandomAgent对战
-    ├─ 与BestModel对战
-    └─ 决定是否更新best_model.pt
+[评估阶段] — src/evaluate.py
+    ├─ 与 RandomAgent 对战
+    ├─ 与上一迭代模型对战 (--eval_games_vs_previous)
+    ├─ 与 BestModel 对战
+    └─ 决定是否更新 best_model.pt
     ↓
 保存检查点 → 下一迭代
-
 ```
