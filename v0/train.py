@@ -578,16 +578,16 @@ def train_pipeline_v0(
                 devices=self_play_devices_list,
             )
             training_data = training_data or []
-            sp_wins = sum(1 for g in training_data if g[3] > 0)
-            sp_losses = sum(1 for g in training_data if g[3] < 0)
+            sp_black_wins = sum(1 for g in training_data if g[3] > 0)
+            sp_white_wins = sum(1 for g in training_data if g[3] < 0)
             sp_draws = sum(1 for g in training_data if g[3] == 0)
-            iteration_metrics["self_play_wins"] = sp_wins
-            iteration_metrics["self_play_losses"] = sp_losses
+            iteration_metrics["self_play_wins"] = sp_black_wins
+            iteration_metrics["self_play_losses"] = sp_white_wins
             iteration_metrics["self_play_draws"] = sp_draws
             if training_data:
                 print(
-                    f"Self-play outcomes: {sp_wins} wins, {sp_losses} losses, {sp_draws} draws "
-                    f"(draw rate {sp_draws / len(training_data):.1%})"
+                    f"Self-play outcomes: Black wins {sp_black_wins}, White wins {sp_white_wins}, "
+                    f"draws {sp_draws} (draw rate {sp_draws / len(training_data):.1%})"
                 )
             if decisive_only:
                 before_games = len(training_data)
