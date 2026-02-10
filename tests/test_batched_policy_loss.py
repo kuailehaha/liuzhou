@@ -34,8 +34,9 @@ def test_action_to_index_move():
         "to_position": (0, 1),
     }
     idx = action_to_index(move, 6)
-    assert idx is not None
-    assert 36 <= idx < 36 + 144
+    # movement index is cell-major: placement + cell_idx * 4 + dir_idx
+    # from (1,1) -> cell_idx=7, dir=(-1,0)->dir_idx=0
+    assert idx == 36 + 7 * 4 + 0
 
 
 def test_action_to_index_process_removal():

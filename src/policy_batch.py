@@ -51,10 +51,7 @@ def action_to_index(
         dc = c_to - c_from
         dir_idx = DIR_TO_INDEX.get((dr, dc))
         if dir_idx is None:
-            return None
-        cell_idx = r_from * board_size + c_from
         placement_dim = board_size * board_size
-        # Match build_combined_logits / v0 C++: movement slice is dir-major (dir*36 + cell)
         return placement_end + dir_idx * placement_dim + cell_idx
 
     selection_offset = placement_end + MOVEMENT_DIM
