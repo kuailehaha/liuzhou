@@ -28,8 +28,13 @@ from src.evaluate import (
     evaluate_against_agent_parallel_v0,
 )
 from src.random_agent import RandomAgent
+from src.policy_batch import action_to_index as policy_batch_action_to_index
 
 from v0.python.self_play_runner import self_play_v0
+from v0.python.move_encoder import (
+    DEFAULT_ACTION_SPEC,
+    action_to_index as v0_action_to_index,
+)
 from v0.python.state_io import (
     flatten_training_games,
     load_examples_from_files,
@@ -110,6 +115,119 @@ def _cuda_device_ids(devices: Sequence[str]) -> List[int]:
             unique_ids.append(idx)
             seen.add(idx)
     return unique_ids
+
+
+def _serialize_move_for_metrics(move: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert move dict into a JSON-safe payload for metrics logging."""
+    out: Dict[str, Any] = {}
+    for key, value in move.items():
+        if key == "phase":
+            out[key] = value.name if hasattr(value, "name") else str(value)
+        elif isinstance(value, tuple):
+            out[key] = [int(x) for x in value]
+        else:
+            out[key] = value
+    return out
+
+
+def _probe_policy_index_alignment(
+    examples: Sequence[SampleTuple],
+    board_size: int,
+    sample_examples: int = 1024,
+    max_moves: int = 50000,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """
+    Regression probe: compare action indices between training-side encoder
+    (src.policy_batch) and v0 encoder (v0.python.move_encoder).
+
+    This does not affect training; it only reports mismatch statistics.
+    """
+    total_examples = len(examples)
+    if total_examples == 0:
+        return {
+            "status": "empty",
+            "sampled_examples": 0,
+            "checked_examples": 0,
+            "checked_moves": 0,
+            "comparable_moves": 0,
+            "mismatch_count": 0,
+            "mismatch_rate": 0.0,
+            "move_limit_hit": False,
+            "mismatch_by_phase": {},
+            "mismatch_by_action_type": {},
+            "first_mismatch": None,
+        }
+
+    sample_n = min(max(1, int(sample_examples)), total_examples)
+    if sample_n >= total_examples:
+        sampled_indices: Sequence[int] = range(total_examples)
+    else:
+        sampled_indices = random.Random(seed).sample(range(total_examples), sample_n)
+
+    checked_examples = 0
+    checked_moves = 0
+    comparable_moves = 0
+    mismatch_count = 0
+    move_limit_hit = False
+    mismatch_by_phase: collections.Counter[str] = collections.Counter()
+    mismatch_by_action_type: collections.Counter[str] = collections.Counter()
+    first_mismatch: Optional[Dict[str, Any]] = None
+
+    for sample_idx in sampled_indices:
+        if checked_moves >= max_moves:
+            move_limit_hit = True
+            break
+        legal_moves = examples[sample_idx][2]
+        if not legal_moves:
+            continue
+        checked_examples += 1
+        for move in legal_moves:
+            if checked_moves >= max_moves:
+                move_limit_hit = True
+                break
+            checked_moves += 1
+
+            idx_policy_batch = policy_batch_action_to_index(move, board_size)
+            idx_v0 = v0_action_to_index(move, board_size, DEFAULT_ACTION_SPEC)
+
+            if idx_policy_batch is None and idx_v0 is None:
+                continue
+            comparable_moves += 1
+            if idx_policy_batch == idx_v0:
+                continue
+
+            mismatch_count += 1
+            phase = move.get("phase")
+            phase_key = phase.name if hasattr(phase, "name") else str(phase)
+            action_key = str(move.get("action_type"))
+            mismatch_by_phase[phase_key] += 1
+            mismatch_by_action_type[action_key] += 1
+
+            if first_mismatch is None:
+                first_mismatch = {
+                    "sample_index": int(sample_idx),
+                    "move": _serialize_move_for_metrics(move),
+                    "policy_batch_index": (
+                        None if idx_policy_batch is None else int(idx_policy_batch)
+                    ),
+                    "v0_index": None if idx_v0 is None else int(idx_v0),
+                }
+
+    mismatch_rate = (mismatch_count / comparable_moves) if comparable_moves > 0 else 0.0
+    return {
+        "status": "ok",
+        "sampled_examples": int(sample_n),
+        "checked_examples": int(checked_examples),
+        "checked_moves": int(checked_moves),
+        "comparable_moves": int(comparable_moves),
+        "mismatch_count": int(mismatch_count),
+        "mismatch_rate": float(mismatch_rate),
+        "move_limit_hit": bool(move_limit_hit),
+        "mismatch_by_phase": dict(mismatch_by_phase),
+        "mismatch_by_action_type": dict(mismatch_by_action_type),
+        "first_mismatch": first_mismatch,
+    }
 
 
 def train_pipeline_v0(
@@ -612,6 +730,37 @@ def train_pipeline_v0(
                 record_iter = (sample_to_record(*sample) for sample in examples)
                 saved = write_records_to_jsonl(record_iter, dump_path)
                 print(f"Saved {saved} samples to {dump_path}")
+
+        # Regression probe: verify policy index alignment (training vs v0).
+        alignment_report = _probe_policy_index_alignment(
+            examples=examples,
+            board_size=board_size,
+            sample_examples=1024,
+            max_moves=50000,
+            seed=(iteration + 1) * 7919,
+        )
+        iteration_metrics["policy_index_alignment"] = alignment_report
+        if alignment_report.get("status") == "ok":
+            print(
+                "[alignment] sampled_examples="
+                f"{alignment_report['sampled_examples']} "
+                f"checked_moves={alignment_report['checked_moves']} "
+                f"comparable_moves={alignment_report['comparable_moves']} "
+                f"mismatch_count={alignment_report['mismatch_count']} "
+                f"mismatch_rate={alignment_report['mismatch_rate']:.2%}"
+            )
+            if alignment_report["mismatch_count"] > 0:
+                first = alignment_report.get("first_mismatch")
+                if first is not None:
+                    print(f"[alignment] first mismatch: {first}")
+                print(
+                    "[alignment] mismatch_by_phase="
+                    f"{alignment_report.get('mismatch_by_phase', {})}"
+                )
+                print(
+                    "[alignment] mismatch_by_action_type="
+                    f"{alignment_report.get('mismatch_by_action_type', {})}"
+                )
 
         # Release self-play VRAM (inference engines, CUDA graphs, etc.)
         # before the training phase allocates its own GPU memory.
