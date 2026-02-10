@@ -3,6 +3,7 @@
 # 详见 TRAINING_STABILITY.md
 set -euo pipefail
 export PYTHONPATH="./:./v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
+PYTHON_BIN="/2023533024/users/zhangmq/condaenvs/naivetorch/bin/python"
 
 # 创建 logs 目录（如果不存在）
 mkdir -p logs
@@ -16,7 +17,7 @@ echo "Press Ctrl+C to stop (or detach tmux session)"
 
 # 使用 tee 同时输出到终端和日志文件
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-python -m v0.train \
+"$PYTHON_BIN" -m v0.train \
   --iterations 40 \
   --self_play_workers 200 \
   --self_play_games_per_worker 32 \

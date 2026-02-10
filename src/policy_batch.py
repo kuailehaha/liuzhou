@@ -51,8 +51,9 @@ def action_to_index(
         dc = c_to - c_from
         dir_idx = DIR_TO_INDEX.get((dr, dc))
         if dir_idx is None:
-        placement_dim = board_size * board_size
-        return placement_end + dir_idx * placement_dim + cell_idx
+            return None
+        cell_idx = r_from * board_size + c_from
+        return placement_end + cell_idx * len(DIRECTIONS) + dir_idx
 
     selection_offset = placement_end + MOVEMENT_DIM
     if action_type in {"mark", "capture", "remove", "counter_remove", "no_moves_remove"}:
