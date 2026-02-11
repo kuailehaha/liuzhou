@@ -21,6 +21,8 @@ checkpoints*/        # checkpoints/ checkpoints_eval_run/ 等一律忽略
 __pycache__/
 *.py[cod]
 
+.vscode
+.pytest_cache
 models/
 build/
 logs/

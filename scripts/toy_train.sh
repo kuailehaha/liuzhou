@@ -28,6 +28,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
   --self_play_resign_threshold -0.8 \
   --self_play_resign_min_moves 36 \
   --self_play_resign_consecutive 3 \
+  --runtime_config '{"soft_value_labels":{"k":2.0,"alpha_start":0.3,"alpha_end":0.6,"anneal_iterations":20}}' \
   --epochs 3 \
   --lr 0.0003 \
   --replay_window 4 \
