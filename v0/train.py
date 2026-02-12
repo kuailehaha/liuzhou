@@ -133,6 +133,7 @@ def train_pipeline_v0(
     self_play_resign_consecutive: int = 3,
     decisive_only: bool = False,
     policy_draw_weight: float = 0.3,
+    policy_soft_only: bool = False,
     eval_games_vs_random: int = 20,
     eval_games_vs_best: int = 20,
     eval_games_vs_previous: int = 0,
@@ -255,6 +256,8 @@ def train_pipeline_v0(
         policy_draw_weight = 1.0
     if policy_draw_weight < 0:
         policy_draw_weight = 0.0
+
+    policy_soft_only = bool(policy_soft_only)
 
     evaluation_cfg = runtime_config.get("evaluation", {})
     eval_temperature = evaluation_cfg.get("temperature", 0.05)
@@ -495,6 +498,7 @@ def train_pipeline_v0(
                 "self_play_resign_consecutive": sp_resign_consecutive,
                 "decisive_only": bool(decisive_only),
                 "policy_draw_weight": policy_draw_weight,
+                "policy_soft_only": policy_soft_only,
                 "eval_backend": eval_backend,
                 "self_play_devices": list(self_play_devices_list),
                 "train_devices": list(train_devices_list),
@@ -661,6 +665,7 @@ def train_pipeline_v0(
                 weight_decay=weight_decay,
                 soft_label_alpha=current_alpha,
                 policy_draw_weight=policy_draw_weight,
+                policy_soft_only=policy_soft_only,
                 device=train_device,
                 board_size=board_size,
                 num_workers=train_num_workers,
@@ -1130,6 +1135,11 @@ if __name__ == "__main__":
         help="Weight for draw samples in policy loss (1.0 = no downweight).",
     )
     parser.add_argument(
+        "--policy_soft_only",
+        action="store_true",
+        help="Ignore hard W/D/L weighting in policy loss; use only soft-based weighting.",
+    )
+    parser.add_argument(
         "--self_play_batch_leaves",
         type=int,
         default=256,
@@ -1288,6 +1298,7 @@ if __name__ == "__main__":
         self_play_resign_consecutive=args.self_play_resign_consecutive,
         decisive_only=args.decisive_only,
         policy_draw_weight=args.policy_draw_weight,
+        policy_soft_only=args.policy_soft_only,
         eval_games_vs_random=args.eval_games_vs_random,
         eval_games_vs_best=args.eval_games_vs_best,
         eval_games_vs_previous=args.eval_games_vs_previous,

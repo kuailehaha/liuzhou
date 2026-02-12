@@ -205,6 +205,7 @@ def train_network(
     weight_decay: float = 1e-4,
     soft_label_alpha: float = 0.0,
     policy_draw_weight: float = 1.0,
+    policy_soft_only: bool = False,
     device: str = 'cpu',
     board_size: int = GameState.BOARD_SIZE,
     use_amp: bool = True,
@@ -223,6 +224,7 @@ def train_network(
         lr: 学习率。
         weight_decay: 权重衰减。
         policy_draw_weight: draw 样本在 policy loss 中的权重（1.0=不降权）。
+        policy_soft_only: policy loss 忽略硬胜负/和棋标签，仅用 soft 相关权重（和 MCTS policy 目标）。
         device: 训练设备。
         board_size: 棋盘大小。
         
@@ -287,10 +289,13 @@ def train_network(
     print(f"[train] batch_size={batch_size}, steps/epoch={len(dataloader)}, "
           f"total_steps={total_train_steps}, num_workers={_num_workers}, "
           f"prefetch_factor={_prefetch}, batched_policy={use_batched_policy}, "
-          f"AMP={'ON' if _use_amp else 'OFF'}, device={device}")
-    
+          f"AMP={'ON' if _use_amp else 'OFF'}, device={device}, "
+          f"policy_draw_weight={policy_draw_weight}, "
+          f"policy_soft_only={policy_soft_only}")
+
     # 创建损失函数
     policy_draw_weight = max(0.0, float(policy_draw_weight))
+    policy_soft_only = bool(policy_soft_only)
     policy_loss_fn = nn.KLDivLoss(reduction='sum')
     
     # 训练循环
@@ -352,13 +357,17 @@ def train_network(
                     legal_mask_batch,
                     target_values_batch,
                     policy_draw_weight,
+                    policy_soft_only=policy_soft_only,
                 )
                 valid_policy_samples_in_batch = (target_dense_batch.sum(dim=1) > 1e-8).sum().item()
-                _policy_weights = torch.where(
-                    draw_mask.squeeze(1),
-                    target_dense_batch.new_full((), policy_draw_weight),
-                    target_dense_batch.new_ones(()),
-                )
+                if policy_soft_only:
+                    _policy_weights = target_dense_batch.new_ones(target_dense_batch.size(0))
+                else:
+                    _policy_weights = torch.where(
+                        draw_mask.squeeze(1),
+                        target_dense_batch.new_full((), policy_draw_weight),
+                        target_dense_batch.new_ones(()),
+                    )
                 policy_weight_sum_in_batch = _policy_weights.sum().item()
             else:
                 current_batch_policy_loss = torch.tensor(0.0, device=device)
@@ -386,7 +395,10 @@ def train_network(
                     if network_log_softmax_for_moves.shape != target_policy_sample.shape:
                         continue
                     value_abs = float(target_values_batch[i].abs().item())
-                    policy_weight = policy_draw_weight if value_abs < 1e-8 else 1.0
+                    if policy_soft_only:
+                        policy_weight = 1.0
+                    else:
+                        policy_weight = policy_draw_weight if value_abs < 1e-8 else 1.0
                     sample_policy_loss = policy_loss_fn(network_log_softmax_for_moves, target_policy_sample)
                     current_batch_policy_loss += sample_policy_loss * policy_weight
                     valid_policy_samples_in_batch += 1
@@ -431,6 +443,7 @@ def train_network(
                 "valid_policy_samples": int(total_valid_policy_samples),
                 "policy_weight_sum": float(policy_weight_sum_epoch),
                 "soft_alpha": float(soft_label_alpha),
+                "policy_soft_only": bool(policy_soft_only),
                 "avg_soft_abs": float(avg_soft_abs),
                 "avg_mix_abs": float(avg_mix_abs),
             })
@@ -444,6 +457,7 @@ def train_network(
                 "samples": 0,
                 "valid_policy_samples": 0,
                 "soft_alpha": float(soft_label_alpha),
+                "policy_soft_only": bool(policy_soft_only),
                 "avg_soft_abs": None,
                 "avg_mix_abs": None,
             })

@@ -171,3 +171,46 @@ def test_batched_policy_loss_gradient():
     loss = batched_policy_loss(log_probs, target_dense, legal_mask, value_batch, 0.3)
     loss.backward()
     assert log_probs.grad is not None
+
+
+def test_batched_policy_loss_soft_only_ignores_hard_wdl_labels():
+    """policy_soft_only=True should make policy loss independent of hard value_batch."""
+    log_probs = torch.log(
+        torch.tensor(
+            [
+                [0.6, 0.4],
+                [0.2, 0.8],
+            ],
+            dtype=torch.float32,
+        )
+    )
+    target_dense = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    legal_mask = torch.ones_like(target_dense, dtype=torch.bool)
+
+    value_batch_a = torch.tensor([[0.0], [1.0]], dtype=torch.float32)
+    value_batch_b = torch.tensor([[-1.0], [0.0]], dtype=torch.float32)
+
+    loss_a = batched_policy_loss(
+        log_probs,
+        target_dense,
+        legal_mask,
+        value_batch_a,
+        policy_draw_weight=0.3,
+        policy_soft_only=True,
+    )
+    loss_b = batched_policy_loss(
+        log_probs,
+        target_dense,
+        legal_mask,
+        value_batch_b,
+        policy_draw_weight=0.3,
+        policy_soft_only=True,
+    )
+
+    assert torch.isclose(loss_a, loss_b, atol=1e-8)
