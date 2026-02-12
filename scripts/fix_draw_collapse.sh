@@ -31,7 +31,7 @@ python -m v0.train \
   --decisive_only \
   --epochs 3 \
   --lr 0.0003 \
-  --replay_window 4 \
+  --replay_window 1 \
   --policy_draw_weight 0.1 \
   --batch_size 4096 \
   --device cuda \
@@ -44,4 +44,5 @@ python -m v0.train \
   --mcts_sims_eval 256 \
   --eval_backend v0 \
   --win_rate_threshold 0.55 \
-  --checkpoint_dir ./checkpoints_v0_fix 2>&1 | tee "$LOG_FILE"
+  --checkpoint_dir ./checkpoints_v0_fix \
+  "$@" 2>&1 | tee "$LOG_FILE"
