@@ -110,6 +110,10 @@ function isHumanTurn(state) {
   return state.currentPlayer === humanPlayer && !state.isGameOver;
 }
 
+function isAITurn(state) {
+  return Boolean(state) && state.currentPlayer !== humanPlayer && !state.isGameOver;
+}
+
 function updateStatus(state) {
   if (state.isGameOver) {
     const winner = state.winner ? `${state.winner} wins` : "Game drawn";
@@ -142,9 +146,9 @@ function updateEvaluation(info) {
     return;
   }
 
-  const { value, winProbability, perspective, range } = currentEvaluation;
+  const { value, winProbability, drawProbability, lossProbability, range } = currentEvaluation;
   const [rangeMin, rangeMax] = Array.isArray(range) && range.length >= 2 ? range : [-1, 1];
-  const sideLabel = perspective ? `${perspective} to move` : "Current player";
+  const sideLabel = "AI perspective";
 
   if (!Number.isFinite(value)) {
     evaluationElement.textContent = `Network evaluation (${sideLabel}, range ${rangeMin}..${rangeMax}): unavailable.`;
@@ -152,10 +156,26 @@ function updateEvaluation(info) {
   }
 
   const clampedValue = Math.max(rangeMin ?? -1, Math.min(rangeMax ?? 1, value));
-  const rawProb = Number.isFinite(winProbability) ? winProbability : (clampedValue + 1) / 2;
-  const clampedProb = Math.max(0, Math.min(1, rawProb));
-  const percentText = `${(clampedProb * 100).toFixed(1)}%`;
-  evaluationElement.textContent = `Network evaluation (${sideLabel}, range ${rangeMin}..${rangeMax}): value ${clampedValue.toFixed(3)}, win approx ${percentText}.`;
+  const denom = (rangeMax ?? 1) - (rangeMin ?? -1);
+  const scoreRaw = Number.isFinite(denom) && Math.abs(denom) > 1e-9
+    ? (clampedValue - (rangeMin ?? -1)) / denom
+    : (clampedValue + 1) / 2;
+  const scoreProb = Math.max(0, Math.min(1, scoreRaw));
+  const scoreText = `${(scoreProb * 100).toFixed(1)}%`;
+
+  const hasWdl =
+    Number.isFinite(winProbability) &&
+    Number.isFinite(drawProbability) &&
+    Number.isFinite(lossProbability);
+  let wdlText = "";
+  if (hasWdl) {
+    const w = Math.max(0, Math.min(1, winProbability));
+    const d = Math.max(0, Math.min(1, drawProbability));
+    const l = Math.max(0, Math.min(1, lossProbability));
+    wdlText = ` | W/D/L: ${(w * 100).toFixed(1)}% / ${(d * 100).toFixed(1)}% / ${(l * 100).toFixed(1)}%`;
+  }
+
+  evaluationElement.textContent = `Network evaluation (${sideLabel}, range ${rangeMin}..${rangeMax}): value ${clampedValue.toFixed(3)}, win approx for AI (from value): ${scoreText}${wdlText}.`;
 }
 
 function getMoveLandingPosition(move) {
@@ -174,31 +194,18 @@ function getMoveLandingPosition(move) {
 
 function refreshOpponentHighlight(moves) {
   if (!Array.isArray(moves) || moves.length === 0) {
-    return;
+    return false;
   }
-  const board = currentState?.board;
   for (let idx = moves.length - 1; idx >= 0; idx -= 1) {
     const landing = getMoveLandingPosition(moves[idx]);
     if (!landing) {
       continue;
     }
-    const [row, col] = landing;
-    if (!board || !Array.isArray(board[row]) || typeof board[row][col] === "undefined") {
-      lastOpponentHighlight = landing.slice(0, 2);
-      return;
-    }
-    const occupant = board[row][col];
-    const occupantColor = occupant === 1 ? "BLACK" : occupant === -1 ? "WHITE" : null;
-    if (!occupantColor) {
-      continue;
-    }
-    if (humanPlayer && occupantColor === humanPlayer) {
-      continue;
-    }
     lastOpponentHighlight = landing.slice(0, 2);
-    return;
+    return true;
   }
   lastOpponentHighlight = null;
+  return true;
 }
 
 function updateHint(state) {
@@ -270,7 +277,7 @@ function markCellState(cell, state, row, col) {
   const highlightMatch = lastOpponentHighlight && arraysEqual(lastOpponentHighlight, [row, col]);
   if (highlightMatch) {
     const occupantColor = stone === 1 ? "BLACK" : stone === -1 ? "WHITE" : null;
-    if (occupantColor && (!humanPlayer || occupantColor !== humanPlayer)) {
+    if (occupantColor) {
       const indicator = document.createElement("div");
       indicator.className = `last-opponent-indicator ${occupantColor.toLowerCase()}`;
       cell.appendChild(indicator);
@@ -369,7 +376,6 @@ function renderBoard(state) {
   boardElement.appendChild(svg);
 
   // 2) 再铺格子（保持你原来的点击/选中逻辑）
-  const humanTurn = isHumanTurn(state);
   for (let r = 0; r < size; r += 1) {
     for (let c = 0; c < size; c += 1) {
       const cell = document.createElement("div");
@@ -377,10 +383,6 @@ function renderBoard(state) {
       cell.dataset.row = r;
       cell.dataset.col = c;
       markCellState(cell, state, r, c);
-
-      if (!humanTurn || state.phase === "REMOVAL") {
-        cell.classList.add("disabled");
-      }
 
       cell.addEventListener("click", () => handleCellClick(r, c));
       boardElement.appendChild(cell);
@@ -413,10 +415,17 @@ function findMovementTo(source, destination) {
   );
 }
 
-function maybeSendProcessRemoval() {
-  const removalMove = currentLegalMoves.find((move) => move.action_type === "process_removal");
+function getProcessRemovalMoveForHuman() {
+  if (!currentState || !isHumanTurn(currentState)) {
+    return null;
+  }
+  return currentLegalMoves.find((move) => move.action_type === "process_removal") || null;
+}
+
+async function maybeSendProcessRemoval() {
+  const removalMove = getProcessRemovalMoveForHuman();
   if (removalMove) {
-    sendMove(removalMove);
+    await sendMove(removalMove);
   }
 }
 
@@ -463,38 +472,120 @@ function handleCellClick(row, col) {
   }
 }
 
-async function sendMove(move) {
-  if (!currentGameId) return;
+async function sendMove(move, options = {}) {
+  if (!currentGameId) return false;
 
-  try {
-    setupError.textContent = "";
+  const { logHuman = true, followUp = true } = options;
+  setupError.textContent = "";
+  if (logHuman) {
     addLogEntry("human", move);
-    const body = {
-      phase: move.phase,
-      actionType: move.action_type,
-      position: move.position ?? null,
-      fromPosition: move.from_position ?? null,
-      toPosition: move.to_position ?? null,
-    };
-    const data = await postJSON(`${apiBasePath}/game/${currentGameId}/human-move`, body);
-    if (!data?.state) {
-      throw new Error("Malformed server response.");
-    }
-    updateGameState(data);
+    renderLog();
+  }
+
+  const body = {
+    phase: move.phase,
+    actionType: move.action_type,
+    position: move.position ?? null,
+    fromPosition: move.from_position ?? null,
+    toPosition: move.to_position ?? null,
+  };
+
+  let data;
+  try {
+    data = await postJSON(`${apiBasePath}/game/${currentGameId}/human-move`, body);
   } catch (error) {
-    moveLog.pop(); // remove optimistic human entry
+    if (logHuman) {
+      moveLog.pop();
+      renderLog();
+    }
     setupError.textContent = error.message;
+    return false;
+  }
+
+  if (!data?.state) {
+    if (logHuman) {
+      moveLog.pop();
+      renderLog();
+    }
+    setupError.textContent = "Malformed server response.";
+    return false;
+  }
+
+  updateGameState(data, { humanMove: move });
+
+  if (followUp) {
+    await settleTurnFlow();
+  }
+  return true;
+}
+
+async function runAiMove(options = {}) {
+  if (!currentGameId || !currentState || !isAITurn(currentState)) {
+    return false;
+  }
+
+  const { followUp = true } = options;
+  setupError.textContent = "";
+
+  let data;
+  try {
+    data = await postJSON(`${apiBasePath}/game/${currentGameId}/ai-move`, {});
+  } catch (error) {
+    setupError.textContent = error.message;
+    return false;
+  }
+
+  if (!data?.state) {
+    setupError.textContent = "Malformed server response.";
+    return false;
+  }
+
+  updateGameState(data);
+
+  if (followUp) {
+    await settleTurnFlow();
+  }
+  return true;
+}
+
+async function settleTurnFlow() {
+  let guard = 0;
+  while (currentState && !currentState.isGameOver && guard < 16) {
+    const removalMove = getProcessRemovalMoveForHuman();
+    if (removalMove) {
+      const applied = await sendMove(removalMove, { logHuman: false, followUp: false });
+      if (!applied) {
+        break;
+      }
+      guard += 1;
+      continue;
+    }
+
+    if (isAITurn(currentState)) {
+      const applied = await runAiMove({ followUp: false });
+      if (!applied) {
+        break;
+      }
+      guard += 1;
+      continue;
+    }
+
+    break;
   }
 }
 
-function updateGameState(data) {
+function updateGameState(data, options = {}) {
+  const { humanMove = null } = options;
   currentGameId = data.gameId;
   currentState = data.state;
   currentLegalMoves = data.legalMoves || [];
   humanPlayer = data.meta?.humanPlayer || humanPlayer;
   selectedSource = null;
 
-  refreshOpponentHighlight(data.aiMoves || []);
+  const highlightedByAI = refreshOpponentHighlight(data.aiMoves || []);
+  if (!highlightedByAI && humanMove) {
+    refreshOpponentHighlight([humanMove]);
+  }
   renderBoard(currentState);
   updateStatus(currentState);
   updateMeta(data.meta || {});
@@ -510,12 +601,7 @@ function updateGameState(data) {
 }
 
 function toggleRemovalButton() {
-  const removalMove = currentLegalMoves.find((move) => move.action_type === "process_removal");
-  if (isHumanTurn(currentState) && removalMove) {
-    processRemovalButton.classList.remove("hidden");
-  } else {
-    processRemovalButton.classList.add("hidden");
-  }
+  processRemovalButton.classList.add("hidden");
 }
 
 async function handleNewGame(event) {
@@ -537,11 +623,9 @@ async function handleNewGame(event) {
     if (gameSection) {
       gameSection.classList.remove("hidden");
     }
-    if (data.aiMoves) {
-      data.aiMoves.forEach((move) => addLogEntry("ai", move));
-    }
     lastOpponentHighlight = null;
     updateGameState(data);
+    await settleTurnFlow();
     setupError.textContent = "";
   } catch (error) {
     setupError.textContent = error.message;

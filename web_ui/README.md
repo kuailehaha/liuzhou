@@ -28,7 +28,8 @@ The API surface:
 
 - `POST /api/new-game`: create a fresh session. When the human chooses WHITE the AI opens automatically.
 - `GET /api/game/{gameId}`: retrieve the serialised game state plus the current legal move list.
-- `POST /api/game/{gameId}/human-move`: submit a move. The backend validates it, applies the change, resolves any AI follow-up moves, and returns the updated state.
+- `POST /api/game/{gameId}/human-move`: submit one human move and get the immediate updated state.
+- `POST /api/game/{gameId}/ai-move`: ask the backend to resolve the AI turn (including chained follow-up phases owned by AI).
 - `DELETE /api/game/{gameId}`: remove a session.
 
 ## Front-end
@@ -44,7 +45,6 @@ The UI mirrors the phase-based rule set:
 - Placement / marking / captures: click the target intersection.
 - Movement: click a source stone, then its destination (clicking a different stone changes the selection).
 - Forced-removal phases: click the highlighted opponent stones.
-- When the rules require the special `process_removal` action, a button appears beneath the board.
+- The special `process_removal` action is auto-applied for the human side when required.
 
 Each response carries the legal moves computed by the core rule engine, so the front-end double-checks validity server-side before accepting a move.
-
