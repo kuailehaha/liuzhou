@@ -174,3 +174,34 @@ Use same hardware and config family as baseline:
 
 ### 6. Deliverables
 - v1 GPU core modules, tensor output bridge, smoke/benchmark scripts, updated docs.
+
+## Implementation Progress (2026-02-16)
+### Added prototype path (v1, GPU-first)
+- Implemented a new v1 self-play/MCTS path that keeps legal-mask, policy projection, action apply, and trajectory construction on GPU tensors.
+- Added tensor-native train bridge so self-play output can feed training directly without JSONL.
+- Kept `v0` unchanged.
+
+### Current scope
+- Implemented root-PUCT search on GPU (`v1/python/mcts_gpu.py`) as a migration baseline.
+- Not yet implemented: full multi-depth GPU node arena kernels (`v1/src/mcts_gpu/`, `v1/src/game/gpu_state_arena.*`, v1 pybind C++ module).
+
+### New files
+- `v1/__init__.py`
+- `v1/python/__init__.py`
+- `v1/python/mcts_gpu.py`
+- `v1/python/self_play_gpu_runner.py`
+- `v1/python/trajectory_buffer.py`
+- `v1/python/train_bridge.py`
+- `tools/smoke_v1_gpu_pipeline.py`
+
+### Build and smoke status (Windows)
+- Rebuilt `v0_core` successfully (`build/v0/src/v0_core.cp313-win_amd64.pyd`).
+- Smoke pipeline passed:
+  - `v1 self-play -> tensor batch -> tensor-native train` end-to-end runnable.
+  - Example command:
+    - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/smoke_v1_gpu_pipeline.py --device cuda:0 --num_games 1 --mcts_simulations 8 --epochs 1 --batch_size 64"`
+
+### Pending milestones
+- Replace root-only search with full GPU tree selection/expansion/backprop arena.
+- Add v1 parity tests versus v0 on fixed seeds.
+- Add v1 worker-sensitivity and power benchmark matrix (`1/2/4` workers) for acceptance criteria.
