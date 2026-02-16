@@ -205,3 +205,22 @@ Use same hardware and config family as baseline:
 - Replace root-only search with full GPU tree selection/expansion/backprop arena.
 - Add v1 parity tests versus v0 on fixed seeds.
 - Add v1 worker-sensitivity and power benchmark matrix (`1/2/4` workers) for acceptance criteria.
+
+## Validation Scripts (2026-02-16)
+### Unified acceptance validator
+- Script: `tools/validate_v1_claims.py`
+- Purpose:
+  - Run v0 worker scaling (`--v0-workers`, default `1,2,4`)
+  - Run v1 CPU-thread sensitivity (`--v1-threads`, default `1,2,4`)
+  - Sample GPU util/power during each run
+  - Compute acceptance indicators:
+    - v1 speedup vs v0(worker=1)
+    - v1 power uplift vs v0(worker=1)
+    - v1 thread-sensitivity gain ratio
+  - Emit JSON report and PASS/FAIL criteria summary.
+- Recommended command (Windows):
+  - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/validate_v1_claims.py --device cuda:0 --v0-workers 1,2,4 --v1-threads 1,2,4 --total-games 8 --v0-mcts-simulations 12 --v1-mcts-simulations 12 --with-inference-baseline --output-json results/v1_validation_latest.json"`
+
+### One-click wrapper
+- Script: `scripts/validate_v1_gpu.cmd`
+- Purpose: launch the above validator with default matrix and output path.
