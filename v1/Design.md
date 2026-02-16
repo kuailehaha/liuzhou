@@ -183,6 +183,7 @@ Use same hardware and config family as baseline:
 
 ### Current scope
 - Implemented root-PUCT search on GPU (`v1/python/mcts_gpu.py`) as a migration baseline.
+- Implemented batched root-search + batched multi-game self-play (`concurrent_games`) to reduce Python per-game overhead and increase GPU-side throughput.
 - Not yet implemented: full multi-depth GPU node arena kernels (`v1/src/mcts_gpu/`, `v1/src/game/gpu_state_arena.*`, v1 pybind C++ module).
 
 ### New files
@@ -212,6 +213,7 @@ Use same hardware and config family as baseline:
 - Purpose:
   - Run v0 worker scaling (`--v0-workers`, default `1,2,4`)
   - Run v1 CPU-thread sensitivity (`--v1-threads`, default `1,2,4`)
+  - Control v1 game-level batching (`--v1-concurrent-games`, default Windows=`8`)
   - Sample GPU util/power during each run
   - Compute acceptance indicators:
     - v1 speedup vs v0(worker=1)
@@ -219,7 +221,18 @@ Use same hardware and config family as baseline:
     - v1 thread-sensitivity gain ratio
   - Emit JSON report and PASS/FAIL criteria summary.
 - Recommended command (Windows):
-  - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/validate_v1_claims.py --device cuda:0 --v0-workers 1,2,4 --v1-threads 1,2,4 --total-games 8 --v0-mcts-simulations 12 --v1-mcts-simulations 12 --with-inference-baseline --output-json results/v1_validation_latest.json"`
+  - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/validate_v1_claims.py --device cuda:0 --seed 12345 --rounds 1 --v0-workers 1,2,4 --v1-threads 1,2,4 --v1-concurrent-games 8 --total-games 8 --v0-mcts-simulations 512 --v1-mcts-simulations 512 --v0-batch-leaves 512 --v0-inference-backend graph --v0-inference-batch-size 512 --v0-inference-warmup-iters 5 --v0-opening-random-moves 2 --v0-resign-threshold -0.8 --v0-resign-min-moves 36 --v0-resign-consecutive 3 --with-inference-baseline --output-json results/v1_validation_latest_after_vec.json"`
+
+### Latest result snapshot (Windows, RTX 3060, 2026-02-16)
+- Config: `sims=512`, `total_games=8`, `v1-concurrent-games=8`
+- `v0` (workers 1/2/4): `0.029 / 0.053 / 0.091 games/s`
+- `v1` (threads 1/2/4): `0.085 / 0.085 / 0.086 games/s`
+- Inference baseline: `~100% util`, `~44.9W`
+- Criteria outcome:
+  - `v1_speedup_ge_threshold`: PASS (`speedup=2.960` vs v0 worker=1)
+  - `v1_thread_gain_le_threshold`: PASS (`0.007`)
+  - `v0_worker_gain_ge_threshold`: PASS (`2.128`)
+  - `v1_power_delta_ge_threshold`: FAIL (`+2.18W`, threshold `+5W`)
 
 ### One-click wrapper
 - Script: `scripts/validate_v1_gpu.cmd`

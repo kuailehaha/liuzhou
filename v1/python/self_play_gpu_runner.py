@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -41,15 +41,13 @@ class SelfPlayV1Stats:
         }
 
 
-def _winner_from_state_tensor(state: GpuStateBatch) -> int:
+def _winner_from_board_row(board_row: torch.Tensor, phase_value: int) -> int:
     """Return winner sign from black perspective: +1 black, -1 white, 0 no winner."""
 
-    phase_val = int(state.phase[0].item())
-    if phase_val == int(Phase.PLACEMENT.value):
+    if phase_value == int(Phase.PLACEMENT.value):
         return 0
-    board = state.board[0]
-    black_count = int((board == 1).sum().item())
-    white_count = int((board == -1).sum().item())
+    black_count = int((board_row == 1).sum().item())
+    white_count = int((board_row == -1).sum().item())
     if black_count == 0:
         return -1
     if white_count == 0:
@@ -57,19 +55,46 @@ def _winner_from_state_tensor(state: GpuStateBatch) -> int:
     return 0
 
 
-def _is_draw_limit(state: GpuStateBatch) -> bool:
+def _is_draw_limit_row(move_count: int, moves_since_capture: int) -> bool:
     return bool(
-        int(state.move_count[0].item()) >= int(GameState.MAX_MOVE_COUNT)
-        or int(state.moves_since_capture[0].item()) >= int(GameState.NO_CAPTURE_DRAW_LIMIT)
+        int(move_count) >= int(GameState.MAX_MOVE_COUNT)
+        or int(moves_since_capture) >= int(GameState.NO_CAPTURE_DRAW_LIMIT)
     )
 
 
-def _soft_value_from_tensor(state: GpuStateBatch, soft_value_k: float) -> float:
-    board = state.board[0]
-    black = float((board == 1).sum().item())
-    white = float((board == -1).sum().item())
+def _soft_value_from_board_row(board_row: torch.Tensor, soft_value_k: float) -> float:
+    black = float((board_row == 1).sum().item())
+    white = float((board_row == -1).sum().item())
     material_delta = (black - white) / float(GameState.BOARD_SIZE * GameState.BOARD_SIZE)
     return float(math.tanh(float(soft_value_k) * material_delta))
+
+
+def _index_copy_state(dst: GpuStateBatch, idx: torch.Tensor, src: GpuStateBatch) -> None:
+    dst.board.index_copy_(0, idx, src.board)
+    dst.marks_black.index_copy_(0, idx, src.marks_black)
+    dst.marks_white.index_copy_(0, idx, src.marks_white)
+    dst.phase.index_copy_(0, idx, src.phase)
+    dst.current_player.index_copy_(0, idx, src.current_player)
+    dst.pending_marks_required.index_copy_(0, idx, src.pending_marks_required)
+    dst.pending_marks_remaining.index_copy_(0, idx, src.pending_marks_remaining)
+    dst.pending_captures_required.index_copy_(0, idx, src.pending_captures_required)
+    dst.pending_captures_remaining.index_copy_(0, idx, src.pending_captures_remaining)
+    dst.forced_removals_done.index_copy_(0, idx, src.forced_removals_done)
+    dst.move_count.index_copy_(0, idx, src.move_count)
+    dst.moves_since_capture.index_copy_(0, idx, src.moves_since_capture)
+
+
+def _finalize_game(
+    *,
+    buffer: TensorTrajectoryBuffer,
+    step_indices: List[int],
+    final_state: GpuStateBatch,
+    final_local_index: int,
+    result_from_black: float,
+    soft_value_k: float,
+) -> None:
+    soft_value = _soft_value_from_board_row(final_state.board[final_local_index], soft_value_k)
+    buffer.finalize_game(step_indices, result_from_black, soft_value)
 
 
 def self_play_v1_gpu(
@@ -87,6 +112,7 @@ def self_play_v1_gpu(
     soft_value_k: float = 2.0,
     max_game_plies: int = 512,
     sample_moves: bool = True,
+    concurrent_games: int = 8,
     verbose: bool = False,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     """Run v1 self-play fully in tensor form and return training-ready tensors."""
@@ -94,6 +120,8 @@ def self_play_v1_gpu(
     if num_games <= 0:
         raise ValueError("num_games must be positive.")
     dev = torch.device(device)
+    max_plies = max(1, int(max_game_plies))
+    wave_size = max(1, min(int(concurrent_games), int(num_games)))
 
     mcts_cfg = V1RootMCTSConfig(
         num_simulations=max(1, int(mcts_simulations)),
@@ -110,80 +138,126 @@ def self_play_v1_gpu(
     black_wins = 0
     white_wins = 0
     draws = 0
-    game_lengths = []
+    game_lengths: List[int] = [0 for _ in range(int(num_games))]
 
     started = time.perf_counter()
 
-    for game_idx in range(num_games):
-        state = GpuStateBatch.initial(dev, batch_size=1)
-        step_indices = []
-        plies = 0
+    for wave_base in range(0, int(num_games), wave_size):
+        wave_games = min(wave_size, int(num_games) - wave_base)
+        states = GpuStateBatch.initial(dev, batch_size=wave_games)
+        step_indices_by_slot: List[List[int]] = [[] for _ in range(wave_games)]
+        plies = torch.zeros((wave_games,), dtype=torch.int64, device=dev)
+        done = torch.zeros((wave_games,), dtype=torch.bool, device=dev)
 
-        while plies < max(1, int(max_game_plies)):
-            temperature = (
-                float(temperature_init)
-                if plies < int(temperature_threshold)
-                else float(temperature_final)
+        while not bool(done.all().item()):
+            active_idx = torch.nonzero(~done, as_tuple=False).view(-1)
+            active_states = states.select(active_idx)
+            active_plies = plies.index_select(0, active_idx)
+            active_temps = torch.where(
+                active_plies < int(temperature_threshold),
+                torch.full_like(active_plies, float(temperature_init), dtype=torch.float32),
+                torch.full_like(active_plies, float(temperature_final), dtype=torch.float32),
             )
-            search = mcts.search(
-                state,
-                temperature=temperature,
+
+            search = mcts.search_batch(
+                active_states,
+                temperatures=active_temps,
                 add_dirichlet_noise=add_dirichlet_noise,
             )
 
-            player_sign = int(state.current_player[0].item())
-            step_idx = buffer.append_step(
-                model_input=search.model_input,
-                legal_mask=search.legal_mask,
-                policy_dense=search.policy_dense,
-                player_sign=player_sign,
+            # Persist one trajectory row for every active game at the current root.
+            active_count = int(active_idx.numel())
+            for local in range(active_count):
+                slot = int(active_idx[local].item())
+                player_sign = int(active_states.current_player[local].item())
+                step_idx = buffer.append_step(
+                    model_input=search.model_input[local],
+                    legal_mask=search.legal_mask[local],
+                    policy_dense=search.policy_dense[local],
+                    player_sign=player_sign,
+                )
+                step_indices_by_slot[slot].append(step_idx)
+
+            immediate_done_local = search.terminal_mask | (~search.chosen_valid_mask)
+            immediate_done_idx = torch.nonzero(immediate_done_local, as_tuple=False).view(-1)
+            if int(immediate_done_idx.numel()) > 0:
+                for local in immediate_done_idx.tolist():
+                    slot = int(active_idx[local].item())
+                    current_player = int(active_states.current_player[local].item())
+                    if bool(search.terminal_mask[local].item()):
+                        result = -float(current_player)
+                        if result > 0:
+                            black_wins += 1
+                        else:
+                            white_wins += 1
+                    else:
+                        result = 0.0
+                        draws += 1
+                    _finalize_game(
+                        buffer=buffer,
+                        step_indices=step_indices_by_slot[slot],
+                        final_state=active_states,
+                        final_local_index=local,
+                        result_from_black=result,
+                        soft_value_k=soft_value_k,
+                    )
+                    game_lengths[wave_base + slot] = len(step_indices_by_slot[slot])
+                    done[slot] = True
+
+            valid_local = torch.nonzero(~immediate_done_local, as_tuple=False).view(-1)
+            if int(valid_local.numel()) == 0:
+                continue
+
+            valid_slots = active_idx.index_select(0, valid_local)
+            valid_states = active_states.select(valid_local)
+            valid_action_codes = search.chosen_action_codes.index_select(0, valid_local)
+            next_states = mcts.apply_action(valid_states, valid_action_codes)
+            _index_copy_state(states, valid_slots, next_states)
+            plies.index_add_(
+                0,
+                valid_slots,
+                torch.ones((int(valid_slots.numel()),), dtype=torch.int64, device=dev),
             )
-            step_indices.append(step_idx)
 
-            if search.terminal:
-                result = -float(player_sign)
-                soft_value = _soft_value_from_tensor(state, soft_value_k)
-                buffer.finalize_game(step_indices, result, soft_value)
-                if result > 0:
-                    black_wins += 1
+            for local_next in range(int(valid_slots.numel())):
+                slot = int(valid_slots[local_next].item())
+                winner = _winner_from_board_row(
+                    next_states.board[local_next],
+                    int(next_states.phase[local_next].item()),
+                )
+                hit_max_plies = int(plies[slot].item()) >= max_plies
+                draw_limit = _is_draw_limit_row(
+                    move_count=int(next_states.move_count[local_next].item()),
+                    moves_since_capture=int(next_states.moves_since_capture[local_next].item()),
+                )
+
+                if winner != 0:
+                    result = float(winner)
+                    if winner > 0:
+                        black_wins += 1
+                    else:
+                        white_wins += 1
+                elif draw_limit or hit_max_plies:
+                    result = 0.0
+                    draws += 1
                 else:
-                    white_wins += 1
-                break
+                    continue
 
-            if search.chosen_action_code is None:
-                soft_value = _soft_value_from_tensor(state, soft_value_k)
-                buffer.finalize_game(step_indices, 0.0, soft_value)
-                draws += 1
-                break
+                _finalize_game(
+                    buffer=buffer,
+                    step_indices=step_indices_by_slot[slot],
+                    final_state=next_states,
+                    final_local_index=local_next,
+                    result_from_black=result,
+                    soft_value_k=soft_value_k,
+                )
+                game_lengths[wave_base + slot] = len(step_indices_by_slot[slot])
+                done[slot] = True
 
-            state = mcts.apply_action(state, search.chosen_action_code.view(1, 4))
-            plies += 1
-
-            winner = _winner_from_state_tensor(state)
-            if winner != 0:
-                soft_value = _soft_value_from_tensor(state, soft_value_k)
-                buffer.finalize_game(step_indices, float(winner), soft_value)
-                if winner > 0:
-                    black_wins += 1
-                else:
-                    white_wins += 1
-                break
-
-            if _is_draw_limit(state):
-                soft_value = _soft_value_from_tensor(state, soft_value_k)
-                buffer.finalize_game(step_indices, 0.0, soft_value)
-                draws += 1
-                break
-        else:
-            soft_value = _soft_value_from_tensor(state, soft_value_k)
-            buffer.finalize_game(step_indices, 0.0, soft_value)
-            draws += 1
-
-        game_lengths.append(len(step_indices))
         if verbose:
+            completed = min(wave_base + wave_games, int(num_games))
             print(
-                f"[v1.self_play] game={game_idx + 1}/{num_games} "
-                f"steps={len(step_indices)} "
+                f"[v1.self_play] games={completed}/{num_games} "
                 f"W/L/D={black_wins}/{white_wins}/{draws}"
             )
 
@@ -202,4 +276,3 @@ def self_play_v1_gpu(
         games_per_sec=float(num_games / elapsed),
     )
     return batch, stats
-
