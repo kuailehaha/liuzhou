@@ -596,6 +596,45 @@ Use same hardware and config family as baseline:
   - `fixed-worker >=10x` is still not met on the minimum scale pair.
   - `P0 ratio >= 0.9` is still not met on this RTX 3060 setup.
 
+### Latest result snapshot (Windows, RTX 3060, R3 step1 slot-path reduction, aligned baseline, 2026-02-17)
+- Baseline comparability correction:
+  - Use the same batch scale for both sides in validator runs: `v0-batch-leaves=512` and `v1-inference-batch-size=512`.
+  - The previous `v0-batch-leaves=128` run is kept as diagnostic only, not as final acceptance evidence.
+- Semantic A/B gate:
+  - `results/v1_child_value_ab_after_r3_step1_256.json`: PASS
+  - `results/v1_child_value_ab_after_r3_step1_512.json`: PASS
+- Fixed-worker regression (`results/v1_validation_workers_py_128_after_r3_step1_aligned512.json`):
+  - `v0` workers 1/2/4: `0.067 / 0.032 / 0.029 games/s`
+  - `v1(py)` threads 1/2/4: `0.715 / 0.913 / 0.953 games/s`
+  - `speedup_fixed_worker_min`: `10.670` (meets `>=10x` gate in this run)
+  - `v1_thread_gain`: `0.333` (fails `<=0.15` gate)
+  - `v1_p0_ratio_min`: `0.0` (fails `>=0.9` gate)
+- Fixed-worker regression (`results/v1_validation_workers_graph_128_after_r3_step1_aligned512.json`):
+  - `v1(graph)` threads 1/2/4: `0.294 / 0.265 / 0.325 games/s`
+  - `speedup_fixed_worker_min`: `4.815` (still below `10x`)
+  - `v1_thread_gain`: `0.104` (passes CPU-scaling gate)
+  - `v1_p0_ratio_min`: `0.0` (fails `>=0.9` gate)
+- Concurrency sweep (`results/v1_gpu_matrix_8_16_32_64_after_r3_step1.json`):
+  - `v1(py)` games/s at `cg=8/16/32/64`: `0.816 / 0.935 / 1.099 / 1.080`
+  - `v1(graph)` games/s at `cg=8/16/32/64`: `0.396 / 0.369 / 0.329 / 0.276`
+  - Observation: `graph` keeps higher util/power but lower games/s, indicating orchestration/shape mismatch rather than compute saturation.
+
+### Latest result snapshot (Windows, RTX 3060, R3 step2 graph small-batch fallback, aligned baseline, 2026-02-17)
+- Implementation note:
+  - In `mcts_gpu.py`, graph backend now falls back to eager model forward for small batches and small remainder chunks (no new external flags/params), to avoid pathological pad-to-512 overhead.
+- Semantic A/B gate:
+  - `results/v1_child_value_ab_after_r3_step2_graphhybrid_256.json`: PASS
+- Fixed-worker regression (`results/v1_validation_workers_graph_128_after_r3_step2_graphhybrid_aligned512.json`):
+  - `v0` workers 1/2/4: `0.061 / 0.042 / 0.033 games/s`
+  - `v1(graph-hybrid)` threads 1/2/4: `0.740 / 0.870 / 0.895 games/s`
+  - `speedup_fixed_worker_min`: `12.209` (passes `>=10x`)
+  - `v1_thread_gain`: `0.209` (still above `<=0.15` gate)
+  - `v1_p0_ratio_min`: `0.0` (still below `>=0.9` gate)
+- Concurrency sweep (`results/v1_gpu_matrix_8_16_32_64_after_r3_step2_graphhybrid.json`):
+  - `v1(py)` games/s at `cg=8/16/32/64`: `0.878 / 1.010 / 0.887 / 0.928`
+  - `v1(graph-hybrid)` games/s at `cg=8/16/32/64`: `0.941 / 0.864 / 0.812 / 0.989`
+  - Compared to step1 graph (`0.396 / 0.369 / 0.329 / 0.276`), graph throughput is now in the same band as py under the same sweep settings.
+
 ### One-click wrapper
 - Script: `scripts/validate_v1_gpu.cmd`
 - Purpose: launch the above validator with default matrix and output path.

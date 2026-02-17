@@ -330,11 +330,27 @@ class V1RootMCTS:
     def _forward_model(
         self, inputs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        def _forward_eager(eager_inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            self.model.eval()
+            with torch.inference_mode():
+                if self.device.type == "cuda":
+                    with self._autocast_context():
+                        return self.model(eager_inputs)
+                return self.model(eager_inputs)
+
+        def _use_eager_for_small_batch(n_valid: int, engine_bs: int) -> bool:
+            # Graph path pads to engine batch size; for very small batches this wastes
+            # substantial compute and can be slower than eager on RTX 3060.
+            fallback_threshold = min(128, max(32, engine_bs // 2))
+            return n_valid < fallback_threshold
+
         if self.inference_engine is not None:
             n_valid = int(inputs.size(0))
             engine_bs = int(getattr(self.inference_engine, "batch_size", n_valid))
             if engine_bs <= 0:
                 raise RuntimeError("Inference engine batch_size must be positive.")
+            if _use_eager_for_small_batch(n_valid, engine_bs):
+                return _forward_eager(inputs)
             if n_valid <= engine_bs:
                 engine_inputs = inputs
                 if engine_bs > n_valid:
@@ -359,6 +375,13 @@ class V1RootMCTS:
                 end = min(start + engine_bs, n_valid)
                 chunk = inputs[start:end]
                 chunk_valid = int(end - start)
+                if chunk_valid < engine_bs and _use_eager_for_small_batch(chunk_valid, engine_bs):
+                    c1, c2, c3, cv = _forward_eager(chunk)
+                    log_p1_parts.append(c1[:chunk_valid])
+                    log_p2_parts.append(c2[:chunk_valid])
+                    log_pmc_parts.append(c3[:chunk_valid])
+                    raw_parts.append(cv[:chunk_valid])
+                    continue
                 if chunk_valid < engine_bs:
                     pad_shape = (
                         engine_bs - chunk_valid,
@@ -379,13 +402,7 @@ class V1RootMCTS:
                 torch.cat(log_pmc_parts, dim=0),
                 torch.cat(raw_parts, dim=0),
             )
-
-        self.model.eval()
-        with torch.inference_mode():
-            if self.device.type == "cuda":
-                with self._autocast_context():
-                    return self.model(inputs)
-            return self.model(inputs)
+        return _forward_eager(inputs)
 
     def _evaluate_batch(
         self, batch: GpuStateBatch

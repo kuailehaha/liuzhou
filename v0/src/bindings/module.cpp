@@ -540,7 +540,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
         return std::make_tuple(empty_slots, empty_float, empty_float.clone());
     }
 
-    auto active_current_player = current_player.index_select(0, active_idx);
     auto immediate_done_local = terminal_mask.logical_or(chosen_valid_mask.logical_not());
     auto immediate_local_idx = torch::nonzero(immediate_done_local).view(-1);
 
@@ -549,11 +548,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
         done.index_fill_(0, immediate_slots, true);
 
         auto terminal_local = terminal_mask.index_select(0, immediate_local_idx);
-        auto player_local = active_current_player.index_select(0, immediate_local_idx).to(torch::kFloat32);
+        auto player_local = current_player.index_select(0, immediate_slots).to(torch::kFloat32);
         auto result_local = torch::where(terminal_local, -player_local, torch::zeros_like(player_local));
 
-        auto active_board = board.index_select(0, active_idx);
-        auto board_local = active_board.index_select(0, immediate_local_idx);
+        auto board_local = board.index_select(0, immediate_slots);
         auto soft_local = SoftValueFromBoardBatch(board_local, soft_value_k);
 
         slot_chunks.push_back(immediate_slots);
@@ -566,36 +564,21 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
     if (valid_local_idx.numel() > 0) {
         auto valid_slots = active_idx.index_select(0, valid_local_idx);
         auto valid_action_codes = chosen_action_codes.index_select(0, valid_local_idx);
-
-        auto valid_board = board.index_select(0, valid_slots);
-        auto valid_marks_black = marks_black.index_select(0, valid_slots);
-        auto valid_marks_white = marks_white.index_select(0, valid_slots);
-        auto valid_phase = phase.index_select(0, valid_slots);
-        auto valid_current_player = current_player.index_select(0, valid_slots);
-        auto valid_pending_marks_required = pending_marks_required.index_select(0, valid_slots);
-        auto valid_pending_marks_remaining = pending_marks_remaining.index_select(0, valid_slots);
-        auto valid_pending_captures_required = pending_captures_required.index_select(0, valid_slots);
-        auto valid_pending_captures_remaining = pending_captures_remaining.index_select(0, valid_slots);
-        auto valid_forced_removals_done = forced_removals_done.index_select(0, valid_slots);
-        auto valid_move_count = move_count.index_select(0, valid_slots);
-        auto valid_moves_since_capture = moves_since_capture.index_select(0, valid_slots);
-
-        auto parent_indices = torch::arange(valid_slots.size(0), slots_options);
         auto applied = v0::batch_apply_moves(
-            valid_board,
-            valid_marks_black,
-            valid_marks_white,
-            valid_phase,
-            valid_current_player,
-            valid_pending_marks_required,
-            valid_pending_marks_remaining,
-            valid_pending_captures_required,
-            valid_pending_captures_remaining,
-            valid_forced_removals_done,
-            valid_move_count,
-            valid_moves_since_capture,
+            board,
+            marks_black,
+            marks_white,
+            phase,
+            current_player,
+            pending_marks_required,
+            pending_marks_remaining,
+            pending_captures_required,
+            pending_captures_remaining,
+            forced_removals_done,
+            move_count,
+            moves_since_capture,
             valid_action_codes,
-            parent_indices);
+            valid_slots);
 
         auto next_board = std::get<0>(applied);
         auto next_marks_black = std::get<1>(applied);
