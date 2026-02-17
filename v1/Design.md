@@ -678,6 +678,19 @@ Use same hardware and config family as baseline:
 - Kept a single active finalize path:
   - `v1/python/trajectory_buffer.py::finalize_games_inplace(...)` -> `v0_core.finalize_trajectory_inplace(...)`.
 
+### Code cleanup (Phase B second pass, 2026-02-17)
+- Removed obsolete ABI fallback branches in `v1/python/mcts_gpu.py`:
+  - dropped legacy `batch_apply_moves` arity compatibility path;
+  - dropped Python fallback loop for root PUCT allocation.
+- Simplified evaluation helpers in `v1/python/mcts_gpu.py`:
+  - removed unused private helpers (`_apply_dirichlet`, `_visits_to_policy`);
+  - reduced `_evaluate_batch` and `_evaluate_values_only` return payloads to only active fields.
+- Validation after cleanup:
+  - `pytest tests/v1/test_v1_tensor_pipeline_smoke.py -q`: PASS.
+  - `tools/ab_v1_child_value_only.py` (smoke config, `mcts=64`):
+    - output: `results/v1_child_ab_redundancy_cleanup_smoke.json`;
+    - action/value/WLD criteria: PASS.
+
 ### One-click wrapper
 - Script: `scripts/validate_v1_gpu.cmd`
 - Purpose: launch the above validator with default matrix and output path.

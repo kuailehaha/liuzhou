@@ -25,10 +25,6 @@ SELECTION_DIM = int(DEFAULT_ACTION_SPEC.selection_dim)
 AUXILIARY_DIM = int(DEFAULT_ACTION_SPEC.auxiliary_dim)
 TOTAL_ACTION_DIM = int(DEFAULT_ACTION_SPEC.total_dim)
 
-_BATCH_APPLY_SUPPORTS_MSC: Optional[bool] = None
-_ROOT_PUCT_OP_AVAILABLE: Optional[bool] = None
-
-
 @dataclass
 class GpuStateBatch:
     """Tensor-native game state batch for v1 GPU self-play."""
@@ -166,7 +162,7 @@ def encode_actions_fast(batch: GpuStateBatch) -> Tuple[torch.Tensor, torch.Tenso
     )
 
 
-def _coerce_apply_output(output: tuple, moves_since_capture: torch.Tensor) -> GpuStateBatch:
+def _coerce_apply_output(output: tuple) -> GpuStateBatch:
     if len(output) == 12:
         return GpuStateBatch(
             board=output[0],
@@ -182,21 +178,6 @@ def _coerce_apply_output(output: tuple, moves_since_capture: torch.Tensor) -> Gp
             move_count=output[10],
             moves_since_capture=output[11],
         )
-    if len(output) == 11:
-        return GpuStateBatch(
-            board=output[0],
-            marks_black=output[1].to(torch.bool),
-            marks_white=output[2].to(torch.bool),
-            phase=output[3],
-            current_player=output[4],
-            pending_marks_required=output[5],
-            pending_marks_remaining=output[6],
-            pending_captures_required=output[7],
-            pending_captures_remaining=output[8],
-            forced_removals_done=output[9],
-            move_count=output[10],
-            moves_since_capture=moves_since_capture,
-        )
     raise RuntimeError(f"Unexpected batch_apply_moves output arity: {len(output)}")
 
 
@@ -205,41 +186,9 @@ def batch_apply_moves_compat(
     action_codes: torch.Tensor,
     parent_indices: torch.Tensor,
 ) -> GpuStateBatch:
-    """Compatibility wrapper for different v0_core ``batch_apply_moves`` ABI."""
-
-    global _BATCH_APPLY_SUPPORTS_MSC
+    """Typed wrapper over v0_core.batch_apply_moves."""
     action_codes = action_codes.to(device=batch.device, dtype=torch.int32)
     parent_indices = parent_indices.to(device=batch.device, dtype=torch.int64)
-
-    if _BATCH_APPLY_SUPPORTS_MSC is not False:
-        try:
-            output = v0_core.batch_apply_moves(
-                batch.board,
-                batch.marks_black,
-                batch.marks_white,
-                batch.phase,
-                batch.current_player,
-                batch.pending_marks_required,
-                batch.pending_marks_remaining,
-                batch.pending_captures_required,
-                batch.pending_captures_remaining,
-                batch.forced_removals_done,
-                batch.move_count,
-                batch.moves_since_capture,
-                action_codes,
-                parent_indices,
-            )
-            _BATCH_APPLY_SUPPORTS_MSC = True
-            return _coerce_apply_output(output, batch.moves_since_capture.index_select(0, parent_indices))
-        except TypeError:
-            _BATCH_APPLY_SUPPORTS_MSC = False
-        except RuntimeError as exc:
-            message = str(exc)
-            if "incompatible function arguments" in message:
-                _BATCH_APPLY_SUPPORTS_MSC = False
-            else:
-                raise
-
     output = v0_core.batch_apply_moves(
         batch.board,
         batch.marks_black,
@@ -252,11 +201,11 @@ def batch_apply_moves_compat(
         batch.pending_captures_remaining,
         batch.forced_removals_done,
         batch.move_count,
+        batch.moves_since_capture,
         action_codes,
         parent_indices,
     )
-    parent_msc = batch.moves_since_capture.index_select(0, parent_indices)
-    return _coerce_apply_output(output, parent_msc)
+    return _coerce_apply_output(output)
 
 
 @dataclass
@@ -406,7 +355,7 @@ class V1RootMCTS:
 
     def _evaluate_batch(
         self, batch: GpuStateBatch
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         inputs = states_to_model_input(batch)
         log_p1, log_p2, log_pmc, raw_values = self._forward_model(inputs)
         values = self._to_scalar_value(raw_values).float()
@@ -421,40 +370,13 @@ class V1RootMCTS:
             SELECTION_DIM,
             AUXILIARY_DIM,
         )
-        return inputs, legal_mask, metadata, probs.float(), values, raw_values
+        return inputs, legal_mask, metadata, probs.float(), values
 
-    def _evaluate_values_only(self, batch: GpuStateBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _evaluate_values_only(self, batch: GpuStateBatch) -> torch.Tensor:
         inputs = states_to_model_input(batch)
         _log_p1, _log_p2, _log_pmc, raw_values = self._forward_model(inputs)
         values = self._to_scalar_value(raw_values).float()
-        return values, raw_values
-
-    def _apply_dirichlet(self, priors: torch.Tensor) -> torch.Tensor:
-        if priors.numel() <= 1:
-            return priors
-        alpha = max(1e-6, float(self.config.dirichlet_alpha))
-        noise_dist = torch.distributions.Dirichlet(
-            torch.full_like(priors, alpha, dtype=torch.float32)
-        )
-        noise = noise_dist.sample()
-        mixed = (1.0 - float(self.config.dirichlet_epsilon)) * priors + float(
-            self.config.dirichlet_epsilon
-        ) * noise
-        denom = mixed.sum().clamp_min(1e-8)
-        return mixed / denom
-
-    @staticmethod
-    def _visits_to_policy(visits: torch.Tensor, temperature: float) -> torch.Tensor:
-        if visits.numel() == 1:
-            return torch.ones_like(visits)
-        temp = max(float(temperature), 1e-6)
-        if temp <= 1e-6:
-            out = torch.zeros_like(visits)
-            out[torch.argmax(visits)] = 1.0
-            return out
-        scaled = torch.pow(visits.clamp_min(1e-8), 1.0 / temp)
-        denom = scaled.sum().clamp_min(1e-8)
-        return scaled / denom
+        return values
 
     def apply_action(self, state: GpuStateBatch, action_code: torch.Tensor) -> GpuStateBatch:
         if action_code.dim() == 1:
@@ -515,7 +437,7 @@ class V1RootMCTS:
             device=state.device,
         )
 
-        model_input, legal_mask, metadata, probs, values, _raw_values = self._evaluate_batch(state)
+        model_input, legal_mask, metadata, probs, values = self._evaluate_batch(state)
         root_values = values.clone().to(torch.float32)
         legal_mask_bool = legal_mask.to(torch.bool)
         policy_dense = torch.zeros(
@@ -563,9 +485,9 @@ class V1RootMCTS:
 
             child_batch = batch_apply_moves_compat(state, action_codes_all, parent_indices_all)
             if self._child_eval_mode == "full":
-                _, _, _, _child_probs, child_values, _ = self._evaluate_batch(child_batch)
+                _, _, _, _, child_values = self._evaluate_batch(child_batch)
             else:
-                child_values, _ = self._evaluate_values_only(child_batch)
+                child_values = self._evaluate_values_only(child_batch)
             child_leaf_values = (-child_values).to(torch.float32)
 
             leaf_mat = torch.zeros(
@@ -574,45 +496,16 @@ class V1RootMCTS:
             if int(flat_indices.numel()) > 0:
                 leaf_mat.view(-1).index_copy_(0, flat_indices, child_leaf_values)
 
-            visits = torch.zeros_like(priors_mat)
-            value_sum = torch.zeros_like(priors_mat)
             sims = max(1, int(self.config.num_simulations))
-            global _ROOT_PUCT_OP_AVAILABLE
-            if _ROOT_PUCT_OP_AVAILABLE is not False and hasattr(v0_core, "root_puct_allocate_visits"):
-                try:
-                    visits_cpp, value_sum_cpp, _ = v0_core.root_puct_allocate_visits(
-                        priors_mat,
-                        leaf_mat,
-                        valid_mask,
-                        sims,
-                        float(self.config.exploration_weight),
-                    )
-                    visits = visits_cpp.to(dtype=torch.float32, device=state.device)
-                    value_sum = value_sum_cpp.to(dtype=torch.float32, device=state.device)
-                    _ROOT_PUCT_OP_AVAILABLE = True
-                except Exception:
-                    _ROOT_PUCT_OP_AVAILABLE = False
-
-            if _ROOT_PUCT_OP_AVAILABLE is not True:
-                total_visit = torch.zeros((num_roots,), dtype=torch.float32, device=state.device)
-                row_ids = torch.arange(num_roots, dtype=torch.int64, device=state.device)
-                for _ in range(sims):
-                    q = torch.where(
-                        visits > 0,
-                        value_sum / visits.clamp_min(1e-8),
-                        torch.zeros_like(value_sum),
-                    )
-                    u = (
-                        float(self.config.exploration_weight)
-                        * priors_mat
-                        * torch.sqrt(total_visit + 1.0).unsqueeze(1)
-                        / (1.0 + visits)
-                    )
-                    scores = (q + u).masked_fill(~valid_mask, float("-inf"))
-                    selected = torch.argmax(scores, dim=1)
-                    visits[row_ids, selected] += 1.0
-                    value_sum[row_ids, selected] += leaf_mat[row_ids, selected]
-                    total_visit += 1.0
+            visits_cpp, value_sum_cpp, _ = v0_core.root_puct_allocate_visits(
+                priors_mat,
+                leaf_mat,
+                valid_mask,
+                sims,
+                float(self.config.exploration_weight),
+            )
+            visits = visits_cpp.to(dtype=torch.float32, device=state.device)
+            value_sum = value_sum_cpp.to(dtype=torch.float32, device=state.device)
 
             root_temps = temp_values.index_select(0, valid_root_indices).clamp_min(1e-6).view(-1, 1)
             legal_policy = torch.pow(visits.clamp_min(1e-8), 1.0 / root_temps)
