@@ -161,51 +161,6 @@ class TensorTrajectoryBuffer:
         self._size = end
         return torch.arange(start, end, dtype=torch.int64, device=self.device)
 
-    def finalize_games(
-        self,
-        *,
-        step_index_matrix: torch.Tensor,
-        step_counts: torch.Tensor,
-        slots: torch.Tensor,
-        result_from_black: torch.Tensor,
-        soft_value_from_black: torch.Tensor,
-    ) -> None:
-        if self._size == 0:
-            return
-        slots_t = torch.as_tensor(slots, dtype=torch.int64, device=self.device).view(-1)
-        if int(slots_t.numel()) == 0:
-            return
-        counts = step_counts.to(device=self.device, dtype=torch.int64).index_select(0, slots_t)
-        has_steps = counts > 0
-        if not bool(has_steps.any().item()):
-            return
-
-        slots_t = slots_t[has_steps]
-        counts = counts[has_steps]
-        result = torch.as_tensor(result_from_black, dtype=torch.float32, device=self.device).view(-1)[has_steps]
-        soft = torch.as_tensor(soft_value_from_black, dtype=torch.float32, device=self.device).view(-1)[has_steps]
-        if int(slots_t.numel()) == 0:
-            return
-
-        max_len = int(counts.max().item())
-        if max_len <= 0:
-            return
-
-        step_rows = step_index_matrix.to(device=self.device, dtype=torch.int64).index_select(0, slots_t)[:, :max_len]
-        pos = torch.arange(max_len, device=self.device, dtype=torch.int64).view(1, -1)
-        valid = pos < counts.view(-1, 1)
-        flat_idx = step_rows[valid]
-        if int(flat_idx.numel()) == 0:
-            return
-
-        row_ids = torch.arange(int(slots_t.numel()), device=self.device, dtype=torch.int64).view(-1, 1)
-        row_ids = row_ids.expand(-1, max_len)[valid]
-        per_step_result = result.index_select(0, row_ids)
-        per_step_soft = soft.index_select(0, row_ids)
-        signs = self._player_signs.index_select(0, flat_idx).to(torch.float32)
-        self._value_targets.index_copy_(0, flat_idx, signs * per_step_result)
-        self._soft_value_targets.index_copy_(0, flat_idx, signs * per_step_soft)
-
     def finalize_games_inplace(
         self,
         *,
@@ -234,16 +189,6 @@ class TensorTrajectoryBuffer:
             result_from_black,
             soft_value_from_black,
         )
-
-    def finalize_game(self, step_indices: list[int], result_from_black: float, soft_value_from_black: float) -> None:
-        if not step_indices:
-            return
-        idx = torch.tensor(step_indices, dtype=torch.int64, device=self.device)
-        signs = self._player_signs.index_select(0, idx).to(torch.float32)
-        value = signs * float(result_from_black)
-        soft = signs * float(soft_value_from_black)
-        self._value_targets.index_copy_(0, idx, value)
-        self._soft_value_targets.index_copy_(0, idx, soft)
 
     def build(self) -> TensorSelfPlayBatch:
         if self._size == 0:

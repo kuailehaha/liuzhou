@@ -658,6 +658,26 @@ Use same hardware and config family as baseline:
   - `v1(graph-hybrid)` games/s at `cg=8/16/32/64`: `1.017 / 1.013 / 1.038 / 0.943`
   - `graph-hybrid` remains at least comparable to `py` in this sweep and is stronger at low concurrency.
 
+### Acceptance execution (Phase A automation)
+- New unified acceptance script:
+  - `tools/run_v1_acceptance_suite.py`
+- Scope:
+  - A/B semantic checks (`sims=256/512`)
+  - fixed-worker regression (`py` + `graph`) with aligned baseline (`v0-batch-leaves=512`, `v1-inference-batch-size=512`)
+  - concurrency matrix (`cg=8/16/32/64`)
+  - smoke (`tests/v1/test_v1_tensor_pipeline_smoke.py`)
+  - one consolidated summary JSON for gate review
+- Full command (project sign-off run):
+  - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/run_v1_acceptance_suite.py --device cuda:0 --seed 12345 --rounds 3 --repeats 3 --total-games 8 --mcts-simulations 128 --output-json results/v1_acceptance_suite_latest.json"`
+- Smoke command (pipeline sanity):
+  - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/run_v1_acceptance_suite.py --device cuda:0 --seed 12345 --rounds 1 --repeats 1 --total-games 4 --mcts-simulations 64 --output-json results/v1_acceptance_suite_smoke.json"`
+
+### Code cleanup (Phase B first pass)
+- Removed redundant Python-only finalize branches now replaced by C++ finalize path:
+  - `v1/python/trajectory_buffer.py`: removed unused `finalize_games(...)` and `finalize_game(...)` methods.
+- Kept a single active finalize path:
+  - `v1/python/trajectory_buffer.py::finalize_games_inplace(...)` -> `v0_core.finalize_trajectory_inplace(...)`.
+
 ### One-click wrapper
 - Script: `scripts/validate_v1_gpu.cmd`
 - Purpose: launch the above validator with default matrix and output path.
