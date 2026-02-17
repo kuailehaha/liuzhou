@@ -560,6 +560,42 @@ Use same hardware and config family as baseline:
   - threads=2: games/s mean/std/worst = `0.352 / 0.002 / 0.350`
   - threads=4: games/s mean/std/worst = `0.353 / 0.003 / 0.349`
 
+### Latest result snapshot (Windows, RTX 3060, after R2 sparse pack/writeback downshift, 2026-02-17)
+- Semantic A/B gate:
+  - `results/v1_child_value_ab_after_r2_256.json`: PASS
+  - `results/v1_child_value_ab_after_r2_512.json`: PASS
+- Fixed-worker regression (`results/v1_validation_workers_py_128_after_r2.json`):
+  - `v0` workers 1/2/4: `0.125 / 0.186 / 0.258 games/s`
+  - `v1(py)` threads 1/2/4: `1.203 / 1.477 / 1.580 games/s`
+  - `speedup_fixed_worker_min`: `6.128`
+  - `speedup_best_v1_vs_v0_worker1`: `12.589`
+  - `v1_thread_gain`: `0.313` (fails `<=0.15` gate)
+  - `v1_p0_ratio_min`: `0.0` (fails `>=0.9` gate)
+- Fixed-worker regression (`results/v1_validation_workers_graph_128_after_r2.json`):
+  - `v1(graph)` threads 1/2/4: `0.385 / 0.398 / 0.397 games/s`
+  - `speedup_fixed_worker_min`: `3.432`
+  - `v1_thread_gain`: `0.035` (passes CPU-scaling gate)
+  - `v1_p0_ratio_min`: `0.0` (fails `>=0.9` gate)
+- Concurrency sweep (`results/v1_gpu_matrix_8_16_32_64_after_r2.json`):
+  - `v1(py)` games/s at `cg=8/16/32/64`: `1.039 / 1.407 / 1.351 / 1.393`
+  - `v1(py)` power at `cg=8/16/32/64`: `28.7 / 27.9 / 26.7 / 26.7 W`
+  - `v1(graph)` games/s at `cg=8/16/32/64`: `1.219 / 1.244 / 1.224 / 1.228`
+  - `v1(graph)` power at `cg=8/16/32/64`: `40.8 / 41.5 / 42.1 / 41.9 W`
+- Long-stability (`rounds=3`, `results/v1_validation_workers_py_128_rounds3_after_r2.json`):
+  - threads=1: games/s mean/std/worst = `0.932 / 0.116 / 0.777`
+  - threads=2: games/s mean/std/worst = `0.994 / 0.093 / 0.909`
+  - threads=4: games/s mean/std/worst = `1.143 / 0.024 / 1.110`
+  - summary: `speedup_fixed_worker_min=8.358`, `v1_thread_gain=0.246`, `v1_p0_ratio_min=0.0`
+- Long-stability (`rounds=3`, `results/v1_validation_workers_graph_128_rounds3_after_r2.json`):
+  - threads=1: games/s mean/std/worst = `0.308 / 0.034 / 0.281`
+  - threads=2: games/s mean/std/worst = `0.267 / 0.034 / 0.219`
+  - threads=4: games/s mean/std/worst = `0.321 / 0.036 / 0.280`
+  - summary: `speedup_fixed_worker_min=4.829`, `v1_thread_gain=0.043`, `v1_p0_ratio_min=0.0`
+- Current acceptance status under main gates:
+  - Progress is substantial versus pre-R2 baseline.
+  - `fixed-worker >=10x` is still not met on the minimum scale pair.
+  - `P0 ratio >= 0.9` is still not met on this RTX 3060 setup.
+
 ### One-click wrapper
 - Script: `scripts/validate_v1_gpu.cmd`
 - Purpose: launch the above validator with default matrix and output path.

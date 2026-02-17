@@ -511,35 +511,26 @@ class V1RootMCTS:
         chosen_action_codes = torch.full((batch_size, 4), -1, dtype=torch.int32, device=state.device)
         chosen_valid_mask = torch.zeros((batch_size,), dtype=torch.bool, device=state.device)
 
-        row_counts = legal_mask_bool.sum(dim=1, dtype=torch.int64)
-        terminal_mask = row_counts.eq(0)
-        valid_root_indices = torch.nonzero(~terminal_mask, as_tuple=False).view(-1)
+        (
+            terminal_mask,
+            valid_root_indices,
+            counts,
+            valid_mask,
+            legal_index_mat,
+            priors_mat,
+            action_code_mat,
+            flat_indices,
+            action_codes_all,
+            parent_indices_all,
+        ) = v0_core.root_pack_sparse_actions(
+            legal_mask_bool,
+            probs,
+            metadata,
+        )
 
         if int(valid_root_indices.numel()) > 0:
-            legal_mask_valid = legal_mask_bool.index_select(0, valid_root_indices)
-            probs_valid = probs.index_select(0, valid_root_indices).to(torch.float32)
-            metadata_valid = metadata.index_select(0, valid_root_indices).to(torch.int32)
-
             num_roots = int(valid_root_indices.numel())
-            counts = row_counts.index_select(0, valid_root_indices).to(torch.int64)
-            max_actions = int(counts.max().item())
-
-            local_pos_all = legal_mask_valid.cumsum(dim=1, dtype=torch.int64) - 1
-            row_ids, legal_indices_all = torch.nonzero(legal_mask_valid, as_tuple=True)
-            local_pos = local_pos_all[row_ids, legal_indices_all]
-
-            valid_mask = torch.zeros((num_roots, max_actions), dtype=torch.bool, device=state.device)
-            valid_mask[row_ids, local_pos] = True
-
-            legal_index_mat = torch.zeros((num_roots, max_actions), dtype=torch.int64, device=state.device)
-            legal_index_mat[row_ids, local_pos] = legal_indices_all.to(torch.int64)
-
-            priors_mat = torch.zeros((num_roots, max_actions), dtype=torch.float32, device=state.device)
-            priors_mat[row_ids, local_pos] = probs_valid[row_ids, legal_indices_all].to(torch.float32)
-            priors_mat = priors_mat / priors_mat.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-            action_code_mat = torch.zeros((num_roots, max_actions, 4), dtype=torch.int32, device=state.device)
-            action_code_mat[row_ids, local_pos] = metadata_valid[row_ids, legal_indices_all].to(torch.int32)
+            max_actions = int(valid_mask.shape[1])
 
             if add_noise:
                 if max_actions > 1:
@@ -553,15 +544,6 @@ class V1RootMCTS:
                     apply_mask = counts.gt(1).view(-1, 1)
                     priors_mat = torch.where(apply_mask, mixed, priors_mat)
 
-            flat_valid = valid_mask.view(-1)
-            action_codes_all = action_code_mat.view(-1, 4)[flat_valid]
-            parent_local = (
-                torch.arange(num_roots, dtype=torch.int64, device=state.device)
-                .view(num_roots, 1)
-                .expand(num_roots, max_actions)
-                .reshape(-1)
-            )[flat_valid]
-            parent_indices_all = valid_root_indices.index_select(0, parent_local)
             child_batch = batch_apply_moves_compat(state, action_codes_all, parent_indices_all)
             if self._child_eval_mode == "full":
                 _, _, _, _child_probs, child_values, _ = self._evaluate_batch(child_batch)
@@ -572,7 +554,8 @@ class V1RootMCTS:
             leaf_mat = torch.zeros(
                 (num_roots, max_actions), dtype=torch.float32, device=state.device
             )
-            leaf_mat.view(-1)[flat_valid] = child_leaf_values
+            if int(flat_indices.numel()) > 0:
+                leaf_mat.view(-1).index_copy_(0, flat_indices, child_leaf_values)
 
             visits = torch.zeros_like(priors_mat)
             value_sum = torch.zeros_like(priors_mat)
@@ -625,25 +608,22 @@ class V1RootMCTS:
                 local_picks = torch.argmax(legal_policy, dim=1)
 
             root_value_vec = value_sum.sum(dim=1) / visits.sum(dim=1).clamp_min(1.0)
-            policy_dense_valid = torch.zeros(
-                (num_roots, TOTAL_ACTION_DIM), dtype=torch.float32, device=state.device
-            )
-            policy_dense_valid.scatter_add_(
-                1,
+            (
+                policy_dense,
+                chosen_action_indices,
+                chosen_action_codes,
+                chosen_valid_mask,
+            ) = v0_core.root_sparse_writeback(
                 legal_index_mat,
-                legal_policy * valid_mask.to(torch.float32),
+                action_code_mat,
+                valid_mask,
+                legal_policy,
+                local_picks,
+                valid_root_indices,
+                batch_size,
+                TOTAL_ACTION_DIM,
             )
-            chosen_indices_local = legal_index_mat.gather(1, local_picks.view(-1, 1)).view(-1)
-            chosen_codes_local = action_code_mat.gather(
-                1,
-                local_picks.view(-1, 1, 1).expand(-1, 1, 4),
-            ).view(-1, 4)
-
-            policy_dense.index_copy_(0, valid_root_indices, policy_dense_valid)
-            chosen_action_indices.index_copy_(0, valid_root_indices, chosen_indices_local)
-            chosen_action_codes.index_copy_(0, valid_root_indices, chosen_codes_local)
             root_values.index_copy_(0, valid_root_indices, root_value_vec)
-            chosen_valid_mask.index_fill_(0, valid_root_indices, True)
 
         return RootSearchBatchOutput(
             model_input=model_input.detach(),
