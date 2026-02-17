@@ -14,6 +14,8 @@ conda run -n torchenv python "%ROOT%\tools\validate_v1_claims.py" ^
   --v0-workers 1,2,4 ^
   --v1-threads 1,2,4 ^
   --v1-concurrent-games 8 ^
+  --v1-child-eval-mode value_only ^
+  --v1-inference-backend py ^
   --total-games 8 ^
   --v0-mcts-simulations 24 ^
   --v1-mcts-simulations 24 ^
@@ -25,6 +27,9 @@ conda run -n torchenv python "%ROOT%\tools\validate_v1_claims.py" ^
   --v0-resign-threshold -0.8 ^
   --v0-resign-min-moves 36 ^
   --v0-resign-consecutive 3 ^
+  --min-v1-speedup-fixed-worker 10.0 ^
+  --min-v1-p0-ratio 0.90 ^
+  --max-v1-thread-gain 0.15 ^
   --with-inference-baseline ^
   --inference-baseline-batch 4096 ^
   --inference-baseline-iters 120 ^

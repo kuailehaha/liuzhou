@@ -26,6 +26,7 @@ AUXILIARY_DIM = int(DEFAULT_ACTION_SPEC.auxiliary_dim)
 TOTAL_ACTION_DIM = int(DEFAULT_ACTION_SPEC.total_dim)
 
 _BATCH_APPLY_SUPPORTS_MSC: Optional[bool] = None
+_ROOT_PUCT_OP_AVAILABLE: Optional[bool] = None
 
 
 @dataclass
@@ -268,6 +269,7 @@ class V1RootMCTSConfig:
     dirichlet_epsilon: float = 0.25
     sample_moves: bool = True
     autocast_dtype: str = "float16"
+    child_eval_mode: str = "value_only"  # "value_only" or "full"
 
 
 @dataclass
@@ -296,10 +298,18 @@ class RootSearchBatchOutput:
 class V1RootMCTS:
     """GPU-first root search (PUCT over root children only)."""
 
-    def __init__(self, model, config: V1RootMCTSConfig, device: torch.device | str) -> None:
+    def __init__(self, model, config: V1RootMCTSConfig, device: torch.device | str, inference_engine=None) -> None:
         self.model = model
         self.config = config
         self.device = torch.device(device)
+        self.inference_engine = inference_engine
+        mode = str(self.config.child_eval_mode).strip().lower()
+        if mode not in ("value_only", "full"):
+            raise ValueError(
+                f"Unsupported child_eval_mode={self.config.child_eval_mode!r}; "
+                "expected 'value_only' or 'full'."
+            )
+        self._child_eval_mode = mode
 
     def _autocast_context(self):
         if self.device.type != "cuda":
@@ -317,17 +327,71 @@ class V1RootMCTS:
             return raw_values[:, 0]
         return raw_values.view(-1)
 
-    def _evaluate_batch(
-        self, batch: GpuStateBatch
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        inputs = states_to_model_input(batch)
+    def _forward_model(
+        self, inputs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.inference_engine is not None:
+            n_valid = int(inputs.size(0))
+            engine_bs = int(getattr(self.inference_engine, "batch_size", n_valid))
+            if engine_bs <= 0:
+                raise RuntimeError("Inference engine batch_size must be positive.")
+            if n_valid <= engine_bs:
+                engine_inputs = inputs
+                if engine_bs > n_valid:
+                    pad_shape = (
+                        engine_bs - n_valid,
+                        int(inputs.size(1)),
+                        int(inputs.size(2)),
+                        int(inputs.size(3)),
+                    )
+                    pad = torch.zeros(pad_shape, dtype=inputs.dtype, device=inputs.device)
+                    engine_inputs = torch.cat([inputs, pad], dim=0)
+                log_p1, log_p2, log_pmc, raw_values = self.inference_engine.forward(
+                    engine_inputs, n_valid
+                )
+                return log_p1[:n_valid], log_p2[:n_valid], log_pmc[:n_valid], raw_values[:n_valid]
+
+            log_p1_parts = []
+            log_p2_parts = []
+            log_pmc_parts = []
+            raw_parts = []
+            for start in range(0, n_valid, engine_bs):
+                end = min(start + engine_bs, n_valid)
+                chunk = inputs[start:end]
+                chunk_valid = int(end - start)
+                if chunk_valid < engine_bs:
+                    pad_shape = (
+                        engine_bs - chunk_valid,
+                        int(chunk.size(1)),
+                        int(chunk.size(2)),
+                        int(chunk.size(3)),
+                    )
+                    pad = torch.zeros(pad_shape, dtype=chunk.dtype, device=chunk.device)
+                    chunk = torch.cat([chunk, pad], dim=0)
+                c1, c2, c3, cv = self.inference_engine.forward(chunk, chunk_valid)
+                log_p1_parts.append(c1[:chunk_valid])
+                log_p2_parts.append(c2[:chunk_valid])
+                log_pmc_parts.append(c3[:chunk_valid])
+                raw_parts.append(cv[:chunk_valid])
+            return (
+                torch.cat(log_p1_parts, dim=0),
+                torch.cat(log_p2_parts, dim=0),
+                torch.cat(log_pmc_parts, dim=0),
+                torch.cat(raw_parts, dim=0),
+            )
+
         self.model.eval()
         with torch.inference_mode():
             if self.device.type == "cuda":
                 with self._autocast_context():
-                    log_p1, log_p2, log_pmc, raw_values = self.model(inputs)
-            else:
-                log_p1, log_p2, log_pmc, raw_values = self.model(inputs)
+                    return self.model(inputs)
+            return self.model(inputs)
+
+    def _evaluate_batch(
+        self, batch: GpuStateBatch
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        inputs = states_to_model_input(batch)
+        log_p1, log_p2, log_pmc, raw_values = self._forward_model(inputs)
         values = self._to_scalar_value(raw_values).float()
         legal_mask, metadata = encode_actions_fast(batch)
         probs, _ = v0_core.project_policy_logits_fast(
@@ -341,6 +405,12 @@ class V1RootMCTS:
             AUXILIARY_DIM,
         )
         return inputs, legal_mask, metadata, probs.float(), values, raw_values
+
+    def _evaluate_values_only(self, batch: GpuStateBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+        inputs = states_to_model_input(batch)
+        _log_p1, _log_p2, _log_pmc, raw_values = self._forward_model(inputs)
+        values = self._to_scalar_value(raw_values).float()
+        return values, raw_values
 
     def _apply_dirichlet(self, priors: torch.Tensor) -> torch.Tensor:
         if priors.numel() <= 1:
@@ -441,83 +511,110 @@ class V1RootMCTS:
         chosen_action_codes = torch.full((batch_size, 4), -1, dtype=torch.int32, device=state.device)
         chosen_valid_mask = torch.zeros((batch_size,), dtype=torch.bool, device=state.device)
 
-        root_order: list[int] = []
-        root_legal_indices: dict[int, torch.Tensor] = {}
-        root_priors: dict[int, torch.Tensor] = {}
-        action_chunks: list[torch.Tensor] = []
-        parent_chunks: list[torch.Tensor] = []
-        counts: list[int] = []
+        row_counts = legal_mask_bool.sum(dim=1, dtype=torch.int64)
+        terminal_mask = row_counts.eq(0)
+        valid_root_indices = torch.nonzero(~terminal_mask, as_tuple=False).view(-1)
 
-        for bi in range(batch_size):
-            row_mask = legal_mask_bool[bi]
-            legal_indices = torch.nonzero(row_mask, as_tuple=False).view(-1)
-            if legal_indices.numel() == 0:
-                terminal_mask[bi] = True
-                continue
-            priors = probs[bi, legal_indices].to(torch.float32)
-            priors = priors / priors.sum().clamp_min(1e-8)
+        if int(valid_root_indices.numel()) > 0:
+            legal_mask_valid = legal_mask_bool.index_select(0, valid_root_indices)
+            probs_valid = probs.index_select(0, valid_root_indices).to(torch.float32)
+            metadata_valid = metadata.index_select(0, valid_root_indices).to(torch.int32)
+
+            num_roots = int(valid_root_indices.numel())
+            counts = row_counts.index_select(0, valid_root_indices).to(torch.int64)
+            max_actions = int(counts.max().item())
+
+            local_pos_all = legal_mask_valid.cumsum(dim=1, dtype=torch.int64) - 1
+            row_ids, legal_indices_all = torch.nonzero(legal_mask_valid, as_tuple=True)
+            local_pos = local_pos_all[row_ids, legal_indices_all]
+
+            valid_mask = torch.zeros((num_roots, max_actions), dtype=torch.bool, device=state.device)
+            valid_mask[row_ids, local_pos] = True
+
+            legal_index_mat = torch.zeros((num_roots, max_actions), dtype=torch.int64, device=state.device)
+            legal_index_mat[row_ids, local_pos] = legal_indices_all.to(torch.int64)
+
+            priors_mat = torch.zeros((num_roots, max_actions), dtype=torch.float32, device=state.device)
+            priors_mat[row_ids, local_pos] = probs_valid[row_ids, legal_indices_all].to(torch.float32)
+            priors_mat = priors_mat / priors_mat.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+            action_code_mat = torch.zeros((num_roots, max_actions, 4), dtype=torch.int32, device=state.device)
+            action_code_mat[row_ids, local_pos] = metadata_valid[row_ids, legal_indices_all].to(torch.int32)
+
             if add_noise:
-                priors = self._apply_dirichlet(priors)
-            action_codes = metadata[bi, legal_indices].to(torch.int32)
-            root_order.append(bi)
-            root_legal_indices[bi] = legal_indices
-            root_priors[bi] = priors
-            action_chunks.append(action_codes)
-            parent_chunks.append(
-                torch.full((int(legal_indices.numel()),), bi, dtype=torch.int64, device=state.device)
-            )
-            counts.append(int(legal_indices.numel()))
+                if max_actions > 1:
+                    eps = float(self.config.dirichlet_epsilon)
+                    alpha = float(self.config.dirichlet_alpha)
+                    alpha_t = torch.full_like(priors_mat, alpha, dtype=torch.float32)
+                    gamma_dist = torch.distributions.Gamma(alpha_t, torch.ones_like(priors_mat))
+                    noise = gamma_dist.sample() * valid_mask.to(torch.float32)
+                    noise = noise / noise.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                    mixed = (1.0 - eps) * priors_mat + eps * noise
+                    apply_mask = counts.gt(1).view(-1, 1)
+                    priors_mat = torch.where(apply_mask, mixed, priors_mat)
 
-        if action_chunks:
-            action_codes_all = torch.cat(action_chunks, dim=0)
-            parent_indices_all = torch.cat(parent_chunks, dim=0)
+            flat_valid = valid_mask.view(-1)
+            action_codes_all = action_code_mat.view(-1, 4)[flat_valid]
+            parent_local = (
+                torch.arange(num_roots, dtype=torch.int64, device=state.device)
+                .view(num_roots, 1)
+                .expand(num_roots, max_actions)
+                .reshape(-1)
+            )[flat_valid]
+            parent_indices_all = valid_root_indices.index_select(0, parent_local)
             child_batch = batch_apply_moves_compat(state, action_codes_all, parent_indices_all)
-            _, _, _, _child_probs, child_values, _ = self._evaluate_batch(child_batch)
+            if self._child_eval_mode == "full":
+                _, _, _, _child_probs, child_values, _ = self._evaluate_batch(child_batch)
+            else:
+                child_values, _ = self._evaluate_values_only(child_batch)
             child_leaf_values = (-child_values).to(torch.float32)
 
-            num_roots = len(root_order)
-            max_actions = max(counts)
-            priors_mat = torch.zeros(
-                (num_roots, max_actions), dtype=torch.float32, device=state.device
-            )
             leaf_mat = torch.zeros(
                 (num_roots, max_actions), dtype=torch.float32, device=state.device
             )
-            valid_mask = torch.zeros((num_roots, max_actions), dtype=torch.bool, device=state.device)
-
-            offset = 0
-            for ridx, n in enumerate(counts):
-                priors_mat[ridx, :n] = root_priors[root_order[ridx]]
-                leaf_mat[ridx, :n] = child_leaf_values[offset : offset + n]
-                valid_mask[ridx, :n] = True
-                offset += n
+            leaf_mat.view(-1)[flat_valid] = child_leaf_values
 
             visits = torch.zeros_like(priors_mat)
             value_sum = torch.zeros_like(priors_mat)
-            total_visit = torch.zeros((num_roots,), dtype=torch.float32, device=state.device)
-            row_ids = torch.arange(num_roots, dtype=torch.int64, device=state.device)
             sims = max(1, int(self.config.num_simulations))
+            global _ROOT_PUCT_OP_AVAILABLE
+            if _ROOT_PUCT_OP_AVAILABLE is not False and hasattr(v0_core, "root_puct_allocate_visits"):
+                try:
+                    visits_cpp, value_sum_cpp, _ = v0_core.root_puct_allocate_visits(
+                        priors_mat,
+                        leaf_mat,
+                        valid_mask,
+                        sims,
+                        float(self.config.exploration_weight),
+                    )
+                    visits = visits_cpp.to(dtype=torch.float32, device=state.device)
+                    value_sum = value_sum_cpp.to(dtype=torch.float32, device=state.device)
+                    _ROOT_PUCT_OP_AVAILABLE = True
+                except Exception:
+                    _ROOT_PUCT_OP_AVAILABLE = False
 
-            for _ in range(sims):
-                q = torch.where(
-                    visits > 0,
-                    value_sum / visits.clamp_min(1e-8),
-                    torch.zeros_like(value_sum),
-                )
-                u = (
-                    float(self.config.exploration_weight)
-                    * priors_mat
-                    * torch.sqrt(total_visit + 1.0).unsqueeze(1)
-                    / (1.0 + visits)
-                )
-                scores = (q + u).masked_fill(~valid_mask, float("-inf"))
-                selected = torch.argmax(scores, dim=1)
-                visits[row_ids, selected] += 1.0
-                value_sum[row_ids, selected] += leaf_mat[row_ids, selected]
-                total_visit += 1.0
+            if _ROOT_PUCT_OP_AVAILABLE is not True:
+                total_visit = torch.zeros((num_roots,), dtype=torch.float32, device=state.device)
+                row_ids = torch.arange(num_roots, dtype=torch.int64, device=state.device)
+                for _ in range(sims):
+                    q = torch.where(
+                        visits > 0,
+                        value_sum / visits.clamp_min(1e-8),
+                        torch.zeros_like(value_sum),
+                    )
+                    u = (
+                        float(self.config.exploration_weight)
+                        * priors_mat
+                        * torch.sqrt(total_visit + 1.0).unsqueeze(1)
+                        / (1.0 + visits)
+                    )
+                    scores = (q + u).masked_fill(~valid_mask, float("-inf"))
+                    selected = torch.argmax(scores, dim=1)
+                    visits[row_ids, selected] += 1.0
+                    value_sum[row_ids, selected] += leaf_mat[row_ids, selected]
+                    total_visit += 1.0
 
-            root_ids = torch.tensor(root_order, dtype=torch.int64, device=state.device)
-            root_temps = temp_values.index_select(0, root_ids).clamp_min(1e-6).view(-1, 1)
+            root_temps = temp_values.index_select(0, valid_root_indices).clamp_min(1e-6).view(-1, 1)
             legal_policy = torch.pow(visits.clamp_min(1e-8), 1.0 / root_temps)
             legal_policy = legal_policy * valid_mask.to(torch.float32)
             legal_policy = legal_policy / legal_policy.sum(dim=1, keepdim=True).clamp_min(1e-8)
@@ -528,16 +625,25 @@ class V1RootMCTS:
                 local_picks = torch.argmax(legal_policy, dim=1)
 
             root_value_vec = value_sum.sum(dim=1) / visits.sum(dim=1).clamp_min(1.0)
-            for ridx, bi in enumerate(root_order):
-                legal_indices = root_legal_indices[bi]
-                n = counts[ridx]
-                policy_legal = legal_policy[ridx, :n]
-                policy_dense[bi, legal_indices] = policy_legal
-                local_pick_int = int(local_picks[ridx].item())
-                chosen_action_indices[bi] = int(legal_indices[local_pick_int].item())
-                chosen_action_codes[bi] = action_chunks[ridx][local_pick_int]
-                chosen_valid_mask[bi] = True
-                root_values[bi] = root_value_vec[ridx]
+            policy_dense_valid = torch.zeros(
+                (num_roots, TOTAL_ACTION_DIM), dtype=torch.float32, device=state.device
+            )
+            policy_dense_valid.scatter_add_(
+                1,
+                legal_index_mat,
+                legal_policy * valid_mask.to(torch.float32),
+            )
+            chosen_indices_local = legal_index_mat.gather(1, local_picks.view(-1, 1)).view(-1)
+            chosen_codes_local = action_code_mat.gather(
+                1,
+                local_picks.view(-1, 1, 1).expand(-1, 1, 4),
+            ).view(-1, 4)
+
+            policy_dense.index_copy_(0, valid_root_indices, policy_dense_valid)
+            chosen_action_indices.index_copy_(0, valid_root_indices, chosen_indices_local)
+            chosen_action_codes.index_copy_(0, valid_root_indices, chosen_codes_local)
+            root_values.index_copy_(0, valid_root_indices, root_value_vec)
+            chosen_valid_mask.index_fill_(0, valid_root_indices, True)
 
         return RootSearchBatchOutput(
             model_input=model_input.detach(),
