@@ -446,6 +446,91 @@ torch::Tensor SoftValueFromBoardBatch(const torch::Tensor& boards, double soft_v
     return torch::tanh(material_delta * static_cast<float>(soft_value_k));
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> FinalizeTrajectoryInplace(
+    torch::Tensor value_targets,
+    torch::Tensor soft_value_targets,
+    const torch::Tensor& player_signs,
+    const torch::Tensor& step_index_matrix,
+    const torch::Tensor& step_counts,
+    torch::Tensor slots,
+    torch::Tensor result_from_black,
+    torch::Tensor soft_value_from_black) {
+    TORCH_CHECK(value_targets.dim() == 1, "value_targets must be [S]");
+    TORCH_CHECK(soft_value_targets.dim() == 1, "soft_value_targets must be [S]");
+    TORCH_CHECK(player_signs.dim() == 1, "player_signs must be [S]");
+    TORCH_CHECK(step_index_matrix.dim() == 2, "step_index_matrix must be [G, T]");
+    TORCH_CHECK(step_counts.dim() == 1, "step_counts must be [G]");
+
+    auto device = value_targets.device();
+    TORCH_CHECK(soft_value_targets.device() == device, "soft_value_targets must be on the same device");
+    TORCH_CHECK(player_signs.device() == device, "player_signs must be on the same device");
+    TORCH_CHECK(step_index_matrix.device() == device, "step_index_matrix must be on the same device");
+    TORCH_CHECK(step_counts.device() == device, "step_counts must be on the same device");
+
+    TORCH_CHECK(soft_value_targets.size(0) == value_targets.size(0), "target buffers shape mismatch");
+    TORCH_CHECK(player_signs.size(0) == value_targets.size(0), "player_signs shape mismatch");
+    TORCH_CHECK(step_counts.size(0) == step_index_matrix.size(0), "step_counts/step_index_matrix shape mismatch");
+
+    auto slots_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
+    auto counts_out = torch::zeros({3}, slots_options);
+    auto empty_slots = torch::empty({0}, slots_options);
+    auto empty_counts = torch::empty({0}, slots_options);
+
+    slots = slots.to(slots_options).view(-1).contiguous();
+    result_from_black = result_from_black.to(torch::TensorOptions().dtype(torch::kFloat32).device(device)).view(-1).contiguous();
+    soft_value_from_black = soft_value_from_black.to(torch::TensorOptions().dtype(torch::kFloat32).device(device)).view(-1).contiguous();
+
+    if (slots.numel() == 0) {
+        return std::make_tuple(empty_slots, empty_counts, counts_out);
+    }
+    TORCH_CHECK(result_from_black.numel() == slots.numel(), "result_from_black must align with slots");
+    TORCH_CHECK(soft_value_from_black.numel() == slots.numel(), "soft_value_from_black must align with slots");
+
+    auto counts = step_counts.to(torch::kInt64).contiguous().index_select(0, slots);
+    auto has_steps = counts.gt(0);
+    auto keep_idx = torch::nonzero(has_steps).view(-1);
+    if (keep_idx.numel() == 0) {
+        return std::make_tuple(empty_slots, empty_counts, counts_out);
+    }
+
+    auto final_slots = slots.index_select(0, keep_idx);
+    auto final_counts = counts.index_select(0, keep_idx);
+    auto final_result = result_from_black.index_select(0, keep_idx);
+    auto final_soft = soft_value_from_black.index_select(0, keep_idx);
+
+    counts_out.index_put_({0}, final_result.gt(0).sum().to(torch::kInt64));
+    counts_out.index_put_({1}, final_result.lt(0).sum().to(torch::kInt64));
+    counts_out.index_put_({2}, final_result.eq(0).sum().to(torch::kInt64));
+
+    auto max_len = final_counts.max().item<int64_t>();
+    if (max_len <= 0) {
+        return std::make_tuple(final_slots, final_counts, counts_out);
+    }
+
+    auto step_rows = step_index_matrix.to(torch::kInt64).contiguous().index_select(0, final_slots);
+    if (step_rows.size(1) > max_len) {
+        step_rows = step_rows.narrow(1, 0, max_len);
+    }
+    auto pos = torch::arange(max_len, slots_options).view({1, -1});
+    auto valid = pos.lt(final_counts.view({-1, 1}));
+    auto flat_idx = step_rows.masked_select(valid);
+    if (flat_idx.numel() == 0) {
+        return std::make_tuple(final_slots, final_counts, counts_out);
+    }
+
+    auto row_ids = torch::arange(final_slots.size(0), slots_options)
+                       .view({-1, 1})
+                       .expand({-1, max_len})
+                       .masked_select(valid);
+    auto per_step_result = final_result.index_select(0, row_ids);
+    auto per_step_soft = final_soft.index_select(0, row_ids);
+    auto signs = player_signs.to(torch::kInt8).contiguous().index_select(0, flat_idx).to(torch::kFloat32);
+
+    value_targets.index_copy_(0, flat_idx, signs * per_step_result);
+    soft_value_targets.index_copy_(0, flat_idx, signs * per_step_soft);
+    return std::make_tuple(final_slots, final_counts, counts_out);
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
     torch::Tensor board,
     torch::Tensor marks_black,
@@ -1181,6 +1266,17 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("chosen_valid_mask"),
         py::arg("max_game_plies"),
         py::arg("soft_value_k"));
+    m.def(
+        "finalize_trajectory_inplace",
+        &FinalizeTrajectoryInplace,
+        py::arg("value_targets"),
+        py::arg("soft_value_targets"),
+        py::arg("player_signs"),
+        py::arg("step_index_matrix"),
+        py::arg("step_counts"),
+        py::arg("slots"),
+        py::arg("result_from_black"),
+        py::arg("soft_value_from_black"));
 
     py::class_<v0::InferenceEngine, std::shared_ptr<v0::InferenceEngine>>(m, "InferenceEngine")
         .def(

@@ -206,6 +206,35 @@ class TensorTrajectoryBuffer:
         self._value_targets.index_copy_(0, flat_idx, signs * per_step_result)
         self._soft_value_targets.index_copy_(0, flat_idx, signs * per_step_soft)
 
+    def finalize_games_inplace(
+        self,
+        *,
+        step_index_matrix: torch.Tensor,
+        step_counts: torch.Tensor,
+        slots: torch.Tensor,
+        result_from_black: torch.Tensor,
+        soft_value_from_black: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Finalize trajectories via v0_core op and return slots/lengths/outcome counts."""
+        if self._size == 0:
+            empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+            counts = torch.zeros((3,), dtype=torch.int64, device=self.device)
+            return empty, empty, counts
+        if self._value_targets is None or self._soft_value_targets is None or self._player_signs is None:
+            raise RuntimeError("Trajectory storage is not initialized.")
+        import v0_core
+
+        return v0_core.finalize_trajectory_inplace(
+            self._value_targets,
+            self._soft_value_targets,
+            self._player_signs,
+            step_index_matrix,
+            step_counts,
+            slots,
+            result_from_black,
+            soft_value_from_black,
+        )
+
     def finalize_game(self, step_indices: list[int], result_from_black: float, soft_value_from_black: float) -> None:
         if not step_indices:
             return

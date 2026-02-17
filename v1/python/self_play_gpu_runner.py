@@ -89,9 +89,7 @@ def self_play_v1_gpu(
         concurrent_games_hint=wave_size,
     )
 
-    black_wins = 0
-    white_wins = 0
-    draws = 0
+    outcome_counts = torch.zeros((3,), dtype=torch.int64, device=dev)
     game_lengths = torch.zeros((int(num_games),), dtype=torch.int64, device=dev)
 
     started = time.perf_counter()
@@ -158,22 +156,23 @@ def self_play_v1_gpu(
                 float(soft_value_k),
             )
             if int(finalize_slots.numel()) > 0:
-                buffer.finalize_games(
+                finalized_slots, finalized_lengths, outcome_delta = buffer.finalize_games_inplace(
                     step_index_matrix=step_index_matrix,
                     step_counts=step_counts,
                     slots=finalize_slots,
                     result_from_black=result_local,
                     soft_value_from_black=soft_local,
                 )
-                global_slots = finalize_slots + int(wave_base)
-                game_lengths.index_copy_(0, global_slots, step_counts.index_select(0, finalize_slots))
-
-                black_wins += int(result_local.gt(0).sum().item())
-                white_wins += int(result_local.lt(0).sum().item())
-                draws += int(result_local.eq(0).sum().item())
+                if int(finalized_slots.numel()) > 0:
+                    global_slots = finalized_slots + int(wave_base)
+                    game_lengths.index_copy_(0, global_slots, finalized_lengths)
+                outcome_counts.add_(outcome_delta)
 
         if verbose:
             completed = min(wave_base + wave_games, int(num_games))
+            black_wins = int(outcome_counts[0].item())
+            white_wins = int(outcome_counts[1].item())
+            draws = int(outcome_counts[2].item())
             print(
                 f"[v1.self_play] games={completed}/{num_games} "
                 f"W/L/D={black_wins}/{white_wins}/{draws}"
@@ -181,6 +180,9 @@ def self_play_v1_gpu(
 
     elapsed = max(1e-9, time.perf_counter() - started)
     batch = buffer.build()
+    black_wins = int(outcome_counts[0].item())
+    white_wins = int(outcome_counts[1].item())
+    draws = int(outcome_counts[2].item())
     avg_len = float(game_lengths.to(torch.float32).mean().item())
     stats = SelfPlayV1Stats(
         num_games=num_games,

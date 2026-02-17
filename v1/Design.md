@@ -635,6 +635,29 @@ Use same hardware and config family as baseline:
   - `v1(graph-hybrid)` games/s at `cg=8/16/32/64`: `0.941 / 0.864 / 0.812 / 0.989`
   - Compared to step1 graph (`0.396 / 0.369 / 0.329 / 0.276`), graph throughput is now in the same band as py under the same sweep settings.
 
+### Latest result snapshot (Windows, RTX 3060, R4 finalize downshift, aligned baseline, 2026-02-17)
+- Implementation note:
+  - Added `v0_core.finalize_trajectory_inplace` to move trajectory target finalize and W/L/D counting into C++.
+  - `self_play_gpu_runner.py` now uses this op and accumulates outcome counters on device, avoiding per-step `sum().item()` host sync.
+- Semantic A/B gate:
+  - `results/v1_child_value_ab_after_r4_256.json`: PASS
+- Fixed-worker regression (`results/v1_validation_workers_py_128_after_r4_aligned512.json`):
+  - `v0` workers 1/2/4: `0.100 / 0.045 / 0.025 games/s`
+  - `v1(py)` threads 1/2/4: `0.891 / 1.009 / 0.764 games/s`
+  - `speedup_fixed_worker_min`: `8.932`
+  - `v1_thread_gain`: `0.132` (passes `<=0.15` in this run)
+  - `v1_p0_ratio_min`: `0.0`
+- Fixed-worker regression (`results/v1_validation_workers_graph_after_r4_graphhybrid_aligned512.json`):
+  - `v0` workers 1/2/4: `0.054 / 0.038 / 0.030 games/s`
+  - `v1(graph-hybrid)` threads 1/2/4: `0.851 / 0.757 / 0.921 games/s`
+  - `speedup_fixed_worker_min`: `15.669` (passes `>=10x`)
+  - `v1_thread_gain`: `0.082` (passes `<=0.15`)
+  - `v1_p0_ratio_min`: `0.0`
+- Concurrency sweep (`results/v1_gpu_matrix_8_16_32_64_after_r4.json`):
+  - `v1(py)` games/s at `cg=8/16/32/64`: `0.557 / 0.897 / 1.110 / 1.005`
+  - `v1(graph-hybrid)` games/s at `cg=8/16/32/64`: `1.017 / 1.013 / 1.038 / 0.943`
+  - `graph-hybrid` remains at least comparable to `py` in this sweep and is stronger at low concurrency.
+
 ### One-click wrapper
 - Script: `scripts/validate_v1_gpu.cmd`
 - Purpose: launch the above validator with default matrix and output path.
