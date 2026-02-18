@@ -1,5 +1,5 @@
 ﻿#!/usr/bin/env python
-"""Profile v0/v1 workloads with Nsight Systems and generate timeline/fragmentation comparison."""
+"""Profile v0/v1 workloads with Nsight Systems and generate timeline/fragmentation summaries."""
 
 from __future__ import annotations
 
@@ -248,12 +248,6 @@ def _pick_report(available: Sequence[str], candidates: Sequence[str]) -> Optiona
 def _plot_timeline(v0_ops: List[TraceOp], v1_ops: List[TraceOp], output_path: Path, max_ops: int) -> None:
     import matplotlib.pyplot as plt
 
-    def _prep(ops: List[TraceOp]) -> List[TraceOp]:
-        ordered = sorted(ops, key=lambda x: x.start_ns)
-        if max_ops > 0:
-            ordered = ordered[:max_ops]
-        return ordered
-
     def _draw(ax, ops: List[TraceOp], title: str) -> None:
         if not ops:
             ax.text(0.5, 0.5, "No GPU ops", ha="center", va="center")
@@ -272,11 +266,46 @@ def _plot_timeline(v0_ops: List[TraceOp], v1_ops: List[TraceOp], output_path: Pa
         ax.set_title(title)
         ax.grid(axis="x", alpha=0.25)
 
+    def _prep(ops: List[TraceOp]) -> List[TraceOp]:
+        ordered = sorted(ops, key=lambda x: x.start_ns)
+        if max_ops > 0:
+            ordered = ordered[:max_ops]
+        return ordered
+
     v0_sorted = _prep(v0_ops)
     v1_sorted = _prep(v1_ops)
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), dpi=120, sharex=False)
     _draw(axes[0], v0_sorted, "v0 Nsight Timeline (GPU ops)")
     _draw(axes[1], v1_sorted, "v1 Nsight Timeline (GPU ops)")
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_timeline_single(ops: List[TraceOp], output_path: Path, max_ops: int, title: str) -> None:
+    import matplotlib.pyplot as plt
+
+    ordered = sorted(ops, key=lambda x: x.start_ns)
+    if max_ops > 0:
+        ordered = ordered[:max_ops]
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4), dpi=120)
+    if not ordered:
+        ax.text(0.5, 0.5, "No GPU ops", ha="center", va="center")
+        ax.axis("off")
+    else:
+        t0 = ordered[0].start_ns
+        lanes = {"kernel": (2, "#4C78A8"), "memcpy": (1, "#E45756"), "memset": (0, "#72B7B2")}
+        for op in ordered:
+            lane, color = lanes.get(op.kind, (2, "#4C78A8"))
+            start_ms = (op.start_ns - t0) / 1_000_000.0
+            dur_ms = max(1e-6, (op.end_ns - op.start_ns) / 1_000_000.0)
+            ax.broken_barh([(start_ms, dur_ms)], (lane - 0.38, 0.76), facecolors=color, alpha=0.9)
+        ax.set_yticks([0, 1, 2], ["memset", "memcpy", "kernel"])
+        ax.set_xlabel("Time (ms)")
+        ax.grid(axis="x", alpha=0.25)
+    ax.set_title(title)
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path)
@@ -300,6 +329,24 @@ def _plot_summary(v0_metrics: Dict[str, float], v1_metrics: Dict[str, float], ou
     ax.set_title("Nsight Summary: memcpy/sync/kernel fragmentation")
     ax.grid(axis="y", alpha=0.3)
     ax.legend()
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_summary_single(metrics: Dict[str, float], output_path: Path, title: str) -> None:
+    import matplotlib.pyplot as plt
+
+    keys = ["kernel_count", "memcpy_count", "sync_api_calls", "kernel_gap_mean_us", "kernels_per_ms"]
+    labels = ["kernel_count", "memcpy_count", "sync_calls", "kernel_gap_mean_us", "kernels_per_ms"]
+    vals = [float(metrics.get(k, 0.0)) for k in keys]
+
+    fig, ax = plt.subplots(figsize=(10, 4.2), dpi=120)
+    ax.bar(range(len(vals)), vals, color="#4C78A8")
+    ax.set_xticks(list(range(len(vals))), labels)
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path)
@@ -370,7 +417,6 @@ def _profile_mode(
                 str(args.v1_inference_batch_size),
                 "--v1-inference-warmup-iters",
                 str(args.v1_inference_warmup_iters),
-                "--collect-step-timing",
             ]
         )
 
@@ -440,6 +486,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v1-inference-backend", type=str, default="py", choices=["py", "graph"])
     parser.add_argument("--v1-inference-batch-size", type=int, default=512)
     parser.add_argument("--v1-inference-warmup-iters", type=int, default=5)
+    parser.add_argument(
+        "--profile-modes",
+        type=str,
+        default="v0,v1",
+        help="Comma-separated modes to profile: v0, v1",
+    )
 
     parser.add_argument("--max-timeline-ops", type=int, default=4000)
     parser.add_argument("--nsys-bin", type=str, default="nsys")
@@ -449,6 +501,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.path.join("results", f"nsys_v0_v1_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
     )
     return parser
+
+
+def _parse_profile_modes(raw: str) -> List[str]:
+    allowed = {"v0", "v1"}
+    parts = [p.strip().lower() for p in str(raw).split(",") if p.strip()]
+    if not parts:
+        raise ValueError("profile_modes cannot be empty.")
+    out: List[str] = []
+    seen = set()
+    for p in parts:
+        if p not in allowed:
+            raise ValueError(f"Unsupported profile mode: {p}")
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
 
 
 def main() -> None:
@@ -468,42 +537,77 @@ def main() -> None:
         py_path_parts.append(current_py_path)
     env["PYTHONPATH"] = os.pathsep.join(py_path_parts)
 
-    v0_prefix = output_dir / "v0_trace"
-    v1_prefix = output_dir / "v1_trace"
+    modes = _parse_profile_modes(args.profile_modes)
+    reports: Dict[str, str] = {}
+    csv_paths: Dict[str, Dict[str, str]] = {}
+    ops_by_mode: Dict[str, List[TraceOp]] = {}
+    metrics_by_mode: Dict[str, Dict[str, float]] = {}
 
-    v0_rep = _profile_mode(nsys_bin=nsys_bin, mode="v0", output_prefix=v0_prefix, env=env, args=args)
-    v1_rep = _profile_mode(nsys_bin=nsys_bin, mode="v1", output_prefix=v1_prefix, env=env, args=args)
+    for mode in modes:
+        prefix = output_dir / f"{mode}_trace"
+        rep = _profile_mode(nsys_bin=nsys_bin, mode=mode, output_prefix=prefix, env=env, args=args)
+        gputrace_csv, cudaapisum_csv = _export_stats(nsys_bin, rep, prefix, env)
+        mode_ops, mode_gpu_metrics = _parse_gputrace_csv(gputrace_csv)
+        mode_sync_metrics = _parse_cudaapisum_csv(cudaapisum_csv)
+        reports[f"{mode}_nsys_rep"] = str(rep)
+        csv_paths[f"{mode}_gputrace_csv"] = {"path": str(gputrace_csv)}
+        csv_paths[f"{mode}_cudaapisum_csv"] = {"path": str(cudaapisum_csv)}
+        ops_by_mode[mode] = mode_ops
+        metrics_by_mode[mode] = {**mode_gpu_metrics, **mode_sync_metrics}
 
-    v0_gputrace_csv, v0_cudaapisum_csv = _export_stats(nsys_bin, v0_rep, v0_prefix, env)
-    v1_gputrace_csv, v1_cudaapisum_csv = _export_stats(nsys_bin, v1_rep, v1_prefix, env)
-
-    v0_ops, v0_gpu_metrics = _parse_gputrace_csv(v0_gputrace_csv)
-    v1_ops, v1_gpu_metrics = _parse_gputrace_csv(v1_gputrace_csv)
-    v0_sync_metrics = _parse_cudaapisum_csv(v0_cudaapisum_csv)
-    v1_sync_metrics = _parse_cudaapisum_csv(v1_cudaapisum_csv)
-
-    v0_metrics = {**v0_gpu_metrics, **v0_sync_metrics}
-    v1_metrics = {**v1_gpu_metrics, **v1_sync_metrics}
-
-    timeline_png = output_dir / "nsys_timeline_v0_vs_v1.png"
-    summary_png = output_dir / "nsys_summary_v0_vs_v1.png"
-    _plot_timeline(v0_ops, v1_ops, timeline_png, max_ops=int(args.max_timeline_ops))
-    _plot_summary(v0_metrics, v1_metrics, summary_png)
+    artifacts: Dict[str, str] = {}
+    if "v0" in modes and "v1" in modes:
+        timeline_png = output_dir / "nsys_timeline_v0_vs_v1.png"
+        summary_png = output_dir / "nsys_summary_v0_vs_v1.png"
+        _plot_timeline(
+            ops_by_mode.get("v0", []),
+            ops_by_mode.get("v1", []),
+            timeline_png,
+            max_ops=int(args.max_timeline_ops),
+        )
+        _plot_summary(
+            metrics_by_mode.get("v0", {}),
+            metrics_by_mode.get("v1", {}),
+            summary_png,
+        )
+        artifacts["timeline_png"] = str(timeline_png)
+        artifacts["summary_png"] = str(summary_png)
+    elif len(modes) == 1:
+        mode = modes[0]
+        timeline_png = output_dir / f"nsys_timeline_{mode}.png"
+        summary_png = output_dir / f"nsys_summary_{mode}.png"
+        _plot_timeline_single(
+            ops_by_mode.get(mode, []),
+            timeline_png,
+            max_ops=int(args.max_timeline_ops),
+            title=f"{mode} Nsight Timeline (GPU ops)",
+        )
+        _plot_summary_single(
+            metrics_by_mode.get(mode, {}),
+            summary_png,
+            title=f"{mode} Nsight Summary: memcpy/sync/kernel fragmentation",
+        )
+        artifacts["timeline_png"] = str(timeline_png)
+        artifacts["summary_png"] = str(summary_png)
 
     delta = {}
-    for key in sorted(set(v0_metrics.keys()) | set(v1_metrics.keys())):
-        a = float(v0_metrics.get(key, 0.0))
-        b = float(v1_metrics.get(key, 0.0))
-        delta[key] = {
-            "v0": a,
-            "v1": b,
-            "delta": b - a,
-            "ratio_v1_over_v0": (b / a) if a not in (0.0, -0.0) else float("nan"),
-        }
+    if "v0" in modes and "v1" in modes:
+        v0_metrics = metrics_by_mode.get("v0", {})
+        v1_metrics = metrics_by_mode.get("v1", {})
+        for key in sorted(set(v0_metrics.keys()) | set(v1_metrics.keys())):
+            a = float(v0_metrics.get(key, 0.0))
+            b = float(v1_metrics.get(key, 0.0))
+            delta[key] = {
+                "v0": a,
+                "v1": b,
+                "delta": b - a,
+                "ratio_v1_over_v0": (b / a) if a not in (0.0, -0.0) else float("nan"),
+            }
 
     payload = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "config": {
+            "profile_modes": modes,
             "device": args.device,
             "seed": int(args.seed),
             "duration_sec": float(args.duration_sec),
@@ -515,21 +619,10 @@ def main() -> None:
             "v1_concurrent_games": int(args.v1_concurrent_games),
             "v1_inference_backend": str(args.v1_inference_backend),
         },
-        "reports": {
-            "v0_nsys_rep": str(v0_rep),
-            "v1_nsys_rep": str(v1_rep),
-            "v0_gputrace_csv": str(v0_gputrace_csv),
-            "v1_gputrace_csv": str(v1_gputrace_csv),
-            "v0_cudaapisum_csv": str(v0_cudaapisum_csv),
-            "v1_cudaapisum_csv": str(v1_cudaapisum_csv),
-        },
-        "artifacts": {
-            "timeline_png": str(timeline_png),
-            "summary_png": str(summary_png),
-        },
+        "reports": {**reports, **{k: v["path"] for k, v in csv_paths.items()}},
+        "artifacts": artifacts,
         "metrics": {
-            "v0": v0_metrics,
-            "v1": v1_metrics,
+            **metrics_by_mode,
             "delta": delta,
         },
     }
@@ -537,8 +630,10 @@ def main() -> None:
     out_json = output_dir / "nsys_compare_summary.json"
     out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"summary_saved={out_json}")
-    print(f"timeline_png={timeline_png}")
-    print(f"summary_png={summary_png}")
+    if "timeline_png" in artifacts:
+        print(f"timeline_png={artifacts['timeline_png']}")
+    if "summary_png" in artifacts:
+        print(f"summary_png={artifacts['summary_png']}")
 
 
 if __name__ == "__main__":

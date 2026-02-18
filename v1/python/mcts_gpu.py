@@ -12,9 +12,10 @@ from v0 to allow incremental migration without changing the v0 path.
 from __future__ import annotations
 
 import time
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -246,6 +247,19 @@ class RootSearchBatchOutput:
     chosen_valid_mask: torch.Tensor
 
 
+@dataclass
+class _FinalizeGraphEntry:
+    graph: torch.cuda.CUDAGraph
+    legal_index_mat: torch.Tensor
+    action_code_mat: torch.Tensor
+    valid_mask: torch.Tensor
+    visits: torch.Tensor
+    value_sum: torch.Tensor
+    valid_root_indices: torch.Tensor
+    root_temps: torch.Tensor
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
 class V1RootMCTS:
     """GPU-first root search (PUCT over root children only)."""
 
@@ -270,6 +284,18 @@ class V1RootMCTS:
             "root_puct_ms": 0,
             "pack_writeback_ms": 0,
         }
+        self._timing_event_queue: List[Tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._timing_drain_period = 256
+        self._timed_calls_since_drain = 0
+        self._finalize_graph_cache: Dict[Tuple[int, int, int, int, bool], _FinalizeGraphEntry] = {}
+        self._finalize_graph_lru: list[Tuple[int, int, int, int, bool]] = []
+        self._finalize_graph_blocked: set[Tuple[int, int, int, int, bool]] = set()
+        self._finalize_graph_max_entries = 6
+        self._finalize_graph_min_roots = 32
+        self._finalize_graph_min_actions = 8
+        self._finalize_graph_enabled = self.device.type == "cuda" and not any(
+            str(k).upper().startswith("NSYS_") for k in os.environ.keys()
+        )
         mode = str(self.config.child_eval_mode).strip().lower()
         if mode not in ("value_only", "full"):
             raise ValueError(
@@ -277,6 +303,163 @@ class V1RootMCTS:
                 "expected 'value_only' or 'full'."
             )
         self._child_eval_mode = mode
+
+    def _touch_finalize_graph_key(self, key: Tuple[int, int, int, int, bool]) -> None:
+        if key in self._finalize_graph_lru:
+            self._finalize_graph_lru.remove(key)
+        self._finalize_graph_lru.append(key)
+        while len(self._finalize_graph_lru) > self._finalize_graph_max_entries:
+            old = self._finalize_graph_lru.pop(0)
+            self._finalize_graph_cache.pop(old, None)
+
+    def _drain_timing_events(self, force: bool) -> None:
+        if self.device.type != "cuda" or not self._timing_event_queue:
+            return
+        if force:
+            torch.cuda.synchronize(self.device)
+        pending: List[Tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        for name, start_evt, end_evt in self._timing_event_queue:
+            if force or end_evt.query():
+                elapsed_ms = float(start_evt.elapsed_time(end_evt))
+                self._timing_ms[name] = float(self._timing_ms.get(name, 0.0) + elapsed_ms)
+                self._timing_calls[name] = int(self._timing_calls.get(name, 0) + 1)
+            else:
+                pending.append((name, start_evt, end_evt))
+        self._timing_event_queue = pending
+
+    def _capture_finalize_graph(
+        self,
+        *,
+        key: Tuple[int, int, int, int, bool],
+        legal_index_mat: torch.Tensor,
+        action_code_mat: torch.Tensor,
+        valid_mask: torch.Tensor,
+        visits: torch.Tensor,
+        value_sum: torch.Tensor,
+        valid_root_indices: torch.Tensor,
+        batch_size: int,
+        root_temps: torch.Tensor,
+        sample_moves: bool,
+    ) -> Optional[_FinalizeGraphEntry]:
+        if self.device.type != "cuda":
+            return None
+        if key in self._finalize_graph_blocked:
+            return None
+        try:
+            s_legal_index_mat = legal_index_mat.detach().clone()
+            s_action_code_mat = action_code_mat.detach().clone()
+            s_valid_mask = valid_mask.detach().clone()
+            s_visits = visits.detach().clone()
+            s_value_sum = value_sum.detach().clone()
+            s_valid_root_indices = valid_root_indices.detach().clone()
+            s_root_temps = root_temps.detach().clone()
+
+            graph = torch.cuda.CUDAGraph()
+            torch.cuda.synchronize(self.device)
+            with torch.cuda.graph(graph):
+                outputs = v0_core.root_finalize_from_visits(
+                    s_legal_index_mat,
+                    s_action_code_mat,
+                    s_valid_mask,
+                    s_visits,
+                    s_value_sum,
+                    s_valid_root_indices,
+                    batch_size,
+                    TOTAL_ACTION_DIM,
+                    s_root_temps,
+                    sample_moves,
+                )
+            return _FinalizeGraphEntry(
+                graph=graph,
+                legal_index_mat=s_legal_index_mat,
+                action_code_mat=s_action_code_mat,
+                valid_mask=s_valid_mask,
+                visits=s_visits,
+                value_sum=s_value_sum,
+                valid_root_indices=s_valid_root_indices,
+                root_temps=s_root_temps,
+                outputs=outputs,
+            )
+        except Exception:
+            self._finalize_graph_blocked.add(key)
+            return None
+
+    def _root_finalize_from_visits(
+        self,
+        *,
+        legal_index_mat: torch.Tensor,
+        action_code_mat: torch.Tensor,
+        valid_mask: torch.Tensor,
+        visits: torch.Tensor,
+        value_sum: torch.Tensor,
+        valid_root_indices: torch.Tensor,
+        batch_size: int,
+        root_temps: torch.Tensor,
+        sample_moves: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_roots = int(legal_index_mat.size(0))
+        max_actions = int(legal_index_mat.size(1))
+        can_graph = (
+            self._finalize_graph_enabled
+            and num_roots >= self._finalize_graph_min_roots
+            and max_actions >= self._finalize_graph_min_actions
+            and (not sample_moves)
+        )
+        if not can_graph:
+            return v0_core.root_finalize_from_visits(
+                legal_index_mat,
+                action_code_mat,
+                valid_mask,
+                visits,
+                value_sum,
+                valid_root_indices,
+                batch_size,
+                TOTAL_ACTION_DIM,
+                root_temps,
+                sample_moves,
+            )
+
+        device_idx = int(self.device.index or 0)
+        key = (device_idx, num_roots, max_actions, int(batch_size), bool(sample_moves))
+        entry = self._finalize_graph_cache.get(key)
+        if entry is None:
+            entry = self._capture_finalize_graph(
+                key=key,
+                legal_index_mat=legal_index_mat,
+                action_code_mat=action_code_mat,
+                valid_mask=valid_mask,
+                visits=visits,
+                value_sum=value_sum,
+                valid_root_indices=valid_root_indices,
+                batch_size=batch_size,
+                root_temps=root_temps,
+                sample_moves=sample_moves,
+            )
+            if entry is None:
+                return v0_core.root_finalize_from_visits(
+                    legal_index_mat,
+                    action_code_mat,
+                    valid_mask,
+                    visits,
+                    value_sum,
+                    valid_root_indices,
+                    batch_size,
+                    TOTAL_ACTION_DIM,
+                    root_temps,
+                    sample_moves,
+                )
+            self._finalize_graph_cache[key] = entry
+        self._touch_finalize_graph_key(key)
+
+        entry.legal_index_mat.copy_(legal_index_mat, non_blocking=True)
+        entry.action_code_mat.copy_(action_code_mat, non_blocking=True)
+        entry.valid_mask.copy_(valid_mask, non_blocking=True)
+        entry.visits.copy_(visits, non_blocking=True)
+        entry.value_sum.copy_(value_sum, non_blocking=True)
+        entry.valid_root_indices.copy_(valid_root_indices, non_blocking=True)
+        entry.root_temps.copy_(root_temps, non_blocking=True)
+        entry.graph.replay()
+        return entry.outputs
 
     @contextmanager
     def _nvtx_range(self, name: str):
@@ -296,23 +479,37 @@ class V1RootMCTS:
                 yield
             return
         if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+            try:
+                yield
+            finally:
+                end_evt.record()
+                self._timing_event_queue.append((name, start_evt, end_evt))
+                self._timed_calls_since_drain += 1
+                if self._timed_calls_since_drain >= self._timing_drain_period:
+                    self._timed_calls_since_drain = 0
+                    self._drain_timing_events(force=False)
+            return
         t0 = time.perf_counter()
         try:
             yield
         finally:
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self._timing_ms[name] = float(self._timing_ms.get(name, 0.0) + elapsed_ms)
             self._timing_calls[name] = int(self._timing_calls.get(name, 0) + 1)
 
     def get_timing(self, reset: bool = False) -> Dict[str, Dict[str, float]]:
+        if self._collect_timing and self.device.type == "cuda":
+            self._drain_timing_events(force=True)
         payload = {
             "timing_ms": {k: float(v) for k, v in self._timing_ms.items()},
             "timing_calls": {k: int(v) for k, v in self._timing_calls.items()},
         }
         if reset:
+            self._timing_event_queue.clear()
+            self._timed_calls_since_drain = 0
             for key in list(self._timing_ms.keys()):
                 self._timing_ms[key] = 0.0
             for key in list(self._timing_calls.keys()):
@@ -568,32 +765,24 @@ class V1RootMCTS:
             visits = visits_cpp.to(dtype=torch.float32, device=state.device)
             value_sum = value_sum_cpp.to(dtype=torch.float32, device=state.device)
 
-            root_temps = temp_values.index_select(0, valid_root_indices).clamp_min(1e-6).view(-1, 1)
-            legal_policy = torch.pow(visits.clamp_min(1e-8), 1.0 / root_temps)
-            legal_policy = legal_policy * valid_mask.to(torch.float32)
-            legal_policy = legal_policy / legal_policy.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-            if self.config.sample_moves and max_actions > 1:
-                local_picks = torch.multinomial(legal_policy, num_samples=1).view(-1)
-            else:
-                local_picks = torch.argmax(legal_policy, dim=1)
-
-            root_value_vec = value_sum.sum(dim=1) / visits.sum(dim=1).clamp_min(1.0)
-            with self._nvtx_range("v1.root_sparse_writeback"), self._timed("pack_writeback_ms"):
+            root_temps = temp_values.index_select(0, valid_root_indices)
+            with self._nvtx_range("v1.root_finalize_from_visits"), self._timed("pack_writeback_ms"):
                 (
                     policy_dense,
                     chosen_action_indices,
                     chosen_action_codes,
                     chosen_valid_mask,
-                ) = v0_core.root_sparse_writeback(
-                    legal_index_mat,
-                    action_code_mat,
-                    valid_mask,
-                    legal_policy,
-                    local_picks,
-                    valid_root_indices,
-                    batch_size,
-                    TOTAL_ACTION_DIM,
+                    root_value_vec,
+                ) = self._root_finalize_from_visits(
+                    legal_index_mat=legal_index_mat,
+                    action_code_mat=action_code_mat,
+                    valid_mask=valid_mask,
+                    visits=visits,
+                    value_sum=value_sum,
+                    valid_root_indices=valid_root_indices,
+                    batch_size=batch_size,
+                    root_temps=root_temps,
+                    sample_moves=bool(self.config.sample_moves and max_actions > 1),
                 )
             root_values.index_copy_(0, valid_root_indices, root_value_vec)
 

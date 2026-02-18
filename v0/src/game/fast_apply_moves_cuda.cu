@@ -743,6 +743,179 @@ __global__ void BatchApplyMovesKernel(
     }
 }
 
+__global__ void BatchApplyMovesInplaceKernel(
+    int8_t* board,
+    bool* marks_black,
+    bool* marks_white,
+    int64_t* phase,
+    int64_t* current_player,
+    int64_t* pending_marks_required,
+    int64_t* pending_marks_remaining,
+    int64_t* pending_captures_required,
+    int64_t* pending_captures_remaining,
+    int64_t* forced_removals_done,
+    int64_t* move_count,
+    int64_t* moves_since_capture,
+    const int32_t* action_codes,
+    const int64_t* slot_indices,
+    int64_t batch_size,
+    int64_t num_actions,
+    int size,
+    int cell_count) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_actions) {
+        return;
+    }
+
+    int64_t slot = slot_indices[idx];
+    if (slot < 0 || slot >= batch_size) {
+        return;
+    }
+
+    int8_t* slot_board = board + slot * cell_count;
+    bool* slot_marks_black = marks_black + slot * cell_count;
+    bool* slot_marks_white = marks_white + slot * cell_count;
+
+    int64_t* phase_ptr = phase + slot;
+    int64_t* current_ptr = current_player + slot;
+    int64_t* marks_req_ptr = pending_marks_required + slot;
+    int64_t* marks_rem_ptr = pending_marks_remaining + slot;
+    int64_t* captures_req_ptr = pending_captures_required + slot;
+    int64_t* captures_rem_ptr = pending_captures_remaining + slot;
+    int64_t* forced_ptr = forced_removals_done + slot;
+    int64_t* move_count_ptr = move_count + slot;
+    int64_t phase_before = *phase_ptr;
+
+    int old_total = 0;
+    bool count_capture_progress = !(phase_before == kPhasePlacement || phase_before == kPhaseMarkSelection);
+    if (count_capture_progress) {
+        for (int i = 0; i < cell_count; ++i) {
+            if (slot_board[i] != 0) {
+                ++old_total;
+            }
+        }
+    }
+
+    int32_t kind = action_codes[idx * 4 + 0];
+    int32_t primary = action_codes[idx * 4 + 1];
+    int32_t secondary = action_codes[idx * 4 + 2];
+
+    switch (kind) {
+        case kActionPlacement:
+            apply_placement(
+                slot_board,
+                slot_marks_black,
+                slot_marks_white,
+                phase_ptr,
+                current_ptr,
+                marks_req_ptr,
+                marks_rem_ptr,
+                captures_req_ptr,
+                captures_rem_ptr,
+                forced_ptr,
+                move_count_ptr,
+                size,
+                primary);
+            break;
+        case kActionMarkSelection:
+            apply_mark_selection(
+                slot_board,
+                slot_marks_black,
+                slot_marks_white,
+                phase_ptr,
+                current_ptr,
+                marks_req_ptr,
+                marks_rem_ptr,
+                size,
+                primary);
+            *move_count_ptr += 1;
+            break;
+        case kActionProcessRemoval:
+            process_removal_phase(
+                slot_board,
+                slot_marks_black,
+                slot_marks_white,
+                phase_ptr,
+                current_ptr,
+                forced_ptr,
+                size);
+            *move_count_ptr += 1;
+            break;
+        case kActionForcedRemovalSelection:
+            apply_forced_removal(
+                slot_board,
+                phase_ptr,
+                current_ptr,
+                forced_ptr,
+                size,
+                primary);
+            *move_count_ptr += 1;
+            break;
+        case kActionMovement:
+            apply_movement(
+                slot_board,
+                phase_ptr,
+                current_ptr,
+                captures_req_ptr,
+                captures_rem_ptr,
+                size,
+                primary,
+                secondary);
+            *move_count_ptr += 1;
+            break;
+        case kActionNoMovesRemovalSelection:
+            apply_no_moves_removal(
+                slot_board,
+                phase_ptr,
+                current_ptr,
+                size,
+                primary);
+            *move_count_ptr += 1;
+            break;
+        case kActionCaptureSelection:
+            apply_capture_selection(
+                slot_board,
+                slot_marks_black,
+                slot_marks_white,
+                phase_ptr,
+                current_ptr,
+                captures_rem_ptr,
+                captures_req_ptr,
+                size,
+                primary);
+            *move_count_ptr += 1;
+            break;
+        case kActionCounterRemovalSelection:
+            apply_counter_removal(
+                slot_board,
+                phase_ptr,
+                current_ptr,
+                size,
+                primary);
+            *move_count_ptr += 1;
+            break;
+        default:
+            break;
+    }
+
+    if (!count_capture_progress) {
+        moves_since_capture[slot] = 0;
+        return;
+    }
+
+    int new_total = 0;
+    for (int i = 0; i < cell_count; ++i) {
+        if (slot_board[i] != 0) {
+            ++new_total;
+        }
+    }
+    if (new_total < old_total) {
+        moves_since_capture[slot] = 0;
+    } else {
+        moves_since_capture[slot] = moves_since_capture[slot] + 1;
+    }
+}
+
 }  // namespace
 
 std::tuple<
@@ -886,6 +1059,79 @@ batch_apply_moves_cuda(
         out_move_count,
         out_moves_since_capture,
     };
+}
+
+void batch_apply_moves_inplace_cuda(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
+    torch::Tensor action_codes,
+    torch::Tensor slot_indices) {
+    TORCH_CHECK(board.device().is_cuda(), "batch_apply_moves_inplace_cuda requires CUDA tensors.");
+
+    at::cuda::OptionalCUDAGuard guard(board.device());
+
+    board = board.contiguous();
+    marks_black = marks_black.contiguous();
+    marks_white = marks_white.contiguous();
+    phase = phase.contiguous();
+    current_player = current_player.contiguous();
+    pending_marks_required = pending_marks_required.contiguous();
+    pending_marks_remaining = pending_marks_remaining.contiguous();
+    pending_captures_required = pending_captures_required.contiguous();
+    pending_captures_remaining = pending_captures_remaining.contiguous();
+    forced_removals_done = forced_removals_done.contiguous();
+    move_count = move_count.contiguous();
+    moves_since_capture = moves_since_capture.contiguous();
+    action_codes = action_codes.contiguous();
+    slot_indices = slot_indices.to(torch::kInt64).contiguous();
+
+    const auto B = board.size(0);
+    const auto H = board.size(1);
+    const auto W = board.size(2);
+    TORCH_CHECK(H == W, "Board must be square.");
+    const int size = static_cast<int>(H);
+    const int cell_count = size * size;
+
+    TORCH_CHECK(action_codes.dim() == 2 && action_codes.size(1) == 4, "action_codes must be (N, 4).");
+    const int64_t num_actions = action_codes.size(0);
+    TORCH_CHECK(slot_indices.numel() == num_actions, "slot_indices must align with action_codes.");
+
+    if (num_actions == 0) {
+        return;
+    }
+
+    const int threads = 128;
+    const int blocks = static_cast<int>((num_actions + threads - 1) / threads);
+    BatchApplyMovesInplaceKernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        board.data_ptr<int8_t>(),
+        marks_black.data_ptr<bool>(),
+        marks_white.data_ptr<bool>(),
+        phase.data_ptr<int64_t>(),
+        current_player.data_ptr<int64_t>(),
+        pending_marks_required.data_ptr<int64_t>(),
+        pending_marks_remaining.data_ptr<int64_t>(),
+        pending_captures_required.data_ptr<int64_t>(),
+        pending_captures_remaining.data_ptr<int64_t>(),
+        forced_removals_done.data_ptr<int64_t>(),
+        move_count.data_ptr<int64_t>(),
+        moves_since_capture.data_ptr<int64_t>(),
+        action_codes.data_ptr<int32_t>(),
+        slot_indices.data_ptr<int64_t>(),
+        B,
+        num_actions,
+        size,
+        cell_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace v0

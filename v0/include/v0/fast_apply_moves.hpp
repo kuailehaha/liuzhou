@@ -34,4 +34,20 @@ batch_apply_moves(
     torch::Tensor action_codes,
     torch::Tensor parent_indices);
 
+void batch_apply_moves_inplace(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
+    torch::Tensor action_codes,
+    torch::Tensor slot_indices);
+
 }  // namespace v0

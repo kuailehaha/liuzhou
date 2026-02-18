@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import v0_core
@@ -114,21 +114,51 @@ def self_play_v1_gpu(
         "self_play_step_ms": 0,
         "finalize_ms": 0,
     }
+    timing_event_queue: List[Tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+    timed_calls_since_drain = 0
+    timing_drain_period = 256
+
+    def _drain_timing_events(force: bool) -> None:
+        nonlocal timing_event_queue
+        if dev.type != "cuda" or not collect_timing or not timing_event_queue:
+            return
+        if force:
+            torch.cuda.synchronize(dev)
+        pending: List[Tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        for key, start_evt, end_evt in timing_event_queue:
+            if force or end_evt.query():
+                elapsed_ms = float(start_evt.elapsed_time(end_evt))
+                step_timing_ms[key] = float(step_timing_ms.get(key, 0.0) + elapsed_ms)
+                step_timing_calls[key] = int(step_timing_calls.get(key, 0) + 1)
+            else:
+                pending.append((key, start_evt, end_evt))
+        timing_event_queue = pending
 
     @contextmanager
     def _timed(name: str):
+        nonlocal timed_calls_since_drain
         if not collect_timing:
             with nullcontext():
                 yield
             return
         if dev.type == "cuda":
-            torch.cuda.synchronize(dev)
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+            try:
+                yield
+            finally:
+                end_evt.record()
+                timing_event_queue.append((name, start_evt, end_evt))
+                timed_calls_since_drain += 1
+                if timed_calls_since_drain >= timing_drain_period:
+                    timed_calls_since_drain = 0
+                    _drain_timing_events(force=False)
+            return
         t0 = time.perf_counter()
         try:
             yield
         finally:
-            if dev.type == "cuda":
-                torch.cuda.synchronize(dev)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             step_timing_ms[name] = float(step_timing_ms.get(name, 0.0) + elapsed_ms)
             step_timing_calls[name] = int(step_timing_calls.get(name, 0) + 1)
@@ -234,6 +264,7 @@ def self_play_v1_gpu(
             )
 
     elapsed = max(1e-9, time.perf_counter() - started)
+    _drain_timing_events(force=True)
     batch = buffer.build()
     mcts_timing = mcts.get_timing(reset=False)
     for key, value in mcts_timing.get("timing_ms", {}).items():

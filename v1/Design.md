@@ -867,3 +867,117 @@ Recommended commands:
   - `tools/nsys_v0_v1_compare.py` (`duration=30s`, same benchmark shape).
 - Required artifact bundle:
   - JSON summaries + timeline plots + step-breakdown plots under `results/`.
+
+### Implementation Status (2026-02-18, after R5 coding)
+#### R5-A delivered
+- Added fused root finalize op in `v0_core`:
+  - `v0/src/bindings/module.cpp::RootFinalizeFromVisits`
+  - Python callsite switched in `v1/python/mcts_gpu.py` (`root_finalize_from_visits`).
+- Scope covered:
+  - policy-from-visits, root action pick, dense writeback, chosen action/code writeback, root-value vector.
+- Validation:
+  - `tests/v1/test_v1_tensor_pipeline_smoke.py`: PASS.
+  - `results/v1_child_ab_after_r5b_guarded_smoke.json`: all semantic criteria PASS.
+
+#### R5-B implemented as guarded slot-inplace path
+- Added slot-inplace apply API:
+  - `v0/include/v0/fast_apply_moves.hpp::batch_apply_moves_inplace`
+  - `v0/src/game/fast_apply_moves.cpp` (CPU/CUDA dispatch + CPU fallback)
+  - `v0/src/game/fast_apply_moves_cuda.cu::BatchApplyMovesInplaceKernel`
+- `v0/src/bindings/module.cpp::SelfPlayStepInplace` now supports two internal paths:
+  - legacy compact apply path (`batch_apply_moves + index_copy`) for default `cg=8`;
+  - slot-inplace path only when `CUDA && batch_n>=32 && active_slots==batch_n`.
+- Rationale:
+  - Full always-on slot-inplace caused regression on current `cg=8` production-like setup.
+  - Guard keeps the path available for high-concurrency waves while preventing regression in default runs.
+
+#### R5-B performance observation (same workload shape, `v1`, `duration=120s`, `cg=8`, `sims=64`)
+- Baseline:
+  - `results/v1_stable_120s_20260218.json`
+  - `games/s=0.628`, `positions/s=82.06`
+- Full always-on slot-inplace (diagnostic only):
+  - `results/v1_stable_120s_20260218_after_r5b.json`
+  - `games/s=0.404`, `positions/s=52.99` (regression, not accepted)
+- Guarded slot-inplace (current default behavior):
+  - `results/v1_stable_120s_20260218_after_r5b_guarded.json`
+  - `games/s=0.619`, `positions/s=80.90` (near-baseline, no major regression)
+
+#### Current decision
+- Keep guarded R5-B path merged.
+- Do not enable always-on slot-inplace on `cg=8` until dedicated high-concurrency profiling shows net gain.
+- Move next effort to `R5-C` (synchronize callstack cleanup) and `R6` (shape-stable graph capture) per plan.
+- Note (`2026-02-18`): rerun of `tools/nsys_v0_v1_compare.py` with explicit Nsight 2024.4.2 binary hit a profiler-side crash on the `v0` profiled command (`exit status 3221225477`), so this stage keeps the previous valid nsys bundle for v0/v1 timeline comparison and uses workload/step telemetry for immediate regression gating.
+
+### R6 Baseline Refresh (v1-only nsys, 2026-02-18)
+Objective:
+- Build a fresh pre-R6 baseline from `v1` only (no `v0` dependency), at fixed `seed/config`, and sweep `cg=8/32/64`.
+
+Execution notes:
+- Script updated to support single-mode profiling:
+  - `tools/nsys_v0_v1_compare.py --profile-modes v1`
+- First pass used `--num-games-per-iter 8`; this does not fully exercise `cg=32/64`.
+- Final accepted baseline uses `--num-games-per-iter 64` for all three `cg` points.
+
+Artifacts:
+- `results/nsys_v1_baseline_cg8_ng64_20260218/nsys_compare_summary.json`
+- `results/nsys_v1_baseline_cg32_ng64_20260218/nsys_compare_summary.json`
+- `results/nsys_v1_baseline_cg64_ng64_20260218/nsys_compare_summary.json`
+- `results/nsys_v1_baseline_matrix_20260218.json`
+
+Key baseline numbers (`duration=30s`, `sims=128`, `threads=1`, `backend=py`, `batch=512`, `num_games_per_iter=64`):
+
+| cg | kernel_count | kernels/ms | kernel_gap_mean_us | kernel_idle_ratio | memcpy_count | sync_api_calls | sync_api_total_ms | games/s | pos/s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 853,771 | 39.544 | 42.49 | 0.627 | 24,747 | 26,857 | 5,627.6 | 1.091 | 137.1 |
+| 32 | 426,721 | 13.671 | 40.82 | 0.358 | 12,752 | 13,687 | 18,270.5 | 2.553 | 338.1 |
+| 64 | 214,819 | 6.816 | 34.57 | 0.191 | 6,658 | 7,043 | 22,567.7 | 3.122 | 403.8 |
+
+Interpretation for R6:
+- Increasing `cg` already reduces launch density and kernel fragmentation indicators.
+- Remaining cost is still launch/sync heavy (especially at low `cg`), so R6 should target a shape-stable segment where launch replay can replace repeated eager dispatch.
+- Recommended R6 implementation order:
+  1. Start from `cg=32` and `cg=64` where shapes are more stable and guarded slot-inplace path is active.
+  2. Capture the stable root-search subsegment first, keep eager fallback for remainder/small waves.
+  3. Re-run the same v1-only nsys matrix and compare against `results/nsys_v1_baseline_matrix_20260218.json`.
+
+### R5-C Sync Cleanup + Profiling Separation (2026-02-18)
+Delivered code changes:
+- Replaced per-segment `torch.cuda.synchronize()` timing in `v1/python/mcts_gpu.py` with CUDA-event based async timing queue (`_timing_event_queue` + deferred drain).
+- Replaced per-segment `torch.cuda.synchronize()` timing in `v1/python/self_play_gpu_runner.py` with CUDA-event based async timing queue.
+- Updated `tools/nsys_v0_v1_compare.py` so nsys profiling runs do not force `--collect-step-timing` in workload command.
+  - Policy: nsys is used for launch/memcpy/sync structure; step segment ratio comes from separate stable workload runs.
+
+Validation (correctness):
+- `tests/v1/test_v1_tensor_pipeline_smoke.py`: PASS.
+- `results/v1_child_ab_after_r5c_eventtimer_smoke.json`: strict A/B semantic criteria PASS.
+
+Clean v1-only nsys baseline for post-R5-C/R6 entry (no step-timing instrumentation in profile command):
+- `results/nsys_v1_after_r5c_clean_cg8_20260218/nsys_compare_summary.json`
+- `results/nsys_v1_after_r5c_clean_cg32_20260218/nsys_compare_summary.json`
+- `results/nsys_v1_after_r5c_clean_cg64_20260218/nsys_compare_summary.json`
+- Consolidated: `results/nsys_v1_r6_clean_baseline_matrix_20260218.json`
+
+Key clean baseline numbers (`duration=30s`, `sims=128`, `threads=1`, `backend=py`, `batch=512`, `num_games_per_iter=64`):
+
+| cg | kernel_count | kernels/ms | kernel_gap_mean_us | kernel_idle_ratio | memcpy_count | sync_api_calls | sync_api_total_ms | games/s | pos/s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 853,771 | 25.583 | 56.18 | 0.590 | 24,747 | 17,577 | 4,896.3 | 0.783 | 98.3 |
+| 32 | 212,921 | 9.757 | 68.52 | 0.401 | 6,389 | 4,547 | 9,645.8 | 1.676 | 228.6 |
+| 64 | 214,819 | 6.234 | 83.45 | 0.342 | 6,658 | 4,655 | 18,099.1 | 2.350 | 303.9 |
+
+Fixed-config long-stable run (for power/clock + step share evidence):
+- Command family: `tools/run_selfplay_workload.py`, `duration=120s`, `cg=32`, `sims=128`, `collect-step-timing`.
+- Artifact: `results/v1_stable_120s_after_r5c_events_cg32_20260218.json`
+- Plots:
+  - `results/v1_stable_120s_after_r5c_events_cg32_20260218_step_breakdown_bar.png`
+  - `results/v1_stable_120s_after_r5c_events_cg32_20260218_step_breakdown_pie.png`
+  - `results/v1_stable_120s_after_r5c_events_cg32_20260218_stable_throughput.png`
+  - `results/v1_stable_120s_after_r5c_events_cg32_20260218_stable_gpu.png`
+- Stable summary:
+  - `games/s=2.899`, `positions/s=380.8`
+  - step ratio: `root_puct=14.4%`, `pack_writeback=46.2%`, `self_play_step=36.9%`, `finalize=2.5%`
+  - GPU telemetry: util avg `66.1%`, power avg `32.8W`, graphics clock avg `389MHz`, `P0 ratio=0.0`.
+
+Current decision after R5-C:
+- Keep nsys and step-timing separated to avoid instrumentation coupling in launch analysis.
+- Keep R6 target focused on shape-stable `cg>=32` segment first; `cg=8` remains a stress point and should not be used alone to judge graph-capture gains.

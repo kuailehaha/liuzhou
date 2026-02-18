@@ -438,6 +438,102 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> RootSpars
         chosen_valid_mask);
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> RootFinalizeFromVisits(
+    const torch::Tensor& legal_index_mat,
+    const torch::Tensor& action_code_mat,
+    const torch::Tensor& valid_mask,
+    const torch::Tensor& visits,
+    const torch::Tensor& value_sum,
+    const torch::Tensor& valid_root_indices,
+    int64_t batch_size,
+    int64_t total_action_dim,
+    const torch::Tensor& root_temperatures,
+    bool sample_moves) {
+    TORCH_CHECK(batch_size >= 0, "batch_size must be non-negative");
+    TORCH_CHECK(total_action_dim > 0, "total_action_dim must be positive");
+    TORCH_CHECK(legal_index_mat.dim() == 2, "legal_index_mat must be [R, M]");
+    TORCH_CHECK(valid_mask.dim() == 2, "valid_mask must be [R, M]");
+    TORCH_CHECK(visits.dim() == 2, "visits must be [R, M]");
+    TORCH_CHECK(value_sum.dim() == 2, "value_sum must be [R, M]");
+    TORCH_CHECK(action_code_mat.dim() == 3 && action_code_mat.size(2) == 4, "action_code_mat must be [R, M, 4]");
+    TORCH_CHECK(valid_root_indices.dim() == 1, "valid_root_indices must be [R]");
+    TORCH_CHECK(root_temperatures.dim() == 1, "root_temperatures must be [R]");
+    TORCH_CHECK(legal_index_mat.size(0) == valid_mask.size(0) && legal_index_mat.size(1) == valid_mask.size(1), "legal_index_mat/valid_mask shape mismatch");
+    TORCH_CHECK(legal_index_mat.size(0) == visits.size(0) && legal_index_mat.size(1) == visits.size(1), "legal_index_mat/visits shape mismatch");
+    TORCH_CHECK(legal_index_mat.size(0) == value_sum.size(0) && legal_index_mat.size(1) == value_sum.size(1), "legal_index_mat/value_sum shape mismatch");
+    TORCH_CHECK(legal_index_mat.size(0) == action_code_mat.size(0) && legal_index_mat.size(1) == action_code_mat.size(1), "legal_index_mat/action_code_mat shape mismatch");
+    TORCH_CHECK(valid_root_indices.size(0) == legal_index_mat.size(0), "valid_root_indices size mismatch");
+    TORCH_CHECK(root_temperatures.size(0) == legal_index_mat.size(0), "root_temperatures size mismatch");
+
+    auto device = legal_index_mat.device();
+    TORCH_CHECK(
+        device == action_code_mat.device() &&
+            device == valid_mask.device() &&
+            device == visits.device() &&
+            device == value_sum.device() &&
+            device == valid_root_indices.device() &&
+            device == root_temperatures.device(),
+        "all tensors must be on the same device");
+
+    auto legal_idx = legal_index_mat.to(torch::kInt64).contiguous();
+    auto action_codes = action_code_mat.to(torch::kInt32).contiguous();
+    auto mask_b = valid_mask.to(torch::kBool).contiguous();
+    auto visits_f = visits.to(torch::kFloat32).contiguous();
+    auto value_sum_f = value_sum.to(torch::kFloat32).contiguous();
+    auto roots = valid_root_indices.to(torch::kInt64).contiguous();
+    auto root_temps = root_temperatures.to(torch::kFloat32).clamp_min(1e-6).contiguous();
+
+    auto legal_policy = torch::pow(visits_f.clamp_min(1e-8), 1.0 / root_temps.view({-1, 1}));
+    legal_policy = legal_policy * mask_b.to(torch::kFloat32);
+    legal_policy = legal_policy / legal_policy.sum(1, true).clamp_min(1e-8);
+
+    torch::Tensor local_picks;
+    if (sample_moves && legal_idx.size(1) > 1) {
+        local_picks = torch::multinomial(legal_policy, 1, false).view(-1);
+    } else {
+        local_picks = std::get<1>(legal_policy.max(1, false));
+    }
+
+    auto root_value_vec = value_sum_f.sum(1) / visits_f.sum(1).clamp_min(1.0);
+
+    auto policy_dense_valid = torch::zeros(
+        {legal_idx.size(0), total_action_dim},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    policy_dense_valid.scatter_add_(1, legal_idx, legal_policy * mask_b.to(torch::kFloat32));
+
+    auto chosen_indices_local = legal_idx.gather(1, local_picks.view({-1, 1})).view(-1);
+    auto chosen_codes_local = action_codes
+                                  .gather(1, local_picks.view({-1, 1, 1}).expand({-1, 1, 4}))
+                                  .view({-1, 4});
+
+    auto policy_dense = torch::zeros(
+        {batch_size, total_action_dim},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    auto chosen_action_indices = torch::full(
+        {batch_size},
+        -1,
+        torch::TensorOptions().dtype(torch::kInt64).device(device));
+    auto chosen_action_codes = torch::full(
+        {batch_size, 4},
+        -1,
+        torch::TensorOptions().dtype(torch::kInt32).device(device));
+    auto chosen_valid_mask = torch::zeros(
+        {batch_size},
+        torch::TensorOptions().dtype(torch::kBool).device(device));
+
+    policy_dense.index_copy_(0, roots, policy_dense_valid);
+    chosen_action_indices.index_copy_(0, roots, chosen_indices_local);
+    chosen_action_codes.index_copy_(0, roots, chosen_codes_local);
+    chosen_valid_mask.index_fill_(0, roots, true);
+
+    return std::make_tuple(
+        policy_dense,
+        chosen_action_indices,
+        chosen_action_codes,
+        chosen_valid_mask,
+        root_value_vec);
+}
+
 torch::Tensor SoftValueFromBoardBatch(const torch::Tensor& boards, double soft_value_k) {
     TORCH_CHECK(boards.dim() == 3, "boards must be 3D [N, H, W]");
     auto black = boards.eq(1).sum({1, 2}).to(torch::kFloat32);
@@ -649,47 +745,75 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
     if (valid_local_idx.numel() > 0) {
         auto valid_slots = active_idx.index_select(0, valid_local_idx);
         auto valid_action_codes = chosen_action_codes.index_select(0, valid_local_idx);
-        auto applied = v0::batch_apply_moves(
-            board,
-            marks_black,
-            marks_white,
-            phase,
-            current_player,
-            pending_marks_required,
-            pending_marks_remaining,
-            pending_captures_required,
-            pending_captures_remaining,
-            forced_removals_done,
-            move_count,
-            moves_since_capture,
-            valid_action_codes,
-            valid_slots);
+        auto use_inplace_path =
+            device.is_cuda() && batch_n >= 32 && valid_slots.size(0) == batch_n;
+        torch::Tensor next_phase;
+        torch::Tensor next_move_count;
+        torch::Tensor next_moves_since_capture;
+        torch::Tensor valid_board;
 
-        auto next_board = std::get<0>(applied);
-        auto next_marks_black = std::get<1>(applied);
-        auto next_marks_white = std::get<2>(applied);
-        auto next_phase = std::get<3>(applied);
-        auto next_current_player = std::get<4>(applied);
-        auto next_pending_marks_required = std::get<5>(applied);
-        auto next_pending_marks_remaining = std::get<6>(applied);
-        auto next_pending_captures_required = std::get<7>(applied);
-        auto next_pending_captures_remaining = std::get<8>(applied);
-        auto next_forced_removals_done = std::get<9>(applied);
-        auto next_move_count = std::get<10>(applied);
-        auto next_moves_since_capture = std::get<11>(applied);
+        if (use_inplace_path) {
+            v0::batch_apply_moves_inplace(
+                board,
+                marks_black,
+                marks_white,
+                phase,
+                current_player,
+                pending_marks_required,
+                pending_marks_remaining,
+                pending_captures_required,
+                pending_captures_remaining,
+                forced_removals_done,
+                move_count,
+                moves_since_capture,
+                valid_action_codes,
+                valid_slots);
+            next_phase = phase.index_select(0, valid_slots);
+            next_move_count = move_count.index_select(0, valid_slots);
+            next_moves_since_capture = moves_since_capture.index_select(0, valid_slots);
+            valid_board = board.index_select(0, valid_slots);
+        } else {
+            auto applied = v0::batch_apply_moves(
+                board,
+                marks_black,
+                marks_white,
+                phase,
+                current_player,
+                pending_marks_required,
+                pending_marks_remaining,
+                pending_captures_required,
+                pending_captures_remaining,
+                forced_removals_done,
+                move_count,
+                moves_since_capture,
+                valid_action_codes,
+                valid_slots);
+            valid_board = std::get<0>(applied);
+            auto next_marks_black = std::get<1>(applied);
+            auto next_marks_white = std::get<2>(applied);
+            next_phase = std::get<3>(applied);
+            auto next_current_player = std::get<4>(applied);
+            auto next_pending_marks_required = std::get<5>(applied);
+            auto next_pending_marks_remaining = std::get<6>(applied);
+            auto next_pending_captures_required = std::get<7>(applied);
+            auto next_pending_captures_remaining = std::get<8>(applied);
+            auto next_forced_removals_done = std::get<9>(applied);
+            next_move_count = std::get<10>(applied);
+            next_moves_since_capture = std::get<11>(applied);
 
-        board.index_copy_(0, valid_slots, next_board);
-        marks_black.index_copy_(0, valid_slots, next_marks_black.to(torch::kBool));
-        marks_white.index_copy_(0, valid_slots, next_marks_white.to(torch::kBool));
-        phase.index_copy_(0, valid_slots, next_phase);
-        current_player.index_copy_(0, valid_slots, next_current_player);
-        pending_marks_required.index_copy_(0, valid_slots, next_pending_marks_required);
-        pending_marks_remaining.index_copy_(0, valid_slots, next_pending_marks_remaining);
-        pending_captures_required.index_copy_(0, valid_slots, next_pending_captures_required);
-        pending_captures_remaining.index_copy_(0, valid_slots, next_pending_captures_remaining);
-        forced_removals_done.index_copy_(0, valid_slots, next_forced_removals_done);
-        move_count.index_copy_(0, valid_slots, next_move_count);
-        moves_since_capture.index_copy_(0, valid_slots, next_moves_since_capture);
+            board.index_copy_(0, valid_slots, valid_board);
+            marks_black.index_copy_(0, valid_slots, next_marks_black.to(torch::kBool));
+            marks_white.index_copy_(0, valid_slots, next_marks_white.to(torch::kBool));
+            phase.index_copy_(0, valid_slots, next_phase);
+            current_player.index_copy_(0, valid_slots, next_current_player);
+            pending_marks_required.index_copy_(0, valid_slots, next_pending_marks_required);
+            pending_marks_remaining.index_copy_(0, valid_slots, next_pending_marks_remaining);
+            pending_captures_required.index_copy_(0, valid_slots, next_pending_captures_required);
+            pending_captures_remaining.index_copy_(0, valid_slots, next_pending_captures_remaining);
+            forced_removals_done.index_copy_(0, valid_slots, next_forced_removals_done);
+            move_count.index_copy_(0, valid_slots, next_move_count);
+            moves_since_capture.index_copy_(0, valid_slots, next_moves_since_capture);
+        }
 
         auto ones = torch::ones({valid_slots.size(0)}, slots_options);
         plies.index_add_(0, valid_slots, ones);
@@ -697,8 +821,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
 
         auto winner_sign = torch::zeros({valid_slots.size(0)}, torch::TensorOptions().dtype(torch::kInt8).device(device));
         auto non_placement = next_phase.ne(static_cast<int64_t>(v0::Phase::kPlacement));
-        auto black_count = next_board.eq(1).sum({1, 2});
-        auto white_count = next_board.eq(-1).sum({1, 2});
+        auto black_count = valid_board.eq(1).sum({1, 2});
+        auto white_count = valid_board.eq(-1).sum({1, 2});
         winner_sign = torch::where(
             non_placement.logical_and(black_count.eq(0)),
             torch::full_like(winner_sign, -1),
@@ -722,7 +846,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
                 winner_local.ne(0),
                 winner_local,
                 torch::zeros_like(winner_local));
-            auto board_local = next_board.index_select(0, finalize_local_idx);
+            auto board_local = valid_board.index_select(0, finalize_local_idx);
             auto soft_local = SoftValueFromBoardBatch(board_local, soft_value_k);
 
             slot_chunks.push_back(finalize_slots);
@@ -1243,6 +1367,19 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("valid_root_indices"),
         py::arg("batch_size"),
         py::arg("total_action_dim"));
+    m.def(
+        "root_finalize_from_visits",
+        &RootFinalizeFromVisits,
+        py::arg("legal_index_mat"),
+        py::arg("action_code_mat"),
+        py::arg("valid_mask"),
+        py::arg("visits"),
+        py::arg("value_sum"),
+        py::arg("valid_root_indices"),
+        py::arg("batch_size"),
+        py::arg("total_action_dim"),
+        py::arg("root_temperatures"),
+        py::arg("sample_moves"));
     m.def(
         "self_play_step_inplace",
         &SelfPlayStepInplace,
