@@ -694,3 +694,94 @@ Use same hardware and config family as baseline:
 ### One-click wrapper
 - Script: `scripts/validate_v1_gpu.cmd`
 - Purpose: launch the above validator with default matrix and output path.
+
+### Observability Metrics (2026-02-18)
+To support the three requested diagnostics (Nsight timeline, per-step segment ratio, fixed-config stable run), new instrumentation and scripts were added.
+
+Code instrumentation:
+- `v1/python/mcts_gpu.py`
+  - Added NVTX ranges:
+    - `v1.root_pack_sparse_actions`
+    - `v1.root_puct_allocate_visits`
+    - `v1.root_sparse_writeback`
+  - Added optional timing aggregation (`collect_timing`) for:
+    - `root_puct_ms`
+    - `pack_writeback_ms`
+- `v1/python/self_play_gpu_runner.py`
+  - Added NVTX ranges:
+    - `v1.search_batch`
+    - `v1.self_play_step_inplace`
+    - `v1.finalize_trajectory_inplace`
+  - Added optional segment timing output in `SelfPlayV1Stats`:
+    - `step_timing_ms`
+    - `step_timing_ratio`
+    - `step_timing_calls`
+  - New tracked keys:
+    - `root_puct_ms`
+    - `pack_writeback_ms`
+    - `self_play_step_ms`
+    - `finalize_ms`
+
+New scripts:
+- `tools/run_selfplay_workload.py`
+  - Unified fixed-config runner (`mode=v0|v1`) with:
+    - throughput stats,
+    - GPU telemetry sampling (`util/power/memory/pstate/graphics_clock/sm_clock`),
+    - optional v1 step timing export,
+    - optional step breakdown plots (bar + pie),
+    - optional stable-run plots (throughput line + GPU telemetry line).
+- `tools/nsys_v0_v1_compare.py`
+  - Runs Nsight Systems for `v0` and `v1` workloads.
+  - Exports and parses `gputrace` + `cudaapisum`.
+  - Produces:
+    - timeline image (`v0 vs v1`) highlighting kernel/memcpy/memset distribution,
+    - summary image for kernel count / memcpy count / sync calls / kernel gap / kernel fragmentation,
+    - JSON with parsed metrics and deltas.
+
+Recommended commands:
+- Per-step segment breakdown (with plots):
+  - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/run_selfplay_workload.py --mode v1 --device cuda:0 --seed 12345 --num-games-per-iter 8 --iterations 1 --mcts-simulations 128 --v1-threads 1 --v1-concurrent-games 8 --v1-child-eval-mode value_only --v1-inference-backend py --collect-step-timing --plot-step-breakdown --output-json results/v1_step_breakdown_latest.json"`
+- Fixed-config stable run (`>=180s`, with plots):
+  - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/run_selfplay_workload.py --mode v1 --device cuda:0 --seed 12345 --num-games-per-iter 8 --duration-sec 180 --mcts-simulations 128 --v1-threads 1 --v1-concurrent-games 8 --v1-child-eval-mode value_only --v1-inference-backend py --plot-stability --output-json results/v1_stable_run_180s.json"`
+- Nsight timeline compare (`v0 vs v1`):
+  - `conda run -n torchenv cmd /c "set PYTHONPATH=d:\CODES\liuzhou\build\v0\src;d:\CODES\liuzhou&& python tools/nsys_v0_v1_compare.py --device cuda:0 --seed 12345 --duration-sec 30 --num-games-per-iter 8 --mcts-simulations 128 --v0-workers 1 --v0-batch-leaves 512 --v1-threads 1 --v1-concurrent-games 8 --v1-inference-backend py --output-dir results/nsys_v0_v1_latest"`
+
+### Observability Run Snapshot (Windows, RTX 3060, 2026-02-18)
+#### Nsight timeline (`v0` vs `v1`)
+- Nsight binary used:
+  - `C:\Program Files\NVIDIA Corporation\Nsight Systems 2024.4.2\target-windows-x64\nsys.exe`
+- Run config:
+  - `duration=30s`, `mcts_simulations=64`, `v0(workers=1,batch_leaves=512,backend=graph)`, `v1(threads=1,concurrent_games=8,backend=py)`.
+- Artifacts:
+  - Summary JSON: `results/nsys_v0_v1_20260218_run3/nsys_compare_summary.json`
+  - Timeline image: `results/nsys_v0_v1_20260218_run3/nsys_timeline_v0_vs_v1.png`
+  - Summary image: `results/nsys_v0_v1_20260218_run3/nsys_summary_v0_vs_v1.png`
+- Key parsed metrics (from `nsys_compare_summary.json`):
+  - `kernel_count`: `69,850 -> 532,806` (`7.63x`)
+  - `memcpy_count`: `21,859 -> 15,447` (`0.71x`)
+  - `sync_api_calls`: `20,569 -> 16,792` (`0.82x`)
+  - `sync_api_total_ms`: `28,151.69 -> 2,424.14` (`0.086x`)
+  - `kernel_gap_mean_us`: `624.995 -> 32.695` (`0.052x`)
+  - `kernel_idle_ratio`: `0.979 -> 0.535`
+- Workload throughput in the same Nsight run:
+  - `v0`: `0.087 games/s` (`results/nsys_v0_v1_20260218_run3/v0_trace_workload.json`)
+  - `v1`: `0.578 games/s` (`results/nsys_v0_v1_20260218_run3/v1_trace_workload.json`)
+
+#### Fixed-config stable run (`v1`, 120s)
+- Output JSON:
+  - `results/v1_stable_120s_20260218.json`
+- Stability plots:
+  - `results/v1_stable_120s_20260218_stable_throughput.png`
+  - `results/v1_stable_120s_20260218_stable_gpu.png`
+- Step breakdown plots:
+  - `results/v1_stable_120s_20260218_step_breakdown_bar.png`
+  - `results/v1_stable_120s_20260218_step_breakdown_pie.png`
+- Summary:
+  - `run_elapsed=121.08s`, `iterations=19`, `games=76`, `positions=9,936`
+  - `games/s=0.628`, `positions/s=82.06`
+  - `gpu_util_avg=30.8%`, `gpu_power_avg=25.1W`, `gpu_p0_ratio=0.0`
+- Step segment ratio:
+  - `pack_writeback_ms`: `49.55%`
+  - `self_play_step_ms`: `41.51%`
+  - `root_puct_ms`: `8.31%`
+  - `finalize_ms`: `0.64%`

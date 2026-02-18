@@ -11,8 +11,10 @@ from v0 to allow incremental migration without changing the v0 path.
 
 from __future__ import annotations
 
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -247,11 +249,27 @@ class RootSearchBatchOutput:
 class V1RootMCTS:
     """GPU-first root search (PUCT over root children only)."""
 
-    def __init__(self, model, config: V1RootMCTSConfig, device: torch.device | str, inference_engine=None) -> None:
+    def __init__(
+        self,
+        model,
+        config: V1RootMCTSConfig,
+        device: torch.device | str,
+        inference_engine=None,
+        collect_timing: bool = False,
+    ) -> None:
         self.model = model
         self.config = config
         self.device = torch.device(device)
         self.inference_engine = inference_engine
+        self._collect_timing = bool(collect_timing)
+        self._timing_ms: Dict[str, float] = {
+            "root_puct_ms": 0.0,
+            "pack_writeback_ms": 0.0,
+        }
+        self._timing_calls: Dict[str, int] = {
+            "root_puct_ms": 0,
+            "pack_writeback_ms": 0,
+        }
         mode = str(self.config.child_eval_mode).strip().lower()
         if mode not in ("value_only", "full"):
             raise ValueError(
@@ -259,6 +277,47 @@ class V1RootMCTS:
                 "expected 'value_only' or 'full'."
             )
         self._child_eval_mode = mode
+
+    @contextmanager
+    def _nvtx_range(self, name: str):
+        if self.device.type != "cuda":
+            yield
+            return
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+    @contextmanager
+    def _timed(self, name: str):
+        if not self._collect_timing:
+            with nullcontext():
+                yield
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self._timing_ms[name] = float(self._timing_ms.get(name, 0.0) + elapsed_ms)
+            self._timing_calls[name] = int(self._timing_calls.get(name, 0) + 1)
+
+    def get_timing(self, reset: bool = False) -> Dict[str, Dict[str, float]]:
+        payload = {
+            "timing_ms": {k: float(v) for k, v in self._timing_ms.items()},
+            "timing_calls": {k: int(v) for k, v in self._timing_calls.items()},
+        }
+        if reset:
+            for key in list(self._timing_ms.keys()):
+                self._timing_ms[key] = 0.0
+            for key in list(self._timing_calls.keys()):
+                self._timing_calls[key] = 0
+        return payload
 
     def _autocast_context(self):
         if self.device.type != "cuda":
@@ -450,22 +509,23 @@ class V1RootMCTS:
         chosen_action_codes = torch.full((batch_size, 4), -1, dtype=torch.int32, device=state.device)
         chosen_valid_mask = torch.zeros((batch_size,), dtype=torch.bool, device=state.device)
 
-        (
-            terminal_mask,
-            valid_root_indices,
-            counts,
-            valid_mask,
-            legal_index_mat,
-            priors_mat,
-            action_code_mat,
-            flat_indices,
-            action_codes_all,
-            parent_indices_all,
-        ) = v0_core.root_pack_sparse_actions(
-            legal_mask_bool,
-            probs,
-            metadata,
-        )
+        with self._nvtx_range("v1.root_pack_sparse_actions"), self._timed("pack_writeback_ms"):
+            (
+                terminal_mask,
+                valid_root_indices,
+                counts,
+                valid_mask,
+                legal_index_mat,
+                priors_mat,
+                action_code_mat,
+                flat_indices,
+                action_codes_all,
+                parent_indices_all,
+            ) = v0_core.root_pack_sparse_actions(
+                legal_mask_bool,
+                probs,
+                metadata,
+            )
 
         if int(valid_root_indices.numel()) > 0:
             num_roots = int(valid_root_indices.numel())
@@ -497,13 +557,14 @@ class V1RootMCTS:
                 leaf_mat.view(-1).index_copy_(0, flat_indices, child_leaf_values)
 
             sims = max(1, int(self.config.num_simulations))
-            visits_cpp, value_sum_cpp, _ = v0_core.root_puct_allocate_visits(
-                priors_mat,
-                leaf_mat,
-                valid_mask,
-                sims,
-                float(self.config.exploration_weight),
-            )
+            with self._nvtx_range("v1.root_puct_allocate_visits"), self._timed("root_puct_ms"):
+                visits_cpp, value_sum_cpp, _ = v0_core.root_puct_allocate_visits(
+                    priors_mat,
+                    leaf_mat,
+                    valid_mask,
+                    sims,
+                    float(self.config.exploration_weight),
+                )
             visits = visits_cpp.to(dtype=torch.float32, device=state.device)
             value_sum = value_sum_cpp.to(dtype=torch.float32, device=state.device)
 
@@ -518,21 +579,22 @@ class V1RootMCTS:
                 local_picks = torch.argmax(legal_policy, dim=1)
 
             root_value_vec = value_sum.sum(dim=1) / visits.sum(dim=1).clamp_min(1.0)
-            (
-                policy_dense,
-                chosen_action_indices,
-                chosen_action_codes,
-                chosen_valid_mask,
-            ) = v0_core.root_sparse_writeback(
-                legal_index_mat,
-                action_code_mat,
-                valid_mask,
-                legal_policy,
-                local_picks,
-                valid_root_indices,
-                batch_size,
-                TOTAL_ACTION_DIM,
-            )
+            with self._nvtx_range("v1.root_sparse_writeback"), self._timed("pack_writeback_ms"):
+                (
+                    policy_dense,
+                    chosen_action_indices,
+                    chosen_action_codes,
+                    chosen_valid_mask,
+                ) = v0_core.root_sparse_writeback(
+                    legal_index_mat,
+                    action_code_mat,
+                    valid_mask,
+                    legal_policy,
+                    local_picks,
+                    valid_root_indices,
+                    batch_size,
+                    TOTAL_ACTION_DIM,
+                )
             root_values.index_copy_(0, valid_root_indices, root_value_vec)
 
         return RootSearchBatchOutput(

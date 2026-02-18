@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -24,9 +25,12 @@ class SelfPlayV1Stats:
     elapsed_sec: float
     positions_per_sec: float
     games_per_sec: float
+    step_timing_ms: Dict[str, float]
+    step_timing_ratio: Dict[str, float]
+    step_timing_calls: Dict[str, int]
 
-    def to_dict(self) -> Dict[str, float]:
-        return {
+    def to_dict(self) -> Dict[str, object]:
+        payload: Dict[str, object] = {
             "num_games": float(self.num_games),
             "num_positions": float(self.num_positions),
             "black_wins": float(self.black_wins),
@@ -37,6 +41,10 @@ class SelfPlayV1Stats:
             "positions_per_sec": float(self.positions_per_sec),
             "games_per_sec": float(self.games_per_sec),
         }
+        payload["step_timing_ms"] = {k: float(v) for k, v in self.step_timing_ms.items()}
+        payload["step_timing_ratio"] = {k: float(v) for k, v in self.step_timing_ratio.items()}
+        payload["step_timing_calls"] = {k: int(v) for k, v in self.step_timing_calls.items()}
+        return payload
 
 def self_play_v1_gpu(
     model,
@@ -56,6 +64,7 @@ def self_play_v1_gpu(
     concurrent_games: int = 8,
     child_eval_mode: str = "value_only",
     inference_engine=None,
+    collect_step_timing: bool = False,
     verbose: bool = False,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     """Run v1 self-play fully in tensor form and return training-ready tensors."""
@@ -76,11 +85,13 @@ def self_play_v1_gpu(
         sample_moves=bool(sample_moves),
         child_eval_mode=str(child_eval_mode),
     )
+    collect_timing = bool(collect_step_timing)
     mcts = V1RootMCTS(
         model=model,
         config=mcts_cfg,
         device=dev,
         inference_engine=inference_engine,
+        collect_timing=collect_timing,
     )
     buffer = TensorTrajectoryBuffer(
         device=dev,
@@ -91,6 +102,47 @@ def self_play_v1_gpu(
 
     outcome_counts = torch.zeros((3,), dtype=torch.int64, device=dev)
     game_lengths = torch.zeros((int(num_games),), dtype=torch.int64, device=dev)
+    step_timing_ms: Dict[str, float] = {
+        "root_puct_ms": 0.0,
+        "pack_writeback_ms": 0.0,
+        "self_play_step_ms": 0.0,
+        "finalize_ms": 0.0,
+    }
+    step_timing_calls: Dict[str, int] = {
+        "root_puct_ms": 0,
+        "pack_writeback_ms": 0,
+        "self_play_step_ms": 0,
+        "finalize_ms": 0,
+    }
+
+    @contextmanager
+    def _timed(name: str):
+        if not collect_timing:
+            with nullcontext():
+                yield
+            return
+        if dev.type == "cuda":
+            torch.cuda.synchronize(dev)
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            step_timing_ms[name] = float(step_timing_ms.get(name, 0.0) + elapsed_ms)
+            step_timing_calls[name] = int(step_timing_calls.get(name, 0) + 1)
+
+    @contextmanager
+    def _nvtx_range(name: str):
+        if dev.type != "cuda":
+            yield
+            return
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
 
     started = time.perf_counter()
 
@@ -114,11 +166,12 @@ def self_play_v1_gpu(
                 torch.full_like(active_plies, float(temperature_init), dtype=torch.float32),
                 torch.full_like(active_plies, float(temperature_final), dtype=torch.float32),
             )
-            search = mcts.search_batch(
-                active_states,
-                temperatures=active_temps,
-                add_dirichlet_noise=add_dirichlet_noise,
-            )
+            with _nvtx_range("v1.search_batch"):
+                search = mcts.search_batch(
+                    active_states,
+                    temperatures=active_temps,
+                    add_dirichlet_noise=add_dirichlet_noise,
+                )
 
             step_indices = buffer.append_steps(
                 model_input=search.model_input,
@@ -133,36 +186,38 @@ def self_play_v1_gpu(
                 active_idx,
                 torch.ones((int(active_idx.numel()),), dtype=torch.int64, device=dev),
             )
-            finalize_slots, result_local, soft_local = v0_core.self_play_step_inplace(
-                states.board,
-                states.marks_black,
-                states.marks_white,
-                states.phase,
-                states.current_player,
-                states.pending_marks_required,
-                states.pending_marks_remaining,
-                states.pending_captures_required,
-                states.pending_captures_remaining,
-                states.forced_removals_done,
-                states.move_count,
-                states.moves_since_capture,
-                plies,
-                done,
-                active_idx,
-                search.chosen_action_codes,
-                search.terminal_mask,
-                search.chosen_valid_mask,
-                int(max_plies),
-                float(soft_value_k),
-            )
-            if int(finalize_slots.numel()) > 0:
-                finalized_slots, finalized_lengths, outcome_delta = buffer.finalize_games_inplace(
-                    step_index_matrix=step_index_matrix,
-                    step_counts=step_counts,
-                    slots=finalize_slots,
-                    result_from_black=result_local,
-                    soft_value_from_black=soft_local,
+            with _nvtx_range("v1.self_play_step_inplace"), _timed("self_play_step_ms"):
+                finalize_slots, result_local, soft_local = v0_core.self_play_step_inplace(
+                    states.board,
+                    states.marks_black,
+                    states.marks_white,
+                    states.phase,
+                    states.current_player,
+                    states.pending_marks_required,
+                    states.pending_marks_remaining,
+                    states.pending_captures_required,
+                    states.pending_captures_remaining,
+                    states.forced_removals_done,
+                    states.move_count,
+                    states.moves_since_capture,
+                    plies,
+                    done,
+                    active_idx,
+                    search.chosen_action_codes,
+                    search.terminal_mask,
+                    search.chosen_valid_mask,
+                    int(max_plies),
+                    float(soft_value_k),
                 )
+            if int(finalize_slots.numel()) > 0:
+                with _nvtx_range("v1.finalize_trajectory_inplace"), _timed("finalize_ms"):
+                    finalized_slots, finalized_lengths, outcome_delta = buffer.finalize_games_inplace(
+                        step_index_matrix=step_index_matrix,
+                        step_counts=step_counts,
+                        slots=finalize_slots,
+                        result_from_black=result_local,
+                        soft_value_from_black=soft_local,
+                    )
                 if int(finalized_slots.numel()) > 0:
                     global_slots = finalized_slots + int(wave_base)
                     game_lengths.index_copy_(0, global_slots, finalized_lengths)
@@ -180,6 +235,17 @@ def self_play_v1_gpu(
 
     elapsed = max(1e-9, time.perf_counter() - started)
     batch = buffer.build()
+    mcts_timing = mcts.get_timing(reset=False)
+    for key, value in mcts_timing.get("timing_ms", {}).items():
+        step_timing_ms[key] = float(step_timing_ms.get(key, 0.0) + float(value))
+    for key, value in mcts_timing.get("timing_calls", {}).items():
+        step_timing_calls[key] = int(step_timing_calls.get(key, 0) + int(value))
+    tracked_keys = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
+    total_tracked_ms = float(sum(float(step_timing_ms.get(k, 0.0)) for k in tracked_keys))
+    step_timing_ratio = {
+        k: (float(step_timing_ms.get(k, 0.0)) / total_tracked_ms if total_tracked_ms > 0.0 else 0.0)
+        for k in tracked_keys
+    }
     black_wins = int(outcome_counts[0].item())
     white_wins = int(outcome_counts[1].item())
     draws = int(outcome_counts[2].item())
@@ -194,5 +260,8 @@ def self_play_v1_gpu(
         elapsed_sec=elapsed,
         positions_per_sec=float(batch.num_samples / elapsed),
         games_per_sec=float(num_games / elapsed),
+        step_timing_ms={k: float(step_timing_ms.get(k, 0.0)) for k in tracked_keys},
+        step_timing_ratio={k: float(step_timing_ratio.get(k, 0.0)) for k in tracked_keys},
+        step_timing_calls={k: int(step_timing_calls.get(k, 0)) for k in tracked_keys},
     )
     return batch, stats
