@@ -785,3 +785,85 @@ Recommended commands:
   - `self_play_step_ms`: `41.51%`
   - `root_puct_ms`: `8.31%`
   - `finalize_ms`: `0.64%`
+
+## Launch-Reduction Execution Plan (2026-02-18, nsys-driven)
+### Problem Statement
+- Current bottleneck has shifted from host-device sync to launch overhead and kernel fragmentation:
+  - `cudaLaunchKernel` API share: `~75%` (`~510k` launches / `30s`).
+  - `cudaDeviceSynchronize` API share: `~16%` (not dominant, but still a tail-latency source).
+- Step timing confirms two dominant stages:
+  - `pack_writeback_ms`: `49.55%`
+  - `self_play_step_ms`: `41.51%`
+- Strategy switch:
+  - Keep semantics unchanged (no pruning/surrogate shortcuts).
+  - Prioritize reducing launch count and increasing per-launch work.
+
+### Scope And Invariants
+- In scope:
+  - `v1/python/mcts_gpu.py` pack/writeback path.
+  - `v0/src/bindings/module.cpp` + CUDA kernels used by self-play step.
+  - Optional CUDA Graph capture for shape-stable segments.
+- Out of scope:
+  - Rule changes, action encoding changes, search-policy semantic changes.
+- Invariants:
+  - Root action/value parity against baseline A/B remains strict-pass.
+  - Same benchmark comparability (`v0-batch-leaves=512`, `v1-inference-batch-size=512`).
+
+### Milestones
+#### R5-A (Highest priority): Pack/Writeback fusion
+- Goal:
+  - Replace fragmented tensor-op chain (`nonzero/masked_select/prefix-sum/gather/scatter/index_copy`) with 1-2 fused C++/CUDA ops.
+- Implementation:
+  - Add fused op(s) in `v0_core` for root sparse pack + policy writeback.
+  - Keep current Python call contract in `mcts_gpu.py` stable.
+  - Add micro-benchmark for op-level launch/time reduction.
+- Expected impact:
+  - Direct reduction of launch count in the largest stage (`~50%` share).
+
+#### R5-B: Self-play step kernel consolidation
+- Goal:
+  - Reduce short-kernel chain inside `self_play_step` path by fusing active-slot transition and bookkeeping.
+- Implementation:
+  - Extend current `self_play_step_inplace` internal CUDA path to avoid fragmented gather/apply/scatter subchains.
+  - Keep external API unchanged for runner integration.
+- Expected impact:
+  - Reduce second-largest stage (`~42%` share) and improve sustained GPU occupancy.
+
+#### R5-C: Synchronize source cleanup
+- Goal:
+  - Remove avoidable syncs and isolate unavoidable ones.
+- Implementation:
+  - Run nsys with `cuda+nvtx`; inspect `cudaDeviceSynchronize` call stacks.
+  - Remove accidental sync triggers in hot path (`.item()/.cpu()/explicit synchronize`) if present.
+- Expected impact:
+  - Lower long-tail stalls and throughput jitter.
+
+#### R6: CUDA Graph capture on shape-stable segment
+- Goal:
+  - Batch repeated launch sequences into graph replay to cut launch API overhead.
+- Implementation:
+  - Capture only stable-shape core segment; keep eager fallback for small/remainder batches.
+  - Reuse current graph-hybrid strategy and avoid external config expansion.
+- Expected impact:
+  - Additional launch-count reduction after R5-A/R5-B cleanups.
+
+### Acceptance Gates For This Plan
+- Semantic gates:
+  - `tools/ab_v1_child_value_only.py` strict pass at `sims=256/512`.
+- Throughput/efficiency gates (same aligned baseline):
+  - `speedup_fixed_worker_min` should not regress vs latest accepted baseline.
+  - `games/s` in stable run should improve after each milestone.
+- Launch-fragmentation gates (nsys):
+  - `cudaLaunchKernel` API share: target down from `~75%` to `<45%` (phase target).
+  - Kernel launch rate: target down from `~17k/sec` to `<10k/sec` (phase target).
+  - Keep `kernel_gap_mean_us` near current low level (no regression back to host-starved profile).
+
+### Validation And Artifacts
+- Required runs per milestone:
+  - `tools/ab_v1_child_value_only.py` (`256/512`).
+  - `tools/validate_v1_claims.py` (aligned 512, `py` + `graph-hybrid`).
+  - `tools/sweep_v1_gpu_matrix.py` (`cg=8/16/32/64`).
+  - `tools/run_selfplay_workload.py` (`duration>=120s`, step timing enabled).
+  - `tools/nsys_v0_v1_compare.py` (`duration=30s`, same benchmark shape).
+- Required artifact bundle:
+  - JSON summaries + timeline plots + step-breakdown plots under `results/`.
