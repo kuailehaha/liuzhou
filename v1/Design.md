@@ -1136,3 +1136,38 @@ Matrix gate (`sweep_v1_gpu_matrix.py`, `cg=32/64`, `backend=py`, `sample_moves=f
 
 Execution note:
 - `tools/sweep_v1_gpu_matrix.py` now supports `--sample-moves` and `--finalize-graph`, and reports capture/replay/fallback counters per row.
+
+### R6-2 Event-Dependency Refactor (Task A, 2026-02-18)
+Objective:
+- Replace graph-boundary host hard waits with GPU event dependencies (`EventRecord + StreamWaitEvent`) on the finalize replay path.
+
+Code changes:
+- `v1/python/mcts_gpu.py`
+  - Added a dedicated finalize replay stream (`self._finalize_graph_stream`).
+  - Reworked `_root_finalize_from_visits(...)` replay path:
+    - record producer-ready event on caller stream,
+    - `replay_stream.wait_event(ready_evt)`,
+    - run static input copy + `entry.graph.replay()` on replay stream,
+    - record done event and `caller_stream.wait_event(done_evt)`.
+  - Added counters for visibility:
+    - `finalize_graph_event_bridge_count`
+    - `finalize_graph_event_wait_count`
+    - `finalize_graph_inline_replay_count`
+  - Counters exported via `mcts.get_timing()["counters"]` and reset with existing timing reset flow.
+
+Local counter log artifact (RTX 3060, `cg=64`, `sims=64`, `sample_moves=false`, `backend=py`):
+- `results/v1_r6_taskA_eventdeps_cg64_on_20260218.json`
+- `results/v1_r6_taskA_eventdeps_cg64_off_20260218.json`
+- consolidated: `results/v1_r6_taskA_eventdeps_counters_20260218.json`
+
+Observed counter snapshot:
+- `on`:
+  - `capture=12`, `replay=12`, `fallback=276`
+  - `event_bridge=12`, `event_wait=24`, `inline_replay=0`
+- `off`:
+  - `capture=0`, `replay=0`, `fallback=288`
+  - `event_bridge=0`, `event_wait=0`, `inline_replay=0`
+
+Interpretation:
+- Event-driven graph boundary is active in `on` mode and replaces replay-side inline execution with explicit stream-event dependency.
+- This closes R6-2 implementation scope locally; final performance conclusion remains deferred to H20 + `sims=1024` acceptance runs.

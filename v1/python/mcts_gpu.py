@@ -290,12 +290,20 @@ class V1RootMCTS:
         self._finalize_graph_capture_count = 0
         self._finalize_graph_replay_count = 0
         self._finalize_graph_fallback_count = 0
+        self._finalize_graph_event_bridge_count = 0
+        self._finalize_graph_event_wait_count = 0
+        self._finalize_graph_inline_replay_count = 0
         self._finalize_graph_cache: Dict[Tuple[int, int, int, int, bool], _FinalizeGraphEntry] = {}
         self._finalize_graph_lru: list[Tuple[int, int, int, int, bool]] = []
         self._finalize_graph_blocked: set[Tuple[int, int, int, int, bool]] = set()
         self._finalize_graph_max_entries = 6
         self._finalize_graph_min_roots = 32
         self._finalize_graph_min_actions = 8
+        self._finalize_graph_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
         mode = str(os.environ.get("V1_FINALIZE_GRAPH", "auto")).strip().lower()
         if mode in ("off", "0", "false", "no"):
             self._finalize_graph_enabled = False
@@ -476,14 +484,44 @@ class V1RootMCTS:
             self._finalize_graph_capture_count += 1
         self._touch_finalize_graph_key(key)
 
-        entry.legal_index_mat.copy_(legal_index_mat, non_blocking=True)
-        entry.action_code_mat.copy_(action_code_mat, non_blocking=True)
-        entry.valid_mask.copy_(valid_mask, non_blocking=True)
-        entry.visits.copy_(visits, non_blocking=True)
-        entry.value_sum.copy_(value_sum, non_blocking=True)
-        entry.valid_root_indices.copy_(valid_root_indices, non_blocking=True)
-        entry.root_temps.copy_(root_temps, non_blocking=True)
-        entry.graph.replay()
+        caller_stream = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+        replay_stream = self._finalize_graph_stream if self.device.type == "cuda" else None
+        use_event_bridge = (
+            self.device.type == "cuda"
+            and caller_stream is not None
+            and replay_stream is not None
+            and caller_stream.cuda_stream != replay_stream.cuda_stream
+        )
+
+        if use_event_bridge:
+            ready_evt = torch.cuda.Event(enable_timing=False, blocking=False)
+            done_evt = torch.cuda.Event(enable_timing=False, blocking=False)
+            ready_evt.record(caller_stream)
+            replay_stream.wait_event(ready_evt)
+            self._finalize_graph_event_wait_count += 1
+            with torch.cuda.stream(replay_stream):
+                entry.legal_index_mat.copy_(legal_index_mat, non_blocking=True)
+                entry.action_code_mat.copy_(action_code_mat, non_blocking=True)
+                entry.valid_mask.copy_(valid_mask, non_blocking=True)
+                entry.visits.copy_(visits, non_blocking=True)
+                entry.value_sum.copy_(value_sum, non_blocking=True)
+                entry.valid_root_indices.copy_(valid_root_indices, non_blocking=True)
+                entry.root_temps.copy_(root_temps, non_blocking=True)
+                entry.graph.replay()
+                done_evt.record(replay_stream)
+            caller_stream.wait_event(done_evt)
+            self._finalize_graph_event_wait_count += 1
+            self._finalize_graph_event_bridge_count += 1
+        else:
+            entry.legal_index_mat.copy_(legal_index_mat, non_blocking=True)
+            entry.action_code_mat.copy_(action_code_mat, non_blocking=True)
+            entry.valid_mask.copy_(valid_mask, non_blocking=True)
+            entry.visits.copy_(visits, non_blocking=True)
+            entry.value_sum.copy_(value_sum, non_blocking=True)
+            entry.valid_root_indices.copy_(valid_root_indices, non_blocking=True)
+            entry.root_temps.copy_(root_temps, non_blocking=True)
+            entry.graph.replay()
+            self._finalize_graph_inline_replay_count += 1
         self._finalize_graph_replay_count += 1
         return entry.outputs
 
@@ -536,6 +574,9 @@ class V1RootMCTS:
                 "finalize_graph_capture_count": int(self._finalize_graph_capture_count),
                 "finalize_graph_replay_count": int(self._finalize_graph_replay_count),
                 "finalize_graph_fallback_count": int(self._finalize_graph_fallback_count),
+                "finalize_graph_event_bridge_count": int(self._finalize_graph_event_bridge_count),
+                "finalize_graph_event_wait_count": int(self._finalize_graph_event_wait_count),
+                "finalize_graph_inline_replay_count": int(self._finalize_graph_inline_replay_count),
             },
         }
         if reset:
@@ -548,6 +589,9 @@ class V1RootMCTS:
             self._finalize_graph_capture_count = 0
             self._finalize_graph_replay_count = 0
             self._finalize_graph_fallback_count = 0
+            self._finalize_graph_event_bridge_count = 0
+            self._finalize_graph_event_wait_count = 0
+            self._finalize_graph_inline_replay_count = 0
         return payload
 
     def _autocast_context(self):
