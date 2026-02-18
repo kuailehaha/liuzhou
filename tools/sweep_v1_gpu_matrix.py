@@ -22,6 +22,15 @@ from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 from v1.python.self_play_gpu_runner import self_play_v1_gpu
 
 
+def _parse_bool_flag(value: str) -> bool:
+    v = str(value).strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean flag value: {value!r}")
+
+
 def _parse_int_list(raw: str, default: Sequence[int]) -> List[int]:
     values: List[int] = []
     for token in str(raw).split(","):
@@ -261,6 +270,9 @@ class SweepRow:
     gpu_p0_ratio: float
     gpu_graphics_clock_avg_mhz: float
     gpu_sm_clock_avg_mhz: float
+    finalize_graph_capture_count: int
+    finalize_graph_replay_count: int
+    finalize_graph_fallback_count: int
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -282,6 +294,8 @@ def _run_case(
     total_games: int,
     mcts_simulations: int,
     child_eval_mode: str,
+    sample_moves: bool,
+    finalize_graph_mode: str,
     sampler_interval: float,
     gpu_index: int,
 ) -> SweepRow:
@@ -298,49 +312,72 @@ def _run_case(
     p0_ratio = []
     gfx_clk = []
     sm_clk = []
-    for ridx in range(int(rounds)):
-        seed = int(base_seed) + 500003 * (ridx + 1) + 97 * int(concurrent_games)
-        torch.manual_seed(seed)
-        torch.set_num_threads(int(threads))
-        sampler = GPUSampler(gpu_index=gpu_index, interval_sec=sampler_interval)
-        sampler.start()
-        t0 = time.perf_counter()
-        _batch, stats = self_play_v1_gpu(
-            model=model,
-            num_games=int(total_games),
-            mcts_simulations=int(mcts_simulations),
-            temperature_init=1.0,
-            temperature_final=0.2,
-            temperature_threshold=8,
-            exploration_weight=1.0,
-            device=str(device),
-            add_dirichlet_noise=True,
-            dirichlet_alpha=0.3,
-            dirichlet_epsilon=0.25,
-            soft_value_k=2.0,
-            max_game_plies=512,
-            sample_moves=True,
-            concurrent_games=int(concurrent_games),
-            child_eval_mode=str(child_eval_mode),
-            inference_engine=inference_engine,
-            verbose=False,
-        )
-        elapsed_sec = time.perf_counter() - t0
-        sampled = sampler.stop()
+    capture_counts = []
+    replay_counts = []
+    fallback_counts = []
+    prev_finalize_graph = os.environ.get("V1_FINALIZE_GRAPH")
+    graph_mode = str(finalize_graph_mode).strip().lower()
+    if graph_mode == "auto":
+        if "V1_FINALIZE_GRAPH" in os.environ:
+            del os.environ["V1_FINALIZE_GRAPH"]
+    elif graph_mode == "on":
+        os.environ["V1_FINALIZE_GRAPH"] = "1"
+    elif graph_mode == "off":
+        os.environ["V1_FINALIZE_GRAPH"] = "0"
+    else:
+        raise ValueError(f"Unsupported finalize_graph_mode: {finalize_graph_mode}")
+    try:
+        for ridx in range(int(rounds)):
+            seed = int(base_seed) + 500003 * (ridx + 1) + 97 * int(concurrent_games)
+            torch.manual_seed(seed)
+            torch.set_num_threads(int(threads))
+            sampler = GPUSampler(gpu_index=gpu_index, interval_sec=sampler_interval)
+            sampler.start()
+            t0 = time.perf_counter()
+            _batch, stats = self_play_v1_gpu(
+                model=model,
+                num_games=int(total_games),
+                mcts_simulations=int(mcts_simulations),
+                temperature_init=1.0,
+                temperature_final=0.2,
+                temperature_threshold=8,
+                exploration_weight=1.0,
+                device=str(device),
+                add_dirichlet_noise=True,
+                dirichlet_alpha=0.3,
+                dirichlet_epsilon=0.25,
+                soft_value_k=2.0,
+                max_game_plies=512,
+                sample_moves=bool(sample_moves),
+                concurrent_games=int(concurrent_games),
+                child_eval_mode=str(child_eval_mode),
+                inference_engine=inference_engine,
+                verbose=False,
+            )
+            elapsed_sec = time.perf_counter() - t0
+            sampled = sampler.stop()
 
-        games.append(float(stats.num_games))
-        positions.append(float(stats.num_positions))
-        elapsed.append(float(elapsed_sec))
-        games_per_sec.append(float(stats.games_per_sec))
-        pos_per_sec.append(float(stats.positions_per_sec))
-        gpu_util.append(float(sampled["gpu_util_avg"]))
-        gpu_power.append(float(sampled["gpu_power_avg_w"]))
-        gpu_power_max.append(float(sampled["gpu_power_max_w"]))
-        gpu_mem.append(float(sampled["gpu_mem_avg_mib"]))
-        gpu_mem_max.append(float(sampled["gpu_mem_max_mib"]))
-        p0_ratio.append(float(sampled["gpu_p0_ratio"]))
-        gfx_clk.append(float(sampled["gpu_graphics_clock_avg_mhz"]))
-        sm_clk.append(float(sampled["gpu_sm_clock_avg_mhz"]))
+            games.append(float(stats.num_games))
+            positions.append(float(stats.num_positions))
+            elapsed.append(float(elapsed_sec))
+            games_per_sec.append(float(stats.games_per_sec))
+            pos_per_sec.append(float(stats.positions_per_sec))
+            gpu_util.append(float(sampled["gpu_util_avg"]))
+            gpu_power.append(float(sampled["gpu_power_avg_w"]))
+            gpu_power_max.append(float(sampled["gpu_power_max_w"]))
+            gpu_mem.append(float(sampled["gpu_mem_avg_mib"]))
+            gpu_mem_max.append(float(sampled["gpu_mem_max_mib"]))
+            p0_ratio.append(float(sampled["gpu_p0_ratio"]))
+            gfx_clk.append(float(sampled["gpu_graphics_clock_avg_mhz"]))
+            sm_clk.append(float(sampled["gpu_sm_clock_avg_mhz"]))
+            capture_counts.append(int(stats.mcts_counters.get("finalize_graph_capture_count", 0)))
+            replay_counts.append(int(stats.mcts_counters.get("finalize_graph_replay_count", 0)))
+            fallback_counts.append(int(stats.mcts_counters.get("finalize_graph_fallback_count", 0)))
+    finally:
+        if prev_finalize_graph is None:
+            os.environ.pop("V1_FINALIZE_GRAPH", None)
+        else:
+            os.environ["V1_FINALIZE_GRAPH"] = prev_finalize_graph
 
     return SweepRow(
         backend=str(backend),
@@ -360,6 +397,9 @@ def _run_case(
         gpu_p0_ratio=_mean(p0_ratio),
         gpu_graphics_clock_avg_mhz=_mean(gfx_clk),
         gpu_sm_clock_avg_mhz=_mean(sm_clk),
+        finalize_graph_capture_count=int(sum(capture_counts)),
+        finalize_graph_replay_count=int(sum(replay_counts)),
+        finalize_graph_fallback_count=int(sum(fallback_counts)),
     )
 
 
@@ -375,6 +415,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--total-games", type=int, default=8)
     parser.add_argument("--mcts-simulations", type=int, default=256)
     parser.add_argument("--child-eval-mode", type=str, default="value_only", choices=["value_only", "full"])
+    parser.add_argument("--sample-moves", type=str, default="true", choices=["true", "false"])
+    parser.add_argument("--finalize-graph", type=str, default="auto", choices=["auto", "on", "off"])
     parser.add_argument("--inference-batch-size", type=int, default=512)
     parser.add_argument("--inference-warmup-iters", type=int, default=5)
     parser.add_argument("--gpu-sample-interval", type=float, default=0.2)
@@ -405,7 +447,8 @@ def main() -> None:
     print(
         f"device={args.device} backends={backends} concurrent_games={conc_values} "
         f"threads={int(args.threads)} rounds={int(args.rounds)} mcts_sims={int(args.mcts_simulations)} "
-        f"child_eval_mode={str(args.child_eval_mode)}"
+        f"child_eval_mode={str(args.child_eval_mode)} sample_moves={str(args.sample_moves)} "
+        f"finalize_graph={str(args.finalize_graph)}"
     )
 
     for backend in backends:
@@ -431,6 +474,8 @@ def main() -> None:
                 total_games=int(max(1, args.total_games)),
                 mcts_simulations=int(max(1, args.mcts_simulations)),
                 child_eval_mode=str(args.child_eval_mode),
+                sample_moves=_parse_bool_flag(str(args.sample_moves)),
+                finalize_graph_mode=str(args.finalize_graph),
                 sampler_interval=float(args.gpu_sample_interval),
                 gpu_index=gpu_index,
             )
@@ -443,7 +488,9 @@ def main() -> None:
             f"games/s={row.games_per_sec:.3f} pos/s={row.positions_per_sec:.1f} "
             f"gpu_util={row.gpu_util_avg:.1f}% power={row.gpu_power_avg_w:.1f}W "
             f"mem={row.gpu_mem_avg_mib:.0f}MiB p0={100.0 * row.gpu_p0_ratio:.1f}% "
-            f"gfx_clk={row.gpu_graphics_clock_avg_mhz:.0f}MHz sm_clk={row.gpu_sm_clock_avg_mhz:.0f}MHz"
+            f"gfx_clk={row.gpu_graphics_clock_avg_mhz:.0f}MHz sm_clk={row.gpu_sm_clock_avg_mhz:.0f}MHz "
+            f"capture/replay/fallback={row.finalize_graph_capture_count}/"
+            f"{row.finalize_graph_replay_count}/{row.finalize_graph_fallback_count}"
         )
 
     payload = {
@@ -458,6 +505,8 @@ def main() -> None:
             "total_games": int(args.total_games),
             "mcts_simulations": int(args.mcts_simulations),
             "child_eval_mode": str(args.child_eval_mode),
+            "sample_moves": _parse_bool_flag(str(args.sample_moves)),
+            "finalize_graph": str(args.finalize_graph),
             "inference_batch_size": int(args.inference_batch_size),
             "inference_warmup_iters": int(args.inference_warmup_iters),
             "torchscript_paths": backend_paths,

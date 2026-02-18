@@ -234,6 +234,15 @@ def _safe_div(a: float, b: float) -> float:
     return float(a / b)
 
 
+def _parse_bool_flag(value: str) -> bool:
+    v = str(value).strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean flag value: {value!r}")
+
+
 def _gain_ratio(values: Sequence[float]) -> float:
     if not values:
         return float("nan")
@@ -485,35 +494,54 @@ def _run_v1_case(
     gpu_index: int,
     child_eval_mode: str,
     inference_engine=None,
+    sample_moves: bool = True,
+    finalize_graph_mode: str = "auto",
 ) -> RunRow:
     seed = int(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.set_num_threads(int(threads))
+    prev_finalize_graph = os.environ.get("V1_FINALIZE_GRAPH")
+    graph_mode = str(finalize_graph_mode).strip().lower()
+    if graph_mode == "auto":
+        if "V1_FINALIZE_GRAPH" in os.environ:
+            del os.environ["V1_FINALIZE_GRAPH"]
+    elif graph_mode == "on":
+        os.environ["V1_FINALIZE_GRAPH"] = "1"
+    elif graph_mode == "off":
+        os.environ["V1_FINALIZE_GRAPH"] = "0"
+    else:
+        raise ValueError(f"Unsupported finalize_graph_mode: {finalize_graph_mode}")
     sampler = GPUSampler(gpu_index=gpu_index, interval_sec=sampler_interval)
     sampler.start()
     t0 = time.perf_counter()
-    _batch, stats = self_play_v1_gpu(
-        model=model,
-        num_games=total_games,
-        mcts_simulations=mcts_simulations,
-        temperature_init=1.0,
-        temperature_final=0.2,
-        temperature_threshold=8,
-        exploration_weight=1.0,
-        device=device,
-        add_dirichlet_noise=True,
-        dirichlet_alpha=0.3,
-        dirichlet_epsilon=0.25,
-        soft_value_k=2.0,
-        max_game_plies=int(max_game_plies),
-        sample_moves=True,
-        concurrent_games=int(concurrent_games),
-        child_eval_mode=str(child_eval_mode),
-        inference_engine=inference_engine,
-        verbose=False,
-    )
+    try:
+        _batch, stats = self_play_v1_gpu(
+            model=model,
+            num_games=total_games,
+            mcts_simulations=mcts_simulations,
+            temperature_init=1.0,
+            temperature_final=0.2,
+            temperature_threshold=8,
+            exploration_weight=1.0,
+            device=device,
+            add_dirichlet_noise=True,
+            dirichlet_alpha=0.3,
+            dirichlet_epsilon=0.25,
+            soft_value_k=2.0,
+            max_game_plies=int(max_game_plies),
+            sample_moves=bool(sample_moves),
+            concurrent_games=int(concurrent_games),
+            child_eval_mode=str(child_eval_mode),
+            inference_engine=inference_engine,
+            verbose=False,
+        )
+    finally:
+        if prev_finalize_graph is None:
+            os.environ.pop("V1_FINALIZE_GRAPH", None)
+        else:
+            os.environ["V1_FINALIZE_GRAPH"] = prev_finalize_graph
     elapsed = time.perf_counter() - t0
     sampler.stop()
     summ = sampler.summary()
@@ -615,6 +643,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v0-workers", type=str, default=str(profile["v0_workers"]))
     parser.add_argument("--v1-threads", type=str, default=str(profile["v1_threads"]))
     parser.add_argument("--v1-concurrent-games", type=int, default=int(profile["v1_concurrent_games"]))
+    parser.add_argument("--v1-sample-moves", type=str, default="true", choices=["true", "false"])
+    parser.add_argument("--v1-finalize-graph", type=str, default="auto", choices=["auto", "on", "off"])
     parser.add_argument(
         "--v1-child-eval-mode",
         type=str,
@@ -825,6 +855,8 @@ def main() -> None:
                     gpu_index=gpu_index,
                     child_eval_mode=str(args.v1_child_eval_mode),
                     inference_engine=v1_inference_engine,
+                    sample_moves=_parse_bool_flag(str(args.v1_sample_moves)),
+                    finalize_graph_mode=str(args.v1_finalize_graph),
                 )
             )
         rows_v1.append(_aggregate_case_rows(mode="v1", scale=threads, rows=per_scale_rows))
@@ -974,6 +1006,8 @@ def main() -> None:
             "v1_mcts_simulations": int(args.v1_mcts_simulations),
             "v1_concurrent_games": int(args.v1_concurrent_games),
             "v1_child_eval_mode": str(args.v1_child_eval_mode),
+            "v1_sample_moves": _parse_bool_flag(str(args.v1_sample_moves)),
+            "v1_finalize_graph": str(args.v1_finalize_graph),
             "v1_inference_backend": str(args.v1_inference_backend),
             "v1_inference_batch_size": int(args.v1_inference_batch_size),
             "v1_inference_warmup_iters": int(args.v1_inference_warmup_iters),

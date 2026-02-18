@@ -50,6 +50,7 @@ class IterRow:
     step_timing_ms: Dict[str, float]
     step_timing_ratio: Dict[str, float]
     step_timing_calls: Dict[str, int]
+    mcts_counters: Dict[str, int]
 
 
 class GPUSampler:
@@ -146,6 +147,15 @@ def _safe_div(a: float, b: float) -> float:
     if b == 0:
         return float("nan")
     return float(a / b)
+
+
+def _parse_bool_flag(value: str) -> bool:
+    v = str(value).strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean flag value: {value!r}")
 
 
 def _resolve_gpu_index(device: str) -> int:
@@ -252,6 +262,7 @@ def _run_v0_once(model: ChessNet, args: argparse.Namespace, iter_seed: int) -> I
         step_timing_ms={},
         step_timing_ratio={},
         step_timing_calls={},
+        mcts_counters={},
     )
 
 
@@ -262,28 +273,45 @@ def _run_v1_once(
     iter_seed: int,
 ) -> IterRow:
     torch.set_num_threads(int(args.v1_threads))
+    prev_finalize_graph = os.environ.get("V1_FINALIZE_GRAPH")
+    finalize_mode = str(args.v1_finalize_graph).strip().lower()
+    if finalize_mode == "auto":
+        if "V1_FINALIZE_GRAPH" in os.environ:
+            del os.environ["V1_FINALIZE_GRAPH"]
+    elif finalize_mode == "on":
+        os.environ["V1_FINALIZE_GRAPH"] = "1"
+    elif finalize_mode == "off":
+        os.environ["V1_FINALIZE_GRAPH"] = "0"
+    else:
+        raise ValueError(f"Unsupported v1-finalize-graph mode: {args.v1_finalize_graph}")
     t0 = time.perf_counter()
-    _batch, stats = self_play_v1_gpu(
-        model=model,
-        num_games=int(args.num_games_per_iter),
-        mcts_simulations=int(args.mcts_simulations),
-        temperature_init=1.0,
-        temperature_final=0.2,
-        temperature_threshold=8,
-        exploration_weight=1.0,
-        device=args.device,
-        add_dirichlet_noise=True,
-        dirichlet_alpha=0.3,
-        dirichlet_epsilon=0.25,
-        soft_value_k=2.0,
-        max_game_plies=int(args.max_game_plies),
-        sample_moves=True,
-        concurrent_games=int(args.v1_concurrent_games),
-        child_eval_mode=str(args.v1_child_eval_mode),
-        inference_engine=inference_engine,
-        collect_step_timing=bool(args.collect_step_timing),
-        verbose=False,
-    )
+    try:
+        _batch, stats = self_play_v1_gpu(
+            model=model,
+            num_games=int(args.num_games_per_iter),
+            mcts_simulations=int(args.mcts_simulations),
+            temperature_init=1.0,
+            temperature_final=0.2,
+            temperature_threshold=8,
+            exploration_weight=1.0,
+            device=args.device,
+            add_dirichlet_noise=True,
+            dirichlet_alpha=0.3,
+            dirichlet_epsilon=0.25,
+            soft_value_k=2.0,
+            max_game_plies=int(args.max_game_plies),
+            sample_moves=_parse_bool_flag(str(args.v1_sample_moves)),
+            concurrent_games=int(args.v1_concurrent_games),
+            child_eval_mode=str(args.v1_child_eval_mode),
+            inference_engine=inference_engine,
+            collect_step_timing=bool(args.collect_step_timing),
+            verbose=False,
+        )
+    finally:
+        if prev_finalize_graph is None:
+            os.environ.pop("V1_FINALIZE_GRAPH", None)
+        else:
+            os.environ["V1_FINALIZE_GRAPH"] = prev_finalize_graph
     elapsed = max(1e-9, time.perf_counter() - t0)
     return IterRow(
         index=0,
@@ -297,6 +325,7 @@ def _run_v1_once(
         step_timing_ms={k: float(v) for k, v in stats.step_timing_ms.items()},
         step_timing_ratio={k: float(v) for k, v in stats.step_timing_ratio.items()},
         step_timing_calls={k: int(v) for k, v in stats.step_timing_calls.items()},
+        mcts_counters={k: int(v) for k, v in stats.mcts_counters.items()},
     )
 
 
@@ -419,6 +448,14 @@ def _aggregate_timing(rows: List[IterRow]) -> Tuple[Dict[str, float], Dict[str, 
     return totals, ratio, calls
 
 
+def _aggregate_mcts_counters(rows: List[IterRow]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for row in rows:
+        for key, value in row.mcts_counters.items():
+            out[key] = int(out.get(key, 0) + int(value))
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run fixed self-play workload and export telemetry.")
     parser.add_argument("--mode", type=str, choices=["v0", "v1"], required=True)
@@ -445,6 +482,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v1-threads", type=int, default=1)
     parser.add_argument("--v1-concurrent-games", type=int, default=8)
     parser.add_argument("--v1-child-eval-mode", type=str, default="value_only", choices=["value_only", "full"])
+    parser.add_argument("--v1-sample-moves", type=str, default="true", choices=["true", "false"])
+    parser.add_argument("--v1-finalize-graph", type=str, default="auto", choices=["auto", "on", "off"])
     parser.add_argument("--v1-inference-backend", type=str, default="py", choices=["py", "graph"])
     parser.add_argument("--v1-inference-batch-size", type=int, default=512)
     parser.add_argument("--v1-inference-warmup-iters", type=int, default=5)
@@ -463,6 +502,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     _ensure_v0_binary_compat()
+    if bool(args.collect_step_timing) and any(str(k).upper().startswith("NSYS_") for k in os.environ.keys()):
+        print("[warn] collect-step-timing is disabled under nsys to avoid sync-polluted traces.")
+        args.collect_step_timing = False
 
     if int(args.num_games_per_iter) <= 0:
         raise ValueError("num-games-per-iter must be positive")
@@ -538,6 +580,7 @@ def main() -> None:
     total_games = int(sum(r.games for r in rows))
     total_positions = int(sum(r.positions for r in rows))
     step_timing_ms, step_timing_ratio, step_timing_calls = _aggregate_timing(rows)
+    mcts_counters = _aggregate_mcts_counters(rows)
 
     output_path = Path(args.output_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -568,6 +611,8 @@ def main() -> None:
             "v1_threads": int(args.v1_threads),
             "v1_concurrent_games": int(args.v1_concurrent_games),
             "v1_child_eval_mode": str(args.v1_child_eval_mode),
+            "v1_sample_moves": _parse_bool_flag(str(args.v1_sample_moves)),
+            "v1_finalize_graph": str(args.v1_finalize_graph),
             "v1_inference_backend": str(args.v1_inference_backend),
             "v1_inference_batch_size": int(args.v1_inference_batch_size),
             "collect_step_timing": bool(args.collect_step_timing),
@@ -582,6 +627,7 @@ def main() -> None:
             "step_timing_ms": {k: float(v) for k, v in step_timing_ms.items()},
             "step_timing_ratio": {k: float(v) for k, v in step_timing_ratio.items()},
             "step_timing_calls": {k: int(v) for k, v in step_timing_calls.items()},
+            "mcts_counters": {k: int(v) for k, v in mcts_counters.items()},
         },
         "gpu_summary": sampler.summary(),
         "gpu_samples": [

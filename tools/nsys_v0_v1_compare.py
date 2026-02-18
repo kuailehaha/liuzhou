@@ -411,6 +411,10 @@ def _profile_mode(
                 str(args.v1_concurrent_games),
                 "--v1-child-eval-mode",
                 str(args.v1_child_eval_mode),
+                "--v1-sample-moves",
+                str(args.v1_sample_moves),
+                "--v1-finalize-graph",
+                str(args.v1_finalize_graph),
                 "--v1-inference-backend",
                 str(args.v1_inference_backend),
                 "--v1-inference-batch-size",
@@ -483,6 +487,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v1-threads", type=int, default=1)
     parser.add_argument("--v1-concurrent-games", type=int, default=8)
     parser.add_argument("--v1-child-eval-mode", type=str, default="value_only", choices=["value_only", "full"])
+    parser.add_argument("--v1-sample-moves", type=str, default="true", choices=["true", "false"])
+    parser.add_argument("--v1-finalize-graph", type=str, default="auto", choices=["auto", "on", "off"])
     parser.add_argument("--v1-inference-backend", type=str, default="py", choices=["py", "graph"])
     parser.add_argument("--v1-inference-batch-size", type=int, default=512)
     parser.add_argument("--v1-inference-warmup-iters", type=int, default=5)
@@ -617,6 +623,8 @@ def main() -> None:
             "v0_batch_leaves": int(args.v0_batch_leaves),
             "v1_threads": int(args.v1_threads),
             "v1_concurrent_games": int(args.v1_concurrent_games),
+            "v1_sample_moves": str(args.v1_sample_moves),
+            "v1_finalize_graph": str(args.v1_finalize_graph),
             "v1_inference_backend": str(args.v1_inference_backend),
         },
         "reports": {**reports, **{k: v["path"] for k, v in csv_paths.items()}},

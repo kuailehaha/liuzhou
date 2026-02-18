@@ -981,3 +981,158 @@ Fixed-config long-stable run (for power/clock + step share evidence):
 Current decision after R5-C:
 - Keep nsys and step-timing separated to avoid instrumentation coupling in launch analysis.
 - Keep R6 target focused on shape-stable `cg>=32` segment first; `cg=8` remains a stress point and should not be used alone to judge graph-capture gains.
+
+### R6 Triggerability + A/B + Matrix Update (2026-02-18)
+Delivered implementation (flow remains semantics-preserving):
+- `v1/python/mcts_gpu.py`
+  - Root finalize now captures deterministic subsegment only.
+  - Sampling is moved outside graph replay (`sample_moves=False` in finalize op + separate multinomial path).
+  - Added graph counters in timing payload:
+    - `finalize_graph_capture_count`
+    - `finalize_graph_replay_count`
+    - `finalize_graph_fallback_count`
+  - Added anti-thrash guard for capture attempts:
+    - capture only when `num_roots == batch_size` (shape-stable wave),
+    - if graph cache is full and key is not cached, fallback to eager (no extra capture churn).
+- `v1/python/self_play_gpu_runner.py`
+  - Exposes MCTS counters into stats payload for workload/profiler reporting.
+- Tooling updates for pure validation mode:
+  - `tools/run_selfplay_workload.py`: added `--v1-sample-moves` and `--v1-finalize-graph`.
+  - `tools/validate_v1_claims.py`: added same controls for benchmark comparability.
+  - `tools/nsys_v0_v1_compare.py`: passes the two flags through.
+  - New script `tools/ab_v1_finalize_graph_capture.py` for forced deterministic A/B (`sample_moves=false`).
+
+Pure A/B (deterministic, `sample_moves=false`) results:
+- `results/v1_finalize_graph_ab_r6_cg32_20260218.json`
+  - off: `2.635 games/s`
+  - on: `2.066 games/s`
+  - ratio (`on/off`): `0.784`
+  - counters(on): `capture=12`, `replay=12`, `fallback=276`
+- `results/v1_finalize_graph_ab_r6_cg64_20260218.json`
+  - off: `3.417 games/s`
+  - on: `3.117 games/s`
+  - ratio (`on/off`): `0.912`
+  - counters(on): `capture=12`, `replay=12`, `fallback=276`
+
+Same nsys matrix (`cg=32/64`, `duration=30s`, `sims=64`, `sample_moves=false`, v1-only):
+- `results/nsys_v1_r6_matrix_cg32_off_20260218/nsys_compare_summary.json`
+- `results/nsys_v1_r6_matrix_cg32_on_20260218/nsys_compare_summary.json`
+- `results/nsys_v1_r6_matrix_cg64_off_20260218/nsys_compare_summary.json`
+- `results/nsys_v1_r6_matrix_cg64_on_20260218/nsys_compare_summary.json`
+- consolidated matrix: `results/nsys_v1_r6_trigger_matrix_20260218.json`
+
+| case | games/s | kernels/ms | kernel_idle_ratio | launch share (`cudaLaunchKernel`) | stream sync share (`cudaStreamSynchronize`) | device sync share (`cudaDeviceSynchronize`) | sync_api_total_ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| cg32 off | 1.568 | 10.044 | 0.460 | 49.2% | 46.5% | 0.0% | 8,587.7 |
+| cg32 on | 1.693 | 10.418 | 0.447 | 43.6% | 44.3% | 7.9% | 9,168.8 |
+| cg64 off | 3.091 | 6.582 | 0.186 | 17.5% | 80.1% | 0.0% | 21,909.1 |
+| cg64 on | 2.673 | 6.459 | 0.289 | 25.0% | 62.0% | 9.8% | 19,866.8 |
+
+Interpretation:
+- R6 path is now verifiably triggerable in main evaluation scripts (`capture/replay` counters available and non-zero in `on` mode).
+- Capture currently helps launch share at `cg32`, but introduces non-trivial `cudaDeviceSynchronize` cost (capture-time overhead).
+- At `cg64`, current `on` setting is still net-regressive in throughput for this 30s matrix.
+- This confirms next optimization effort should stay on launch-fragmentation reduction in `pack_writeback` and `self_play_step` first, then revisit broader graph replay window with fewer capture-time sync penalties.
+
+### Sync Root-Cause Follow-up (2026-02-18, cg64 retry evidence)
+User-reported evidence:
+- `results/nsys_v1_after_r6_cg64_ng64_retry_20260218/v1_trace_stats_cuda_api_sum.csv`
+- key signal: `cudaDeviceSynchronize` dominated (`75.9%`, `2388` calls), while `cudaLaunchKernel` was `20.6%`.
+
+Root-cause confirmation:
+- The old retry workload was profiled with `collect_step_timing=true`:
+  - `results/nsys_v1_after_r6_cg64_ng64_retry_20260218/v1_trace_workload.json`
+- At that point, finalize-capture path could still trigger heavy sync churn.
+
+Code fix applied:
+- Removed explicit device-wide sync before graph capture in `v1/python/mcts_gpu.py::_capture_finalize_graph`:
+  - deleted `torch.cuda.synchronize(self.device)` before `with torch.cuda.graph(graph):`
+- Existing anti-thrash gates and deterministic-capture split remain in place.
+
+Re-run evidence (`cg=64`, `num_games_per_iter=64`, `duration=30s`, `sims=64`, `sample_moves=false`):
+- off:
+  - `results/nsys_v1_r6_cg64_syncdrop_off_20260218/v1_trace_stats_cuda_api_sum.csv`
+  - `results/nsys_v1_r6_cg64_syncdrop_off_20260218/v1_trace_workload.json`
+- on:
+  - `results/nsys_v1_r6_cg64_syncdrop_on_20260218/v1_trace_stats_cuda_api_sum.csv`
+  - `results/nsys_v1_r6_cg64_syncdrop_on_20260218/v1_trace_workload.json`
+- compact comparison artifact:
+  - `results/nsys_v1_r6_syncdrop_compare_20260218.json`
+
+Observed API-level changes:
+- `cudaDeviceSynchronize`:
+  - old retry: `75.9%`, `2388` calls
+  - new on: `10.1%`, `12` calls
+- `cudaLaunchKernel`:
+  - old retry: `20.6%`
+  - new on: `17.1%`
+
+Current status after sync cleanup:
+- High-frequency device-wide synchronization issue from the reported retry trace is resolved.
+- `finalize_graph` is triggerable (`capture=12`, `replay=12` in this run), but `on` is still slower than `off` at `cg=64`.
+- The remaining dominant host wait now appears as `cudaStreamSynchronize`, so next work should prioritize reducing orchestration boundaries and stream-level blocking around pack/writeback + self-play step chain rather than adding new graph knobs.
+- Added guardrail in workload harness:
+  - `tools/run_selfplay_workload.py` now auto-disables `collect_step_timing` when running under `nsys` (`NSYS_*` env detected), preventing accidental sync-polluted traces in future profiling runs.
+
+### R6 Diagnostic Loop (Step1-3, 2026-02-18)
+This section follows the requested order:
+1. lock down `on`-slower-than-`off` with nsys API evidence,
+2. decide replay/capture status from hard counters,
+3. run semantic + regression + matrix gates and record artifacts.
+
+#### Step 1: nsys API proof (`cg=32/64`, `off/on`, `30s`)
+Artifacts:
+- `results/nsys_v1_r6_cg32_syncdrop_off_20260218/v1_trace_stats_cuda_api_sum.csv`
+- `results/nsys_v1_r6_cg32_syncdrop_on_20260218/v1_trace_stats_cuda_api_sum.csv`
+- `results/nsys_v1_r6_cg64_syncdrop_off_20260218/v1_trace_stats_cuda_api_sum.csv`
+- `results/nsys_v1_r6_cg64_syncdrop_on_20260218/v1_trace_stats_cuda_api_sum.csv`
+- consolidated proof: `results/r6_step1_api_proof_20260218.json`
+
+Required metrics (`cudaLaunchKernel calls`, `cudaGraphLaunch calls`, `cudaStreamSynchronize calls+ms`):
+
+| cg | mode | cudaLaunchKernel calls | cudaGraphLaunch calls | cudaStreamSynchronize calls | cudaStreamSynchronize total ms |
+|---|---|---:|---:|---:|---:|
+| 32 | off | 613,600 | 0 | 13,426 | 2,276.5 |
+| 32 | on | 408,749 | 24 | 9,012 | 6,827.1 |
+| 64 | off | 311,432 | 0 | 6,883 | 23,805.7 |
+| 64 | on | 207,569 | 12 | 4,638 | 19,229.9 |
+
+Auxiliary sync evidence:
+- `cudaDeviceSynchronize` calls:
+  - `cg32`: `off=0`, `on=12` (`1.6%`)
+  - `cg64`: `off=0`, `on=12` (`10.1%`)
+
+Step-1 verdict:
+- Replay is actually active in `on` mode (`cudaGraphLaunch` is non-zero).
+- `on` mode reduces eager launch calls, but graph boundary/sync cost is not yet amortized enough; at least one work point (`cg32`) shows strong stream-sync amplification.
+
+#### Step 2: replay status and capture scope decision
+Replay/capture status (from workload counters):
+- `cg32 on`: `capture=12`, `replay=24`, `fallback=552`
+- `cg64 on`: `capture=12`, `replay=12`, `fallback=276`
+
+Interpretation:
+- Replay is not the dominant path yet (fallback is still much larger than replay), so current capture segment is too narrow or too sparse to dominate wall time.
+- Next optimization direction remains:
+  - reduce graph-external orchestration/sync around `pack_writeback + self_play_step`,
+  - then widen capture window only when replay coverage can materially exceed fallback.
+
+#### Step 3: semantic + regression + matrix gates
+Semantic gate:
+- `results/v1_child_value_ab_r6_syncdrop_256.json`: PASS
+- `results/v1_child_value_ab_r6_syncdrop_512.json`: PASS
+
+Regression gate (`validate_v1_claims.py`, minimized v0 repeat: `v0-workers=1`, `v1-threads=1`):
+- `results/v1_validate_r6_syncdrop_off_20260218.json`
+  - `v0=0.053 games/s`, `v1=0.452 games/s`, `speedup_fixed_worker_min=8.594`
+- `results/v1_validate_r6_syncdrop_on_20260218.json`
+  - `v0=0.044 games/s`, `v1=0.401 games/s`, `speedup_fixed_worker_min=9.079`
+
+Matrix gate (`sweep_v1_gpu_matrix.py`, `cg=32/64`, `backend=py`, `sample_moves=false`):
+- `results/v1_gpu_matrix_r6_syncdrop_off_32_64_20260218.json`
+  - `cg32=1.568`, `cg64=2.453`, `capture/replay/fallback=0/0/288` and `0/0/144`
+- `results/v1_gpu_matrix_r6_syncdrop_on_32_64_20260218.json`
+  - `cg32=2.092`, `cg64=2.487`, `capture/replay/fallback=6/12/276` and `6/6/138`
+
+Execution note:
+- `tools/sweep_v1_gpu_matrix.py` now supports `--sample-moves` and `--finalize-graph`, and reports capture/replay/fallback counters per row.

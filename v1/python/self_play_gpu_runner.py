@@ -28,6 +28,7 @@ class SelfPlayV1Stats:
     step_timing_ms: Dict[str, float]
     step_timing_ratio: Dict[str, float]
     step_timing_calls: Dict[str, int]
+    mcts_counters: Dict[str, int]
 
     def to_dict(self) -> Dict[str, object]:
         payload: Dict[str, object] = {
@@ -44,6 +45,7 @@ class SelfPlayV1Stats:
         payload["step_timing_ms"] = {k: float(v) for k, v in self.step_timing_ms.items()}
         payload["step_timing_ratio"] = {k: float(v) for k, v in self.step_timing_ratio.items()}
         payload["step_timing_calls"] = {k: int(v) for k, v in self.step_timing_calls.items()}
+        payload["mcts_counters"] = {k: int(v) for k, v in self.mcts_counters.items()}
         return payload
 
 def self_play_v1_gpu(
@@ -294,5 +296,6 @@ def self_play_v1_gpu(
         step_timing_ms={k: float(step_timing_ms.get(k, 0.0)) for k in tracked_keys},
         step_timing_ratio={k: float(step_timing_ratio.get(k, 0.0)) for k in tracked_keys},
         step_timing_calls={k: int(step_timing_calls.get(k, 0)) for k in tracked_keys},
+        mcts_counters={k: int(v) for k, v in mcts_timing.get("counters", {}).items()},
     )
     return batch, stats

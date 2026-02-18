@@ -287,15 +287,24 @@ class V1RootMCTS:
         self._timing_event_queue: List[Tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
         self._timing_drain_period = 256
         self._timed_calls_since_drain = 0
+        self._finalize_graph_capture_count = 0
+        self._finalize_graph_replay_count = 0
+        self._finalize_graph_fallback_count = 0
         self._finalize_graph_cache: Dict[Tuple[int, int, int, int, bool], _FinalizeGraphEntry] = {}
         self._finalize_graph_lru: list[Tuple[int, int, int, int, bool]] = []
         self._finalize_graph_blocked: set[Tuple[int, int, int, int, bool]] = set()
         self._finalize_graph_max_entries = 6
         self._finalize_graph_min_roots = 32
         self._finalize_graph_min_actions = 8
-        self._finalize_graph_enabled = self.device.type == "cuda" and not any(
-            str(k).upper().startswith("NSYS_") for k in os.environ.keys()
-        )
+        mode = str(os.environ.get("V1_FINALIZE_GRAPH", "auto")).strip().lower()
+        if mode in ("off", "0", "false", "no"):
+            self._finalize_graph_enabled = False
+        elif mode in ("on", "1", "true", "yes"):
+            self._finalize_graph_enabled = self.device.type == "cuda"
+        else:
+            self._finalize_graph_enabled = self.device.type == "cuda" and not any(
+                str(k).upper().startswith("NSYS_") for k in os.environ.keys()
+            )
         mode = str(self.config.child_eval_mode).strip().lower()
         if mode not in ("value_only", "full"):
             raise ValueError(
@@ -355,7 +364,6 @@ class V1RootMCTS:
             s_root_temps = root_temps.detach().clone()
 
             graph = torch.cuda.CUDAGraph()
-            torch.cuda.synchronize(self.device)
             with torch.cuda.graph(graph):
                 outputs = v0_core.root_finalize_from_visits(
                     s_legal_index_mat,
@@ -403,9 +411,10 @@ class V1RootMCTS:
             self._finalize_graph_enabled
             and num_roots >= self._finalize_graph_min_roots
             and max_actions >= self._finalize_graph_min_actions
-            and (not sample_moves)
+            and num_roots == int(batch_size)
         )
         if not can_graph:
+            self._finalize_graph_fallback_count += 1
             return v0_core.root_finalize_from_visits(
                 legal_index_mat,
                 action_code_mat,
@@ -423,6 +432,20 @@ class V1RootMCTS:
         key = (device_idx, num_roots, max_actions, int(batch_size), bool(sample_moves))
         entry = self._finalize_graph_cache.get(key)
         if entry is None:
+            if len(self._finalize_graph_cache) >= self._finalize_graph_max_entries:
+                self._finalize_graph_fallback_count += 1
+                return v0_core.root_finalize_from_visits(
+                    legal_index_mat,
+                    action_code_mat,
+                    valid_mask,
+                    visits,
+                    value_sum,
+                    valid_root_indices,
+                    batch_size,
+                    TOTAL_ACTION_DIM,
+                    root_temps,
+                    sample_moves,
+                )
             entry = self._capture_finalize_graph(
                 key=key,
                 legal_index_mat=legal_index_mat,
@@ -436,6 +459,7 @@ class V1RootMCTS:
                 sample_moves=sample_moves,
             )
             if entry is None:
+                self._finalize_graph_fallback_count += 1
                 return v0_core.root_finalize_from_visits(
                     legal_index_mat,
                     action_code_mat,
@@ -449,6 +473,7 @@ class V1RootMCTS:
                     sample_moves,
                 )
             self._finalize_graph_cache[key] = entry
+            self._finalize_graph_capture_count += 1
         self._touch_finalize_graph_key(key)
 
         entry.legal_index_mat.copy_(legal_index_mat, non_blocking=True)
@@ -459,6 +484,7 @@ class V1RootMCTS:
         entry.valid_root_indices.copy_(valid_root_indices, non_blocking=True)
         entry.root_temps.copy_(root_temps, non_blocking=True)
         entry.graph.replay()
+        self._finalize_graph_replay_count += 1
         return entry.outputs
 
     @contextmanager
@@ -506,6 +532,11 @@ class V1RootMCTS:
         payload = {
             "timing_ms": {k: float(v) for k, v in self._timing_ms.items()},
             "timing_calls": {k: int(v) for k, v in self._timing_calls.items()},
+            "counters": {
+                "finalize_graph_capture_count": int(self._finalize_graph_capture_count),
+                "finalize_graph_replay_count": int(self._finalize_graph_replay_count),
+                "finalize_graph_fallback_count": int(self._finalize_graph_fallback_count),
+            },
         }
         if reset:
             self._timing_event_queue.clear()
@@ -514,6 +545,9 @@ class V1RootMCTS:
                 self._timing_ms[key] = 0.0
             for key in list(self._timing_calls.keys()):
                 self._timing_calls[key] = 0
+            self._finalize_graph_capture_count = 0
+            self._finalize_graph_replay_count = 0
+            self._finalize_graph_fallback_count = 0
         return payload
 
     def _autocast_context(self):
@@ -766,6 +800,7 @@ class V1RootMCTS:
             value_sum = value_sum_cpp.to(dtype=torch.float32, device=state.device)
 
             root_temps = temp_values.index_select(0, valid_root_indices)
+            sample_moves = bool(self.config.sample_moves and max_actions > 1)
             with self._nvtx_range("v1.root_finalize_from_visits"), self._timed("pack_writeback_ms"):
                 (
                     policy_dense,
@@ -782,8 +817,24 @@ class V1RootMCTS:
                     valid_root_indices=valid_root_indices,
                     batch_size=batch_size,
                     root_temps=root_temps,
-                    sample_moves=bool(self.config.sample_moves and max_actions > 1),
+                    sample_moves=False,
                 )
+            if sample_moves:
+                with self._nvtx_range("v1.root_sample_outside_graph"), self._timed("pack_writeback_ms"):
+                    legal_policy = torch.pow(
+                        visits.clamp_min(1e-8),
+                        1.0 / root_temps.clamp_min(1e-6).view(-1, 1),
+                    )
+                    legal_policy = legal_policy * valid_mask.to(torch.float32)
+                    legal_policy = legal_policy / legal_policy.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                    local_picks = torch.multinomial(legal_policy, num_samples=1).view(-1)
+                    sampled_indices_local = legal_index_mat.gather(1, local_picks.view(-1, 1)).view(-1)
+                    sampled_codes_local = action_code_mat.gather(
+                        1,
+                        local_picks.view(-1, 1, 1).expand(-1, 1, 4),
+                    ).view(-1, 4)
+                    chosen_action_indices.index_copy_(0, valid_root_indices, sampled_indices_local)
+                    chosen_action_codes.index_copy_(0, valid_root_indices, sampled_codes_local)
             root_values.index_copy_(0, valid_root_indices, root_value_vec)
 
         return RootSearchBatchOutput(
