@@ -982,6 +982,65 @@ Current decision after R5-C:
 - Keep nsys and step-timing separated to avoid instrumentation coupling in launch analysis.
 - Keep R6 target focused on shape-stable `cg>=32` segment first; `cg=8` remains a stress point and should not be used alone to judge graph-capture gains.
 
+### H20 Matrix Run Snapshot (`instruction.sh`, 2026-02-19)
+Source bundle:
+- `results/v1_matrix_h20/20260219_074031`
+
+Run shape (from script config):
+- Device: `cuda:0` (H20 host)
+- `mcts_simulations=1024`
+- v1 backend: `py`, `inference_batch_size=512`
+- validate: `v1_concurrent_games=64`, `v1_sample_moves=false`, finalize graph `off/on`
+- matrix: `cg=32/64`, `sample_moves={false,true}`, finalize graph `off/on`
+- stable: `duration=180s`, `cg=64`, `sample_moves=false`, finalize graph `on`
+
+Semantic gate:
+- `ab_v1_child_value_256.json`: PASS
+- `ab_v1_child_value_512.json`: PASS
+- Key parity remains strict: `action_match=1.0`, root/value/WLD diffs all `0.0`.
+
+Fixed-worker regression (`sims=1024`, aligned baseline):
+- `validate_v1_off.json` (`v1_finalize_graph=off`)
+  - `v0` workers 1/2/4: `0.107 / 0.127 / 0.233 games/s`
+  - `v1` threads 1/2/4: `3.858 / 5.752 / 6.369 games/s`
+  - `speedup_fixed_worker_min=27.366`, `speedup_best=59.548`
+  - `v1_thread_gain=0.651` (fails `<=0.15` gate)
+  - `v1_p0_ratio_min=1.0` (passes)
+- `validate_v1_on.json` (`v1_finalize_graph=on`)
+  - `v0` workers 1/2/4: `0.069 / 0.127 / 0.206 games/s`
+  - `v1` threads 1/2/4: `3.685 / 5.672 / 6.184 games/s`
+  - `speedup_fixed_worker_min=30.019`, `speedup_best=89.967`
+  - `v1_thread_gain=0.678` (fails `<=0.15` gate)
+  - `v1_p0_ratio_min=1.0` (passes)
+
+Matrix (`py`, `cg=32/64`, rounds=1):
+- `matrix_py_false_off.json`: `2.757 / 5.528 games/s`
+- `matrix_py_false_on.json`: `2.533 / 5.587 games/s`
+- `matrix_py_true_off.json`: `2.926 / 5.586 games/s`
+- `matrix_py_true_on.json`: `2.890 / 5.930 games/s`
+- Observation:
+  - At `cg=64`, `finalize_graph=on` has only small/unstable gains depending on `sample_moves`.
+  - At `cg=32`, `finalize_graph=on` is not consistently faster.
+  - For all four matrix files, counters show `capture=0`, `replay=0`, `fallback=144` per row, so finalize graph path is not being hit in this short sweep shape.
+
+Stable run (`stable_v1_180s.json`, `cg=64`, graph on):
+- Throughput: `games/s=33.135`, `positions/s=4415.812`
+- GPU telemetry (`gpu_summary`):
+  - `util_avg=61.42%`, `power_avg=166.22W`, `p0_ratio=1.0`
+  - `graphics_clock_avg=1980MHz`, `sm_clock_avg=1980MHz`
+- Step ratio:
+  - `root_puct=41.80%`, `pack_writeback=42.77%`, `self_play_step=13.81%`, `finalize=1.62%`
+- MCTS counters:
+  - `finalize_graph_capture_count=564`
+  - `finalize_graph_replay_count=564`
+  - `finalize_graph_fallback_count=12972`
+  - replay coverage by count: `~4.17%` (`564 / (564+12972)`), fallback dominates.
+
+Interpretation for next step:
+- H20 + `sims=1024` confirms strong absolute throughput and stable `P0=1.0`.
+- R6 graph path is partially active in long stable run but not dominant; short matrix runs show no capture/replay hit.
+- Priority remains improving shape stability / eligibility of finalize-graph path so replay can replace fallback on the main path, instead of relying on occasional captures.
+
 ### R6 Triggerability + A/B + Matrix Update (2026-02-18)
 Delivered implementation (flow remains semantics-preserving):
 - `v1/python/mcts_gpu.py`
@@ -1204,3 +1263,39 @@ Interpretation:
 - In this tiny local sample, throughput difference between `off/on` is small and mixed by `cg`.
 - Replay did not trigger (`capture/replay=0`) in this run, so this dataset is only a local sanity checkpoint for the `sim=512` setting.
 - Final replay-chain performance judgment remains reserved for H20 runs (`sims=1024`, longer stable duration, full nsys + validate matrix).
+
+### R6-3 Shared Finalize-Graph Cache Across Calls (2026-02-19)
+Motivation:
+- H20 180s run showed per-call counters with `capture ~= replay` and large fallback, indicating graph cache was effectively scoped to one `self_play_v1_gpu()` call and rebuilt repeatedly.
+
+Implementation:
+- `v1/python/mcts_gpu.py`
+  - Promote finalize graph cache/LRU/blocked sets to class-level shared objects:
+    - `_SHARED_FINALIZE_GRAPH_CACHE`
+    - `_SHARED_FINALIZE_GRAPH_LRU`
+    - `_SHARED_FINALIZE_GRAPH_BLOCKED`
+  - Each `V1RootMCTS` instance now reuses shared cache instead of fresh per-instance cache.
+  - Increase default cache capacity from fixed tiny value to environment-tunable pooled capacity:
+    - `V1_FINALIZE_GRAPH_MAX_ENTRIES` (default `64`, min clamp `6`).
+  - Add visibility counter:
+    - `finalize_graph_cache_hit_count`
+  - Counters are exported in `mcts_counters` and included in workload summaries.
+
+Local smoke verification (RTX 3060, trend check):
+- Artifact: `results/v1_r6_shared_cache_smoke64_20260219.json`
+- Config: `mode=v1`, `duration=70s`, `num_games_per_iter=64`, `mcts=32`, `sample_moves=false`, `finalize_graph=on`
+- Aggregated counters:
+  - `capture=64`
+  - `replay=401`
+  - `cache_hit=337`
+  - `fallback=175`
+- Per-iteration pattern:
+  - first iter: `capture=64, replay=125, hit=61, fallback=19`
+  - later iters: `capture=0`, replay and hit continue growing (cache reuse effective).
+
+Semantic smoke (post-change):
+- `results/v1_child_value_ab_r6_shared_cache_smoke_20260219.json`: PASS
+
+Interpretation:
+- R6 replay path now persists across repeated self-play calls in one process, reducing repeated capture churn and improving replay/capture ratio.
+- Next H20 checkpoint should re-run the same 180s/stats matrix and verify that replay coverage increases and fallback decreases under `mcts=1024`.

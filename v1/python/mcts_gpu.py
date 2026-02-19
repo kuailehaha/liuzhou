@@ -263,6 +263,10 @@ class _FinalizeGraphEntry:
 class V1RootMCTS:
     """GPU-first root search (PUCT over root children only)."""
 
+    _SHARED_FINALIZE_GRAPH_CACHE: Dict[Tuple[int, int, int, int, bool], _FinalizeGraphEntry] = {}
+    _SHARED_FINALIZE_GRAPH_LRU: List[Tuple[int, int, int, int, bool]] = []
+    _SHARED_FINALIZE_GRAPH_BLOCKED: set[Tuple[int, int, int, int, bool]] = set()
+
     def __init__(
         self,
         model,
@@ -290,13 +294,20 @@ class V1RootMCTS:
         self._finalize_graph_capture_count = 0
         self._finalize_graph_replay_count = 0
         self._finalize_graph_fallback_count = 0
+        self._finalize_graph_cache_hit_count = 0
         self._finalize_graph_event_bridge_count = 0
         self._finalize_graph_event_wait_count = 0
         self._finalize_graph_inline_replay_count = 0
-        self._finalize_graph_cache: Dict[Tuple[int, int, int, int, bool], _FinalizeGraphEntry] = {}
-        self._finalize_graph_lru: list[Tuple[int, int, int, int, bool]] = []
-        self._finalize_graph_blocked: set[Tuple[int, int, int, int, bool]] = set()
-        self._finalize_graph_max_entries = 6
+        self._finalize_graph_cache = V1RootMCTS._SHARED_FINALIZE_GRAPH_CACHE
+        self._finalize_graph_lru = V1RootMCTS._SHARED_FINALIZE_GRAPH_LRU
+        self._finalize_graph_blocked = V1RootMCTS._SHARED_FINALIZE_GRAPH_BLOCKED
+        try:
+            self._finalize_graph_max_entries = max(
+                6,
+                int(os.environ.get("V1_FINALIZE_GRAPH_MAX_ENTRIES", "64")),
+            )
+        except ValueError:
+            self._finalize_graph_max_entries = 64
         self._finalize_graph_min_roots = 32
         self._finalize_graph_min_actions = 8
         self._finalize_graph_stream: Optional[torch.cuda.Stream] = (
@@ -482,6 +493,8 @@ class V1RootMCTS:
                 )
             self._finalize_graph_cache[key] = entry
             self._finalize_graph_capture_count += 1
+        else:
+            self._finalize_graph_cache_hit_count += 1
         self._touch_finalize_graph_key(key)
 
         caller_stream = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
@@ -574,6 +587,7 @@ class V1RootMCTS:
                 "finalize_graph_capture_count": int(self._finalize_graph_capture_count),
                 "finalize_graph_replay_count": int(self._finalize_graph_replay_count),
                 "finalize_graph_fallback_count": int(self._finalize_graph_fallback_count),
+                "finalize_graph_cache_hit_count": int(self._finalize_graph_cache_hit_count),
                 "finalize_graph_event_bridge_count": int(self._finalize_graph_event_bridge_count),
                 "finalize_graph_event_wait_count": int(self._finalize_graph_event_wait_count),
                 "finalize_graph_inline_replay_count": int(self._finalize_graph_inline_replay_count),
@@ -589,6 +603,7 @@ class V1RootMCTS:
             self._finalize_graph_capture_count = 0
             self._finalize_graph_replay_count = 0
             self._finalize_graph_fallback_count = 0
+            self._finalize_graph_cache_hit_count = 0
             self._finalize_graph_event_bridge_count = 0
             self._finalize_graph_event_wait_count = 0
             self._finalize_graph_inline_replay_count = 0
