@@ -58,6 +58,7 @@ def _run_v1(args: argparse.Namespace) -> int:
 
     print("[train_entry] dispatch pipeline=v1")
     train_pipeline_v1(
+        stage=str(args.stage),
         iterations=int(args.iterations),
         self_play_games=int(args.self_play_games),
         mcts_simulations=int(args.mcts_simulations),
@@ -73,9 +74,22 @@ def _run_v1(args: argparse.Namespace) -> int:
         dirichlet_epsilon=float(args.dirichlet_epsilon),
         checkpoint_dir=str(args.checkpoint_dir),
         device=str(args.device),
+        devices=args.devices,
+        train_devices=args.train_devices,
+        train_strategy=str(args.train_strategy),
         soft_value_k=float(args.soft_value_k),
         max_game_plies=int(args.max_game_plies),
         load_checkpoint=args.load_checkpoint,
+        self_play_output=args.self_play_output,
+        self_play_input=args.self_play_input,
+        self_play_stats_json=args.self_play_stats_json,
+        checkpoint_name=args.checkpoint_name,
+        metrics_output=args.metrics_output,
+        infer_devices=args.infer_devices,
+        infer_batch_size=int(args.infer_batch_size),
+        infer_warmup_iters=int(args.infer_warmup_iters),
+        infer_iters=int(args.infer_iters),
+        infer_output=args.infer_output,
     )
     return 0
 
@@ -83,6 +97,13 @@ def _run_v1(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Shared training entry for v0/v1 pipelines.")
     parser.add_argument("--pipeline", type=str, choices=["v0", "v1"], required=True)
+    parser.add_argument(
+        "--stage",
+        type=str,
+        default="all",
+        choices=["all", "selfplay", "train", "infer"],
+        help="v1 stage selector; ignored by v0.",
+    )
 
     parser.add_argument("--iterations", type=int, default=40)
     parser.add_argument("--self_play_games", type=int, default=6400)
@@ -104,6 +125,70 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_shared")
     parser.add_argument("--load_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default=None,
+        help="Optional v1 self-play device list, e.g. cuda:0,cuda:1,cuda:2,cuda:3.",
+    )
+    parser.add_argument(
+        "--train_devices",
+        type=str,
+        default=None,
+        help="Optional v1 training device list; default is single --device.",
+    )
+    parser.add_argument(
+        "--train_strategy",
+        type=str,
+        default="data_parallel",
+        choices=["none", "data_parallel", "ddp"],
+        help="v1 training parallel strategy.",
+    )
+    parser.add_argument(
+        "--self_play_output",
+        type=str,
+        default=None,
+        help="v1 self-play payload output path.",
+    )
+    parser.add_argument(
+        "--self_play_input",
+        type=str,
+        default=None,
+        help="v1 self-play payload input path.",
+    )
+    parser.add_argument(
+        "--self_play_stats_json",
+        type=str,
+        default=None,
+        help="v1 self-play stats JSON output path.",
+    )
+    parser.add_argument(
+        "--checkpoint_name",
+        type=str,
+        default=None,
+        help="v1 stage=train checkpoint file name.",
+    )
+    parser.add_argument(
+        "--metrics_output",
+        type=str,
+        default=None,
+        help="v1 metrics output path.",
+    )
+    parser.add_argument(
+        "--infer_devices",
+        type=str,
+        default=None,
+        help="v1 infer stage device list.",
+    )
+    parser.add_argument("--infer_batch_size", type=int, default=4096)
+    parser.add_argument("--infer_warmup_iters", type=int, default=20)
+    parser.add_argument("--infer_iters", type=int, default=100)
+    parser.add_argument(
+        "--infer_output",
+        type=str,
+        default=None,
+        help="v1 infer stage output JSON path.",
+    )
 
     parser.add_argument("--v0_batch_leaves", type=int, default=512)
     parser.add_argument("--v0_eval_games", type=int, default=20)

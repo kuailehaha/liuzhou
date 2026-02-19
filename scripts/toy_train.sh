@@ -19,6 +19,8 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints_${PIPELINE}}"
 V0_BATCH_LEAVES="${V0_BATCH_LEAVES:-512}"
 V0_DATA_DIR="${V0_DATA_DIR:-./v0/data/self_play}"
 V0_EVAL_GAMES="${V0_EVAL_GAMES:-20}"
+DEVICES="${DEVICES:-}"
+TRAIN_DEVICES="${TRAIN_DEVICES:-}"
 
 mkdir -p logs
 LOG_FILE="logs/train_${PIPELINE}_$(date +%Y%m%d_%H%M%S).log"
@@ -27,6 +29,20 @@ echo "Starting shared toy training..."
 echo "Pipeline: $PIPELINE"
 echo "Python: $PYTHON_BIN"
 echo "Log file: $LOG_FILE"
+if [[ -n "$DEVICES" ]]; then
+  echo "Multi devices: $DEVICES"
+fi
+if [[ -n "$TRAIN_DEVICES" ]]; then
+  echo "Train devices: $TRAIN_DEVICES"
+fi
+
+EXTRA_ARGS=()
+if [[ -n "$DEVICES" ]]; then
+  EXTRA_ARGS+=(--devices "$DEVICES")
+fi
+if [[ -n "$TRAIN_DEVICES" ]]; then
+  EXTRA_ARGS+=(--train_devices "$TRAIN_DEVICES")
+fi
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
 "$PYTHON_BIN" scripts/train_entry.py \
@@ -50,4 +66,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
   --checkpoint_dir "$CHECKPOINT_DIR" \
   --v0_batch_leaves "$V0_BATCH_LEAVES" \
   --v0_eval_games "$V0_EVAL_GAMES" \
-  --v0_data_dir "$V0_DATA_DIR" 2>&1 | tee "$LOG_FILE"
+  --v0_data_dir "$V0_DATA_DIR" \
+  "${EXTRA_ARGS[@]}" 2>&1 | tee "$LOG_FILE"

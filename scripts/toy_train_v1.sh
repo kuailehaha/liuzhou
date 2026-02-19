@@ -14,6 +14,8 @@ LR="${LR:-0.0003}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0001}"
 DEVICE="${DEVICE:-cuda:0}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints_v1}"
+DEVICES="${DEVICES:-cuda:0,cuda:1,cuda:2,cuda:3}"
+TRAIN_DEVICES="${TRAIN_DEVICES:-$DEVICE}"
 
 mkdir -p logs
 LOG_FILE="logs/train_v1_$(date +%Y%m%d_%H%M%S).log"
@@ -22,8 +24,18 @@ echo "Starting v1 training via shared entry..."
 echo "Python: $PYTHON_BIN"
 echo "Log file: $LOG_FILE"
 echo "Press Ctrl+C to stop (or detach tmux session)"
+echo "Self-play devices: $DEVICES"
+echo "Train devices: $TRAIN_DEVICES"
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
+EXTRA_ARGS=()
+if [[ -n "$DEVICES" ]]; then
+  EXTRA_ARGS+=(--devices "$DEVICES")
+fi
+if [[ -n "$TRAIN_DEVICES" ]]; then
+  EXTRA_ARGS+=(--train_devices "$TRAIN_DEVICES")
+fi
+
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
 "$PYTHON_BIN" scripts/train_entry.py \
   --pipeline v1 \
   --iterations "$ITERATIONS" \
@@ -42,4 +54,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
   --soft_value_k 2.0 \
   --max_game_plies 512 \
   --device "$DEVICE" \
-  --checkpoint_dir "$CHECKPOINT_DIR" 2>&1 | tee "$LOG_FILE"
+  --checkpoint_dir "$CHECKPOINT_DIR" \
+  "${EXTRA_ARGS[@]}" 2>&1 | tee "$LOG_FILE"

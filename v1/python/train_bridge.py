@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 
@@ -24,6 +26,46 @@ def _train_permutation(num_samples: int, device: torch.device) -> torch.Tensor:
     return torch.randperm(num_samples)
 
 
+def _resolve_parallel_cuda_device_ids(
+    primary_device: torch.device,
+    parallel_devices: Optional[List[str]],
+) -> List[int]:
+    if primary_device.type != "cuda" or not parallel_devices:
+        return []
+    if not torch.cuda.is_available():
+        return []
+
+    world = int(torch.cuda.device_count())
+    primary_idx = 0 if primary_device.index is None else int(primary_device.index)
+    ids: List[int] = []
+    seen = set()
+    for name in parallel_devices:
+        dev = torch.device(name)
+        if dev.type != "cuda":
+            continue
+        idx = 0 if dev.index is None else int(dev.index)
+        if idx < 0 or idx >= world:
+            continue
+        if idx in seen:
+            continue
+        seen.add(idx)
+        ids.append(idx)
+
+    if primary_idx not in seen and 0 <= primary_idx < world:
+        ids.insert(0, primary_idx)
+    elif primary_idx in seen and ids and ids[0] != primary_idx:
+        ids.remove(primary_idx)
+        ids.insert(0, primary_idx)
+
+    if len(ids) <= 1:
+        return []
+    return ids
+
+
+def _ddp_is_ready() -> bool:
+    return bool(dist.is_available() and dist.is_initialized())
+
+
 def train_network_from_tensors(
     model,
     samples: TensorSelfPlayBatch,
@@ -37,6 +79,8 @@ def train_network_from_tensors(
     device: str = "cpu",
     use_amp: bool = True,
     grad_clip_norm: float = 1.0,
+    parallel_devices: Optional[List[str]] = None,
+    parallel_strategy: str = "data_parallel",
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train directly from tensor-native self-play output."""
 
@@ -44,8 +88,57 @@ def train_network_from_tensors(
         return model, {"epoch_stats": [], "num_samples": 0}
 
     device_obj = torch.device(device)
+    strategy_raw = str(parallel_strategy).strip().lower()
+    if strategy_raw in {"dp", "data_parallel"}:
+        strategy = "data_parallel"
+    elif strategy_raw in {"none", "single"}:
+        strategy = "none"
+    elif strategy_raw == "ddp":
+        strategy = "ddp"
+    else:
+        raise ValueError(
+            f"Unsupported parallel_strategy={parallel_strategy!r}; "
+            "expected one of: none, data_parallel, ddp."
+        )
+
+    ddp_rank = 0
+    ddp_world = 1
+    if strategy == "ddp":
+        if not _ddp_is_ready():
+            raise RuntimeError(
+                "parallel_strategy='ddp' requires torch.distributed to be initialized. "
+                "Launch with torchrun."
+            )
+        if device_obj.type != "cuda":
+            raise RuntimeError("parallel_strategy='ddp' currently requires CUDA.")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device_obj = torch.device(f"cuda:{local_rank}")
+        ddp_rank = int(dist.get_rank())
+        ddp_world = int(dist.get_world_size())
+
     model.to(device_obj)
     model.train()
+    train_model: nn.Module = model
+    if strategy == "ddp":
+        train_model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device_obj.index],
+            output_device=device_obj.index,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+    elif strategy == "data_parallel":
+        parallel_device_ids = _resolve_parallel_cuda_device_ids(
+            primary_device=device_obj,
+            parallel_devices=parallel_devices,
+        )
+        if parallel_device_ids:
+            train_model = nn.DataParallel(
+                model,
+                device_ids=parallel_device_ids,
+                output_device=parallel_device_ids[0],
+            )
 
     states = samples.state_tensors.to(device_obj, non_blocking=True).to(torch.float32)
     legal_masks = samples.legal_masks.to(device_obj, non_blocking=True).to(torch.bool)
@@ -68,6 +161,9 @@ def train_network_from_tensors(
 
     for epoch in range(max(1, int(epochs))):
         perm = _train_permutation(num_samples, device_obj)
+        if strategy == "ddp" and ddp_world > 1:
+            dist.broadcast(perm, src=0)
+            perm = perm[ddp_rank::ddp_world]
         total_loss_sum = 0.0
         policy_loss_sum = 0.0
         value_loss_sum = 0.0
@@ -78,8 +174,14 @@ def train_network_from_tensors(
         mix_abs_sum = 0.0
         mix_batches = 0
 
-        for start in range(0, num_samples, bsz):
-            end = min(start + bsz, num_samples)
+        local_count = int(perm.numel())
+        if strategy == "ddp" and local_count <= 0:
+            raise RuntimeError(
+                "DDP received no local samples on one rank. "
+                "Increase self-play samples or reduce world size."
+            )
+        for start in range(0, local_count, bsz):
+            end = min(start + bsz, local_count)
             idx = perm[start:end]
 
             batch_states = states.index_select(0, idx)
@@ -91,7 +193,7 @@ def train_network_from_tensors(
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp_enabled):
-                log_p1, log_p2, log_pmc, wdl_logits = model(batch_states)
+                log_p1, log_p2, log_pmc, wdl_logits = train_model(batch_states)
 
                 wdl_hard = scalar_to_wdl(batch_values)
                 wdl_soft = scalar_to_wdl(batch_soft)
@@ -143,6 +245,33 @@ def train_network_from_tensors(
             mix_abs_sum += float(wdl_to_scalar(wdl_target).abs().mean().item())
             mix_batches += 1
 
+        if strategy == "ddp":
+            reduced = torch.tensor(
+                [
+                    total_loss_sum,
+                    policy_loss_sum,
+                    value_loss_sum,
+                    float(total_seen),
+                    total_policy_weight,
+                    float(total_valid_policy),
+                    soft_abs_sum,
+                    mix_abs_sum,
+                    float(mix_batches),
+                ],
+                dtype=torch.float64,
+                device=device_obj,
+            )
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+            total_loss_sum = float(reduced[0].item())
+            policy_loss_sum = float(reduced[1].item())
+            value_loss_sum = float(reduced[2].item())
+            total_seen = int(round(float(reduced[3].item())))
+            total_policy_weight = float(reduced[4].item())
+            total_valid_policy = int(round(float(reduced[5].item())))
+            soft_abs_sum = float(reduced[6].item())
+            mix_abs_sum = float(reduced[7].item())
+            mix_batches = int(round(float(reduced[8].item())))
+
         avg_loss = total_loss_sum / max(1, total_seen)
         avg_policy_loss = policy_loss_sum / max(1e-8, total_policy_weight)
         avg_value_loss = value_loss_sum / max(1, total_seen)
@@ -161,8 +290,14 @@ def train_network_from_tensors(
                 "soft_alpha": alpha,
                 "avg_soft_abs": avg_soft_abs,
                 "avg_mix_abs": avg_mix_abs,
+                "parallel_strategy": strategy,
+                "ddp_world_size": ddp_world,
             }
         )
 
-    return model, {"epoch_stats": epoch_stats, "num_samples": num_samples}
-
+    return model, {
+        "epoch_stats": epoch_stats,
+        "num_samples": num_samples,
+        "parallel_strategy": strategy,
+        "ddp_world_size": ddp_world,
+    }

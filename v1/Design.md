@@ -1530,3 +1530,87 @@ Current dispatch behavior:
 
 Notes:
 - This change focuses on entry unification and parameter alignment, without changing v0/v1 training semantics.
+
+### P3 Initial Delivery: v1 Multi-GPU Training (2026-02-19)
+Objective:
+- Implement the first usable multi-GPU training path for v1 without changing game/search semantics.
+
+Delivered scope:
+1. Multi-device self-play sharding in `v1/train.py`
+   - New optional arg: `--devices cuda:0,cuda:1,...`
+   - Split `self_play_games` across devices and run shards concurrently (thread pool).
+   - Each shard runs `self_play_v1_gpu(...)` on its assigned GPU with identical pipeline semantics.
+   - Merge shard tensor batches on CPU and aggregate stats/counters.
+2. Multi-device training in `v1/python/train_bridge.py`
+   - Added optional `parallel_devices` input.
+   - When more than one CUDA device is valid, training uses single-process `torch.nn.DataParallel`.
+   - Single-GPU behavior is unchanged.
+3. Shared entry wiring
+   - `scripts/train_entry.py` now forwards `--devices` to `pipeline=v1`.
+   - `scripts/toy_train.sh` and `scripts/toy_train_v1.sh` accept `DEVICES` env and pass through.
+
+Runtime behavior:
+- If requested devices include unavailable GPU indices, they are skipped with log output.
+- If only one valid GPU remains, pipeline automatically falls back to single-GPU mode.
+
+Local smoke (Windows `torchenv`, regression-only):
+- `conda run -n torchenv python scripts/train_entry.py --pipeline v1 --iterations 1 --self_play_games 2 --mcts_simulations 4 --batch_size 16 --epochs 1 --device cuda:0 --checkpoint_dir results/tmp_v1_single_smoke_after_p3`
+  - PASS, metrics written.
+- `conda run -n torchenv python scripts/train_entry.py --pipeline v1 --iterations 0 --device cuda:0 --devices "cuda:0,cuda:1" --checkpoint_dir results/tmp_v1_multigpu_parse`
+  - PASS, unavailable `cuda:1` skipped on single-GPU machine.
+
+Current limitation:
+- Training parallelism is DataParallel (not DDP yet). This is intentional for a low-risk first stage.
+- Next P3 step on H20 should evaluate DDP migration only if DataParallel scaling is insufficient.
+
+### P3 Update: Split Self-Play Devices vs Train Devices (2026-02-19)
+Motivation:
+- Support the practical topology requested for H20 runs:
+  - parallel self-play on multiple GPUs,
+  - training on one designated GPU.
+
+Delivered:
+- `v1/train.py`
+  - `--devices`: self-play shard devices.
+  - `--train_devices`: training devices (default single `--device`).
+  - metrics/checkpoint metadata now records `self_play_devices` and `train_devices` separately.
+- `scripts/train_entry.py`
+  - forwards both `--devices` and `--train_devices` to `pipeline=v1`.
+- `scripts/toy_train_v1.sh`
+  - defaults to:
+    - `DEVICES=cuda:0,cuda:1,cuda:2,cuda:3` (self-play),
+    - `TRAIN_DEVICES=$DEVICE` (single-card training by default).
+  - default `CUDA_VISIBLE_DEVICES=0,1,2,3`.
+- `scripts/toy_train.sh`
+  - generic pass-through for `TRAIN_DEVICES`.
+
+### P3 Update: Staged v1 Pipeline + DDP Train Stage (2026-02-19)
+Objective:
+- Split v1 execution into explicit stages (`selfplay` / `train` / `infer`) and enable 4-GPU DDP training in the train stage.
+
+Delivered:
+1. Staged v1 entry in `v1/train.py`
+   - New `--stage {all,selfplay,train,infer}`.
+   - `selfplay` stage: runs multi-device self-play and saves tensor payload (`.pt`) + optional stats JSON.
+   - `train` stage: loads saved self-play payload and trains once, then saves checkpoint/metrics.
+   - `infer` stage: runs multi-device forward benchmark and saves inference report JSON.
+2. DDP-ready train bridge in `v1/python/train_bridge.py`
+   - Added `parallel_strategy={none,data_parallel,ddp}`.
+   - `ddp` mode supports per-rank sharded batches and epoch metric all-reduce.
+   - Existing single-process DataParallel path remains compatible.
+3. Shared launcher passthrough in `scripts/train_entry.py`
+   - Added forwarding of stage/strategy and staged IO args:
+     - `--self_play_output`, `--self_play_input`
+     - `--checkpoint_name`, `--metrics_output`
+     - `--infer_*`.
+4. New high-load orchestrator script
+   - Added `scripts/big_train_v1.sh`.
+   - Supports profiles:
+     - `PROFILE=stable`: 60 iters, 12288 games, 1536 sims, batch 8192.
+     - `PROFILE=aggressive`: 80 iters, 16384 games, 2048 sims, batch 12288.
+   - Runs staged loop: `selfplay -> train -> infer`.
+   - Supports `TRAIN_STRATEGY=ddp` using `torchrun --nproc_per_node=<gpu_count>`.
+
+Guardrail:
+- `stage=all` + `train_strategy=ddp` is blocked intentionally to avoid duplicated self-play across ranks.
+- Recommended DDP workflow is staged mode with an external loop (`big_train_v1.sh`).
