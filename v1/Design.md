@@ -1371,3 +1371,90 @@ Current optimization priority after this update:
 1. Keep reducing `root_puct + pack_writeback` wall share (still dominant in stable and probe runs).
 2. Keep replay coverage high while lowering fallback in high-load shapes.
 3. Separate "power-limit verification" from "algorithm throughput" to avoid misattributing infra limits to kernel path design.
+
+### Off vs On Speedup Interpretation (H20, 2026-02-19)
+Question:
+- Why does `finalize_graph=off` show higher fixed-worker min speedup than `on` in one run?
+
+Data-backed explanation:
+- `validate_v1_off.json` and `validate_v1_on.json` are two independent benchmark runs.
+- Their `v0` baselines are not numerically identical:
+  - `off` v0 workers `1/2/4`: `0.082 / 0.152 / 0.206`
+  - `on`  v0 workers `1/2/4`: `0.082 / 0.172 / 0.235`
+- At the same time, `v1` rows also shifted slightly:
+  - `off` v1 threads `1/2/4`: `3.780 / 5.792 / 6.383`
+  - `on`  v1 threads `1/2/4`: `3.899 / 5.523 / 6.239`
+- Since fixed-worker speedup is pairwise (`v1(scale)/v0(scale)`), this run-to-run baseline shift can flip the `off/on` min comparison.
+- Therefore this is not sufficient evidence that `on` is structurally worse; it is a comparability/noise issue under `rounds=1`, small per-round game count.
+
+Action:
+- For strict `off vs on` judgment, reuse the same recorded `v0` baseline or run repeated rounds with larger per-round workload.
+
+### R5/R6 Acceptance Status (as of 2026-02-19)
+R5:
+- `R5-A` (pack/writeback fusion): **Accepted**
+  - semantic gates remain PASS;
+  - fixed-worker throughput gate (`>=10x`) is strongly satisfied on H20.
+- `R5-B` (self-play-step consolidation): **Accepted (guarded mode)**
+  - guarded path kept to avoid low-concurrency regression;
+  - no semantic regression in current branch.
+- `R5-C` (sync cleanup + profiling decoupling): **Accepted**
+  - segment timing switched to CUDA-event accumulation;
+  - nsys and timing collection are decoupled.
+
+R6:
+- `R6-1` (triggerability/instrumentation): **Accepted**
+  - capture/replay/fallback counters are available in matrix/stable artifacts.
+- `R6-2` (event dependency instead of hard stream sync): **Accepted**
+  - replay path uses stream-event dependency (`record/wait_event`) and counters confirm activation.
+- `R6-3` (shared graph cache across calls): **Accepted (functional), Performance-Partial**
+  - functional: replay persistence and cache hits are confirmed on H20 long stable run;
+  - performance: replay coverage improved to majority (`~60%`) but fallback remains material (`~40%`), and short matrix runs still show unstable graph benefit.
+
+Overall phase result:
+- R5 is accepted for merge-level completion.
+- R6 is accepted for mechanism completion, but optimization acceptance is **partial**; further work is required to make graph-on consistently superior across representative shapes.
+
+### Next Plan (Project-Manager Priority)
+P0: Reproducible off/on comparison protocol
+- Goal:
+  - remove baseline drift when comparing `finalize_graph=off/on`.
+- Tasks:
+  - add a compare mode that reuses one fixed `v0` baseline for both `off` and `on` v1 runs;
+  - increase rounds/workload for on/off A/B judgment.
+- Exit criteria:
+  - off/on conclusion is stable across repeated runs.
+
+P1: Raise replay coverage on main training shapes
+- Goal:
+  - turn `R6` from mechanism-ready to consistently beneficial.
+- Tasks:
+  - prioritize shape-stable paths used by training (`cg=64+`, `sims=1024+`);
+  - reduce fallback causes in finalize replay path and keep cache-hit growth.
+- Exit criteria:
+  - replay coverage stays high and fallback decreases in both stable and matrix runs.
+
+P2: Shared training entry (`v0`/`v1` selectable by arg)
+- Decision:
+  - **Recommended now** (engineering efficiency).
+- Scope:
+  - one launcher with `--pipeline {v0,v1}` and aligned common knobs.
+- Exit criteria:
+  - one command can reproduce both baselines and training runs.
+
+P3: Multi-GPU enablement for v1
+- Decision:
+  - **Recommended after P0/P1**, because single-card replay behavior must be stable first.
+- Scope:
+  - self-play sharding + training side parallelism (DDP or equivalent), with deterministic aggregation.
+- Exit criteria:
+  - near-linear scale on 2->4 GPUs for target workload family.
+
+P4: Power optimization (secondary KPI)
+- Decision:
+  - do not use board power as primary acceptance KPI; use throughput first.
+- Tasks:
+  - verify server-side power limit/permission (`nvidia-smi -q -d POWER`);
+  - then evaluate if software tuning still has headroom.
+- Exit criteria:
+  - power conclusions are separated from infra cap constraints.
