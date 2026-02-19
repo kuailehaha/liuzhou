@@ -39,9 +39,13 @@ EVAL_BATCH_LEAVES="${EVAL_BATCH_LEAVES:-1024}"
 EVAL_INFER_BACKEND="${EVAL_INFER_BACKEND:-graph}"
 EVAL_INFER_BATCH_SIZE="${EVAL_INFER_BATCH_SIZE:-1024}"
 EVAL_INFER_WARMUP_ITERS="${EVAL_INFER_WARMUP_ITERS:-5}"
-EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-0}" # 0 | 1
+EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-1}" # 0 | 1
 EVAL_DEVICES="${EVAL_DEVICES:-$INFER_DEVICES}"
 EVAL_V1_CONCURRENT_GAMES="${EVAL_V1_CONCURRENT_GAMES:-8192}"
+EVAL_V1_OPENING_RANDOM_MOVES="${EVAL_V1_OPENING_RANDOM_MOVES:-6}"
+
+SELF_PLAY_ALLOC_CONF="${SELF_PLAY_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.95,max_split_size_mb:512}"
+SELF_PLAY_MEMORY_ANCHOR_MB="${SELF_PLAY_MEMORY_ANCHOR_MB:-0}"
 
 if [[ "$PROFILE" == "stable" ]]; then
   : "${ITERATIONS:=60}"
@@ -148,6 +152,8 @@ echo "[big_train_v1] run_eval_stage=$RUN_EVAL_STAGE eval_backend=$EVAL_BACKEND"
 echo "[big_train_v1] eval_games_vs_random=$EVAL_GAMES_VS_RANDOM eval_games_vs_previous=$EVAL_GAMES_VS_PREVIOUS"
 echo "[big_train_v1] eval_devices=$EVAL_DEVICES eval_workers=$EVAL_WORKERS eval_mcts_sims=$EVAL_MCTS_SIMULATIONS"
 echo "[big_train_v1] eval_v1_concurrent_games=$EVAL_V1_CONCURRENT_GAMES"
+echo "[big_train_v1] eval_v1_opening_random_moves=$EVAL_V1_OPENING_RANDOM_MOVES eval_sample_moves=$EVAL_SAMPLE_MOVES"
+echo "[big_train_v1] selfplay_alloc_conf=$SELF_PLAY_ALLOC_CONF selfplay_memory_anchor_mb=$SELF_PLAY_MEMORY_ANCHOR_MB"
 
 LATEST_MODEL="${LOAD_CHECKPOINT:-}"
 if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
@@ -209,7 +215,44 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   if [[ -n "$LATEST_MODEL" && -f "$LATEST_MODEL" ]]; then
     SP_CMD+=(--load_checkpoint "$LATEST_MODEL")
   fi
+  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$SELF_PLAY_ALLOC_CONF}" \
+  V1_SELFPLAY_MEMORY_ANCHOR_MB="$SELF_PLAY_MEMORY_ANCHOR_MB" \
   CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${SP_CMD[@]}"
+
+  if [[ -f "$SELFPLAY_STATS_JSON" ]]; then
+    "$PYTHON_BIN" - "$SELFPLAY_STATS_JSON" <<'PY'
+import json
+import sys
+path = str(sys.argv[1])
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+black = int(data.get("black_wins", 0))
+white = int(data.get("white_wins", 0))
+draws = int(data.get("draws", 0))
+games = int(data.get("num_games", black + white + draws))
+decisive = black + white
+decisive_ratio = (decisive / games) if games > 0 else 0.0
+draw_ratio = (draws / games) if games > 0 else 0.0
+print(
+    "[big_train_v1] selfplay outcomes: "
+    f"W-L-D(black-win/white-win/draw)={black}-{white}-{draws}, "
+    f"decisive_games={decisive}/{games} ({decisive_ratio*100.0:.2f}%), "
+    f"draw_rate={draw_ratio*100.0:.2f}%"
+)
+vsum = data.get("value_target_summary")
+if isinstance(vsum, dict):
+    nonzero = int(vsum.get("nonzero_count", 0))
+    total = int(vsum.get("total", 0))
+    pos = int(vsum.get("positive_count", 0))
+    neg = int(vsum.get("negative_count", 0))
+    nonzero_ratio = float(vsum.get("nonzero_ratio", 0.0))
+    print(
+        "[big_train_v1] selfplay value targets: "
+        f"nonzero={nonzero}/{total} ({nonzero_ratio*100.0:.2f}%), "
+        f"positive={pos}, negative={neg}"
+    )
+PY
+  fi
 
   echo "[big_train_v1] stage=train input=$SELFPLAY_FILE strategy=$TRAIN_STRATEGY"
   if [[ "$TRAIN_STRATEGY" == "ddp" ]]; then
@@ -287,6 +330,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
       --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
       --inference_warmup_iters "$EVAL_INFER_WARMUP_ITERS"
       --v1_concurrent_games "$EVAL_V1_CONCURRENT_GAMES"
+      --v1_opening_random_moves "$EVAL_V1_OPENING_RANDOM_MOVES"
       --output_json "$EVAL_JSON"
     )
     if [[ "$EVAL_SAMPLE_MOVES" == "1" ]]; then

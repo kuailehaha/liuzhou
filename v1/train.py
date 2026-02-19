@@ -195,6 +195,72 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
     )
 
 
+def _compute_value_target_summary(samples: TensorSelfPlayBatch) -> Dict[str, Any]:
+    values = samples.value_targets.detach().to("cpu", dtype=torch.float32).view(-1)
+    total = int(values.numel())
+    if total <= 0:
+        return {
+            "total": 0,
+            "nonzero_count": 0,
+            "zero_count": 0,
+            "positive_count": 0,
+            "negative_count": 0,
+            "nonzero_ratio": 0.0,
+        }
+    positive = int(torch.count_nonzero(values > 0).item())
+    negative = int(torch.count_nonzero(values < 0).item())
+    nonzero = int(positive + negative)
+    zero = int(total - nonzero)
+    return {
+        "total": total,
+        "nonzero_count": nonzero,
+        "zero_count": zero,
+        "positive_count": positive,
+        "negative_count": negative,
+        "nonzero_ratio": float(nonzero / max(1, total)),
+    }
+
+
+def _build_self_play_report(
+    *,
+    stats: SelfPlayV1Stats,
+    value_target_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = stats.to_dict()
+    games = max(1, int(stats.num_games))
+    decisive = int(stats.black_wins + stats.white_wins)
+    payload["decisive_games"] = int(decisive)
+    payload["decisive_game_ratio"] = float(decisive / games)
+    payload["draw_game_ratio"] = float(int(stats.draws) / games)
+    payload["value_target_summary"] = dict(value_target_summary)
+    return payload
+
+
+def _print_self_play_summary(
+    *,
+    stats: SelfPlayV1Stats,
+    value_target_summary: Dict[str, Any],
+) -> None:
+    games = max(1, int(stats.num_games))
+    decisive = int(stats.black_wins + stats.white_wins)
+    decisive_ratio = float(decisive / games)
+    draw_ratio = float(int(stats.draws) / games)
+    nonzero = int(value_target_summary.get("nonzero_count", 0))
+    total = int(value_target_summary.get("total", 0))
+    nonzero_ratio = float(value_target_summary.get("nonzero_ratio", 0.0))
+    _print_rank0(
+        "[v1.train] selfplay outcomes "
+        f"black_win={int(stats.black_wins)} white_win={int(stats.white_wins)} draw={int(stats.draws)} "
+        f"decisive={decisive}/{games} ({decisive_ratio*100.0:.2f}%) draw_rate={draw_ratio*100.0:.2f}%"
+    )
+    _print_rank0(
+        "[v1.train] selfplay value targets "
+        f"nonzero={nonzero}/{total} ({nonzero_ratio*100.0:.2f}%) "
+        f"pos={int(value_target_summary.get('positive_count', 0))} "
+        f"neg={int(value_target_summary.get('negative_count', 0))}"
+    )
+
+
 def _run_self_play_shard(
     *,
     model_state_dict_cpu: Dict[str, torch.Tensor],
@@ -956,6 +1022,11 @@ def train_pipeline_v1(
                 self_play_backend=backend_arg,
                 self_play_shard_dir=shard_dir_arg,
             )
+            value_target_summary = _compute_value_target_summary(samples)
+            sp_report = _build_self_play_report(
+                stats=sp_stats,
+                value_target_summary=value_target_summary,
+            )
             output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
             _save_self_play_payload(
                 path=output_path,
@@ -969,10 +1040,15 @@ def train_pipeline_v1(
                     "mcts_simulations": int(mcts_simulations),
                     "self_play_games": int(self_play_games),
                     "self_play_concurrent_games": int(self_play_concurrent_games),
+                    "value_target_summary": dict(value_target_summary),
                 },
                 )
             if self_play_stats_json:
-                _save_json(str(self_play_stats_json), sp_stats.to_dict())
+                _save_json(str(self_play_stats_json), sp_report)
+            _print_self_play_summary(
+                stats=sp_stats,
+                value_target_summary=value_target_summary,
+            )
             _print_rank0(
                 f"[v1.train] selfplay saved: {output_path} "
                 f"(games={sp_stats.num_games}, positions={sp_stats.num_positions})"
@@ -1028,6 +1104,10 @@ def train_pipeline_v1(
                     "self_play_input": str(self_play_input),
                     "self_play_games": sp_stats_payload.get("num_games"),
                     "self_play_positions": samples.num_samples,
+                    "self_play_decisive_games": sp_stats_payload.get("decisive_games"),
+                    "self_play_decisive_game_ratio": sp_stats_payload.get("decisive_game_ratio"),
+                    "self_play_draw_game_ratio": sp_stats_payload.get("draw_game_ratio"),
+                    "self_play_value_target_summary": sp_stats_payload.get("value_target_summary"),
                     "train_devices": list(train_device_list),
                     "train_strategy": train_strategy_norm,
                     "train_time_sec": float(train_elapsed),
@@ -1094,6 +1174,7 @@ def train_pipeline_v1(
                 self_play_backend=backend_arg,
                 self_play_shard_dir=shard_dir_arg,
             )
+            value_target_summary = _compute_value_target_summary(samples)
             sp_elapsed = time.perf_counter() - sp_start
 
             train_start = time.perf_counter()
@@ -1145,6 +1226,12 @@ def train_pipeline_v1(
                 "black_wins": sp_stats.black_wins,
                 "white_wins": sp_stats.white_wins,
                 "draws": sp_stats.draws,
+                "decisive_games": int(sp_stats.black_wins + sp_stats.white_wins),
+                "decisive_game_ratio": float(
+                    (sp_stats.black_wins + sp_stats.white_wins) / max(1, int(sp_stats.num_games))
+                ),
+                "draw_game_ratio": float(int(sp_stats.draws) / max(1, int(sp_stats.num_games))),
+                "value_target_summary": dict(value_target_summary),
                 "train_time_sec": train_elapsed,
                 "train_avg_loss": last_epoch.get("avg_loss"),
                 "train_avg_policy_loss": last_epoch.get("avg_policy_loss"),
@@ -1166,9 +1253,14 @@ def train_pipeline_v1(
                         "self_play_backend": backend_arg if backend_arg is not None else "auto",
                         "self_play_shard_dir": shard_dir_arg,
                         "self_play_concurrent_games": int(self_play_concurrent_games),
+                        "value_target_summary": dict(value_target_summary),
                     },
                 )
 
+            _print_self_play_summary(
+                stats=sp_stats,
+                value_target_summary=value_target_summary,
+            )
             _print_rank0(
                 "[v1.train] "
                 f"games={sp_stats.num_games} positions={sp_stats.num_positions} "

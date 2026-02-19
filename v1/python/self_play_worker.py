@@ -22,6 +22,29 @@ def _is_stream_capture_error(exc: Exception) -> bool:
     )
 
 
+def _reserve_memory_anchor(device: torch.device) -> int:
+    if device.type != "cuda":
+        return 0
+    raw = str(os.environ.get("V1_SELFPLAY_MEMORY_ANCHOR_MB", "")).strip()
+    if not raw:
+        return 0
+    try:
+        anchor_mb = max(0, int(raw))
+    except ValueError:
+        return 0
+    if anchor_mb <= 0:
+        return 0
+    anchor_bytes = anchor_mb * 1024 * 1024
+    try:
+        # Keep a small fixed chunk alive to reduce allocator return-to-system churn.
+        _anchor = torch.empty((anchor_bytes,), dtype=torch.uint8, device=device)
+    except Exception:
+        return 0
+    # Tie the anchor to a module-level name so it lives for the worker lifetime.
+    globals()["_V1_SELFPLAY_MEMORY_ANCHOR"] = _anchor
+    return anchor_mb
+
+
 def run_self_play_worker(
     *,
     worker_idx: int,
@@ -50,6 +73,7 @@ def run_self_play_worker(
         if dev.type == "cuda":
             torch.cuda.set_device(dev)
             torch.cuda.manual_seed(local_seed)
+        anchor_mb_effective = _reserve_memory_anchor(dev)
 
         state_payload = torch.load(str(model_state_path), map_location="cpu")
         if not isinstance(state_payload, dict):
@@ -110,6 +134,7 @@ def run_self_play_worker(
                 "device": str(dev),
                 "games": int(shard_games_i),
                 "graph_retry_off": bool(graph_retry_off),
+                "memory_anchor_mb": int(anchor_mb_effective),
             },
         }
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)

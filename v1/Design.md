@@ -1734,3 +1734,30 @@ Remaining acceptance (Step B/C):
 2. Verify no `stream is capturing` failure in multi-device process backend.
 3. Compare throughput/utilization vs thread backend under `cg=32/64/128`.
 4. After gates pass, switch default policy to process for Linux multi-CUDA.
+
+### P3 Follow-up Optimization Status (2026-02-19)
+Delivered after first H20 staged run feedback:
+1. Self-play signal visibility
+- `v1/train.py` now emits explicit self-play outcome summary:
+  - `black_win / white_win / draw`,
+  - `decisive_game_ratio`.
+- Added `value_target_summary`:
+  - `nonzero/zero/positive/negative` counts and ratio.
+- Saved into `self_play_stats_json` and metadata for downstream audit.
+
+2. Eval stage improvements
+- Added `v1` eval backend in `scripts/eval_checkpoint.py`:
+  - multi-worker (`eval_workers`) + multi-device (`eval_devices`) supported,
+  - configurable per-worker search batching via `--v1_concurrent_games`.
+- Added `--v1_opening_random_moves` to improve decisiveness probing in draw-heavy regimes.
+- `scripts/big_train_v1.sh` now forwards:
+  - `EVAL_BACKEND=v1`,
+  - `EVAL_V1_CONCURRENT_GAMES`,
+  - `EVAL_V1_OPENING_RANDOM_MOVES`.
+
+3. Self-play memory jitter controls
+- Added self-play allocator controls in `scripts/big_train_v1.sh`:
+  - `SELF_PLAY_ALLOC_CONF` -> `PYTORCH_CUDA_ALLOC_CONF`,
+  - `SELF_PLAY_MEMORY_ANCHOR_MB`.
+- Added worker-side fixed memory anchor in `v1/python/self_play_worker.py`:
+  - keep a configurable CUDA anchor tensor alive per worker process to reduce allocator churn.

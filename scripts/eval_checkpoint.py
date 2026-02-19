@@ -107,6 +107,13 @@ def _print_stats_line(title: str, payload: Dict[str, Any]) -> None:
         f"loss={float(payload['loss_rate']) * 100.0:.2f}% "
         f"draw={float(payload['draw_rate']) * 100.0:.2f}%"
     )
+    total = int(payload["total_games"])
+    draw_rate = float(payload["draw_rate"])
+    if total >= 100 and draw_rate >= 0.95:
+        print(
+            "[eval] note: very high draw rate. "
+            "Try EVAL_SAMPLE_MOVES=1 and EVAL_V1_OPENING_RANDOM_MOVES=4~8 for a more decisive probe."
+        )
 
 
 def _build_gpu_state_batch(states: Sequence[GameState], device: torch.device) -> GpuStateBatch:
@@ -244,6 +251,7 @@ def _eval_worker_v1(
     opponent_checkpoint: Optional[str],
     seed: int,
     concurrent_games: int,
+    opening_random_moves: int,
     sample_moves: bool,
 ) -> Tuple[int, int, int]:
     _seed_worker(int(seed) + int(worker_id))
@@ -328,6 +336,10 @@ def _eval_worker_v1(
                     wins += 1
                 ctx["done"] = True
                 unfinished -= 1
+                continue
+
+            if int(state.move_count) < int(opening_random_moves):
+                pending_moves[slot] = random.choice(legal)
                 continue
 
             challenger_to_move = _is_challenger_to_move(state, challenger_is_black)
@@ -425,6 +437,7 @@ def evaluate_against_agent_parallel_v1(
     num_workers: int,
     devices: Optional[Sequence[str]],
     concurrent_games: int,
+    opening_random_moves: int,
     sample_moves: bool,
 ) -> EvaluationStats:
     num_games_n = _normalize_eval_games(int(num_games))
@@ -450,6 +463,7 @@ def evaluate_against_agent_parallel_v1(
             opponent_checkpoint,
             seed_base,
             int(concurrent_games),
+            int(opening_random_moves),
             bool(sample_moves),
         )
         return EvaluationStats(wins=wins, losses=losses, draws=draws, total_games=num_games_n)
@@ -470,6 +484,7 @@ def evaluate_against_agent_parallel_v1(
                     opponent_checkpoint,
                     seed_base,
                     int(concurrent_games),
+                    int(opening_random_moves),
                     bool(sample_moves),
                 )
                 for worker_id in range(len(chunks))
@@ -499,6 +514,7 @@ def _run_eval_one(
     inference_batch_size: int,
     inference_warmup_iters: int,
     v1_concurrent_games: int,
+    v1_opening_random_moves: int,
 ) -> EvaluationStats:
     if backend == "v1":
         return evaluate_against_agent_parallel_v1(
@@ -511,6 +527,7 @@ def _run_eval_one(
             num_workers=int(workers),
             devices=devices,
             concurrent_games=int(v1_concurrent_games),
+            opening_random_moves=int(v1_opening_random_moves),
             sample_moves=bool(sample_moves),
         )
 
@@ -578,6 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inference_batch_size", type=int, default=512)
     parser.add_argument("--inference_warmup_iters", type=int, default=5)
     parser.add_argument("--v1_concurrent_games", type=int, default=64)
+    parser.add_argument("--v1_opening_random_moves", type=int, default=0)
     parser.add_argument("--output_json", type=str, default=None)
     return parser
 
@@ -617,6 +635,7 @@ def main() -> int:
             inference_batch_size=int(args.inference_batch_size),
             inference_warmup_iters=int(args.inference_warmup_iters),
             v1_concurrent_games=int(args.v1_concurrent_games),
+            v1_opening_random_moves=int(args.v1_opening_random_moves),
         )
         payload = _stats_to_payload("vs_random", stats)
         result_rows.append(payload)
@@ -640,6 +659,7 @@ def main() -> int:
             inference_batch_size=int(args.inference_batch_size),
             inference_warmup_iters=int(args.inference_warmup_iters),
             v1_concurrent_games=int(args.v1_concurrent_games),
+            v1_opening_random_moves=int(args.v1_opening_random_moves),
         )
         payload = _stats_to_payload("vs_previous", stats)
         result_rows.append(payload)
@@ -659,6 +679,7 @@ def main() -> int:
         "temperature": float(args.temperature),
         "sample_moves": bool(args.sample_moves),
         "v1_concurrent_games": int(args.v1_concurrent_games),
+        "v1_opening_random_moves": int(args.v1_opening_random_moves),
         "elapsed_sec": float(elapsed),
         "results": result_rows,
     }
