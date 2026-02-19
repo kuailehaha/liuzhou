@@ -16,6 +16,8 @@ BUILD_V0="${BUILD_V0:-0}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONPATH="$ROOT_DIR:$ROOT_DIR/build/v0/src:$ROOT_DIR/v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
+export CUDACXX=/usr/local/cuda/bin/nvcc
+export PYTHONPATH=./liuzhou:./liuzhou/v0/build/src:$PYTHONPATH
 
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="results/v1_matrix/$RUN_TAG"
@@ -31,15 +33,20 @@ if [[ "$BUILD_V0" == "1" ]]; then
   echo "[step] build v0_core (required by v1 pipeline)"
   TORCH_CMAKE_PREFIX="$("$PYTHON_BIN" -c 'import torch; print(torch.utils.cmake_prefix_path)')"
   PYBIND11_CMAKE_DIR="$("$PYTHON_BIN" -c 'import pybind11; print(pybind11.get_cmake_dir())')"
-  cmake -S v0 -B build/v0 \
+  
+  PY=$CONDA_PREFIX/bin/python
+  cmake -S v0 -B v0/build \
     -G Ninja \
     -DUSE_CUDA=ON \
-    -DBUILD_CUDA_KERNELS=ON \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
     -DCMAKE_CUDA_ARCHITECTURES=90 \
-    -DPython3_EXECUTABLE="$PYTHON_BIN" \
-    -Dpybind11_DIR="$PYBIND11_CMAKE_DIR" \
-    -DCMAKE_PREFIX_PATH="$TORCH_CMAKE_PREFIX"
-  cmake --build build/v0 -j"$(nproc)"
+    -DPython3_EXECUTABLE=$PY \
+    -DPython3_INCLUDE_DIR=$CONDA_PREFIX/include/python3.13 \
+    -DPython3_LIBRARY=$CONDA_PREFIX/lib/libpython3.13.so \
+    -Dpybind11_DIR="$($PY -c 'import pybind11; print(pybind11.get_cmake_dir())')" \
+    -DCUDAToolkit_ROOT=/usr/local/cuda \
+    -DCMAKE_PREFIX_PATH="$CONDA_PREFIX;$($PY -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+  cmake --build v0/build -j"$(nproc)"
 fi
 
 echo "[step] gpu status"
