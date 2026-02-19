@@ -1299,3 +1299,75 @@ Semantic smoke (post-change):
 Interpretation:
 - R6 replay path now persists across repeated self-play calls in one process, reducing repeated capture churn and improving replay/capture ratio.
 - Next H20 checkpoint should re-run the same 180s/stats matrix and verify that replay coverage increases and fallback decreases under `mcts=1024`.
+
+### H20 Post-R6-3 Result Update (`instruction.sh`, 2026-02-19)
+Source bundles:
+- full suite: `results/v1_matrix_h20/20260219_090803`
+- extra aggressive power probe: `results/v1_matrix_h20/20260219_094527`
+
+#### 1) Fixed-worker regression (`sims=1024`, aligned baseline)
+From `20260219_090803`:
+
+- `validate_v1_off.json` (`finalize_graph=off`)
+  - `v0` workers `1/2/4`: `0.082 / 0.152 / 0.206 games/s`
+  - `v1` threads `1/2/4`: `3.780 / 5.792 / 6.383 games/s`
+  - speedup: `46.178x / 38.220x / 31.003x` (fixed-worker min `31.003x`)
+  - `v1_thread_gain=0.689`, `v1_p0_ratio_min=1.0`
+
+- `validate_v1_on.json` (`finalize_graph=on`)
+  - `v0` workers `1/2/4`: `0.082 / 0.172 / 0.235 games/s`
+  - `v1` threads `1/2/4`: `3.899 / 5.523 / 6.239 games/s`
+  - speedup: `47.420x / 32.148x / 26.546x` (fixed-worker min `26.546x`)
+  - `v1_thread_gain=0.600`, `v1_p0_ratio_min=1.0`
+
+Interpretation:
+- Throughput gate (`fixed-worker >=10x`) remains strongly satisfied on H20.
+- CPU-thread sensitivity gate (`<=0.15`) is still not satisfied in this config family.
+
+#### 2) Stable 180s run (`sims=1024`, `cg=64`, graph on)
+Artifact:
+- `results/v1_matrix_h20/20260219_090803/stable_v1_180s.json`
+
+Observed:
+- Throughput: `37.531 games/s`, `4995.8 positions/s`
+- GPU telemetry: util avg `68.1%`, power avg `174.16W`, power max `194.09W`, `P0 ratio=1.0`
+- Step ratio:
+  - `root_puct=55.68%`
+  - `pack_writeback=23.67%`
+  - `self_play_step=18.43%`
+  - `finalize=2.21%`
+- R6 counters:
+  - `capture=64`, `replay=9203`, `fallback=6061`, `cache_hit=9139`
+  - replay coverage by count: `60.29%` (`9203 / (9203 + 6061)`)
+
+Comparison to pre-R6-3 H20 snapshot:
+- Replay coverage moved from very low single-digit to majority coverage in this stable run.
+- This confirms shared finalize-graph cache is effective on long-running shape-stable workloads.
+
+#### 3) High-power probes (targeting higher board power draw)
+Baseline probe from `instruction.sh` profile (`20260219_090803`):
+- Artifact: `results/v1_matrix_h20/20260219_090803/power_probe_v1_400w_target.json`
+- Config: `sims=2048`, `cg=128`, `num_games_per_iter=128`, `batch=1024`, `threads=1`
+- Results:
+  - `48.759 games/s`, `6505.6 positions/s`
+  - util avg `74.8%`
+  - power avg `193.60W`, max `223.73W`
+  - replay coverage: `79.23%` (`replay=7872`, `fallback=2064`)
+
+Aggressive override probe (`20260219_094527`):
+- Artifact: `results/v1_matrix_h20/20260219_094527/power_probe_v1_400w_target.json`
+- Config: `sims=8192`, `cg=512`, `num_games_per_iter=512`, `batch=2048`, `threads=8`
+- Results:
+  - `65.016 games/s`, `8222.7 positions/s`
+  - util avg `81.6%`
+  - power avg `222.11W`, max `286.61W`
+  - replay coverage: `65.25%` (`replay=2161`, `fallback=1151`)
+
+Power-focused conclusion (current environment):
+- Under current single-GPU H20 deployment and tested workload shapes, measured peak is `286.61W` and average is `~222W` at most aggressive probe.
+- The requested `~400W` level is not reached in these runs; next step should verify server-side power cap/permission (`nvidia-smi -q -d POWER`) before further software-only tuning claims.
+
+Current optimization priority after this update:
+1. Keep reducing `root_puct + pack_writeback` wall share (still dominant in stable and probe runs).
+2. Keep replay coverage high while lowering fallback in high-load shapes.
+3. Separate "power-limit verification" from "algorithm throughput" to avoid misattributing infra limits to kernel path design.
