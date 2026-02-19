@@ -1500,3 +1500,33 @@ Minimal replay follow-up (non-blocking):
 1. Add fallback reason counters (`not_can_graph`, `cache_full`, `capture_fail`) for precise attribution.
 2. Keep replay-evaluation workloads at `total_games >= concurrent_games` to avoid false zero-replay conclusions.
 3. Optionally increase default `V1_FINALIZE_GRAPH_MAX_ENTRIES` for H20 production profile after memory/latency check.
+
+### P2 Kickoff: Shared Training Entry (2026-02-19)
+Goal:
+- Start the shared launcher refactor so `v0` and `v1` use one aligned command surface.
+
+Delivered:
+- Added unified Python entry:
+  - `scripts/train_entry.py`
+  - core switch: `--pipeline {v0,v1}`
+  - aligned common knobs:
+    - `--iterations`
+    - `--self_play_games`
+    - `--mcts_simulations`
+    - `--batch_size`
+    - `--epochs`
+    - `--lr`
+    - `--weight_decay`
+    - temperature / exploration / dirichlet / soft-value / device / checkpoint.
+- Added unified shell wrapper:
+  - `scripts/toy_train.sh`
+  - environment-driven `PIPELINE=v0|v1`.
+- Updated v1 wrapper to reuse shared entry:
+  - `scripts/toy_train_v1.sh` now dispatches through `scripts/train_entry.py --pipeline v1`.
+
+Current dispatch behavior:
+- `pipeline=v1`: direct call to `v1.train.train_pipeline_v1(...)`.
+- `pipeline=v0`: delegates to existing `scripts/train_loop.py` with mapped shared arguments.
+
+Notes:
+- This change focuses on entry unification and parameter alignment, without changing v0/v1 training semantics.
