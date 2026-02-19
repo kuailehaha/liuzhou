@@ -5,7 +5,7 @@ set -euo pipefail
 export PYTHONPATH="./:./build/v0/src:./v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
 PYTHON_BIN="${PYTHON_BIN:-/2023533024/users/zhangmq/condaenvs/naivetorch/bin/python}"
 
-PROFILE="${PROFILE:-stable}" # stable | aggressive
+PROFILE="${PROFILE:-aggressive}" # stable | aggressive
 TRAIN_STRATEGY="${TRAIN_STRATEGY:-ddp}" # ddp | data_parallel | none
 DEVICE="${DEVICE:-cuda:0}"
 
@@ -26,7 +26,7 @@ DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
 SOFT_VALUE_K="${SOFT_VALUE_K:-2.0}"
 MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
-SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-auto}" # auto | thread | process
+SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
 
 if [[ "$PROFILE" == "stable" ]]; then
@@ -39,9 +39,9 @@ if [[ "$PROFILE" == "stable" ]]; then
   : "${WEIGHT_DECAY:=1e-4}"
 elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${ITERATIONS:=80}"
-  : "${SELF_PLAY_GAMES:=16384}"
-  : "${MCTS_SIMULATIONS:=2048}"
-  : "${BATCH_SIZE:=12288}"
+  : "${SELF_PLAY_GAMES:=32768}"
+  : "${MCTS_SIMULATIONS:=4096}"
+  : "${BATCH_SIZE:=16384}"
   : "${EPOCHS:=4}"
   : "${LR:=2e-4}"
   : "${WEIGHT_DECAY:=1e-4}"
