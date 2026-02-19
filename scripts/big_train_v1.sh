@@ -129,6 +129,13 @@ fi
 
 GLOBAL_VISIBLE="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 echo "[big_train_v1] global CUDA_VISIBLE_DEVICES=$GLOBAL_VISIBLE"
+if [[ "${CUDA_LAUNCH_BLOCKING:-0}" == "1" ]]; then
+  echo "[big_train_v1] warning: CUDA_LAUNCH_BLOCKING=1 is debug-only and hurts throughput."
+  if [[ -z "${V1_FINALIZE_GRAPH:-}" ]]; then
+    export V1_FINALIZE_GRAPH=off
+    echo "[big_train_v1] set V1_FINALIZE_GRAPH=off for CUDA_LAUNCH_BLOCKING compatibility."
+  fi
+fi
 
 for ((it = 1; it <= ITERATIONS; it++)); do
   ITER_TAG="$(printf "%03d" "$it")"

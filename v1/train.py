@@ -208,12 +208,14 @@ def _run_self_play_shard(
     seed: int,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
+    shard_dev_obj = torch.device(shard_device)
+    if shard_dev_obj.type == "cuda":
+        torch.cuda.set_device(shard_dev_obj)
+        torch.cuda.manual_seed(int(seed))
 
     local_model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
     local_model.load_state_dict(model_state_dict_cpu, strict=True)
-    local_model.to(torch.device(shard_device))
+    local_model.to(shard_dev_obj)
     local_model.eval()
 
     shard_concurrent = max(1, min(int(shard_games), int(concurrent_games_per_device)))
@@ -288,40 +290,56 @@ def _run_self_play_multi_device(
     started = time.perf_counter()
     batches: List[TensorSelfPlayBatch] = []
     stats_list: List[SelfPlayV1Stats] = []
-    with ThreadPoolExecutor(max_workers=len(active), thread_name_prefix="v1-sp") as pool:
-        future_map = {}
-        for worker_idx, shard_dev, shard_games in active:
-            worker_seed = int(iteration_seed * 10007 + (worker_idx + 1) * 9973)
-            future = pool.submit(
-                _run_self_play_shard,
-                model_state_dict_cpu=model_state_cpu,
-                shard_games=int(shard_games),
-                shard_device=str(shard_dev),
-                mcts_simulations=int(mcts_simulations),
-                temperature_init=float(temperature_init),
-                temperature_final=float(temperature_final),
-                temperature_threshold=int(temperature_threshold),
-                exploration_weight=float(exploration_weight),
-                dirichlet_alpha=float(dirichlet_alpha),
-                dirichlet_epsilon=float(dirichlet_epsilon),
-                soft_value_k=float(soft_value_k),
-                max_game_plies=int(max_game_plies),
-                concurrent_games_per_device=int(concurrent_games_per_device),
-                seed=int(worker_seed),
-            )
-            future_map[future] = (worker_idx, shard_dev, shard_games)
+    finalize_graph_key = "V1_FINALIZE_GRAPH"
+    had_finalize_graph_env = finalize_graph_key in os.environ
+    prev_finalize_graph = os.environ.get(finalize_graph_key)
+    if not had_finalize_graph_env:
+        os.environ[finalize_graph_key] = "off"
+        _print_rank0(
+            "[v1.train] multi-device self-play default V1_FINALIZE_GRAPH=off for stability. "
+            "Set V1_FINALIZE_GRAPH=on to force capture."
+        )
+    try:
+        with ThreadPoolExecutor(max_workers=len(active), thread_name_prefix="v1-sp") as pool:
+            future_map = {}
+            for worker_idx, shard_dev, shard_games in active:
+                worker_seed = int(iteration_seed * 10007 + (worker_idx + 1) * 9973)
+                future = pool.submit(
+                    _run_self_play_shard,
+                    model_state_dict_cpu=model_state_cpu,
+                    shard_games=int(shard_games),
+                    shard_device=str(shard_dev),
+                    mcts_simulations=int(mcts_simulations),
+                    temperature_init=float(temperature_init),
+                    temperature_final=float(temperature_final),
+                    temperature_threshold=int(temperature_threshold),
+                    exploration_weight=float(exploration_weight),
+                    dirichlet_alpha=float(dirichlet_alpha),
+                    dirichlet_epsilon=float(dirichlet_epsilon),
+                    soft_value_k=float(soft_value_k),
+                    max_game_plies=int(max_game_plies),
+                    concurrent_games_per_device=int(concurrent_games_per_device),
+                    seed=int(worker_seed),
+                )
+                future_map[future] = (worker_idx, shard_dev, shard_games)
 
-        for future in as_completed(future_map):
-            worker_idx, shard_dev, shard_games = future_map[future]
-            try:
-                samples_cpu, stats = future.result()
-                batches.append(samples_cpu)
-                stats_list.append(stats)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"v1 multi-device self-play failed on worker={worker_idx}, "
-                    f"device={shard_dev}, games={shard_games}"
-                ) from exc
+            for future in as_completed(future_map):
+                worker_idx, shard_dev, shard_games = future_map[future]
+                try:
+                    samples_cpu, stats = future.result()
+                    batches.append(samples_cpu)
+                    stats_list.append(stats)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"v1 multi-device self-play failed on worker={worker_idx}, "
+                        f"device={shard_dev}, games={shard_games}"
+                    ) from exc
+    finally:
+        if not had_finalize_graph_env:
+            if prev_finalize_graph is None:
+                os.environ.pop(finalize_graph_key, None)
+            else:
+                os.environ[finalize_graph_key] = prev_finalize_graph
 
     merged_batch = _concat_self_play_batches_cpu(batches)
     merged_stats = _merge_self_play_stats(
@@ -623,6 +641,11 @@ def train_pipeline_v1(
         _print_rank0(f"[v1.train] self_play_devices={self_play_device_list}")
         _print_rank0(f"[v1.train] train_devices={train_device_list}")
         _print_rank0(f"[v1.train] infer_devices={infer_device_list}")
+        if int(self_play_concurrent_games) > 256:
+            _print_rank0(
+                "[v1.train] warning: self_play_concurrent_games is very high; "
+                "start with 32~128 for stability and throughput."
+            )
 
         model = _build_model()
         _load_checkpoint_into_model(

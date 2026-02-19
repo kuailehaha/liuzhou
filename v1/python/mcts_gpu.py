@@ -266,6 +266,7 @@ class V1RootMCTS:
     _SHARED_FINALIZE_GRAPH_CACHE: Dict[Tuple[int, int, int, int, bool], _FinalizeGraphEntry] = {}
     _SHARED_FINALIZE_GRAPH_LRU: List[Tuple[int, int, int, int, bool]] = []
     _SHARED_FINALIZE_GRAPH_BLOCKED: set[Tuple[int, int, int, int, bool]] = set()
+    _WARNED_LAUNCH_BLOCKING_GRAPH_DISABLE: bool = False
 
     def __init__(
         self,
@@ -324,6 +325,15 @@ class V1RootMCTS:
             self._finalize_graph_enabled = self.device.type == "cuda" and not any(
                 str(k).upper().startswith("NSYS_") for k in os.environ.keys()
             )
+        launch_blocking = str(os.environ.get("CUDA_LAUNCH_BLOCKING", "")).strip().lower()
+        if self._finalize_graph_enabled and launch_blocking in ("1", "true", "yes", "on"):
+            self._finalize_graph_enabled = False
+            if not V1RootMCTS._WARNED_LAUNCH_BLOCKING_GRAPH_DISABLE:
+                print(
+                    "[v1.mcts] CUDA_LAUNCH_BLOCKING is enabled; disable finalize graph capture "
+                    "for compatibility."
+                )
+                V1RootMCTS._WARNED_LAUNCH_BLOCKING_GRAPH_DISABLE = True
         mode = str(self.config.child_eval_mode).strip().lower()
         if mode not in ("value_only", "full"):
             raise ValueError(
