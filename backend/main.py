@@ -140,10 +140,18 @@ def _ensure_human_turn(session: GameSession) -> None:
         )
 
 
+def _ensure_ai_turn(session: GameSession) -> None:
+    if session.state.current_player != session.ai_player:
+        raise HTTPException(
+            status_code=400,
+            detail="It is not the AI player's turn.",
+        )
+
+
 def _evaluate_position(session: GameSession) -> Dict[str, Any] | None:
     """
     Run the value head of the AI model on the current state (when available).
-    Returns the estimate from the current player's perspective in the [-1, 1] range.
+    Returns the estimate from the AI player's perspective in the [-1, 1] range.
     """
     if torch is None:
         return None
@@ -160,20 +168,41 @@ def _evaluate_position(session: GameSession) -> Dict[str, Any] | None:
     current_player = session.state.current_player
     try:
         from src.neural_network import wdl_to_scalar
+        # Keep inference on the side-to-move perspective (training-time convention),
+        # then convert to AI perspective below if needed.
         inputs = state_to_tensor(session.state, current_player).to(device)
         with torch.inference_mode():
             _, _, _, wdl_logits = model(inputs)
-        raw_value = float(wdl_to_scalar(wdl_logits).squeeze().detach().to("cpu").item())
-        wdl_probs = torch.softmax(wdl_logits, dim=-1).squeeze().detach().to("cpu").tolist()
+        value_current = float(wdl_to_scalar(wdl_logits).squeeze().detach().to("cpu").item())
+        probs_current = torch.softmax(wdl_logits, dim=-1).squeeze().detach().to("cpu").tolist()
     except Exception:
         return None
 
+    if len(probs_current) == 3:
+        win_current, draw_current, loss_current = probs_current
+    else:
+        win_current = (value_current + 1.0) / 2.0
+        draw_current = 0.0
+        loss_current = 1.0 - win_current
+
+    if session.ai_player == current_player:
+        win_ai = win_current
+        draw_ai = draw_current
+        loss_ai = loss_current
+        value_ai = value_current
+    else:
+        win_ai = loss_current
+        draw_ai = draw_current
+        loss_ai = win_current
+        value_ai = -value_current
+
     return {
-        "value": raw_value,
-        "winProbability": wdl_probs[0] if len(wdl_probs) == 3 else (raw_value + 1.0) / 2.0,
-        "drawProbability": wdl_probs[1] if len(wdl_probs) == 3 else 0.0,
-        "lossProbability": wdl_probs[2] if len(wdl_probs) == 3 else 1.0 - (raw_value + 1.0) / 2.0,
-        "perspective": current_player.name,
+        "value": value_ai,
+        "winProbability": win_ai,
+        "drawProbability": draw_ai,
+        "lossProbability": loss_ai,
+        "perspective": "AI",
+        "perspectivePlayer": session.ai_player.name,
         "range": [-1.0, 1.0],
     }
 
@@ -255,10 +284,22 @@ def submit_human_move(game_id: str, request: MoveRequest):
     session.state = apply_move(session.state, canonical_move, quiet=True)
     _reset_agent(session.ai_agent)
 
-    ai_moves = None
-    if not session.state.is_game_over() and session.state.current_player == session.ai_player:
-        ai_moves = _maybe_run_ai_turn(session)
+    return _prepare_payload(session)
 
+
+@app.post("/api/game/{game_id}/ai-move")
+def submit_ai_move(game_id: str):
+    try:
+        session = game_manager.get_session(game_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Game not found")
+
+    if session.state.is_game_over():
+        raise HTTPException(status_code=400, detail="Game is already over.")
+
+    _ensure_ai_turn(session)
+
+    ai_moves = _maybe_run_ai_turn(session)
     return _prepare_payload(session, ai_moves=ai_moves or None)
 
 

@@ -782,6 +782,22 @@ batch_apply_moves_cuda(
     torch::Tensor moves_since_capture,
     torch::Tensor action_codes,
     torch::Tensor parent_indices);
+
+void batch_apply_moves_inplace_cuda(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
+    torch::Tensor action_codes,
+    torch::Tensor slot_indices);
 #endif
 
 std::tuple<
@@ -920,6 +936,65 @@ batch_apply_moves_cpu(
     };
 }
 
+void batch_apply_moves_inplace_cpu(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
+    torch::Tensor action_codes,
+    torch::Tensor slot_indices) {
+    TORCH_CHECK(board.device().is_cpu(), "batch_apply_moves_inplace currently supports CPU tensors only.");
+    TORCH_CHECK(action_codes.device().is_cpu(), "action_codes must be on CPU.");
+    TORCH_CHECK(slot_indices.device().is_cpu(), "slot_indices must be on CPU.");
+
+    slot_indices = slot_indices.to(torch::kInt64).contiguous();
+    action_codes = action_codes.contiguous();
+    if (slot_indices.numel() == 0) {
+        return;
+    }
+    TORCH_CHECK(action_codes.dim() == 2 && action_codes.size(1) == 4, "action_codes must be (N, 4).");
+    TORCH_CHECK(
+        action_codes.size(0) == slot_indices.size(0),
+        "action_codes must align with slot_indices.");
+
+    auto applied = batch_apply_moves_cpu(
+        board,
+        marks_black,
+        marks_white,
+        phase,
+        current_player,
+        pending_marks_required,
+        pending_marks_remaining,
+        pending_captures_required,
+        pending_captures_remaining,
+        forced_removals_done,
+        move_count,
+        moves_since_capture,
+        action_codes,
+        slot_indices);
+
+    board.index_copy_(0, slot_indices, std::get<0>(applied));
+    marks_black.index_copy_(0, slot_indices, std::get<1>(applied).to(torch::kBool));
+    marks_white.index_copy_(0, slot_indices, std::get<2>(applied).to(torch::kBool));
+    phase.index_copy_(0, slot_indices, std::get<3>(applied));
+    current_player.index_copy_(0, slot_indices, std::get<4>(applied));
+    pending_marks_required.index_copy_(0, slot_indices, std::get<5>(applied));
+    pending_marks_remaining.index_copy_(0, slot_indices, std::get<6>(applied));
+    pending_captures_required.index_copy_(0, slot_indices, std::get<7>(applied));
+    pending_captures_remaining.index_copy_(0, slot_indices, std::get<8>(applied));
+    forced_removals_done.index_copy_(0, slot_indices, std::get<9>(applied));
+    move_count.index_copy_(0, slot_indices, std::get<10>(applied));
+    moves_since_capture.index_copy_(0, slot_indices, std::get<11>(applied));
+}
+
 std::tuple<
     torch::Tensor,
     torch::Tensor,
@@ -988,6 +1063,64 @@ batch_apply_moves(
         std::move(moves_since_capture),
         std::move(action_codes),
         std::move(parent_indices));
+}
+
+void batch_apply_moves_inplace(
+    torch::Tensor board,
+    torch::Tensor marks_black,
+    torch::Tensor marks_white,
+    torch::Tensor phase,
+    torch::Tensor current_player,
+    torch::Tensor pending_marks_required,
+    torch::Tensor pending_marks_remaining,
+    torch::Tensor pending_captures_required,
+    torch::Tensor pending_captures_remaining,
+    torch::Tensor forced_removals_done,
+    torch::Tensor move_count,
+    torch::Tensor moves_since_capture,
+    torch::Tensor action_codes,
+    torch::Tensor slot_indices) {
+    if (board.device().is_cuda()) {
+#if defined(V0_HAS_CUDA_APPLY_MOVES)
+        batch_apply_moves_inplace_cuda(
+            std::move(board),
+            std::move(marks_black),
+            std::move(marks_white),
+            std::move(phase),
+            std::move(current_player),
+            std::move(pending_marks_required),
+            std::move(pending_marks_remaining),
+            std::move(pending_captures_required),
+            std::move(pending_captures_remaining),
+            std::move(forced_removals_done),
+            std::move(move_count),
+            std::move(moves_since_capture),
+            std::move(action_codes),
+            std::move(slot_indices));
+        return;
+#else
+        TORCH_CHECK(
+            false,
+            "batch_apply_moves_inplace: requested CUDA tensors but CUDA kernels were not built. "
+            "Rebuild with -DBUILD_CUDA_KERNELS=ON to enable GPU support.");
+#endif
+    }
+
+    batch_apply_moves_inplace_cpu(
+        std::move(board),
+        std::move(marks_black),
+        std::move(marks_white),
+        std::move(phase),
+        std::move(current_player),
+        std::move(pending_marks_required),
+        std::move(pending_marks_remaining),
+        std::move(pending_captures_required),
+        std::move(pending_captures_remaining),
+        std::move(forced_removals_done),
+        std::move(move_count),
+        std::move(moves_since_capture),
+        std::move(action_codes),
+        std::move(slot_indices));
 }
 
 }  // namespace v0

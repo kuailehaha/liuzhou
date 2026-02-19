@@ -42,6 +42,7 @@ if(BUILD_CUDA_KERNELS)
   list(APPEND CUDA_SRCS
     game/fast_legal_mask_cuda.cu
     game/fast_apply_moves_cuda.cu
+    mcts/root_puct_fused.cu
   )
 endif()
 
@@ -146,7 +147,7 @@ target_compile_definitions(
 )
 
 if(BUILD_CUDA_KERNELS)
-  target_compile_definitions(v0_core PRIVATE V0_HAS_CUDA_LEGAL_MASK V0_HAS_CUDA_APPLY_MOVES)
+  target_compile_definitions(v0_core PRIVATE V0_HAS_CUDA_LEGAL_MASK V0_HAS_CUDA_APPLY_MOVES V0_HAS_CUDA_ROOT_PUCT)
 endif()
 
 if(C10_CUDA_LIBRARY)
