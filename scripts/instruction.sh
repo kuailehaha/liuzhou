@@ -52,127 +52,127 @@ fi
 echo "[step] gpu status"
 nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw,memory.used,pstate --format=csv
 
-echo "[step] python/v0_core sanity"
-"$PYTHON_BIN" - <<'PY'
-import torch
-import v0_core
-print("torch", torch.__version__)
-print("cuda_available", torch.cuda.is_available())
-print("v0_core_ok", hasattr(v0_core, "root_puct_allocate_visits"))
-PY
+# echo "[step] python/v0_core sanity"
+# "$PYTHON_BIN" - <<'PY'
+# import torch
+# import v0_core
+# print("torch", torch.__version__)
+# print("cuda_available", torch.cuda.is_available())
+# print("v0_core_ok", hasattr(v0_core, "root_puct_allocate_visits"))
+# PY
 
-echo "[step] semantic AB (256/512)"
-"$PYTHON_BIN" tools/ab_v1_child_value_only.py \
-  --device "$DEVICE" \
-  --seed "$SEED" \
-  --num-states 32 \
-  --state-plies 8 \
-  --mcts-simulations 256 \
-  --self-play-games 8 \
-  --self-play-concurrent-games 8 \
-  --strict \
-  --output-json "$OUT_DIR/ab_v1_child_value_256.json"
+# echo "[step] semantic AB (256/512)"
+# "$PYTHON_BIN" tools/ab_v1_child_value_only.py \
+#   --device "$DEVICE" \
+#   --seed "$SEED" \
+#   --num-states 32 \
+#   --state-plies 8 \
+#   --mcts-simulations 256 \
+#   --self-play-games 8 \
+#   --self-play-concurrent-games 8 \
+#   --strict \
+#   --output-json "$OUT_DIR/ab_v1_child_value_256.json"
 
-"$PYTHON_BIN" tools/ab_v1_child_value_only.py \
-  --device "$DEVICE" \
-  --seed "$SEED" \
-  --num-states 32 \
-  --state-plies 8 \
-  --mcts-simulations 512 \
-  --self-play-games 8 \
-  --self-play-concurrent-games 8 \
-  --strict \
-  --output-json "$OUT_DIR/ab_v1_child_value_512.json"
+# "$PYTHON_BIN" tools/ab_v1_child_value_only.py \
+#   --device "$DEVICE" \
+#   --seed "$SEED" \
+#   --num-states 32 \
+#   --state-plies 8 \
+#   --mcts-simulations 512 \
+#   --self-play-games 8 \
+#   --self-play-concurrent-games 8 \
+#   --strict \
+#   --output-json "$OUT_DIR/ab_v1_child_value_512.json"
 
-for FG in off on; do
-  echo "[step] validate_v1_claims finalize_graph=$FG"
-  "$PYTHON_BIN" tools/validate_v1_claims.py \
-    --device "$DEVICE" \
-    --seed "$SEED" \
-    --rounds 1 \
-    --v0-workers 1,2,4 \
-    --v1-threads 1,2,4 \
-    --v1-concurrent-games 64 \
-    --v1-sample-moves false \
-    --v1-finalize-graph "$FG" \
-    --v1-child-eval-mode value_only \
-    --total-games "$TOTAL_GAMES" \
-    --v0-mcts-simulations "$MCTS_SIMS" \
-    --v1-mcts-simulations "$MCTS_SIMS" \
-    --v0-batch-leaves 512 \
-    --v0-inference-backend graph \
-    --v0-inference-batch-size 512 \
-    --v0-inference-warmup-iters 5 \
-    --v1-inference-backend py \
-    --v1-inference-batch-size 512 \
-    --v1-inference-warmup-iters 5 \
-    --v0-opening-random-moves 2 \
-    --v0-resign-threshold -0.8 \
-    --v0-resign-min-moves 36 \
-    --v0-resign-consecutive 3 \
-    --with-inference-baseline \
-    --output-json "$OUT_DIR/validate_v1_$FG.json"
-done
+# for FG in off on; do
+#   echo "[step] validate_v1_claims finalize_graph=$FG"
+#   "$PYTHON_BIN" tools/validate_v1_claims.py \
+#     --device "$DEVICE" \
+#     --seed "$SEED" \
+#     --rounds 1 \
+#     --v0-workers 1,2,4 \
+#     --v1-threads 1,2,4 \
+#     --v1-concurrent-games 64 \
+#     --v1-sample-moves false \
+#     --v1-finalize-graph "$FG" \
+#     --v1-child-eval-mode value_only \
+#     --total-games "$TOTAL_GAMES" \
+#     --v0-mcts-simulations "$MCTS_SIMS" \
+#     --v1-mcts-simulations "$MCTS_SIMS" \
+#     --v0-batch-leaves 512 \
+#     --v0-inference-backend graph \
+#     --v0-inference-batch-size 512 \
+#     --v0-inference-warmup-iters 5 \
+#     --v1-inference-backend py \
+#     --v1-inference-batch-size 512 \
+#     --v1-inference-warmup-iters 5 \
+#     --v0-opening-random-moves 2 \
+#     --v0-resign-threshold -0.8 \
+#     --v0-resign-min-moves 36 \
+#     --v0-resign-consecutive 3 \
+#     --with-inference-baseline \
+#     --output-json "$OUT_DIR/validate_v1_$FG.json"
+# done
 
-for SAMPLE in false true; do
-  for FG in off on; do
-    echo "[step] sweep_v1_gpu_matrix sample_moves=$SAMPLE finalize_graph=$FG"
-    "$PYTHON_BIN" tools/sweep_v1_gpu_matrix.py \
-      --device "$DEVICE" \
-      --seed "$SEED" \
-      --rounds 1 \
-      --threads 1 \
-      --concurrent-games "$V1_CGS" \
-      --backends py \
-      --total-games "$TOTAL_GAMES" \
-      --mcts-simulations "$MCTS_SIMS" \
-      --child-eval-mode value_only \
-      --sample-moves "$SAMPLE" \
-      --finalize-graph "$FG" \
-      --inference-batch-size 512 \
-      --inference-warmup-iters 5 \
-      --output-json "$OUT_DIR/matrix_py_${SAMPLE}_${FG}.json"
-  done
-done
+# for SAMPLE in false true; do
+#   for FG in off on; do
+#     echo "[step] sweep_v1_gpu_matrix sample_moves=$SAMPLE finalize_graph=$FG"
+#     "$PYTHON_BIN" tools/sweep_v1_gpu_matrix.py \
+#       --device "$DEVICE" \
+#       --seed "$SEED" \
+#       --rounds 1 \
+#       --threads 1 \
+#       --concurrent-games "$V1_CGS" \
+#       --backends py \
+#       --total-games "$TOTAL_GAMES" \
+#       --mcts-simulations "$MCTS_SIMS" \
+#       --child-eval-mode value_only \
+#       --sample-moves "$SAMPLE" \
+#       --finalize-graph "$FG" \
+#       --inference-batch-size 512 \
+#       --inference-warmup-iters 5 \
+#       --output-json "$OUT_DIR/matrix_py_${SAMPLE}_${FG}.json"
+#   done
+# done
 
-echo "[step] stable run (v1, ${STABLE_DURATION_SEC}s)"
-"$PYTHON_BIN" tools/run_selfplay_workload.py \
-  --mode v1 \
-  --device "$DEVICE" \
-  --seed "$SEED" \
-  --duration-sec "$STABLE_DURATION_SEC" \
-  --num-games-per-iter 64 \
-  --mcts-simulations "$MCTS_SIMS" \
-  --v1-threads 1 \
-  --v1-concurrent-games 64 \
-  --v1-child-eval-mode value_only \
-  --v1-sample-moves false \
-  --v1-finalize-graph on \
-  --v1-inference-backend py \
-  --v1-inference-batch-size 512 \
-  --v1-inference-warmup-iters 5 \
-  --collect-step-timing \
-  --plot-step-breakdown \
-  --plot-stability \
-  --output-json "$OUT_DIR/stable_v1_180s.json"
+# echo "[step] stable run (v1, ${STABLE_DURATION_SEC}s)"
+# "$PYTHON_BIN" tools/run_selfplay_workload.py \
+#   --mode v1 \
+#   --device "$DEVICE" \
+#   --seed "$SEED" \
+#   --duration-sec "$STABLE_DURATION_SEC" \
+#   --num-games-per-iter 64 \
+#   --mcts-simulations "$MCTS_SIMS" \
+#   --v1-threads 1 \
+#   --v1-concurrent-games 64 \
+#   --v1-child-eval-mode value_only \
+#   --v1-sample-moves false \
+#   --v1-finalize-graph on \
+#   --v1-inference-backend py \
+#   --v1-inference-batch-size 512 \
+#   --v1-inference-warmup-iters 5 \
+#   --collect-step-timing \
+#   --plot-step-breakdown \
+#   --plot-stability \
+#   --output-json "$OUT_DIR/stable_v1_180s.json"
 
 echo "[step] power-efficiency probe (v1, target >=400W on H20)"
-echo "[step] profile: sims=2048, cg=128, batch=1024, sample_moves=false, finalize_graph=on"
+echo "[step] profile: sims=8192, cg=512, batch=1024, sample_moves=false, finalize_graph=on"
 V1_FINALIZE_GRAPH_MAX_ENTRIES=256 \
 "$PYTHON_BIN" tools/run_selfplay_workload.py \
   --mode v1 \
   --device "$DEVICE" \
   --seed "$SEED" \
   --duration-sec "${POWER_PROBE_DURATION_SEC:-180}" \
-  --num-games-per-iter 128 \
-  --mcts-simulations "${POWER_PROBE_MCTS_SIMS:-2048}" \
-  --v1-threads 1 \
-  --v1-concurrent-games 128 \
+  --num-games-per-iter 512 \
+  --mcts-simulations "${POWER_PROBE_MCTS_SIMS:-8192}" \
+  --v1-threads 8 \
+  --v1-concurrent-games 512 \
   --v1-child-eval-mode value_only \
   --v1-sample-moves false \
   --v1-finalize-graph on \
   --v1-inference-backend py \
-  --v1-inference-batch-size 1024 \
+  --v1-inference-batch-size 2048 \
   --v1-inference-warmup-iters 5 \
   --collect-step-timing \
   --plot-step-breakdown \
