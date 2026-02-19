@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
+import shutil
+import sys
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -16,6 +20,7 @@ from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 from v1.python.mcts_gpu import TOTAL_ACTION_DIM
 from v1.python.self_play_gpu_runner import SelfPlayV1Stats, self_play_v1_gpu
+from v1.python.self_play_worker import run_self_play_worker
 from v1.python.train_bridge import train_network_from_tensors
 from v1.python.trajectory_buffer import TensorSelfPlayBatch
 
@@ -240,7 +245,97 @@ def _run_self_play_shard(
     return samples.to("cpu"), stats
 
 
-def _run_self_play_multi_device(
+def _self_play_stats_from_payload(stats_payload: Dict[str, Any]) -> SelfPlayV1Stats:
+    payload = stats_payload if isinstance(stats_payload, dict) else {}
+    step_timing_ms_raw = payload.get("step_timing_ms")
+    step_timing_ratio_raw = payload.get("step_timing_ratio")
+    step_timing_calls_raw = payload.get("step_timing_calls")
+    mcts_counters_raw = payload.get("mcts_counters")
+    step_timing_ms = (
+        {str(k): float(v) for k, v in step_timing_ms_raw.items()}
+        if isinstance(step_timing_ms_raw, dict)
+        else {}
+    )
+    step_timing_ratio = (
+        {str(k): float(v) for k, v in step_timing_ratio_raw.items()}
+        if isinstance(step_timing_ratio_raw, dict)
+        else {}
+    )
+    step_timing_calls = (
+        {str(k): int(v) for k, v in step_timing_calls_raw.items()}
+        if isinstance(step_timing_calls_raw, dict)
+        else {}
+    )
+    mcts_counters = (
+        {str(k): int(v) for k, v in mcts_counters_raw.items()}
+        if isinstance(mcts_counters_raw, dict)
+        else {}
+    )
+    elapsed = max(1e-9, float(payload.get("elapsed_sec", 0.0) or 0.0))
+    num_games = int(payload.get("num_games", 0) or 0)
+    num_positions = int(payload.get("num_positions", 0) or 0)
+    return SelfPlayV1Stats(
+        num_games=num_games,
+        num_positions=num_positions,
+        black_wins=int(payload.get("black_wins", 0) or 0),
+        white_wins=int(payload.get("white_wins", 0) or 0),
+        draws=int(payload.get("draws", 0) or 0),
+        avg_game_length=float(payload.get("avg_game_length", 0.0) or 0.0),
+        elapsed_sec=elapsed,
+        positions_per_sec=float(payload.get("positions_per_sec", float(num_positions / elapsed))),
+        games_per_sec=float(payload.get("games_per_sec", float(num_games / elapsed))),
+        step_timing_ms=step_timing_ms,
+        step_timing_ratio=step_timing_ratio,
+        step_timing_calls=step_timing_calls,
+        mcts_counters=mcts_counters,
+    )
+
+
+def _normalize_self_play_backend(backend: str) -> str:
+    raw = str(backend).strip().lower()
+    if raw in {"", "auto"}:
+        return "auto"
+    if raw in {"thread", "threads"}:
+        return "thread"
+    if raw in {"process", "proc", "multiprocess", "mp"}:
+        return "process"
+    raise ValueError(
+        f"Unsupported self-play backend={backend!r}; expected one of: auto, thread, process."
+    )
+
+
+def _resolve_self_play_backend(*, requested_backend: Optional[str], devices: List[str]) -> str:
+    source = requested_backend
+    if source is None:
+        source = os.environ.get("V1_SELF_PLAY_BACKEND", "auto")
+    mode = _normalize_self_play_backend(str(source))
+    if mode != "auto":
+        return mode
+    if len(devices) <= 1:
+        return "thread"
+    all_cuda = all(torch.device(str(dev)).type == "cuda" for dev in devices)
+    if all_cuda and sys.platform.startswith("linux"):
+        return "process"
+    return "thread"
+
+
+def _prepare_self_play_workspace(
+    *,
+    shard_dir: Optional[str],
+    iteration_seed: int,
+) -> Tuple[str, bool]:
+    tag = f"iter_{int(iteration_seed):06d}_pid_{os.getpid()}_{int(time.time() * 1000)}"
+    if shard_dir:
+        base = os.path.abspath(str(shard_dir))
+        os.makedirs(base, exist_ok=True)
+        root = os.path.join(base, tag)
+        os.makedirs(root, exist_ok=True)
+        return root, False
+    root = tempfile.mkdtemp(prefix=f"v1_selfplay_{tag}_")
+    return root, True
+
+
+def _run_self_play_multi_device_thread(
     *,
     model: ChessNet,
     num_games: int,
@@ -257,28 +352,6 @@ def _run_self_play_multi_device(
     concurrent_games_per_device: int,
     iteration_seed: int,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
-    if len(devices) <= 1:
-        single_device = devices[0]
-        shard_concurrent = max(1, min(int(num_games), int(concurrent_games_per_device)))
-        return self_play_v1_gpu(
-            model=model,
-            num_games=int(num_games),
-            mcts_simulations=int(mcts_simulations),
-            temperature_init=float(temperature_init),
-            temperature_final=float(temperature_final),
-            temperature_threshold=int(temperature_threshold),
-            exploration_weight=float(exploration_weight),
-            device=str(single_device),
-            add_dirichlet_noise=True,
-            dirichlet_alpha=float(dirichlet_alpha),
-            dirichlet_epsilon=float(dirichlet_epsilon),
-            soft_value_k=float(soft_value_k),
-            max_game_plies=int(max_game_plies),
-            sample_moves=True,
-            concurrent_games=shard_concurrent,
-            verbose=False,
-        )
-
     model_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     shards = _split_games(int(num_games), len(devices))
     active: List[Tuple[int, str, int]] = [
@@ -296,7 +369,7 @@ def _run_self_play_multi_device(
     if not had_finalize_graph_env:
         os.environ[finalize_graph_key] = "off"
         _print_rank0(
-            "[v1.train] multi-device self-play default V1_FINALIZE_GRAPH=off for stability. "
+            "[v1.train] thread backend: default V1_FINALIZE_GRAPH=off for stability. "
             "Set V1_FINALIZE_GRAPH=on to force capture."
         )
     try:
@@ -331,7 +404,7 @@ def _run_self_play_multi_device(
                     stats_list.append(stats)
                 except Exception as exc:
                     raise RuntimeError(
-                        f"v1 multi-device self-play failed on worker={worker_idx}, "
+                        f"v1 thread self-play failed on worker={worker_idx}, "
                         f"device={shard_dev}, games={shard_games}"
                     ) from exc
     finally:
@@ -347,6 +420,199 @@ def _run_self_play_multi_device(
         elapsed_sec=max(1e-9, time.perf_counter() - started),
     )
     return merged_batch, merged_stats
+
+
+def _run_self_play_multi_device_process(
+    *,
+    model: ChessNet,
+    num_games: int,
+    mcts_simulations: int,
+    temperature_init: float,
+    temperature_final: float,
+    temperature_threshold: int,
+    exploration_weight: float,
+    devices: List[str],
+    dirichlet_alpha: float,
+    dirichlet_epsilon: float,
+    soft_value_k: float,
+    max_game_plies: int,
+    concurrent_games_per_device: int,
+    iteration_seed: int,
+    shard_dir: Optional[str],
+) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
+    model_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    shards = _split_games(int(num_games), len(devices))
+    active: List[Tuple[int, str, int]] = [
+        (idx, dev, g) for idx, (dev, g) in enumerate(zip(devices, shards)) if int(g) > 0
+    ]
+    if not active:
+        raise RuntimeError("No self-play shard assigned after game split.")
+
+    workspace, auto_cleanup = _prepare_self_play_workspace(
+        shard_dir=shard_dir,
+        iteration_seed=int(iteration_seed),
+    )
+    state_path = os.path.join(workspace, "model_state_cpu.pt")
+    torch.save(model_state_cpu, state_path)
+
+    started = time.perf_counter()
+    failed = False
+    worker_rows: List[Dict[str, Any]] = []
+    try:
+        mp_ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=len(active),
+            mp_context=mp_ctx,
+        ) as pool:
+            future_map = {}
+            for worker_idx, shard_dev, shard_games in active:
+                worker_seed = int(iteration_seed * 10007 + (worker_idx + 1) * 9973)
+                shard_output = os.path.join(
+                    workspace,
+                    f"selfplay_shard_{int(iteration_seed):06d}_{int(worker_idx):02d}.pt",
+                )
+                future = pool.submit(
+                    run_self_play_worker,
+                    worker_idx=int(worker_idx),
+                    shard_device=str(shard_dev),
+                    shard_games=int(shard_games),
+                    seed=int(worker_seed),
+                    model_state_path=str(state_path),
+                    output_path=str(shard_output),
+                    mcts_simulations=int(mcts_simulations),
+                    temperature_init=float(temperature_init),
+                    temperature_final=float(temperature_final),
+                    temperature_threshold=int(temperature_threshold),
+                    exploration_weight=float(exploration_weight),
+                    dirichlet_alpha=float(dirichlet_alpha),
+                    dirichlet_epsilon=float(dirichlet_epsilon),
+                    soft_value_k=float(soft_value_k),
+                    max_game_plies=int(max_game_plies),
+                    concurrent_games_per_device=int(concurrent_games_per_device),
+                )
+                future_map[future] = (worker_idx, shard_dev, shard_games, shard_output)
+
+            for future in as_completed(future_map):
+                worker_idx, shard_dev, shard_games, shard_output = future_map[future]
+                try:
+                    row = future.result()
+                    worker_rows.append(row)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "v1 process self-play failed "
+                        f"on worker={worker_idx}, device={shard_dev}, games={shard_games}, "
+                        f"shard_output={shard_output}"
+                    ) from exc
+
+        batches: List[TensorSelfPlayBatch] = []
+        stats_list: List[SelfPlayV1Stats] = []
+        for row in sorted(worker_rows, key=lambda x: int(x.get("worker_idx", 0))):
+            shard_path = str(row.get("output_path", ""))
+            if not shard_path:
+                raise RuntimeError(f"Missing shard output path in worker row: {row}")
+            batch_cpu, stats_payload, _meta_payload = _load_self_play_payload(shard_path)
+            batches.append(batch_cpu)
+            stats_list.append(_self_play_stats_from_payload(stats_payload))
+
+        merged_batch = _concat_self_play_batches_cpu(batches)
+        merged_stats = _merge_self_play_stats(
+            stats=stats_list,
+            elapsed_sec=max(1e-9, time.perf_counter() - started),
+        )
+        return merged_batch, merged_stats
+    except Exception:
+        failed = True
+        raise
+    finally:
+        if auto_cleanup and not failed:
+            shutil.rmtree(workspace, ignore_errors=True)
+        elif auto_cleanup and failed:
+            _print_rank0(
+                "[v1.train] process self-play failed; keep shard workspace for debug: "
+                f"{workspace}"
+            )
+
+
+def _run_self_play_multi_device(
+    *,
+    model: ChessNet,
+    num_games: int,
+    mcts_simulations: int,
+    temperature_init: float,
+    temperature_final: float,
+    temperature_threshold: int,
+    exploration_weight: float,
+    devices: List[str],
+    dirichlet_alpha: float,
+    dirichlet_epsilon: float,
+    soft_value_k: float,
+    max_game_plies: int,
+    concurrent_games_per_device: int,
+    iteration_seed: int,
+    self_play_backend: Optional[str],
+    self_play_shard_dir: Optional[str],
+) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
+    if len(devices) <= 1:
+        single_device = devices[0]
+        shard_concurrent = max(1, min(int(num_games), int(concurrent_games_per_device)))
+        return self_play_v1_gpu(
+            model=model,
+            num_games=int(num_games),
+            mcts_simulations=int(mcts_simulations),
+            temperature_init=float(temperature_init),
+            temperature_final=float(temperature_final),
+            temperature_threshold=int(temperature_threshold),
+            exploration_weight=float(exploration_weight),
+            device=str(single_device),
+            add_dirichlet_noise=True,
+            dirichlet_alpha=float(dirichlet_alpha),
+            dirichlet_epsilon=float(dirichlet_epsilon),
+            soft_value_k=float(soft_value_k),
+            max_game_plies=int(max_game_plies),
+            sample_moves=True,
+            concurrent_games=shard_concurrent,
+            verbose=False,
+        )
+
+    backend = _resolve_self_play_backend(
+        requested_backend=self_play_backend,
+        devices=devices,
+    )
+    _print_rank0(f"[v1.train] self-play backend={backend} devices={devices}")
+    if backend == "process":
+        return _run_self_play_multi_device_process(
+            model=model,
+            num_games=int(num_games),
+            mcts_simulations=int(mcts_simulations),
+            temperature_init=float(temperature_init),
+            temperature_final=float(temperature_final),
+            temperature_threshold=int(temperature_threshold),
+            exploration_weight=float(exploration_weight),
+            devices=list(devices),
+            dirichlet_alpha=float(dirichlet_alpha),
+            dirichlet_epsilon=float(dirichlet_epsilon),
+            soft_value_k=float(soft_value_k),
+            max_game_plies=int(max_game_plies),
+            concurrent_games_per_device=int(concurrent_games_per_device),
+            iteration_seed=int(iteration_seed),
+            shard_dir=self_play_shard_dir,
+        )
+    return _run_self_play_multi_device_thread(
+        model=model,
+        num_games=int(num_games),
+        mcts_simulations=int(mcts_simulations),
+        temperature_init=float(temperature_init),
+        temperature_final=float(temperature_final),
+        temperature_threshold=int(temperature_threshold),
+        exploration_weight=float(exploration_weight),
+        devices=list(devices),
+        dirichlet_alpha=float(dirichlet_alpha),
+        dirichlet_epsilon=float(dirichlet_epsilon),
+        soft_value_k=float(soft_value_k),
+        max_game_plies=int(max_game_plies),
+        concurrent_games_per_device=int(concurrent_games_per_device),
+        iteration_seed=int(iteration_seed),
+    )
 
 
 def _build_model() -> ChessNet:
@@ -582,6 +848,8 @@ def train_pipeline_v1(
     dirichlet_alpha: float = 0.3,
     dirichlet_epsilon: float = 0.25,
     self_play_concurrent_games: int = 8,
+    self_play_backend: Optional[str] = None,
+    self_play_shard_dir: Optional[str] = None,
     checkpoint_dir: str = "./checkpoints_v1",
     device: str = "cpu",
     devices: Optional[str] = None,
@@ -619,6 +887,14 @@ def train_pipeline_v1(
 
     init_pg_here = _maybe_init_process_group(train_strategy_norm)
     try:
+        backend_arg = (
+            _normalize_self_play_backend(str(self_play_backend))
+            if self_play_backend is not None
+            else None
+        )
+        shard_dir_arg = str(self_play_shard_dir).strip() if self_play_shard_dir is not None else ""
+        shard_dir_arg = shard_dir_arg or None
+
         self_play_device_list = _parse_device_list(primary_device=device, devices=devices)
         if train_devices is None:
             train_device_list = _parse_device_list(primary_device=device, devices=str(device))
@@ -639,6 +915,11 @@ def train_pipeline_v1(
 
         _print_rank0(f"[v1.train] stage={stage_norm} train_strategy={train_strategy_norm}")
         _print_rank0(f"[v1.train] self_play_devices={self_play_device_list}")
+        _print_rank0(
+            "[v1.train] self_play_backend="
+            f"{backend_arg if backend_arg is not None else 'auto'} "
+            f"self_play_shard_dir={shard_dir_arg or '<temp>'}"
+        )
         _print_rank0(f"[v1.train] train_devices={train_device_list}")
         _print_rank0(f"[v1.train] infer_devices={infer_device_list}")
         if int(self_play_concurrent_games) > 256:
@@ -672,6 +953,8 @@ def train_pipeline_v1(
                 max_game_plies=int(max_game_plies),
                 concurrent_games_per_device=int(self_play_concurrent_games),
                 iteration_seed=1,
+                self_play_backend=backend_arg,
+                self_play_shard_dir=shard_dir_arg,
             )
             output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
             _save_self_play_payload(
@@ -681,10 +964,12 @@ def train_pipeline_v1(
                 metadata={
                     "stage": "selfplay",
                     "self_play_devices": list(self_play_device_list),
-                        "mcts_simulations": int(mcts_simulations),
-                        "self_play_games": int(self_play_games),
-                        "self_play_concurrent_games": int(self_play_concurrent_games),
-                    },
+                    "self_play_backend": backend_arg if backend_arg is not None else "auto",
+                    "self_play_shard_dir": shard_dir_arg,
+                    "mcts_simulations": int(mcts_simulations),
+                    "self_play_games": int(self_play_games),
+                    "self_play_concurrent_games": int(self_play_concurrent_games),
+                },
                 )
             if self_play_stats_json:
                 _save_json(str(self_play_stats_json), sp_stats.to_dict())
@@ -806,6 +1091,8 @@ def train_pipeline_v1(
                 max_game_plies=int(max_game_plies),
                 concurrent_games_per_device=int(self_play_concurrent_games),
                 iteration_seed=int(it_idx),
+                self_play_backend=backend_arg,
+                self_play_shard_dir=shard_dir_arg,
             )
             sp_elapsed = time.perf_counter() - sp_start
 
@@ -876,6 +1163,8 @@ def train_pipeline_v1(
                         "stage": "all",
                         "iteration": int(it_idx),
                         "self_play_devices": list(self_play_device_list),
+                        "self_play_backend": backend_arg if backend_arg is not None else "auto",
+                        "self_play_shard_dir": shard_dir_arg,
                         "self_play_concurrent_games": int(self_play_concurrent_games),
                     },
                 )
@@ -917,6 +1206,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     parser.add_argument("--self_play_concurrent_games", type=int, default=8)
+    parser.add_argument(
+        "--self_play_backend",
+        type=str,
+        default=None,
+        choices=["auto", "thread", "process"],
+        help="Optional v1 self-play backend override; default is auto.",
+    )
+    parser.add_argument(
+        "--self_play_shard_dir",
+        type=str,
+        default=None,
+        help="Optional directory for process-backend shard payloads (default uses temp dir).",
+    )
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_v1")
@@ -1011,6 +1313,8 @@ if __name__ == "__main__":
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,
         self_play_concurrent_games=args.self_play_concurrent_games,
+        self_play_backend=args.self_play_backend,
+        self_play_shard_dir=args.self_play_shard_dir,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
         devices=args.devices,

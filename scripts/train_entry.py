@@ -73,6 +73,8 @@ def _run_v1(args: argparse.Namespace) -> int:
         dirichlet_alpha=float(args.dirichlet_alpha),
         dirichlet_epsilon=float(args.dirichlet_epsilon),
         self_play_concurrent_games=int(args.self_play_concurrent_games),
+        self_play_backend=args.self_play_backend,
+        self_play_shard_dir=args.self_play_shard_dir,
         checkpoint_dir=str(args.checkpoint_dir),
         device=str(args.device),
         devices=args.devices,
@@ -121,6 +123,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     parser.add_argument("--self_play_concurrent_games", type=int, default=8)
+    parser.add_argument(
+        "--self_play_backend",
+        type=str,
+        default=None,
+        choices=["auto", "thread", "process"],
+        help="Optional v1 self-play backend override.",
+    )
+    parser.add_argument(
+        "--self_play_shard_dir",
+        type=str,
+        default=None,
+        help="Optional v1 process-backend shard directory.",
+    )
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)
     parser.add_argument("--device", type=str, default="cuda:0")

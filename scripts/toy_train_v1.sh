@@ -16,6 +16,8 @@ DEVICE="${DEVICE:-cuda:0}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints_v1}"
 DEVICES="${DEVICES:-cuda:0,cuda:1,cuda:2,cuda:3}"
 TRAIN_DEVICES="${TRAIN_DEVICES:-$DEVICE}"
+SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-auto}"
+SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
 
 mkdir -p logs
 LOG_FILE="logs/train_v1_$(date +%Y%m%d_%H%M%S).log"
@@ -26,6 +28,7 @@ echo "Log file: $LOG_FILE"
 echo "Press Ctrl+C to stop (or detach tmux session)"
 echo "Self-play devices: $DEVICES"
 echo "Train devices: $TRAIN_DEVICES"
+echo "Self-play backend: $SELF_PLAY_BACKEND"
 
 EXTRA_ARGS=()
 if [[ -n "$DEVICES" ]]; then
@@ -33,6 +36,12 @@ if [[ -n "$DEVICES" ]]; then
 fi
 if [[ -n "$TRAIN_DEVICES" ]]; then
   EXTRA_ARGS+=(--train_devices "$TRAIN_DEVICES")
+fi
+if [[ -n "$SELF_PLAY_BACKEND" ]]; then
+  EXTRA_ARGS+=(--self_play_backend "$SELF_PLAY_BACKEND")
+fi
+if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
+  EXTRA_ARGS+=(--self_play_shard_dir "$SELF_PLAY_SHARD_DIR")
 fi
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \

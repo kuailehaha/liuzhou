@@ -21,6 +21,8 @@ V0_DATA_DIR="${V0_DATA_DIR:-./v0/data/self_play}"
 V0_EVAL_GAMES="${V0_EVAL_GAMES:-20}"
 DEVICES="${DEVICES:-}"
 TRAIN_DEVICES="${TRAIN_DEVICES:-}"
+SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-}"
+SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
 
 mkdir -p logs
 LOG_FILE="logs/train_${PIPELINE}_$(date +%Y%m%d_%H%M%S).log"
@@ -35,6 +37,12 @@ fi
 if [[ -n "$TRAIN_DEVICES" ]]; then
   echo "Train devices: $TRAIN_DEVICES"
 fi
+if [[ -n "$SELF_PLAY_BACKEND" ]]; then
+  echo "Self-play backend: $SELF_PLAY_BACKEND"
+fi
+if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
+  echo "Self-play shard dir: $SELF_PLAY_SHARD_DIR"
+fi
 
 EXTRA_ARGS=()
 if [[ -n "$DEVICES" ]]; then
@@ -42,6 +50,12 @@ if [[ -n "$DEVICES" ]]; then
 fi
 if [[ -n "$TRAIN_DEVICES" ]]; then
   EXTRA_ARGS+=(--train_devices "$TRAIN_DEVICES")
+fi
+if [[ -n "$SELF_PLAY_BACKEND" ]]; then
+  EXTRA_ARGS+=(--self_play_backend "$SELF_PLAY_BACKEND")
+fi
+if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
+  EXTRA_ARGS+=(--self_play_shard_dir "$SELF_PLAY_SHARD_DIR")
 fi
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \

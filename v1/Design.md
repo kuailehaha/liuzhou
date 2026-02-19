@@ -1616,3 +1616,121 @@ Delivered:
 Guardrail:
 - `stage=all` + `train_strategy=ddp` is blocked intentionally to avoid duplicated self-play across ranks.
 - Recommended DDP workflow is staged mode with an external loop (`big_train_v1.sh`).
+
+### P3 Next: Process-Per-GPU Self-Play Refactor Plan (2026-02-19)
+Status judgment on current fix:
+- Keep as permanent: per-worker `torch.cuda.set_device(...)` binding.
+- Treat as temporary stabilization: defaulting `V1_FINALIZE_GRAPH=off` in multi-device thread mode.
+- Target architecture: one self-play process per GPU, isolated CUDA context/streams, and host-only merge at stage boundary.
+
+1. Goal and scope
+- Goal:
+  - eliminate thread-level CUDA stream/capture interference in multi-GPU self-play;
+  - keep each game trajectory fully on its assigned GPU during search and rollout;
+  - preserve existing train/infer stage contracts.
+- Out of scope:
+  - no rule/action encoding change;
+  - no MCTS algorithm change;
+  - no training-stage DDP behavior change in this refactor.
+
+2. Impact surface (planned files/modules)
+- `v1/train.py`
+  - replace `_run_self_play_multi_device` thread-pool fanout with a process coordinator;
+  - keep single-device fast path unchanged;
+  - keep shard split/merge API contract unchanged.
+- `v1/python/self_play_worker.py` (new)
+  - spawn-safe top-level worker entry;
+  - owns per-process device setup, model load, self-play execution, and shard output.
+- `scripts/big_train_v1.sh`
+  - pass backend knob and shard temp-dir knob;
+  - keep staged orchestration interface unchanged (`selfplay -> train -> infer`).
+- `tests/v1/` (new tests)
+  - process backend smoke test;
+  - worker failure propagation test.
+
+3. Invariants (must not change)
+- Total games per iteration and shard split must remain exact.
+- State transition, rule semantics, action encoding, and policy/value target schema must remain identical.
+- No inter-GPU synchronization during game/search steps.
+- Only one stage-boundary aggregation is allowed (CPU-side shard merge).
+- Seed policy remains deterministic per shard:
+  - `worker_seed = iteration_seed * 10007 + (worker_idx + 1) * 9973`.
+
+4. Risks and controls
+- Risk: CUDA fork/context instability.
+  - Control: enforce multiprocessing start method `spawn`; set device before model creation.
+- Risk: large IPC overhead from returning tensors through queues.
+  - Control: shard-file handoff (`.pt` per worker) and parent-side merge.
+- Risk: graph capture instability still appears in some shapes.
+  - Control: explicit graph mode policy (`auto|off|on`) per worker, with fallback counters and safe downgrade.
+- Risk: partial worker crash leaves incomplete outputs.
+  - Control: worker exit-code check, structured traceback propagation, and temp shard cleanup.
+- Risk: memory spikes during merge.
+  - Control: streaming merge order and immediate shard release after append.
+
+5. Verification plan
+- Functional gates:
+  - 4-GPU `stage=selfplay` completes without `cudaErrorStreamCaptureUnsupported`.
+  - shard game counts sum to requested `self_play_games`.
+  - merged self-play payload is consumable by `stage=train`.
+- Regression gates:
+  - single-GPU path behavior unchanged;
+  - fixed-seed short run keeps aggregate stats stable (`games`, `positions`, `W/L/D` totals).
+- Performance gates:
+  - compare thread vs process backend under `SELF_PLAY_CONCURRENT_GAMES=32/64/128`;
+  - verify per-GPU utilization jitter decreases and throughput is not regressed.
+- Observability gates:
+  - merged stats include per-worker counters (`finalize_graph_capture/replay/fallback`, errors).
+
+6. Deliverables
+- D1: process backend implementation with selector:
+  - `V1_SELF_PLAY_BACKEND={thread,process}`;
+  - default to `process` when `len(devices)>1` on Linux/CUDA, otherwise fallback to `thread`.
+- D2: shard persistence + merge pipeline (`selfplay_shard_<iter>_<worker>.pt`).
+- D3: robust error propagation (worker id/device/games/traceback) and cleanup behavior.
+- D4: test coverage for success path and failure path.
+
+7. Implementation loop and records
+- Step A: land process backend under opt-in flag; keep thread backend as fallback.
+- Step B: run H20 staged smoke (`selfplay -> train`) with `cg=32/64`.
+- Step C: make process backend default after gates pass.
+- Step D: write before/after metrics and decision in this `v1/Design.md`; sync action item to `TODO.md`.
+
+### P3 Next Implementation Status (2026-02-19)
+Current delivery (Step A complete):
+1. `v1/train.py`
+- Added dual backend selector for multi-device self-play:
+  - `auto|thread|process` (`--self_play_backend` and env fallback `V1_SELF_PLAY_BACKEND`).
+- Kept single-device path unchanged.
+- Split multi-device self-play into:
+  - thread backend (existing behavior, retains default `V1_FINALIZE_GRAPH=off` safety),
+  - process backend (`spawn` + `ProcessPoolExecutor`) with shard file merge.
+- Added shard workspace support:
+  - `--self_play_shard_dir` (or temp workspace with auto-clean on success).
+
+2. `v1/python/self_play_worker.py` (new)
+- New process-safe worker entry:
+  - bind device in-process,
+  - load model state,
+  - run `self_play_v1_gpu`,
+  - persist `selfplay_shard_*.pt` payload.
+- Added one-shot capture-safe fallback:
+  - if stream-capture error occurs and `V1_FINALIZE_GRAPH` is not explicitly set,
+    worker retries once with `V1_FINALIZE_GRAPH=off`.
+
+3. Entrypoints/scripts
+- `scripts/train_entry.py` forwards:
+  - `--self_play_backend`,
+  - `--self_play_shard_dir`.
+- `scripts/big_train_v1.sh`, `scripts/toy_train_v1.sh`, `scripts/toy_train.sh`:
+  - added env passthrough for `SELF_PLAY_BACKEND`, `SELF_PLAY_SHARD_DIR`.
+
+Local validation status:
+- `conda activate torchenv` + `python -m py_compile` passed for changed Python files.
+- tiny `stage=selfplay` smoke (CPU, `games=1`, `sims=1`) passed via shared entry.
+
+Remaining acceptance (Step B/C):
+1. Run H20 4-GPU `stage=selfplay` with `SELF_PLAY_BACKEND=process`.
+2. Verify no `stream is capturing` failure in multi-device process backend.
+3. Compare throughput/utilization vs thread backend under `cg=32/64/128`.
+4. After gates pass, switch default policy to process for Linux multi-CUDA.
