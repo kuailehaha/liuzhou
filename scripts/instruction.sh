@@ -156,6 +156,29 @@ echo "[step] stable run (v1, ${STABLE_DURATION_SEC}s)"
   --plot-stability \
   --output-json "$OUT_DIR/stable_v1_180s.json"
 
+echo "[step] power-efficiency probe (v1, target >=400W on H20)"
+echo "[step] profile: sims=2048, cg=128, batch=1024, sample_moves=false, finalize_graph=on"
+V1_FINALIZE_GRAPH_MAX_ENTRIES=256 \
+"$PYTHON_BIN" tools/run_selfplay_workload.py \
+  --mode v1 \
+  --device "$DEVICE" \
+  --seed "$SEED" \
+  --duration-sec "${POWER_PROBE_DURATION_SEC:-180}" \
+  --num-games-per-iter 128 \
+  --mcts-simulations "${POWER_PROBE_MCTS_SIMS:-2048}" \
+  --v1-threads 1 \
+  --v1-concurrent-games 128 \
+  --v1-child-eval-mode value_only \
+  --v1-sample-moves false \
+  --v1-finalize-graph on \
+  --v1-inference-backend py \
+  --v1-inference-batch-size 1024 \
+  --v1-inference-warmup-iters 5 \
+  --collect-step-timing \
+  --plot-step-breakdown \
+  --plot-stability \
+  --output-json "$OUT_DIR/power_probe_v1_400w_target.json"
+
 if command -v nsys >/dev/null 2>&1; then
   for CG in 32 64; do
     for FG in off on; do
