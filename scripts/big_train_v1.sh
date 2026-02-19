@@ -34,13 +34,14 @@ EVAL_GAMES_VS_RANDOM="${EVAL_GAMES_VS_RANDOM:-1000}"
 EVAL_GAMES_VS_PREVIOUS="${EVAL_GAMES_VS_PREVIOUS:-1000}"
 EVAL_MCTS_SIMULATIONS="${EVAL_MCTS_SIMULATIONS:-1024}"
 EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.05}"
-EVAL_BACKEND="${EVAL_BACKEND:-v0}" # v0 | legacy
+EVAL_BACKEND="${EVAL_BACKEND:-v1}" # v0 | legacy | v1
 EVAL_BATCH_LEAVES="${EVAL_BATCH_LEAVES:-1024}"
 EVAL_INFER_BACKEND="${EVAL_INFER_BACKEND:-graph}"
 EVAL_INFER_BATCH_SIZE="${EVAL_INFER_BATCH_SIZE:-1024}"
 EVAL_INFER_WARMUP_ITERS="${EVAL_INFER_WARMUP_ITERS:-5}"
 EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-0}" # 0 | 1
 EVAL_DEVICES="${EVAL_DEVICES:-$INFER_DEVICES}"
+EVAL_V1_CONCURRENT_GAMES="${EVAL_V1_CONCURRENT_GAMES:-64}"
 
 if [[ "$PROFILE" == "stable" ]]; then
   : "${ITERATIONS:=60}"
@@ -146,6 +147,7 @@ fi
 echo "[big_train_v1] run_eval_stage=$RUN_EVAL_STAGE eval_backend=$EVAL_BACKEND"
 echo "[big_train_v1] eval_games_vs_random=$EVAL_GAMES_VS_RANDOM eval_games_vs_previous=$EVAL_GAMES_VS_PREVIOUS"
 echo "[big_train_v1] eval_devices=$EVAL_DEVICES eval_workers=$EVAL_WORKERS eval_mcts_sims=$EVAL_MCTS_SIMULATIONS"
+echo "[big_train_v1] eval_v1_concurrent_games=$EVAL_V1_CONCURRENT_GAMES"
 
 LATEST_MODEL="${LOAD_CHECKPOINT:-}"
 if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
@@ -183,6 +185,8 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     --stage selfplay
     --device "$DEVICE"
     --devices "$SELF_PLAY_DEVICES"
+    --train_devices "$TRAIN_DEVICES"
+    --infer_devices "$INFER_DEVICES"
     --self_play_games "$SELF_PLAY_GAMES"
     --mcts_simulations "$MCTS_SIMULATIONS"
     --temperature_init "$TEMPERATURE_INIT"
@@ -217,6 +221,8 @@ for ((it = 1; it <= ITERATIONS; it++)); do
       --pipeline v1
       --stage train
       --device cuda:0
+      --devices "$LOCAL_TRAIN_DEVICES"
+      --infer_devices "$LOCAL_TRAIN_DEVICES"
       --train_devices "$LOCAL_TRAIN_DEVICES"
       --train_strategy ddp
       --batch_size "$BATCH_SIZE"
@@ -238,6 +244,8 @@ for ((it = 1; it <= ITERATIONS; it++)); do
       --pipeline v1
       --stage train
       --device "$DEVICE"
+      --devices "$TRAIN_DEVICES"
+      --infer_devices "$INFER_DEVICES"
       --train_devices "$TRAIN_DEVICES"
       --train_strategy "$TRAIN_STRATEGY"
       --batch_size "$BATCH_SIZE"
@@ -278,6 +286,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
       --inference_backend "$EVAL_INFER_BACKEND"
       --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
       --inference_warmup_iters "$EVAL_INFER_WARMUP_ITERS"
+      --v1_concurrent_games "$EVAL_V1_CONCURRENT_GAMES"
       --output_json "$EVAL_JSON"
     )
     if [[ "$EVAL_SAMPLE_MOVES" == "1" ]]; then
