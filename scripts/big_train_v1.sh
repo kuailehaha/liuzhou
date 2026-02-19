@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# High-load v1 staged training script (self-play -> train -> infer).
+# High-load v1 staged training script (self-play -> train -> eval -> infer).
 set -euo pipefail
 
 export PYTHONPATH="./:./build/v0/src:./v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -16,6 +16,7 @@ INFER_DEVICES="${INFER_DEVICES:-cuda:0,cuda:1,cuda:2,cuda:3}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints_v1_big}"
 RUN_ROOT="${RUN_ROOT:-./v1/data/stage_runs}"
 RUN_INFER_STAGE="${RUN_INFER_STAGE:-1}"
+RUN_EVAL_STAGE="${RUN_EVAL_STAGE:-1}"
 
 TEMPERATURE_INIT="${TEMPERATURE_INIT:-1.0}"
 TEMPERATURE_FINAL="${TEMPERATURE_FINAL:-0.1}"
@@ -28,6 +29,18 @@ MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
+
+EVAL_GAMES_VS_RANDOM="${EVAL_GAMES_VS_RANDOM:-40}"
+EVAL_GAMES_VS_PREVIOUS="${EVAL_GAMES_VS_PREVIOUS:-40}"
+EVAL_MCTS_SIMULATIONS="${EVAL_MCTS_SIMULATIONS:-256}"
+EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.05}"
+EVAL_BACKEND="${EVAL_BACKEND:-v0}" # v0 | legacy
+EVAL_BATCH_LEAVES="${EVAL_BATCH_LEAVES:-256}"
+EVAL_INFER_BACKEND="${EVAL_INFER_BACKEND:-graph}"
+EVAL_INFER_BATCH_SIZE="${EVAL_INFER_BATCH_SIZE:-512}"
+EVAL_INFER_WARMUP_ITERS="${EVAL_INFER_WARMUP_ITERS:-5}"
+EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-0}" # 0 | 1
+EVAL_DEVICES="${EVAL_DEVICES:-$INFER_DEVICES}"
 
 if [[ "$PROFILE" == "stable" ]]; then
   : "${ITERATIONS:=60}"
@@ -101,6 +114,10 @@ build_local_cuda_list() {
   )
 }
 
+if [[ -z "${EVAL_WORKERS:-}" ]]; then
+  EVAL_WORKERS="$(csv_count "$EVAL_DEVICES")"
+fi
+
 TRAIN_NPROC="$(csv_count "$TRAIN_DEVICES")"
 if [[ "$TRAIN_STRATEGY" == "ddp" && "$TRAIN_NPROC" -le 1 ]]; then
   echo "[big_train_v1] TRAIN_STRATEGY=ddp needs >1 gpu; fallback to data_parallel"
@@ -126,6 +143,9 @@ echo "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
 if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
   echo "[big_train_v1] self_play_shard_dir=$SELF_PLAY_SHARD_DIR"
 fi
+echo "[big_train_v1] run_eval_stage=$RUN_EVAL_STAGE eval_backend=$EVAL_BACKEND"
+echo "[big_train_v1] eval_games_vs_random=$EVAL_GAMES_VS_RANDOM eval_games_vs_previous=$EVAL_GAMES_VS_PREVIOUS"
+echo "[big_train_v1] eval_devices=$EVAL_DEVICES eval_workers=$EVAL_WORKERS eval_mcts_sims=$EVAL_MCTS_SIMULATIONS"
 
 LATEST_MODEL="${LOAD_CHECKPOINT:-}"
 if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
@@ -148,9 +168,11 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   SELFPLAY_FILE="${RUN_DIR}/selfplay_iter_${ITER_TAG}.pt"
   SELFPLAY_STATS_JSON="${RUN_DIR}/selfplay_iter_${ITER_TAG}.json"
   TRAIN_METRICS_JSON="${RUN_DIR}/train_iter_${ITER_TAG}.json"
+  EVAL_JSON="${RUN_DIR}/eval_iter_${ITER_TAG}.json"
   INFER_JSON="${RUN_DIR}/infer_iter_${ITER_TAG}.json"
   CKPT_NAME="model_iter_${ITER_TAG}.pt"
   CKPT_PATH="${CHECKPOINT_DIR}/${CKPT_NAME}"
+  PREV_MODEL_FOR_EVAL="$LATEST_MODEL"
 
   echo
   echo "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
@@ -237,6 +259,34 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   if [[ ! -f "$LATEST_MODEL" ]]; then
     echo "[big_train_v1] expected checkpoint missing: $LATEST_MODEL" >&2
     exit 1
+  fi
+
+  if [[ "$RUN_EVAL_STAGE" == "1" ]]; then
+    echo "[big_train_v1] stage=eval checkpoint=$LATEST_MODEL"
+    EVAL_CMD=(
+      "$PYTHON_BIN" scripts/eval_checkpoint.py
+      --challenger_checkpoint "$LATEST_MODEL"
+      --device "$DEVICE"
+      --eval_devices "$EVAL_DEVICES"
+      --eval_workers "$EVAL_WORKERS"
+      --backend "$EVAL_BACKEND"
+      --mcts_simulations "$EVAL_MCTS_SIMULATIONS"
+      --temperature "$EVAL_TEMPERATURE"
+      --eval_games_vs_random "$EVAL_GAMES_VS_RANDOM"
+      --eval_games_vs_previous "$EVAL_GAMES_VS_PREVIOUS"
+      --batch_leaves "$EVAL_BATCH_LEAVES"
+      --inference_backend "$EVAL_INFER_BACKEND"
+      --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
+      --inference_warmup_iters "$EVAL_INFER_WARMUP_ITERS"
+      --output_json "$EVAL_JSON"
+    )
+    if [[ "$EVAL_SAMPLE_MOVES" == "1" ]]; then
+      EVAL_CMD+=(--sample_moves)
+    fi
+    if [[ -n "$PREV_MODEL_FOR_EVAL" && -f "$PREV_MODEL_FOR_EVAL" ]]; then
+      EVAL_CMD+=(--previous_checkpoint "$PREV_MODEL_FOR_EVAL")
+    fi
+    CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_CMD[@]}"
   fi
 
   if [[ "$RUN_INFER_STAGE" == "1" ]]; then
