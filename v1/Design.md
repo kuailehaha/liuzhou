@@ -1171,3 +1171,36 @@ Observed counter snapshot:
 Interpretation:
 - Event-driven graph boundary is active in `on` mode and replaces replay-side inline execution with explicit stream-event dependency.
 - This closes R6-2 implementation scope locally; final performance conclusion remains deferred to H20 + `sims=1024` acceptance runs.
+
+### Local Smoke at `mcts_simulations=512` (RTX 3060, non-conclusive)
+Purpose:
+- Quick local check at higher simulation count before H20; this is a trend sample only, not an acceptance conclusion.
+
+Command family:
+- `tools/sweep_v1_gpu_matrix.py` with:
+  - `--mcts-simulations 512`
+  - `--threads 1`
+  - `--concurrent-games 32,64`
+  - `--backends py`
+  - `--total-games 4`
+  - `--sample-moves false`
+  - `--finalize-graph off/on`
+
+Artifacts:
+- `results/v1_gpu_matrix_local_s512_off_20260218.json`
+- `results/v1_gpu_matrix_local_s512_on_20260218.json`
+- consolidated compare: `results/v1_gpu_matrix_local_s512_compare_20260218.json`
+
+Observed snapshot:
+
+| cg | mode | games/s | pos/s | gpu util | gpu power | capture/replay/fallback |
+|---|---|---:|---:|---:|---:|---|
+| 32 | off | 0.599 | 77.3 | 16.5% | 27.9W | 0/0/144 |
+| 32 | on | 0.630 | 73.4 | 16.0% | 28.8W | 0/0/134 |
+| 64 | off | 0.807 | 100.7 | 26.2% | 28.4W | 0/0/144 |
+| 64 | on | 0.793 | 106.4 | 20.8% | 29.0W | 0/0/144 |
+
+Interpretation:
+- In this tiny local sample, throughput difference between `off/on` is small and mixed by `cg`.
+- Replay did not trigger (`capture/replay=0`) in this run, so this dataset is only a local sanity checkpoint for the `sim=512` setting.
+- Final replay-chain performance judgment remains reserved for H20 runs (`sims=1024`, longer stable duration, full nsys + validate matrix).
