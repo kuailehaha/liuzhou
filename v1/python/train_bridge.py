@@ -140,14 +140,37 @@ def train_network_from_tensors(
                 output_device=parallel_device_ids[0],
             )
 
-    states = samples.state_tensors.to(device_obj, non_blocking=True).to(torch.float32)
-    legal_masks = samples.legal_masks.to(device_obj, non_blocking=True).to(torch.bool)
-    policy_targets = samples.policy_targets.to(device_obj, non_blocking=True).to(torch.float32)
-    value_targets = samples.value_targets.to(device_obj, non_blocking=True).to(torch.float32).view(-1, 1)
-    soft_targets = samples.soft_value_targets.to(device_obj, non_blocking=True).to(torch.float32).view(-1, 1)
+    global_num_samples = int(samples.num_samples)
+    if global_num_samples <= 0:
+        return model, {"epoch_stats": [], "num_samples": 0}
+
+    # For DDP, shard on CPU first so each rank only transfers its local partition.
+    if strategy == "ddp" and ddp_world > 1:
+        states_src = samples.state_tensors[ddp_rank::ddp_world]
+        legal_src = samples.legal_masks[ddp_rank::ddp_world]
+        policy_src = samples.policy_targets[ddp_rank::ddp_world]
+        value_src = samples.value_targets[ddp_rank::ddp_world]
+        soft_src = samples.soft_value_targets[ddp_rank::ddp_world]
+    else:
+        states_src = samples.state_tensors
+        legal_src = samples.legal_masks
+        policy_src = samples.policy_targets
+        value_src = samples.value_targets
+        soft_src = samples.soft_value_targets
+
+    states = states_src.to(device_obj, non_blocking=True).to(torch.float32)
+    legal_masks = legal_src.to(device_obj, non_blocking=True).to(torch.bool)
+    policy_targets = policy_src.to(device_obj, non_blocking=True).to(torch.float32)
+    value_targets = value_src.to(device_obj, non_blocking=True).to(torch.float32).view(-1, 1)
+    soft_targets = soft_src.to(device_obj, non_blocking=True).to(torch.float32).view(-1, 1)
 
     num_samples = int(states.shape[0])
-    if num_samples == 0:
+    if num_samples <= 0:
+        if strategy == "ddp":
+            raise RuntimeError(
+                "DDP received no local samples on one rank. "
+                "Increase self-play samples or reduce world size."
+            )
         return model, {"epoch_stats": [], "num_samples": 0}
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -161,9 +184,6 @@ def train_network_from_tensors(
 
     for epoch in range(max(1, int(epochs))):
         perm = _train_permutation(num_samples, device_obj)
-        if strategy == "ddp" and ddp_world > 1:
-            dist.broadcast(perm, src=0)
-            perm = perm[ddp_rank::ddp_world]
         total_loss_sum = 0.0
         policy_loss_sum = 0.0
         value_loss_sum = 0.0
@@ -175,11 +195,6 @@ def train_network_from_tensors(
         mix_batches = 0
 
         local_count = int(perm.numel())
-        if strategy == "ddp" and local_count <= 0:
-            raise RuntimeError(
-                "DDP received no local samples on one rank. "
-                "Increase self-play samples or reduce world size."
-            )
         for start in range(0, local_count, bsz):
             end = min(start + bsz, local_count)
             idx = perm[start:end]
@@ -297,7 +312,7 @@ def train_network_from_tensors(
 
     return model, {
         "epoch_stats": epoch_stats,
-        "num_samples": num_samples,
+        "num_samples": global_num_samples,
         "parallel_strategy": strategy,
         "ddp_world_size": ddp_world,
     }

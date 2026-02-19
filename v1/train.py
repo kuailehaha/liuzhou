@@ -204,6 +204,7 @@ def _run_self_play_shard(
     dirichlet_epsilon: float,
     soft_value_k: float,
     max_game_plies: int,
+    concurrent_games_per_device: int,
     seed: int,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     torch.manual_seed(int(seed))
@@ -215,7 +216,7 @@ def _run_self_play_shard(
     local_model.to(torch.device(shard_device))
     local_model.eval()
 
-    shard_concurrent = max(1, min(int(shard_games), 8))
+    shard_concurrent = max(1, min(int(shard_games), int(concurrent_games_per_device)))
     samples, stats = self_play_v1_gpu(
         model=local_model,
         num_games=int(shard_games),
@@ -251,11 +252,12 @@ def _run_self_play_multi_device(
     dirichlet_epsilon: float,
     soft_value_k: float,
     max_game_plies: int,
+    concurrent_games_per_device: int,
     iteration_seed: int,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     if len(devices) <= 1:
         single_device = devices[0]
-        shard_concurrent = max(1, min(int(num_games), 8))
+        shard_concurrent = max(1, min(int(num_games), int(concurrent_games_per_device)))
         return self_play_v1_gpu(
             model=model,
             num_games=int(num_games),
@@ -304,6 +306,7 @@ def _run_self_play_multi_device(
                 dirichlet_epsilon=float(dirichlet_epsilon),
                 soft_value_k=float(soft_value_k),
                 max_game_plies=int(max_game_plies),
+                concurrent_games_per_device=int(concurrent_games_per_device),
                 seed=int(worker_seed),
             )
             future_map[future] = (worker_idx, shard_dev, shard_games)
@@ -560,6 +563,7 @@ def train_pipeline_v1(
     exploration_weight: float = 1.0,
     dirichlet_alpha: float = 0.3,
     dirichlet_epsilon: float = 0.25,
+    self_play_concurrent_games: int = 8,
     checkpoint_dir: str = "./checkpoints_v1",
     device: str = "cpu",
     devices: Optional[str] = None,
@@ -643,6 +647,7 @@ def train_pipeline_v1(
                 dirichlet_epsilon=float(dirichlet_epsilon),
                 soft_value_k=float(soft_value_k),
                 max_game_plies=int(max_game_plies),
+                concurrent_games_per_device=int(self_play_concurrent_games),
                 iteration_seed=1,
             )
             output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
@@ -653,10 +658,11 @@ def train_pipeline_v1(
                 metadata={
                     "stage": "selfplay",
                     "self_play_devices": list(self_play_device_list),
-                    "mcts_simulations": int(mcts_simulations),
-                    "self_play_games": int(self_play_games),
-                },
-            )
+                        "mcts_simulations": int(mcts_simulations),
+                        "self_play_games": int(self_play_games),
+                        "self_play_concurrent_games": int(self_play_concurrent_games),
+                    },
+                )
             if self_play_stats_json:
                 _save_json(str(self_play_stats_json), sp_stats.to_dict())
             _print_rank0(
@@ -775,6 +781,7 @@ def train_pipeline_v1(
                 dirichlet_epsilon=float(dirichlet_epsilon),
                 soft_value_k=float(soft_value_k),
                 max_game_plies=int(max_game_plies),
+                concurrent_games_per_device=int(self_play_concurrent_games),
                 iteration_seed=int(it_idx),
             )
             sp_elapsed = time.perf_counter() - sp_start
@@ -846,6 +853,7 @@ def train_pipeline_v1(
                         "stage": "all",
                         "iteration": int(it_idx),
                         "self_play_devices": list(self_play_device_list),
+                        "self_play_concurrent_games": int(self_play_concurrent_games),
                     },
                 )
 
@@ -885,6 +893,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exploration_weight", type=float, default=1.0)
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
+    parser.add_argument("--self_play_concurrent_games", type=int, default=8)
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_v1")
@@ -978,6 +987,7 @@ if __name__ == "__main__":
         exploration_weight=args.exploration_weight,
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,
+        self_play_concurrent_games=args.self_play_concurrent_games,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
         devices=args.devices,

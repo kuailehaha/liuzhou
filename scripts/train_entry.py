@@ -72,6 +72,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         exploration_weight=float(args.exploration_weight),
         dirichlet_alpha=float(args.dirichlet_alpha),
         dirichlet_epsilon=float(args.dirichlet_epsilon),
+        self_play_concurrent_games=int(args.self_play_concurrent_games),
         checkpoint_dir=str(args.checkpoint_dir),
         device=str(args.device),
         devices=args.devices,
@@ -119,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exploration_weight", type=float, default=1.0)
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
+    parser.add_argument("--self_play_concurrent_games", type=int, default=8)
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)
     parser.add_argument("--device", type=str, default="cuda:0")

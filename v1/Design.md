@@ -1597,6 +1597,7 @@ Delivered:
 2. DDP-ready train bridge in `v1/python/train_bridge.py`
    - Added `parallel_strategy={none,data_parallel,ddp}`.
    - `ddp` mode supports per-rank sharded batches and epoch metric all-reduce.
+   - Optimization: each rank now pre-shards CPU samples before H2D transfer (avoid loading full batch on every rank).
    - Existing single-process DataParallel path remains compatible.
 3. Shared launcher passthrough in `scripts/train_entry.py`
    - Added forwarding of stage/strategy and staged IO args:
@@ -1610,6 +1611,7 @@ Delivered:
      - `PROFILE=aggressive`: 80 iters, 16384 games, 2048 sims, batch 12288.
    - Runs staged loop: `selfplay -> train -> infer`.
    - Supports `TRAIN_STRATEGY=ddp` using `torchrun --nproc_per_node=<gpu_count>`.
+   - Added `SELF_PLAY_CONCURRENT_GAMES` knob (default `32`) for higher H20 utilization.
 
 Guardrail:
 - `stage=all` + `train_strategy=ddp` is blocked intentionally to avoid duplicated self-play across ranks.

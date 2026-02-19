@@ -25,6 +25,7 @@ DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.3}"
 DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
 SOFT_VALUE_K="${SOFT_VALUE_K:-2.0}"
 MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
+SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
 
 if [[ "$PROFILE" == "stable" ]]; then
   : "${ITERATIONS:=60}"
@@ -118,6 +119,7 @@ echo "[big_train_v1] train_devices=$TRAIN_DEVICES"
 echo "[big_train_v1] infer_devices=$INFER_DEVICES"
 echo "[big_train_v1] checkpoints=$CHECKPOINT_DIR"
 echo "[big_train_v1] run_dir=$RUN_DIR"
+echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 
 LATEST_MODEL="${LOAD_CHECKPOINT:-}"
 if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
@@ -156,6 +158,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     --dirichlet_epsilon "$DIRICHLET_EPSILON"
     --soft_value_k "$SOFT_VALUE_K"
     --max_game_plies "$MAX_GAME_PLIES"
+    --self_play_concurrent_games "$SELF_PLAY_CONCURRENT_GAMES"
     --checkpoint_dir "$CHECKPOINT_DIR"
     --self_play_output "$SELFPLAY_FILE"
     --self_play_stats_json "$SELFPLAY_STATS_JSON"
