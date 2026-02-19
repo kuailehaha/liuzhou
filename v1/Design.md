@@ -1458,3 +1458,45 @@ P4: Power optimization (secondary KPI)
   - then evaluate if software tuning still has headroom.
 - Exit criteria:
   - power conclusions are separated from infra cap constraints.
+
+### Replay Headroom Audit (H20, 2026-02-19)
+Goal:
+- Decide whether replay path still has meaningful optimization space, or whether engineering focus should move to shared training entry.
+
+Evidence set:
+- Pre-R6-3 stable:
+  - `results/v1_matrix_h20/20260219_074031/stable_v1_180s.json`
+- Post-R6-3 stable:
+  - `results/v1_matrix_h20/20260219_090803/stable_v1_180s.json`
+- Post-R6-3 power probes:
+  - `results/v1_matrix_h20/20260219_090803/power_probe_v1_400w_target.json`
+  - `results/v1_matrix_h20/20260219_094527/power_probe_v1_400w_target.json`
+
+Quantitative replay progression:
+
+| run | replay | fallback | replay coverage | games/s | pack_writeback ratio |
+|---|---:|---:|---:|---:|---:|
+| pre-R6-3 stable (`074031`) | 564 | 12972 | 4.17% | 33.135 | 42.77% |
+| post-R6-3 stable (`090803`) | 9203 | 6061 | 60.29% | 37.531 | 23.67% |
+| post-R6-3 probe (`090803`) | 7872 | 2064 | 79.23% | 48.759 | 23.77% |
+| aggressive probe (`094527`) | 2161 | 1151 | 65.25% | 65.016 | 18.74% |
+
+Interpretation:
+1. Replay optimization has already delivered a large jump:
+   - coverage from `4.17%` to `60.29%` in stable run;
+   - corresponding stable throughput rise (`33.135 -> 37.531 games/s`).
+2. There is still some replay headroom (fallback not zero), but it is no longer the only dominant bottleneck:
+   - in latest high-load run, `root_puct` is already `~75.7%` of tracked step time.
+3. Current short matrix files do not represent replay behavior:
+   - `matrix_py_*` uses `total_games=8`, so wave size is too small to trigger replay eligibility consistently (`capture/replay=0` there is expected and non-diagnostic).
+4. Cache-limit signal exists:
+   - capture count hits configured cap (`64` in stable default, `256` in power probe), indicating shape diversity can still push uncached fallback.
+
+Decision:
+- Replay path still has incremental optimization space, but this is no longer a hard blocker.
+- It is reasonable to start shared training entry refactor now (`P2`) and treat replay tuning as parallel/secondary (`P1`) work.
+
+Minimal replay follow-up (non-blocking):
+1. Add fallback reason counters (`not_can_graph`, `cache_full`, `capture_fail`) for precise attribution.
+2. Keep replay-evaluation workloads at `total_games >= concurrent_games` to avoid false zero-replay conclusions.
+3. Optionally increase default `V1_FINALIZE_GRAPH_MAX_ENTRIES` for H20 production profile after memory/latency check.
