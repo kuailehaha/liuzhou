@@ -1761,3 +1761,9 @@ Delivered after first H20 staged run feedback:
   - `SELF_PLAY_MEMORY_ANCHOR_MB`.
 - Added worker-side fixed memory anchor in `v1/python/self_play_worker.py`:
   - keep a configurable CUDA anchor tensor alive per worker process to reduce allocator churn.
+
+4. Self-play shard memory safety
+- Updated `v1/python/self_play_worker.py` to run each shard in fixed-size game chunks
+  (`games_per_chunk = concurrent_games_per_device`) and merge chunk outputs on CPU.
+- This bounds GPU memory by per-device concurrency and removes the direct linear coupling
+  between `SELF_PLAY_GAMES` and worker GPU peak memory.

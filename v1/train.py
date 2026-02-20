@@ -576,7 +576,16 @@ def _run_self_play_multi_device_process(
             shard_path = str(row.get("output_path", ""))
             if not shard_path:
                 raise RuntimeError(f"Missing shard output path in worker row: {row}")
-            batch_cpu, stats_payload, _meta_payload = _load_self_play_payload(shard_path)
+            batch_cpu, stats_payload, meta_payload = _load_self_play_payload(shard_path)
+            if isinstance(meta_payload, dict) and meta_payload:
+                _print_rank0(
+                    "[v1.train] self-play shard merged "
+                    f"worker={int(meta_payload.get('worker_idx', row.get('worker_idx', 0)))} "
+                    f"device={meta_payload.get('device', '')} "
+                    f"games={int(meta_payload.get('games', 0))} "
+                    f"chunks={int(meta_payload.get('num_chunks', 1))} "
+                    f"games_per_chunk={int(meta_payload.get('games_per_chunk', meta_payload.get('games', 0)))}"
+                )
             batches.append(batch_cpu)
             stats_list.append(_self_play_stats_from_payload(stats_payload))
 
