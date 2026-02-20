@@ -1471,53 +1471,108 @@ Protocol:
 Output contract:
 - one JSON report per round + one aggregated summary report.
 
-#### RWD-1: Fixed first reward formula (no extra switch surface)
+#### RWD-1: Objective alignment (updated)
 Goal:
-- inject dense intermediate signal while preserving zero-sum terminal semantics.
+- improve self-play data effectiveness for general policy strength.
+- keep `vs_random` as a probe-only regression test, not a training objective binding.
 
-Fixed formula:
+Policy statement:
+- do not optimize reward directly for "beating random".
+- use `vs_random` only as a health indicator that catches collapse or overfitting drift.
+
+#### RWD-2: Evidence-backed reward design principles
+References used for this design:
+- AlphaZero baseline uses terminal outcome target `z in {-1,0,1}` (`draw=0`), which becomes sparse under high-draw regimes.
+- Lc0 practice uses `DrawScore/Contempt` to bias draw utility when pure draw utility is too neutral.
+- KataGo adds utility beyond binary win/loss to provide denser and more learnable targets.
+- Potential-based shaping (PBRS) gives a way to add dense signal with policy-invariance guarantees in MDP/stochastic-game settings.
+
+Design interpretation for Liuzhou:
+- keep terminal win/loss semantics as the core target.
+- add draw-aware utility and dense shaping using already available tensors (`soft_value`, `moves_since_capture`) without rule changes.
+- keep zero-sum sign convention strict (`white_target = -black_target`).
+
+#### RWD-3: Fixed Liuzhou reward formula (no extra switch surface)
+Black-perspective definitions:
 ```text
-terminal = result_from_black
-dense_piece = 0.20 * (soft_t - soft_{t-1})
-anti_draw = -0.002 if moves_since_capture >= 24 else 0
-step_reward = clip(dense_piece + anti_draw, -0.2, 0.2)
-target_return_t = terminal + sum(step_reward from t to T-1)
-white_target = -black_target (保持零和符号一致)
+z_base = result_from_black                    # +1 / -1 / 0
+soft_t = tanh(k * material_delta_t)           # existing soft value, in [-1, 1]
+nc_t = clamp(moves_since_capture_t / 36, 0, 1)
+
+# Draw-aware terminal utility (only when game ends in draw)
+z_draw = 0.25 * soft_T if z_base == 0 else 0
+z_term = z_base + z_draw
+
+# Potential term (progress + material pressure)
+phi_t = 0.7 * soft_t + 0.3 * (1 - nc_t)
+
+# PBRS-style dense increment
+r_shape_t = clip(0.25 * (phi_{t+1} - phi_t), -0.08, 0.08)
+
+# Per-step training return
+target_return_t = clip(z_term + sum_{tau=t..T-1}(r_shape_tau), -1.25, 1.25)
+white_target_t = -black_target_t
 ```
 
-Implementation boundary:
-- reward construction and per-step accumulation in:
+Rationale:
+- `z_base` keeps true game outcome semantics.
+- `z_draw` breaks fully neutral draw collapse without introducing fixed color bias.
+- `phi_t` uses two existing, game-relevant signals:
+  - `soft_t`: material pressure proxy,
+  - `1 - nc_t`: anti-stagnation proxy near `NO_CAPTURE_DRAW_LIMIT`.
+- difference-form shaping keeps reward dense but resists loop-hacking better than raw per-step constants.
+
+#### RWD-4: Implementation boundary
+- reward construction and accumulation:
   - `v1/python/self_play_gpu_runner.py`
   - `v1/python/trajectory_buffer.py`
-- report and training-side field continuity in:
+- target persistence/report continuity:
   - `v1/train.py`
+- optional kernel-side acceleration only after semantics are validated:
+  - `v0/src/bindings/module.cpp` (`finalize_trajectory_inplace` path)
 
 Invariants:
 - no rule change,
 - no action encoding change,
-- no API break on staged entrypoints.
+- no staged API break.
 
-#### RWD-2: Gate criteria (3-round mean)
-Required thresholds:
-- `decisive_game_ratio >= 1%`
-- `value_target_summary.nonzero_ratio >= 1%`
-- `draw_game_ratio <= 99%`
+#### RWD-5: Gate criteria (3-round mean)
+Self-play effectiveness gates:
+- `decisive_game_ratio >= 2%`
+- `value_target_summary.nonzero_ratio >= 5%`
+- `draw_game_ratio <= 98%`
 - `positions_per_sec >= 85%` of RWD-0 baseline
 
-Decision rule:
-- only if all thresholds pass, proceed to scaled training acceptance.
+Probe-only evaluation gate (`vs_random`):
+- run every round, but not as reward objective.
+- no severe regression vs baseline:
+  - win rate drop <= 1 percentage point,
+  - loss rate increase <= 0.5 percentage point.
 
-#### RWD-3: Scale acceptance in big-train loop
+Decision rule:
+- proceed to scaled training acceptance only if all self-play effectiveness gates pass.
+
+#### RWD-6: Scale acceptance in big-train loop
 Goal:
 - validate that reward gains remain under production workload.
 
 Protocol:
 - run `scripts/big_train_v1.sh` with reward-enabled branch.
-- verify RWD-2 metrics do not regress below gate.
+- verify RWD-5 metrics do not regress below gate.
 - verify stability is not degraded:
   - no new capture-related crashes,
   - no new shard merge corruption,
   - no new memory/capture regressions in process backend.
+
+#### External reference anchors
+- AlphaZero: https://ar5iv.org/html/1712.01815
+- Lc0 draw utility / contempt:
+  - https://draft.lczero.org/blog/2020/09/contempt/
+  - https://lczero.org/play/configuration/flags/
+- KataGo utility-rich target design: https://ar5iv.org/html/1902.10565
+- PBRS foundation:
+  - https://robotics.stanford.edu/~ang/papers/shaping-icml99.ps
+  - https://arxiv.org/abs/1401.3907
 
 ### Public Interfaces (Document-Frozen)
 No code API change is required for this phase. Documentation references must stay aligned with current interfaces:
@@ -1539,7 +1594,8 @@ Data-effectiveness standard fields (must be preserved in reports):
 - associated counts in `value_target_summary`
 
 ### Delivery Checklist for the Next Change Set
-1. Implement RWD-1 formula exactly as specified (no additional runtime switches).
-2. Produce RWD-0 and RWD-2 reports with reproducible seeds and 3-round aggregation.
-3. Run one scaled acceptance cycle under `big_train_v1.sh` and record RWD-3 results.
-4. Sync `TODO.md` and this `v1/Design.md` with measured outcomes and pass/fail decision.
+1. Implement RWD-3 formula exactly as specified (no additional runtime switches).
+2. Produce RWD-0 and RWD-5 reports with reproducible seeds and 3-round aggregation.
+3. Run one scaled acceptance cycle under `big_train_v1.sh` and record RWD-6 results.
+4. Sync `TODO.md` and this `v1/Design.md` with measured outcomes, including probe-only `vs_random` regression checks.
+
