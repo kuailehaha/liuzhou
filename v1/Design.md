@@ -1757,7 +1757,7 @@ Delivered after first H20 staged run feedback:
 
 3. Self-play memory jitter controls
 - Added self-play allocator controls in `scripts/big_train_v1.sh`:
-  - `SELF_PLAY_ALLOC_CONF` -> `PYTORCH_CUDA_ALLOC_CONF`,
+  - `SELF_PLAY_ALLOC_CONF` -> `PYTORCH_ALLOC_CONF`,
   - `SELF_PLAY_MEMORY_ANCHOR_MB`.
 - Added worker-side fixed memory anchor in `v1/python/self_play_worker.py`:
   - keep a configurable CUDA anchor tensor alive per worker process to reduce allocator churn.

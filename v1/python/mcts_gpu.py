@@ -778,6 +778,53 @@ class V1RootMCTS:
             )
         return t
 
+    @staticmethod
+    def _stable_legal_policy_from_visits(
+        *,
+        visits: torch.Tensor,
+        valid_mask: torch.Tensor,
+        root_temps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build a numerically stable policy from visits and temperature.
+
+        Avoid ``visits ** (1 / T)`` overflow at low T by working in log-space:
+        ``softmax(log(visits) / T)`` on legal actions only.
+        """
+        mask_f = valid_mask.to(torch.float32)
+        safe_visits = torch.nan_to_num(
+            visits.to(torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(1e-8)
+        safe_temps = torch.nan_to_num(
+            root_temps.to(torch.float32),
+            nan=1.0,
+            posinf=1.0,
+            neginf=1.0,
+        ).clamp_min(1e-6).view(-1, 1)
+
+        logits = torch.log(safe_visits) / safe_temps
+        logits = logits.masked_fill(~valid_mask, float("-inf"))
+
+        row_max = logits.max(dim=1, keepdim=True).values
+        row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
+
+        exp_logits = torch.exp(logits - row_max) * mask_f
+        exp_logits = torch.nan_to_num(exp_logits, nan=0.0, posinf=0.0, neginf=0.0)
+        row_sum = exp_logits.sum(dim=1, keepdim=True)
+
+        fallback = mask_f / mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+        no_valid = mask_f.sum(dim=1).eq(0.0)
+        fallback[no_valid, 0] = 1.0
+
+        probs = exp_logits / row_sum.clamp_min(1e-8)
+        bad_rows = torch.logical_or(~torch.isfinite(row_sum.view(-1)), row_sum.view(-1).le(0.0))
+        probs = torch.where(bad_rows.view(-1, 1), fallback, probs)
+        probs = probs * mask_f
+        probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+
     def search_batch(
         self,
         state: GpuStateBatch,
@@ -890,12 +937,11 @@ class V1RootMCTS:
                 )
             if sample_moves:
                 with self._nvtx_range("v1.root_sample_outside_graph"), self._timed("pack_writeback_ms"):
-                    legal_policy = torch.pow(
-                        visits.clamp_min(1e-8),
-                        1.0 / root_temps.clamp_min(1e-6).view(-1, 1),
+                    legal_policy = self._stable_legal_policy_from_visits(
+                        visits=visits,
+                        valid_mask=valid_mask,
+                        root_temps=root_temps,
                     )
-                    legal_policy = legal_policy * valid_mask.to(torch.float32)
-                    legal_policy = legal_policy / legal_policy.sum(dim=1, keepdim=True).clamp_min(1e-8)
                     local_picks = torch.multinomial(legal_policy, num_samples=1).view(-1)
                     sampled_indices_local = legal_index_mat.gather(1, local_picks.view(-1, 1)).view(-1)
                     sampled_codes_local = action_code_mat.gather(
