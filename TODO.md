@@ -1,6 +1,25 @@
 # TODOS
 
-TODO以产生时间为准。最近审查：2026.02.09
+TODO以产生时间为准。最近审查：2026.02.20
+
+### 2026.02.20
+
+#### 已完成加速里程碑（v1 主线）
+
+- [x] 完成 v1 staged 流水线（`v1/train.py`，`--stage all/selfplay/train/infer`）
+- [x] 完成多 GPU 自博弈 process-per-GPU 分片与 shard 合并（`v1/python/self_play_worker.py`）
+- [x] 完成训练阶段 DataParallel/DDP 路径与按 rank 预分片 H2D（`v1/python/train_bridge.py`）
+- [x] 完成统一训练入口与大规模训练脚本（`scripts/train_entry.py`、`scripts/big_train_v1.sh`）
+- [x] 完成 v1 评估后端与并发参数贯通（`scripts/eval_checkpoint.py --backend v1`）
+- [x] 完成自博弈有效性信号输出（`decisive_game_ratio`、`draw_game_ratio`、`value_target_summary`）
+
+#### RWD 奖励机制待办（下一阶段主目标）
+
+- [ ] RWD-0（基线冻结）：固定当前配置跑 3 轮 selfplay-only，记录 `decisive_game_ratio`、`draw_game_ratio`、`value_target_summary.nonzero_ratio`、`games_per_sec`、`positions_per_sec`
+- [ ] RWD-1（固定公式首版）：在 `v1/python/self_play_gpu_runner.py` + `v1/python/trajectory_buffer.py` 定义并回填逐步奖励回报，在 `v1/train.py` 接入统计；公式固定为  
+      `terminal=result_from_black`，`dense_piece=0.20*(soft_t-soft_{t-1})`，`anti_draw=-0.002 if moves_since_capture>=24 else 0`，`step_reward=clip(dense_piece+anti_draw,-0.2,0.2)`，`target_return_t=terminal+sum(step_reward from t to T-1)`，`white_target=-black_target`
+- [ ] RWD-2（门槛验收，3 轮均值）：`decisive_game_ratio >= 1%`，`value_target_summary.nonzero_ratio >= 1%`，`draw_game_ratio <= 99%`，`positions_per_sec >= baseline * 85%`
+- [ ] RWD-3（放量验收）：接入 `scripts/big_train_v1.sh` 后，RWD-2 指标不回退，且分片/显存稳定性不引入新的 capture 类崩溃
 
 ### 2025.10.20
 
@@ -33,7 +52,7 @@ TODO以产生时间为准。最近审查：2026.02.09
 - [ ] 并行化DDP训练或实现"自对弈集群+训练服务器"模式
 - [x] ~~确认代码实现逻辑~~ （早期探索性条目，已通过 tests/ 体系充分验证）
 - [ ] 模型结构和超参调优（持续性任务）
-- [ ] 对场上棋子实现reward并检查效果 —— soft_value（棋子差 tanh）已用于投降判断（`self_play_runner.py`），但尚未作为训练中间奖励信号
+- [ ] 在 v1 自博弈中实现中间奖励并检查效果 —— 当前 `v1/python/self_play_gpu_runner.py` + `v1/python/trajectory_buffer.py` 以终局目标回填为主，尚未按步累计奖励回报
 
 ### 2025.10.27
 
@@ -55,7 +74,7 @@ TODO以产生时间为准。最近审查：2026.02.09
 - [x] 实现 v1/game 张量化状态转换与规则逻辑
 - [x] 完成 v1/game/move_encoder.py 动作编码与解码
 - [x] 写出 VectorizedMCTS 主流程并替换自博弈调度
-- [x] ~~打通 v1/self_play -> v1/train 张量化训练闭环~~ （v1 已废弃删除，功能由 v0 C++ 管线承接）
+- [x] 打通 v1/self_play -> v1/train 张量化训练闭环（当前由 `v1/train.py` + `v1/python/train_bridge.py` 承接）
 - [x] 为 v1 分支新增测试与对照验证脚本
 
 ### 2025.10.31
@@ -72,7 +91,7 @@ TODO以产生时间为准。最近审查：2026.02.09
 - [x] 如有需要新增 batched gather/reshape 等张量工具函数
 - [x] 编写 cross-check 脚本对比两套管线的输入张量与动作分布
 - [x] 更新自博弈/MCTS/训练脚本调用路径切换至 v1 张量化实现
-- [x] ~~README/TODO 记录切换方式与验证状态~~ （v1 已废弃，v0 管线文档见 `v0/v0_pipeline_notes.md`）
+- [x] README/TODO 记录切换方式与验证状态（当前主线以 v1 流水线为准）
 - [ ] Future: unify policy heads (head1=place/move-to, head2=move-from, head3=mark+all removals) and drop phase one-hot channels when legacy parity is secured.
 
 ### 2025.11.2
@@ -114,7 +133,7 @@ TODO以产生时间为准。最近审查：2026.02.09
 
 - [x] 将 v0 C++ 扩展的 MSVC 编译支持扩展到 Linux（CMake + Ninja）
 - [x] 清理测试代码，整理测试目录结构
-- [x] 删除 v1 目录（已废弃的张量化方案）
+- [x] 梳理并重建 v1 目录（从早期试验版演进为当前主线）
 - [x] 合并 v0/TODO.md 到根目录
 - [x] 整理说明文件（MD文档）
 - [ ] 进行大规模训练（当前 toy_train.sh 规模：40 iterations × 6400 games/iter）

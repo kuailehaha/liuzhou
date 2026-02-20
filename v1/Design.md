@@ -1416,354 +1416,130 @@ Overall phase result:
 - R6 is accepted for mechanism completion, but optimization acceptance is **partial**; further work is required to make graph-on consistently superior across representative shapes.
 
 ### Next Plan (Project-Manager Priority)
-P0: Reproducible off/on comparison protocol
-- Goal:
-  - remove baseline drift when comparing `finalize_graph=off/on`.
-- Tasks:
-  - add a compare mode that reuses one fixed `v0` baseline for both `off` and `on` v1 runs;
-  - increase rounds/workload for on/off A/B judgment.
-- Exit criteria:
-  - off/on conclusion is stable across repeated runs.
 
-P1: Raise replay coverage on main training shapes
-- Goal:
-  - turn `R6` from mechanism-ready to consistently beneficial.
-- Tasks:
-  - prioritize shape-stable paths used by training (`cg=64+`, `sims=1024+`);
-  - reduce fallback causes in finalize replay path and keep cache-hit growth.
-- Exit criteria:
-  - replay coverage stays high and fallback decreases in both stable and matrix runs.
+### Current Status (2026-02-20)
 
-P2: Shared training entry (`v0`/`v1` selectable by arg)
-- Decision:
-  - **Recommended now** (engineering efficiency).
-- Scope:
-  - one launcher with `--pipeline {v0,v1}` and aligned common knobs.
-- Exit criteria:
-  - one command can reproduce both baselines and training runs.
+#### Evidence anchors (code + records)
+- Commits (ordered by feature delivery):
+  - `49d2e2d` staged v1 selfplay-train-infer flow + 4-GPU launcher
+  - `046b4dc` higher staged throughput via self-play concurrency + DDP local CPU sharding before H2D
+  - `ff807eb` process-per-GPU self-play with shard merge and backend controls
+  - `6fdbc54` post-train staged evaluation report (`vs random` / `vs previous`)
+  - `4415377` v1 evaluation backend with concurrent search controls
+  - `12258aa` decisive self-play signal reporting + v1-parallel eval controls
+  - `514616e` log-space visit sampling in v1 MCTS (low-temperature stability)
+  - `96dd8b1` chunked process worker self-play to decouple peak memory from total shard games
+- Runtime log anchor:
+  - `logs/big_train_v1_20260220_015020.log`
+- Profiling baseline anchor:
+  - `results/nsys_v1_r6_clean_baseline_matrix_20260218.json`
 
-P3: Multi-GPU enablement for v1
-- Decision:
-  - **Recommended after P0/P1**, because single-card replay behavior must be stable first.
-- Scope:
-  - self-play sharding + training side parallelism (DDP or equivalent), with deterministic aggregation.
-- Exit criteria:
-  - near-linear scale on 2->4 GPUs for target workload family.
+#### Consolidated conclusion
+- V1 acceleration pipeline is complete for production training flow:
+  - staged self-play/train/eval/infer,
+  - process-per-GPU self-play sharding,
+  - DDP train-stage support,
+  - v1 eval backend with concurrent search controls.
+- The current bottleneck is **self-play data effectiveness**, not throughput:
+  - in `logs/big_train_v1_20260220_015020.log`, many iterations show near-100% draw rate,
+  - `value_target_summary.nonzero_ratio` collapses close to 0 in later iterations.
+- Therefore, the next major work package is reward-driven self-play reform to increase effective samples while preserving throughput/stability.
 
-P4: Power optimization (secondary KPI)
-- Decision:
-  - do not use board power as primary acceptance KPI; use throughput first.
-- Tasks:
-  - verify server-side power limit/permission (`nvidia-smi -q -d POWER`);
-  - then evaluate if software tuning still has headroom.
-- Exit criteria:
-  - power conclusions are separated from infra cap constraints.
+#### Runtime defaults currently used in large-scale run
+From `scripts/big_train_v1.sh` (`PROFILE=aggressive`):
+- `self_play_games=524288`
+- `mcts_simulations=4096`
+- `batch_size=16384`
+- `self_play_concurrent_games=8192`
+- self-play backend default: `process`
 
-### Replay Headroom Audit (H20, 2026-02-19)
+### Reward-Driven Self-Play Roadmap (RWD)
+
+#### RWD-0: Baseline freeze (must pass first)
 Goal:
-- Decide whether replay path still has meaningful optimization space, or whether engineering focus should move to shared training entry.
+- freeze a reproducible baseline before reward changes.
 
-Evidence set:
-- Pre-R6-3 stable:
-  - `results/v1_matrix_h20/20260219_074031/stable_v1_180s.json`
-- Post-R6-3 stable:
-  - `results/v1_matrix_h20/20260219_090803/stable_v1_180s.json`
-- Post-R6-3 power probes:
-  - `results/v1_matrix_h20/20260219_090803/power_probe_v1_400w_target.json`
-  - `results/v1_matrix_h20/20260219_094527/power_probe_v1_400w_target.json`
+Protocol:
+- run 3 rounds with current configuration in selfplay-only stage.
+- collect the following fields for each round and the 3-round mean:
+  - `decisive_game_ratio`
+  - `draw_game_ratio`
+  - `value_target_summary.nonzero_ratio`
+  - `games_per_sec`
+  - `positions_per_sec`
 
-Quantitative replay progression:
+Output contract:
+- one JSON report per round + one aggregated summary report.
 
-| run | replay | fallback | replay coverage | games/s | pack_writeback ratio |
-|---|---:|---:|---:|---:|---:|
-| pre-R6-3 stable (`074031`) | 564 | 12972 | 4.17% | 33.135 | 42.77% |
-| post-R6-3 stable (`090803`) | 9203 | 6061 | 60.29% | 37.531 | 23.67% |
-| post-R6-3 probe (`090803`) | 7872 | 2064 | 79.23% | 48.759 | 23.77% |
-| aggressive probe (`094527`) | 2161 | 1151 | 65.25% | 65.016 | 18.74% |
-
-Interpretation:
-1. Replay optimization has already delivered a large jump:
-   - coverage from `4.17%` to `60.29%` in stable run;
-   - corresponding stable throughput rise (`33.135 -> 37.531 games/s`).
-2. There is still some replay headroom (fallback not zero), but it is no longer the only dominant bottleneck:
-   - in latest high-load run, `root_puct` is already `~75.7%` of tracked step time.
-3. Current short matrix files do not represent replay behavior:
-   - `matrix_py_*` uses `total_games=8`, so wave size is too small to trigger replay eligibility consistently (`capture/replay=0` there is expected and non-diagnostic).
-4. Cache-limit signal exists:
-   - capture count hits configured cap (`64` in stable default, `256` in power probe), indicating shape diversity can still push uncached fallback.
-
-Decision:
-- Replay path still has incremental optimization space, but this is no longer a hard blocker.
-- It is reasonable to start shared training entry refactor now (`P2`) and treat replay tuning as parallel/secondary (`P1`) work.
-
-Minimal replay follow-up (non-blocking):
-1. Add fallback reason counters (`not_can_graph`, `cache_full`, `capture_fail`) for precise attribution.
-2. Keep replay-evaluation workloads at `total_games >= concurrent_games` to avoid false zero-replay conclusions.
-3. Optionally increase default `V1_FINALIZE_GRAPH_MAX_ENTRIES` for H20 production profile after memory/latency check.
-
-### P2 Kickoff: Shared Training Entry (2026-02-19)
+#### RWD-1: Fixed first reward formula (no extra switch surface)
 Goal:
-- Start the shared launcher refactor so `v0` and `v1` use one aligned command surface.
+- inject dense intermediate signal while preserving zero-sum terminal semantics.
 
-Delivered:
-- Added unified Python entry:
-  - `scripts/train_entry.py`
-  - core switch: `--pipeline {v0,v1}`
-  - aligned common knobs:
-    - `--iterations`
-    - `--self_play_games`
-    - `--mcts_simulations`
-    - `--batch_size`
-    - `--epochs`
-    - `--lr`
-    - `--weight_decay`
-    - temperature / exploration / dirichlet / soft-value / device / checkpoint.
-- Added unified shell wrapper:
-  - `scripts/toy_train.sh`
-  - environment-driven `PIPELINE=v0|v1`.
-- Updated v1 wrapper to reuse shared entry:
-  - `scripts/toy_train_v1.sh` now dispatches through `scripts/train_entry.py --pipeline v1`.
+Fixed formula:
+```text
+terminal = result_from_black
+dense_piece = 0.20 * (soft_t - soft_{t-1})
+anti_draw = -0.002 if moves_since_capture >= 24 else 0
+step_reward = clip(dense_piece + anti_draw, -0.2, 0.2)
+target_return_t = terminal + sum(step_reward from t to T-1)
+white_target = -black_target (保持零和符号一致)
+```
 
-Current dispatch behavior:
-- `pipeline=v1`: direct call to `v1.train.train_pipeline_v1(...)`.
-- `pipeline=v0`: delegates to existing `scripts/train_loop.py` with mapped shared arguments.
+Implementation boundary:
+- reward construction and per-step accumulation in:
+  - `v1/python/self_play_gpu_runner.py`
+  - `v1/python/trajectory_buffer.py`
+- report and training-side field continuity in:
+  - `v1/train.py`
 
-Notes:
-- This change focuses on entry unification and parameter alignment, without changing v0/v1 training semantics.
+Invariants:
+- no rule change,
+- no action encoding change,
+- no API break on staged entrypoints.
 
-### P3 Initial Delivery: v1 Multi-GPU Training (2026-02-19)
-Objective:
-- Implement the first usable multi-GPU training path for v1 without changing game/search semantics.
+#### RWD-2: Gate criteria (3-round mean)
+Required thresholds:
+- `decisive_game_ratio >= 1%`
+- `value_target_summary.nonzero_ratio >= 1%`
+- `draw_game_ratio <= 99%`
+- `positions_per_sec >= 85%` of RWD-0 baseline
 
-Delivered scope:
-1. Multi-device self-play sharding in `v1/train.py`
-   - New optional arg: `--devices cuda:0,cuda:1,...`
-   - Split `self_play_games` across devices and run shards concurrently (thread pool).
-   - Each shard runs `self_play_v1_gpu(...)` on its assigned GPU with identical pipeline semantics.
-   - Merge shard tensor batches on CPU and aggregate stats/counters.
-2. Multi-device training in `v1/python/train_bridge.py`
-   - Added optional `parallel_devices` input.
-   - When more than one CUDA device is valid, training uses single-process `torch.nn.DataParallel`.
-   - Single-GPU behavior is unchanged.
-3. Shared entry wiring
-   - `scripts/train_entry.py` now forwards `--devices` to `pipeline=v1`.
-   - `scripts/toy_train.sh` and `scripts/toy_train_v1.sh` accept `DEVICES` env and pass through.
+Decision rule:
+- only if all thresholds pass, proceed to scaled training acceptance.
 
-Runtime behavior:
-- If requested devices include unavailable GPU indices, they are skipped with log output.
-- If only one valid GPU remains, pipeline automatically falls back to single-GPU mode.
+#### RWD-3: Scale acceptance in big-train loop
+Goal:
+- validate that reward gains remain under production workload.
 
-Local smoke (Windows `torchenv`, regression-only):
-- `conda run -n torchenv python scripts/train_entry.py --pipeline v1 --iterations 1 --self_play_games 2 --mcts_simulations 4 --batch_size 16 --epochs 1 --device cuda:0 --checkpoint_dir results/tmp_v1_single_smoke_after_p3`
-  - PASS, metrics written.
-- `conda run -n torchenv python scripts/train_entry.py --pipeline v1 --iterations 0 --device cuda:0 --devices "cuda:0,cuda:1" --checkpoint_dir results/tmp_v1_multigpu_parse`
-  - PASS, unavailable `cuda:1` skipped on single-GPU machine.
+Protocol:
+- run `scripts/big_train_v1.sh` with reward-enabled branch.
+- verify RWD-2 metrics do not regress below gate.
+- verify stability is not degraded:
+  - no new capture-related crashes,
+  - no new shard merge corruption,
+  - no new memory/capture regressions in process backend.
 
-Current limitation:
-- Training parallelism is DataParallel (not DDP yet). This is intentional for a low-risk first stage.
-- Next P3 step on H20 should evaluate DDP migration only if DataParallel scaling is insufficient.
+### Public Interfaces (Document-Frozen)
+No code API change is required for this phase. Documentation references must stay aligned with current interfaces:
+- `scripts/train_entry.py --pipeline {v0,v1} --stage {all,selfplay,train,infer}`
+- `v1/train.py`:
+  - `--self_play_backend`
+  - `--self_play_shard_dir`
+  - `--train_devices`
+  - `--self_play_stats_json`
+- `scripts/eval_checkpoint.py`:
+  - `--backend v1`
+  - `--v1_concurrent_games`
+  - `--v1_opening_random_moves`
 
-### P3 Update: Split Self-Play Devices vs Train Devices (2026-02-19)
-Motivation:
-- Support the practical topology requested for H20 runs:
-  - parallel self-play on multiple GPUs,
-  - training on one designated GPU.
+Data-effectiveness standard fields (must be preserved in reports):
+- `decisive_game_ratio`
+- `draw_game_ratio`
+- `value_target_summary.nonzero_ratio`
+- associated counts in `value_target_summary`
 
-Delivered:
-- `v1/train.py`
-  - `--devices`: self-play shard devices.
-  - `--train_devices`: training devices (default single `--device`).
-  - metrics/checkpoint metadata now records `self_play_devices` and `train_devices` separately.
-- `scripts/train_entry.py`
-  - forwards both `--devices` and `--train_devices` to `pipeline=v1`.
-- `scripts/toy_train_v1.sh`
-  - defaults to:
-    - `DEVICES=cuda:0,cuda:1,cuda:2,cuda:3` (self-play),
-    - `TRAIN_DEVICES=$DEVICE` (single-card training by default).
-  - default `CUDA_VISIBLE_DEVICES=0,1,2,3`.
-- `scripts/toy_train.sh`
-  - generic pass-through for `TRAIN_DEVICES`.
-
-### P3 Update: Staged v1 Pipeline + DDP Train Stage (2026-02-19)
-Objective:
-- Split v1 execution into explicit stages (`selfplay` / `train` / `infer`) and enable 4-GPU DDP training in the train stage.
-
-Delivered:
-1. Staged v1 entry in `v1/train.py`
-   - New `--stage {all,selfplay,train,infer}`.
-   - `selfplay` stage: runs multi-device self-play and saves tensor payload (`.pt`) + optional stats JSON.
-   - `train` stage: loads saved self-play payload and trains once, then saves checkpoint/metrics.
-   - `infer` stage: runs multi-device forward benchmark and saves inference report JSON.
-2. DDP-ready train bridge in `v1/python/train_bridge.py`
-   - Added `parallel_strategy={none,data_parallel,ddp}`.
-   - `ddp` mode supports per-rank sharded batches and epoch metric all-reduce.
-   - Optimization: each rank now pre-shards CPU samples before H2D transfer (avoid loading full batch on every rank).
-   - Existing single-process DataParallel path remains compatible.
-3. Shared launcher passthrough in `scripts/train_entry.py`
-   - Added forwarding of stage/strategy and staged IO args:
-     - `--self_play_output`, `--self_play_input`
-     - `--checkpoint_name`, `--metrics_output`
-     - `--infer_*`.
-4. New high-load orchestrator script
-   - Added `scripts/big_train_v1.sh`.
-   - Supports profiles:
-     - `PROFILE=stable`: 60 iters, 12288 games, 1536 sims, batch 8192.
-     - `PROFILE=aggressive`: 80 iters, 16384 games, 2048 sims, batch 12288.
-   - Runs staged loop: `selfplay -> train -> infer`.
-   - Supports `TRAIN_STRATEGY=ddp` using `torchrun --nproc_per_node=<gpu_count>`.
-   - Added `SELF_PLAY_CONCURRENT_GAMES` knob (default `32`) for higher H20 utilization.
-
-Guardrail:
-- `stage=all` + `train_strategy=ddp` is blocked intentionally to avoid duplicated self-play across ranks.
-- Recommended DDP workflow is staged mode with an external loop (`big_train_v1.sh`).
-
-### P3 Next: Process-Per-GPU Self-Play Refactor Plan (2026-02-19)
-Status judgment on current fix:
-- Keep as permanent: per-worker `torch.cuda.set_device(...)` binding.
-- Treat as temporary stabilization: defaulting `V1_FINALIZE_GRAPH=off` in multi-device thread mode.
-- Target architecture: one self-play process per GPU, isolated CUDA context/streams, and host-only merge at stage boundary.
-
-1. Goal and scope
-- Goal:
-  - eliminate thread-level CUDA stream/capture interference in multi-GPU self-play;
-  - keep each game trajectory fully on its assigned GPU during search and rollout;
-  - preserve existing train/infer stage contracts.
-- Out of scope:
-  - no rule/action encoding change;
-  - no MCTS algorithm change;
-  - no training-stage DDP behavior change in this refactor.
-
-2. Impact surface (planned files/modules)
-- `v1/train.py`
-  - replace `_run_self_play_multi_device` thread-pool fanout with a process coordinator;
-  - keep single-device fast path unchanged;
-  - keep shard split/merge API contract unchanged.
-- `v1/python/self_play_worker.py` (new)
-  - spawn-safe top-level worker entry;
-  - owns per-process device setup, model load, self-play execution, and shard output.
-- `scripts/big_train_v1.sh`
-  - pass backend knob and shard temp-dir knob;
-  - keep staged orchestration interface unchanged (`selfplay -> train -> infer`).
-- `tests/v1/` (new tests)
-  - process backend smoke test;
-  - worker failure propagation test.
-
-3. Invariants (must not change)
-- Total games per iteration and shard split must remain exact.
-- State transition, rule semantics, action encoding, and policy/value target schema must remain identical.
-- No inter-GPU synchronization during game/search steps.
-- Only one stage-boundary aggregation is allowed (CPU-side shard merge).
-- Seed policy remains deterministic per shard:
-  - `worker_seed = iteration_seed * 10007 + (worker_idx + 1) * 9973`.
-
-4. Risks and controls
-- Risk: CUDA fork/context instability.
-  - Control: enforce multiprocessing start method `spawn`; set device before model creation.
-- Risk: large IPC overhead from returning tensors through queues.
-  - Control: shard-file handoff (`.pt` per worker) and parent-side merge.
-- Risk: graph capture instability still appears in some shapes.
-  - Control: explicit graph mode policy (`auto|off|on`) per worker, with fallback counters and safe downgrade.
-- Risk: partial worker crash leaves incomplete outputs.
-  - Control: worker exit-code check, structured traceback propagation, and temp shard cleanup.
-- Risk: memory spikes during merge.
-  - Control: streaming merge order and immediate shard release after append.
-
-5. Verification plan
-- Functional gates:
-  - 4-GPU `stage=selfplay` completes without `cudaErrorStreamCaptureUnsupported`.
-  - shard game counts sum to requested `self_play_games`.
-  - merged self-play payload is consumable by `stage=train`.
-- Regression gates:
-  - single-GPU path behavior unchanged;
-  - fixed-seed short run keeps aggregate stats stable (`games`, `positions`, `W/L/D` totals).
-- Performance gates:
-  - compare thread vs process backend under `SELF_PLAY_CONCURRENT_GAMES=32/64/128`;
-  - verify per-GPU utilization jitter decreases and throughput is not regressed.
-- Observability gates:
-  - merged stats include per-worker counters (`finalize_graph_capture/replay/fallback`, errors).
-
-6. Deliverables
-- D1: process backend implementation with selector:
-  - `V1_SELF_PLAY_BACKEND={thread,process}`;
-  - default to `process` when `len(devices)>1` on Linux/CUDA, otherwise fallback to `thread`.
-- D2: shard persistence + merge pipeline (`selfplay_shard_<iter>_<worker>.pt`).
-- D3: robust error propagation (worker id/device/games/traceback) and cleanup behavior.
-- D4: test coverage for success path and failure path.
-
-7. Implementation loop and records
-- Step A: land process backend under opt-in flag; keep thread backend as fallback.
-- Step B: run H20 staged smoke (`selfplay -> train`) with `cg=32/64`.
-- Step C: make process backend default after gates pass.
-- Step D: write before/after metrics and decision in this `v1/Design.md`; sync action item to `TODO.md`.
-
-### P3 Next Implementation Status (2026-02-19)
-Current delivery (Step A complete):
-1. `v1/train.py`
-- Added dual backend selector for multi-device self-play:
-  - `auto|thread|process` (`--self_play_backend` and env fallback `V1_SELF_PLAY_BACKEND`).
-- Kept single-device path unchanged.
-- Split multi-device self-play into:
-  - thread backend (existing behavior, retains default `V1_FINALIZE_GRAPH=off` safety),
-  - process backend (`spawn` + `ProcessPoolExecutor`) with shard file merge.
-- Added shard workspace support:
-  - `--self_play_shard_dir` (or temp workspace with auto-clean on success).
-
-2. `v1/python/self_play_worker.py` (new)
-- New process-safe worker entry:
-  - bind device in-process,
-  - load model state,
-  - run `self_play_v1_gpu`,
-  - persist `selfplay_shard_*.pt` payload.
-- Added one-shot capture-safe fallback:
-  - if stream-capture error occurs and `V1_FINALIZE_GRAPH` is not explicitly set,
-    worker retries once with `V1_FINALIZE_GRAPH=off`.
-
-3. Entrypoints/scripts
-- `scripts/train_entry.py` forwards:
-  - `--self_play_backend`,
-  - `--self_play_shard_dir`.
-- `scripts/big_train_v1.sh`, `scripts/toy_train_v1.sh`, `scripts/toy_train.sh`:
-  - added env passthrough for `SELF_PLAY_BACKEND`, `SELF_PLAY_SHARD_DIR`.
-
-Local validation status:
-- `conda activate torchenv` + `python -m py_compile` passed for changed Python files.
-- tiny `stage=selfplay` smoke (CPU, `games=1`, `sims=1`) passed via shared entry.
-
-Remaining acceptance (Step B/C):
-1. Run H20 4-GPU `stage=selfplay` with `SELF_PLAY_BACKEND=process`.
-2. Verify no `stream is capturing` failure in multi-device process backend.
-3. Compare throughput/utilization vs thread backend under `cg=32/64/128`.
-4. After gates pass, switch default policy to process for Linux multi-CUDA.
-
-### P3 Follow-up Optimization Status (2026-02-19)
-Delivered after first H20 staged run feedback:
-1. Self-play signal visibility
-- `v1/train.py` now emits explicit self-play outcome summary:
-  - `black_win / white_win / draw`,
-  - `decisive_game_ratio`.
-- Added `value_target_summary`:
-  - `nonzero/zero/positive/negative` counts and ratio.
-- Saved into `self_play_stats_json` and metadata for downstream audit.
-
-2. Eval stage improvements
-- Added `v1` eval backend in `scripts/eval_checkpoint.py`:
-  - multi-worker (`eval_workers`) + multi-device (`eval_devices`) supported,
-  - configurable per-worker search batching via `--v1_concurrent_games`.
-- Added `--v1_opening_random_moves` to improve decisiveness probing in draw-heavy regimes.
-- `scripts/big_train_v1.sh` now forwards:
-  - `EVAL_BACKEND=v1`,
-  - `EVAL_V1_CONCURRENT_GAMES`,
-  - `EVAL_V1_OPENING_RANDOM_MOVES`.
-
-3. Self-play memory jitter controls
-- Added self-play allocator controls in `scripts/big_train_v1.sh`:
-  - `SELF_PLAY_ALLOC_CONF` -> `PYTORCH_ALLOC_CONF`,
-  - `SELF_PLAY_MEMORY_ANCHOR_MB`.
-- Added worker-side fixed memory anchor in `v1/python/self_play_worker.py`:
-  - keep a configurable CUDA anchor tensor alive per worker process to reduce allocator churn.
-
-4. Self-play shard memory safety
-- Updated `v1/python/self_play_worker.py` to run each shard in fixed-size game chunks
-  (`games_per_chunk = concurrent_games_per_device`) and merge chunk outputs on CPU.
-- This bounds GPU memory by per-device concurrency and removes the direct linear coupling
-  between `SELF_PLAY_GAMES` and worker GPU peak memory.
+### Delivery Checklist for the Next Change Set
+1. Implement RWD-1 formula exactly as specified (no additional runtime switches).
+2. Produce RWD-0 and RWD-2 reports with reproducible seeds and 3-round aggregation.
+3. Run one scaled acceptance cycle under `big_train_v1.sh` and record RWD-3 results.
+4. Sync `TODO.md` and this `v1/Design.md` with measured outcomes and pass/fail decision.

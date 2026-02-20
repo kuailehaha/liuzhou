@@ -7,8 +7,8 @@
 
 如果是Linux系统，项目可用4张H20（CUDA_VISIBLE_DEVICES=0,1,2,3），256核CPU。
 项目环境在/2023533024/users/zhangmq/condaenvs/naivetorch
-项目训练一般使用./scripts/toy_train.sh
-我们谈及优化，一般都是针对于v0 pipeline进行的。legacy只作功能性验证。
+项目训练一般使用scripts\big_train_v1.sh
+我们谈及优化，一般都是针对于v1 pipeline进行的。legacy、v0只作功能性验证。
 
 如果是Windows系统，项目可用1张RTX 3060，16核CPU。
 项目环境启动方式为conda activate torchenv
@@ -22,9 +22,10 @@
 
 - 六洲棋 AI 系统：规则引擎 + MCTS + 强化学习训练 + 人机对战前后端
 - 规则权威来源：`README.md`、`rule_description.md`
-- 两套实现：
-  - Legacy：纯 Python（`src/`）
-  - V0：C++/CUDA 核心（`v0/`）
+- 三层实现（当前主线为 V1）：
+  - Legacy：纯 Python（`src/`），用于规则功能验证
+  - V0：C++/CUDA 核心（`v0/`），作为底层能力与对照实现
+  - V1：训练流水线（`v1/`），建立在 `v0_core` 与现有 CUDA 内核能力上的 staged 管线优化
 
 ## 目录导航
 
@@ -61,6 +62,14 @@
     - `bindings/`：PyBind11 绑定模块（`v0_core`）
   - `include/v0/`：C++ 头文件
   - `CMakeLists.txt`：构建配置（pybind11 + LibTorch + 可选 CUDA）
+- `v1/`：V1 训练流水线（当前主线）
+  - `train.py`：V1 staged 训练入口（`all/selfplay/train/infer`）
+  - `python/self_play_gpu_runner.py`：GPU 自博弈主循环（张量化输出）
+  - `python/self_play_worker.py`：多进程分片自博弈 worker（process-per-GPU）
+  - `python/train_bridge.py`：张量数据训练桥接（single/DP/DDP）
+  - `python/mcts_gpu.py`：V1 Root-MCTS（含温度采样与 value_only 路径）
+  - `python/trajectory_buffer.py`：轨迹缓存与终局 target 回填
+  - `Design.md`：V1 设计、里程碑与验收记录
 - `backend/`：FastAPI 服务端（人机对战/推理接口）
   - `main.py`：应用入口与路由；`game_manager.py`：会话管理；`model_loader.py`：模型加载
   - `schemas.py`：Pydantic 请求/响应模型；`utils.py`：坐标转换与序列化工具
@@ -84,7 +93,10 @@
   - `profile_self_play_gpu.py`：GPU 自博弈性能剖析
   - `run_test_matrix.py`：测试矩阵批量运行器
 - `scripts/`：训练/运行辅助脚本
-  - `toy_train.sh`：主训练脚本（V0 管线，含稳定性评估）
+  - `big_train_v1.sh`：V1 大规模 staged 训练脚本（selfplay -> train -> eval -> infer）
+  - `train_entry.py`：统一训练入口（`--pipeline {v0,v1}`）
+  - `toy_train.sh`：统一 toy 训练脚本（通过 `PIPELINE=v0|v1` 选择）
+  - `toy_train_v1.sh`：V1 toy 训练包装脚本
   - `optimized_train.sh`：大规模优化训练脚本
   - `train_loop.sh`/`train_loop.py`：训练循环调度器
   - `parallel_generate.sh`：多进程并行数据生成
@@ -102,15 +114,23 @@
 - 规则或动作编码变更时，以当前时间同步更新：
   - `src/` 中的规则与动作生成
   - `v0/` 中的参考实现/核心逻辑
+  - `v1/` 中相关自博弈与训练数据路径（尤其是 target 语义）
   - 相关测试或对照脚本
   - `TODO.md`
 
 ## 工作流
 
-- 规则改动：先更新规则文档与 Python 逻辑，再检查 v0 参考逻辑与对拍脚本。
-- 训练/评估：`src/train.py` 或 `v0/train.py`；自博弈数据在 `v0/data/`。
-- 训练稳定性与“是否训进去”的判断：见 `TRAINING_STABILITY.md`；推荐使用 `--eval_games_vs_previous` 看对上一迭代胜率。
-- 性能与回归：`tools/benchmark_*` 与 `tests/` 中的对照脚本。
+- 规则改动：先更新规则文档与 Python 逻辑，再检查 `v0/` 参考逻辑与对拍脚本。
+- 主训练入口：`scripts/big_train_v1.sh`（大规模）或 `scripts/train_entry.py --pipeline v1`（可控分阶段）。
+- 主评估入口：`scripts/eval_checkpoint.py --backend v1`，并结合 `--v1_concurrent_games`、`--v1_opening_random_moves`。
+- V1 staged 运行：`--stage selfplay/train/infer`；`train_strategy=ddp` 需采用 staged 方式。
+- 性能与回归：`tools/validate_v1_claims.py`、`tools/sweep_v1_gpu_matrix.py`、`tests/v1/test_v1_tensor_pipeline_smoke.py`。
+
+## 当前优先级（2026-02-20）
+
+- 结论：V1 训练加速链路已完成（多卡自博弈分片 + staged 训练 + DDP + v1 eval）。
+- 当前主瓶颈：自博弈数据有效性不足（高和棋率导致 `value_target_summary.nonzero_ratio` 过低）。
+- 下一阶段目标：从奖励机制层面改造 V1 自博弈，提升有效样本占比并保持吞吐与稳定性。
 
 ## Vibe Coding 计划内容
 
