@@ -57,7 +57,7 @@ if [[ "$PROFILE" == "stable" ]]; then
   : "${WEIGHT_DECAY:=1e-4}"
 elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${ITERATIONS:=80}"
-  : "${SELF_PLAY_GAMES:=32768}"
+  : "${SELF_PLAY_GAMES:=524288}"
   : "${MCTS_SIMULATIONS:=4096}"
   : "${BATCH_SIZE:=16384}"
   : "${EPOCHS:=4}"
