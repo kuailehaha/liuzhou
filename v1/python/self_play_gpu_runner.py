@@ -61,6 +61,7 @@ def self_play_v1_gpu(
     dirichlet_alpha: float = 0.3,
     dirichlet_epsilon: float = 0.25,
     soft_value_k: float = 2.0,
+    opening_random_moves: int = 0,
     max_game_plies: int = 512,
     sample_moves: bool = True,
     concurrent_games: int = 8,
@@ -75,6 +76,7 @@ def self_play_v1_gpu(
         raise ValueError("num_games must be positive.")
     dev = torch.device(device)
     max_plies = max(1, int(max_game_plies))
+    opening_random_n = max(0, int(opening_random_moves))
     wave_size = max(1, min(int(concurrent_games), int(num_games)))
 
     mcts_cfg = V1RootMCTSConfig(
@@ -86,6 +88,7 @@ def self_play_v1_gpu(
         dirichlet_epsilon=float(dirichlet_epsilon),
         sample_moves=bool(sample_moves),
         child_eval_mode=str(child_eval_mode),
+        soft_value_k=float(soft_value_k),
     )
     collect_timing = bool(collect_step_timing)
     mcts = V1RootMCTS(
@@ -198,11 +201,15 @@ def self_play_v1_gpu(
                 torch.full_like(active_plies, float(temperature_init), dtype=torch.float32),
                 torch.full_like(active_plies, float(temperature_final), dtype=torch.float32),
             )
+            active_force_uniform = (
+                active_plies < opening_random_n if opening_random_n > 0 else None
+            )
             with _nvtx_range("v1.search_batch"):
                 search = mcts.search_batch(
                     active_states,
                     temperatures=active_temps,
                     add_dirichlet_noise=add_dirichlet_noise,
+                    force_uniform_random_mask=active_force_uniform,
                 )
 
             step_indices = buffer.append_steps(
@@ -242,6 +249,13 @@ def self_play_v1_gpu(
                     float(soft_value_k),
                 )
             if int(finalize_slots.numel()) > 0:
+                # Recompute terminal soft labels with v1 tan shaping so runtime behavior
+                # is aligned even if extension binaries are stale.
+                final_boards = states.board.index_select(0, finalize_slots)
+                soft_local = V1RootMCTS._soft_tan_from_board_black(
+                    final_boards,
+                    soft_value_k=float(soft_value_k),
+                ).to(torch.float32)
                 with _nvtx_range("v1.finalize_trajectory_inplace"), _timed("finalize_ms"):
                     finalized_slots, finalized_lengths, outcome_delta = buffer.finalize_games_inplace(
                         step_index_matrix=step_index_matrix,

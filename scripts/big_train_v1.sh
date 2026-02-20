@@ -27,6 +27,7 @@ DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
 SOFT_VALUE_K="${SOFT_VALUE_K:-2.0}"
 MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
+SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-6}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
 
@@ -144,6 +145,7 @@ echo "[big_train_v1] infer_devices=$INFER_DEVICES"
 echo "[big_train_v1] checkpoints=$CHECKPOINT_DIR"
 echo "[big_train_v1] run_dir=$RUN_DIR"
 echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
+echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
 echo "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
 if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
   echo "[big_train_v1] self_play_shard_dir=$SELF_PLAY_SHARD_DIR"
@@ -204,6 +206,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     --soft_value_k "$SOFT_VALUE_K"
     --max_game_plies "$MAX_GAME_PLIES"
     --self_play_concurrent_games "$SELF_PLAY_CONCURRENT_GAMES"
+    --self_play_opening_random_moves "$SELF_PLAY_OPENING_RANDOM_MOVES"
     --self_play_backend "$SELF_PLAY_BACKEND"
     --checkpoint_dir "$CHECKPOINT_DIR"
     --self_play_output "$SELFPLAY_FILE"

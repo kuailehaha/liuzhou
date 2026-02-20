@@ -274,6 +274,7 @@ def _run_self_play_shard(
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
     soft_value_k: float,
+    opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
     seed: int,
@@ -303,6 +304,7 @@ def _run_self_play_shard(
         dirichlet_alpha=float(dirichlet_alpha),
         dirichlet_epsilon=float(dirichlet_epsilon),
         soft_value_k=float(soft_value_k),
+        opening_random_moves=int(opening_random_moves),
         max_game_plies=int(max_game_plies),
         sample_moves=True,
         concurrent_games=shard_concurrent,
@@ -414,6 +416,7 @@ def _run_self_play_multi_device_thread(
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
     soft_value_k: float,
+    opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
     iteration_seed: int,
@@ -456,6 +459,7 @@ def _run_self_play_multi_device_thread(
                     dirichlet_alpha=float(dirichlet_alpha),
                     dirichlet_epsilon=float(dirichlet_epsilon),
                     soft_value_k=float(soft_value_k),
+                    opening_random_moves=int(opening_random_moves),
                     max_game_plies=int(max_game_plies),
                     concurrent_games_per_device=int(concurrent_games_per_device),
                     seed=int(worker_seed),
@@ -501,6 +505,7 @@ def _run_self_play_multi_device_process(
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
     soft_value_k: float,
+    opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
     iteration_seed: int,
@@ -553,6 +558,7 @@ def _run_self_play_multi_device_process(
                     dirichlet_alpha=float(dirichlet_alpha),
                     dirichlet_epsilon=float(dirichlet_epsilon),
                     soft_value_k=float(soft_value_k),
+                    opening_random_moves=int(opening_random_moves),
                     max_game_plies=int(max_game_plies),
                     concurrent_games_per_device=int(concurrent_games_per_device),
                 )
@@ -621,6 +627,7 @@ def _run_self_play_multi_device(
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
     soft_value_k: float,
+    opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
     iteration_seed: int,
@@ -643,6 +650,7 @@ def _run_self_play_multi_device(
             dirichlet_alpha=float(dirichlet_alpha),
             dirichlet_epsilon=float(dirichlet_epsilon),
             soft_value_k=float(soft_value_k),
+            opening_random_moves=int(opening_random_moves),
             max_game_plies=int(max_game_plies),
             sample_moves=True,
             concurrent_games=shard_concurrent,
@@ -667,6 +675,7 @@ def _run_self_play_multi_device(
             dirichlet_alpha=float(dirichlet_alpha),
             dirichlet_epsilon=float(dirichlet_epsilon),
             soft_value_k=float(soft_value_k),
+            opening_random_moves=int(opening_random_moves),
             max_game_plies=int(max_game_plies),
             concurrent_games_per_device=int(concurrent_games_per_device),
             iteration_seed=int(iteration_seed),
@@ -684,6 +693,7 @@ def _run_self_play_multi_device(
         dirichlet_alpha=float(dirichlet_alpha),
         dirichlet_epsilon=float(dirichlet_epsilon),
         soft_value_k=float(soft_value_k),
+        opening_random_moves=int(opening_random_moves),
         max_game_plies=int(max_game_plies),
         concurrent_games_per_device=int(concurrent_games_per_device),
         iteration_seed=int(iteration_seed),
@@ -923,6 +933,7 @@ def train_pipeline_v1(
     dirichlet_alpha: float = 0.3,
     dirichlet_epsilon: float = 0.25,
     self_play_concurrent_games: int = 8,
+    self_play_opening_random_moves: int = 0,
     self_play_backend: Optional[str] = None,
     self_play_shard_dir: Optional[str] = None,
     checkpoint_dir: str = "./checkpoints_v1",
@@ -995,6 +1006,9 @@ def train_pipeline_v1(
             f"{backend_arg if backend_arg is not None else 'auto'} "
             f"self_play_shard_dir={shard_dir_arg or '<temp>'}"
         )
+        _print_rank0(
+            f"[v1.train] self_play_opening_random_moves={int(self_play_opening_random_moves)}"
+        )
         _print_rank0(f"[v1.train] train_devices={train_device_list}")
         _print_rank0(f"[v1.train] infer_devices={infer_device_list}")
         if int(self_play_concurrent_games) > 256:
@@ -1025,6 +1039,7 @@ def train_pipeline_v1(
                 dirichlet_alpha=float(dirichlet_alpha),
                 dirichlet_epsilon=float(dirichlet_epsilon),
                 soft_value_k=float(soft_value_k),
+                opening_random_moves=int(self_play_opening_random_moves),
                 max_game_plies=int(max_game_plies),
                 concurrent_games_per_device=int(self_play_concurrent_games),
                 iteration_seed=1,
@@ -1049,6 +1064,7 @@ def train_pipeline_v1(
                     "mcts_simulations": int(mcts_simulations),
                     "self_play_games": int(self_play_games),
                     "self_play_concurrent_games": int(self_play_concurrent_games),
+                    "self_play_opening_random_moves": int(self_play_opening_random_moves),
                     "value_target_summary": dict(value_target_summary),
                 },
                 )
@@ -1177,6 +1193,7 @@ def train_pipeline_v1(
                 dirichlet_alpha=float(dirichlet_alpha),
                 dirichlet_epsilon=float(dirichlet_epsilon),
                 soft_value_k=float(soft_value_k),
+                opening_random_moves=int(self_play_opening_random_moves),
                 max_game_plies=int(max_game_plies),
                 concurrent_games_per_device=int(self_play_concurrent_games),
                 iteration_seed=int(it_idx),
@@ -1262,6 +1279,7 @@ def train_pipeline_v1(
                         "self_play_backend": backend_arg if backend_arg is not None else "auto",
                         "self_play_shard_dir": shard_dir_arg,
                         "self_play_concurrent_games": int(self_play_concurrent_games),
+                        "self_play_opening_random_moves": int(self_play_opening_random_moves),
                         "value_target_summary": dict(value_target_summary),
                     },
                 )
@@ -1307,6 +1325,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     parser.add_argument("--self_play_concurrent_games", type=int, default=8)
+    parser.add_argument("--self_play_opening_random_moves", type=int, default=0)
     parser.add_argument(
         "--self_play_backend",
         type=str,
@@ -1414,6 +1433,7 @@ if __name__ == "__main__":
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,
         self_play_concurrent_games=args.self_play_concurrent_games,
+        self_play_opening_random_moves=args.self_play_opening_random_moves,
         self_play_backend=args.self_play_backend,
         self_play_shard_dir=args.self_play_shard_dir,
         checkpoint_dir=args.checkpoint_dir,

@@ -538,8 +538,14 @@ torch::Tensor SoftValueFromBoardBatch(const torch::Tensor& boards, double soft_v
     TORCH_CHECK(boards.dim() == 3, "boards must be 3D [N, H, W]");
     auto black = boards.eq(1).sum({1, 2}).to(torch::kFloat32);
     auto white = boards.eq(-1).sum({1, 2}).to(torch::kFloat32);
-    auto material_delta = (black - white) / static_cast<float>(v0::kCellCount);
-    return torch::tanh(material_delta * static_cast<float>(soft_value_k));
+    constexpr float kMaterialDeltaNorm = static_cast<float>(v0::kCellCount) * 0.5f;  // 36 -> 18
+    auto material_delta = (black - white) / kMaterialDeltaNorm;
+    constexpr float kPiHalf = 1.5707963267948966f;
+    constexpr float kInputEps = 1e-3f;
+    auto scaled = material_delta * static_cast<float>(soft_value_k);
+    auto clamped = torch::clamp(scaled, -(kPiHalf - kInputEps), (kPiHalf - kInputEps));
+    auto shaped = torch::tan(clamped);
+    return torch::clamp(shaped, -1.0f, 1.0f);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> FinalizeTrajectoryInplace(

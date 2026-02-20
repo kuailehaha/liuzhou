@@ -1599,3 +1599,81 @@ Data-effectiveness standard fields (must be preserved in reports):
 3. Run one scaled acceptance cycle under `big_train_v1.sh` and record RWD-6 results.
 4. Sync `TODO.md` and this `v1/Design.md` with measured outcomes, including probe-only `vs_random` regression checks.
 
+### Vibe Coding Plan (2026-02-20): v1 Soft-Tan Reward + Random Opening
+
+#### 代码现状结论（用于本次实现）
+- 终局软值当前由 `v0/src/bindings/module.cpp::SoftValueFromBoardBatch(...)` 计算，公式是 `tanh(k * material_delta)`，并在 `self_play_step_inplace` 终局时产出 `soft_local`。
+- `v1/python/self_play_gpu_runner.py` 只把 `soft_local` 回填到样本 (`soft_value_targets`)，当前 `v1/python/mcts_gpu.py` 的 root-PUCT 叶子值仍只使用网络 `child_values`，未引入终局软奖励回传。
+- v1 自博弈链路尚无训练侧 `opening_random_moves`（仅评估链路 `scripts/eval_checkpoint.py` 有 `--v1_opening_random_moves`）。
+- 日志锚点 `logs/big_train_v1_20260220_015020.log` 显示中后期多轮 `draw_rate` 近 `100%`，且 `value_target_summary.nonzero_ratio` 接近 `0`。
+
+#### 1. 目标与范围
+- 目标A: 在 v1 自博弈中实现“终局子数差软标签”，并保证任意终局（胜/负/和）都生成软奖励。
+- 目标B: 将终局软奖励回传到 root-PUCT 的叶子值分配，提升搜索对“更优终局差值”动作的偏好。
+- 目标C: 在 v1 自博弈中加入随机初始开局（前 N 手均匀合法随机），打破开局对称锁死。
+- 范围限定: 仅改 v1 训练链路及其依赖内核，不改规则定义与动作编码，不执行训练任务。
+
+#### 2. 影响面（计划修改模块）
+- `v0/src/bindings/module.cpp`
+  - 将终局软值函数从 `tanh` 切换为 `tan` 形态（数值安全裁剪后输出），保持黑方视角定义。
+  - `self_play_step_inplace` 与 `finalize_trajectory_inplace` 继续复用统一软值函数，避免语义分叉。
+- `v1/python/mcts_gpu.py`
+  - 在 child 状态批量上做终局判定（与 `self_play_step_inplace` 终局条件一致）。
+  - 对终局 child 用终局软奖励覆盖/融合 `child_leaf_values`，再进入 `root_puct_allocate_visits`。
+- `v1/python/self_play_gpu_runner.py`
+  - 增加随机开局分支：前 N plies 对 active roots 从合法动作中均匀采样。
+  - 记录开局随机覆盖统计（用于确认触发率与诊断）。
+- `v1/train.py`、`v1/python/self_play_worker.py`、`scripts/big_train_v1.sh`
+  - 仅做最小必要参数透传（若采用固定默认 N，则不新增额外开关）。
+- `tests/v1/test_v1_tensor_pipeline_smoke.py`（及新增 v1 相关测试文件）
+  - 补充软奖励与随机开局行为的回归测试。
+
+#### 3. 不变量（必须保持）
+- 规则不变量: 阶段流转、胜负判定、和棋判定阈值与现有实现完全一致。
+- 编码不变量: `TOTAL_ACTION_DIM`、动作索引语义、`policy_targets` 编码不变。
+- 目标符号不变量: 黑方视角为正，白方严格取反；`value_targets/soft_value_targets` 的按视角写回逻辑保持一致。
+- 接口不变量: staged 入口和既有 payload 关键字段兼容（可新增 metadata 字段但不破坏旧读取）。
+
+#### 4. 风险点
+- `tan` 在接近奇点时可能爆炸，若不裁剪会导致 value/PUCT 数值不稳定。
+- 若 MCTS 终局判定与 `self_play_step_inplace` 判定不一致，可能出现搜索值与最终回填标签不一致。
+- 随机开局若注入过强，短期可能拉低吞吐或引入过高噪声；需要控制前 N 手范围并监控。
+- 在高并发 + CUDA Graph 条件下新增分支可能影响捕获稳定性，需要保持张量化分支和固定 shape 路径。
+
+#### 5. 验证方式
+- 单元与烟雾:
+  - `pytest tests/v1/test_v1_tensor_pipeline_smoke.py`
+  - 新增/扩展测试覆盖:
+    - 终局软奖励在胜/负/和三类结果都触发；
+    - `tan` 软值单调性、符号性、裁剪边界；
+    - 开局前 N 手随机采样确实发生且仅在窗口内发生。
+- 自博弈指标回归（selfplay stage）:
+  - 对比基线日志 `logs/big_train_v1_20260220_015020.log`，重点看
+    - `decisive_game_ratio`
+    - `draw_game_ratio`
+    - `value_target_summary.nonzero_ratio`
+    - `games_per_sec` / `positions_per_sec`
+- 泛化探针:
+  - 继续使用 `vs_random`，目标为最终趋近 `100%` 胜率，同时监控 draw 比例下降趋势。
+
+#### 6. 产出清单（预期文件）
+- 修改:
+  - `v0/src/bindings/module.cpp`
+  - `v1/python/mcts_gpu.py`
+  - `v1/python/self_play_gpu_runner.py`
+  - `v1/train.py`（仅最小必要透传）
+  - `v1/python/self_play_worker.py`（仅最小必要透传）
+  - `scripts/big_train_v1.sh`（若需要脚本侧参数同步）
+  - `v1/Design.md`
+  - `TODO.md`
+- 新增或扩展测试:
+  - `tests/v1/*`（围绕软奖励与开局随机化）
+
+#### 7. 实现闭环
+- 第一阶段（语义落地）:
+  - 完成 soft-tan 终局奖励 + PUCT 回传 + 随机开局，并通过 v1 smoke 与行为测试。
+- 第二阶段（小规模验证）:
+  - 跑 staged `selfplay` 若干轮，产出 before/after 指标 JSON（含 nonzero_ratio 与 draw_rate）。
+- 第三阶段（文档与记录收敛）:
+  - 将实测结果回填 `v1/Design.md` 与 `TODO.md`，标注是否达到“提高胜负样本占比”的验收门槛。
+

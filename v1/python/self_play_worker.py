@@ -166,6 +166,7 @@ def run_self_play_worker(
     dirichlet_alpha: float,
     dirichlet_epsilon: float,
     soft_value_k: float,
+    opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
 ) -> Dict[str, Any]:
@@ -213,6 +214,7 @@ def run_self_play_worker(
                 dirichlet_alpha=float(dirichlet_alpha),
                 dirichlet_epsilon=float(dirichlet_epsilon),
                 soft_value_k=float(soft_value_k),
+                opening_random_moves=int(opening_random_moves),
                 max_game_plies=int(max_game_plies),
                 sample_moves=True,
                 concurrent_games=max(1, min(int(chunk_games), shard_concurrent)),
@@ -261,6 +263,7 @@ def run_self_play_worker(
                 "num_chunks": int(len(batch_chunks)),
                 "graph_retry_off": bool(graph_retry_off),
                 "memory_anchor_mb": int(anchor_mb_effective),
+                "opening_random_moves": int(opening_random_moves),
             },
         }
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)

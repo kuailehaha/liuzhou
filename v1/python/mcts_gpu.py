@@ -11,6 +11,7 @@ from v0 to allow incremental migration without changing the v0 path.
 
 from __future__ import annotations
 
+import math
 import time
 import os
 from contextlib import contextmanager, nullcontext
@@ -20,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 import v0_core
+from src.game_state import GameState
 from v0.python.move_encoder import DEFAULT_ACTION_SPEC
 
 PLACEMENT_DIM = int(DEFAULT_ACTION_SPEC.placement_dim)
@@ -27,6 +29,10 @@ MOVEMENT_DIM = int(DEFAULT_ACTION_SPEC.movement_dim)
 SELECTION_DIM = int(DEFAULT_ACTION_SPEC.selection_dim)
 AUXILIARY_DIM = int(DEFAULT_ACTION_SPEC.auxiliary_dim)
 TOTAL_ACTION_DIM = int(DEFAULT_ACTION_SPEC.total_dim)
+MAX_MOVE_COUNT = int(GameState.MAX_MOVE_COUNT)
+NO_CAPTURE_DRAW_LIMIT = int(GameState.NO_CAPTURE_DRAW_LIMIT)
+PHASE_PLACEMENT = int(v0_core.Phase.PLACEMENT)
+SOFT_TAN_INPUT_CLAMP = float((math.pi * 0.5) - 1e-3)
 
 @dataclass
 class GpuStateBatch:
@@ -222,6 +228,7 @@ class V1RootMCTSConfig:
     sample_moves: bool = True
     autocast_dtype: str = "float16"
     child_eval_mode: str = "value_only"  # "value_only" or "full"
+    soft_value_k: float = 2.0
 
 
 @dataclass
@@ -299,6 +306,8 @@ class V1RootMCTS:
         self._finalize_graph_event_bridge_count = 0
         self._finalize_graph_event_wait_count = 0
         self._finalize_graph_inline_replay_count = 0
+        self._terminal_soft_override_count = 0
+        self._forced_uniform_pick_count = 0
         self._finalize_graph_cache = V1RootMCTS._SHARED_FINALIZE_GRAPH_CACHE
         self._finalize_graph_lru = V1RootMCTS._SHARED_FINALIZE_GRAPH_LRU
         self._finalize_graph_blocked = V1RootMCTS._SHARED_FINALIZE_GRAPH_BLOCKED
@@ -601,6 +610,8 @@ class V1RootMCTS:
                 "finalize_graph_event_bridge_count": int(self._finalize_graph_event_bridge_count),
                 "finalize_graph_event_wait_count": int(self._finalize_graph_event_wait_count),
                 "finalize_graph_inline_replay_count": int(self._finalize_graph_inline_replay_count),
+                "terminal_soft_override_count": int(self._terminal_soft_override_count),
+                "forced_uniform_pick_count": int(self._forced_uniform_pick_count),
             },
         }
         if reset:
@@ -617,6 +628,8 @@ class V1RootMCTS:
             self._finalize_graph_event_bridge_count = 0
             self._finalize_graph_event_wait_count = 0
             self._finalize_graph_inline_replay_count = 0
+            self._terminal_soft_override_count = 0
+            self._forced_uniform_pick_count = 0
         return payload
 
     def _autocast_context(self):
@@ -634,6 +647,36 @@ class V1RootMCTS:
         if raw_values.dim() == 2 and raw_values.size(1) == 1:
             return raw_values[:, 0]
         return raw_values.view(-1)
+
+    @staticmethod
+    def _terminal_mask_from_next_state(batch: GpuStateBatch) -> torch.Tensor:
+        non_placement = batch.phase.ne(PHASE_PLACEMENT)
+        black_count = batch.board.eq(1).sum(dim=(1, 2))
+        white_count = batch.board.eq(-1).sum(dim=(1, 2))
+        winner_mask = non_placement.logical_and(
+            black_count.eq(0).logical_or(white_count.eq(0))
+        )
+        draw_mask = batch.move_count.ge(MAX_MOVE_COUNT).logical_or(
+            batch.moves_since_capture.ge(NO_CAPTURE_DRAW_LIMIT)
+        )
+        return winner_mask.logical_or(draw_mask)
+
+    @staticmethod
+    def _soft_tan_from_board_black(
+        board: torch.Tensor,
+        soft_value_k: float,
+    ) -> torch.Tensor:
+        black = board.eq(1).sum(dim=(1, 2)).to(torch.float32)
+        white = board.eq(-1).sum(dim=(1, 2)).to(torch.float32)
+        # In Liuzhou, |black-white| <= 18, so normalize by 18 to use full signal range.
+        material_delta = (black - white) / 18.0
+        scaled = torch.clamp(
+            material_delta * float(soft_value_k),
+            min=-SOFT_TAN_INPUT_CLAMP,
+            max=SOFT_TAN_INPUT_CLAMP,
+        )
+        shaped = torch.tan(scaled)
+        return torch.clamp(shaped, min=-1.0, max=1.0)
 
     def _forward_model(
         self, inputs: torch.Tensor
@@ -831,11 +874,24 @@ class V1RootMCTS:
         *,
         temperatures: Optional[float | torch.Tensor | list] = None,
         add_dirichlet_noise: Optional[bool] = None,
+        force_uniform_random_mask: Optional[torch.Tensor] = None,
     ) -> RootSearchBatchOutput:
         batch_size = int(state.batch_size)
         add_noise = self.config.add_dirichlet_noise if add_dirichlet_noise is None else bool(
             add_dirichlet_noise
         )
+        force_uniform_mask: Optional[torch.Tensor] = None
+        if force_uniform_random_mask is not None:
+            force_uniform_mask = (
+                torch.as_tensor(force_uniform_random_mask, device=state.device)
+                .to(torch.bool)
+                .view(-1)
+            )
+            if int(force_uniform_mask.numel()) != batch_size:
+                raise ValueError(
+                    "force_uniform_random_mask size mismatch: "
+                    f"expected {batch_size}, got {int(force_uniform_mask.numel())}"
+                )
         temp_values = self._normalize_temperatures(
             temperatures=temperatures,
             batch_size=batch_size,
@@ -896,6 +952,27 @@ class V1RootMCTS:
             else:
                 child_values = self._evaluate_values_only(child_batch)
             child_leaf_values = (-child_values).to(torch.float32)
+            terminal_child = self._terminal_mask_from_next_state(child_batch)
+            if bool(terminal_child.any().item()):
+                soft_from_black = self._soft_tan_from_board_black(
+                    child_batch.board,
+                    soft_value_k=float(self.config.soft_value_k),
+                ).to(torch.float32)
+                parent_player = state.current_player.index_select(0, parent_indices_all).to(
+                    torch.float32
+                )
+                parent_sign = torch.where(
+                    parent_player.ge(0.0),
+                    torch.ones_like(parent_player),
+                    -torch.ones_like(parent_player),
+                )
+                terminal_leaf_values = soft_from_black * parent_sign
+                child_leaf_values = torch.where(
+                    terminal_child,
+                    terminal_leaf_values,
+                    child_leaf_values,
+                )
+                self._terminal_soft_override_count += int(terminal_child.sum().item())
 
             leaf_mat = torch.zeros(
                 (num_roots, max_actions), dtype=torch.float32, device=state.device
@@ -950,6 +1027,27 @@ class V1RootMCTS:
                     ).view(-1, 4)
                     chosen_action_indices.index_copy_(0, valid_root_indices, sampled_indices_local)
                     chosen_action_codes.index_copy_(0, valid_root_indices, sampled_codes_local)
+            if force_uniform_mask is not None and bool(force_uniform_mask.any().item()):
+                force_local_mask = force_uniform_mask.index_select(0, valid_root_indices)
+                force_local_idx = torch.where(force_local_mask)[0]
+                if int(force_local_idx.numel()) > 0:
+                    force_valid_mask = valid_mask.index_select(0, force_local_idx).to(torch.float32)
+                    force_policy = force_valid_mask / force_valid_mask.sum(
+                        dim=1, keepdim=True
+                    ).clamp_min(1e-8)
+                    force_picks = torch.multinomial(force_policy, num_samples=1).view(-1)
+                    force_indices = legal_index_mat.index_select(0, force_local_idx).gather(
+                        1, force_picks.view(-1, 1)
+                    ).view(-1)
+                    force_codes = action_code_mat.index_select(0, force_local_idx).gather(
+                        1,
+                        force_picks.view(-1, 1, 1).expand(-1, 1, 4),
+                    ).view(-1, 4)
+                    force_global_roots = valid_root_indices.index_select(0, force_local_idx)
+                    chosen_action_indices.index_copy_(0, force_global_roots, force_indices)
+                    chosen_action_codes.index_copy_(0, force_global_roots, force_codes)
+                    chosen_valid_mask.index_fill_(0, force_global_roots, True)
+                    self._forced_uniform_pick_count += int(force_local_idx.numel())
             root_values.index_copy_(0, valid_root_indices, root_value_vec)
 
         return RootSearchBatchOutput(

@@ -238,10 +238,9 @@ def _print_eval_stats(payload: Dict[str, object]) -> None:
 
 
 def _soft_value_from_state(state: GameState, soft_value_k: float) -> float:
-    board_area = GameState.BOARD_SIZE * GameState.BOARD_SIZE
     black_count = state.count_player_pieces(Player.BLACK)
     white_count = state.count_player_pieces(Player.WHITE)
-    material_delta = (black_count - white_count) / float(board_area)
+    material_delta = (black_count - white_count) / 18.0
     return float(np.tanh(soft_value_k * material_delta))
 
 
