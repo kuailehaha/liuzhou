@@ -1,0 +1,37 @@
+﻿import os
+import sys
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from v1.train import train_pipeline_v1
+
+train_pipeline_v1(
+    stage='all',
+    iterations=6,
+    self_play_games=96,
+    mcts_simulations=16,
+    batch_size=64,
+    epochs=1,
+    lr=1e-3,
+    weight_decay=1e-4,
+    soft_label_alpha=1.0,
+    temperature_init=1.0,
+    temperature_final=0.1,
+    temperature_threshold=10,
+    exploration_weight=1.0,
+    dirichlet_alpha=0.3,
+    dirichlet_epsilon=0.25,
+    self_play_concurrent_games=8,
+    self_play_opening_random_moves=8,
+    soft_value_k=2.0,
+    max_game_plies=160,
+    checkpoint_dir=r"checkpoints_v1_local6_96_seed123_20260221_142404",
+    device='cuda:0',
+    devices='cuda:0',
+    train_devices='cuda:0',
+    train_strategy='data_parallel',
+    metrics_output=r"v1/data/stage_runs/local_6iter96_seed123_metrics_20260221_142404.json",
+    seed=123,
+)

@@ -62,10 +62,10 @@ std::optional<Player> GameState::GetWinner() const {
     }
     int black_pieces = CountPlayerPieces(Player::kBlack);
     int white_pieces = CountPlayerPieces(Player::kWhite);
-    if (black_pieces == 0) {
+    if (black_pieces < kLosePieceThreshold) {
         return Player::kWhite;
     }
-    if (white_pieces == 0) {
+    if (white_pieces < kLosePieceThreshold) {
         return Player::kBlack;
     }
     return std::nullopt;

@@ -830,11 +830,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
         auto black_count = valid_board.eq(1).sum({1, 2});
         auto white_count = valid_board.eq(-1).sum({1, 2});
         winner_sign = torch::where(
-            non_placement.logical_and(black_count.eq(0)),
+            non_placement.logical_and(black_count.lt(v0::kLosePieceThreshold)),
             torch::full_like(winner_sign, -1),
             winner_sign);
         winner_sign = torch::where(
-            non_placement.logical_and(white_count.eq(0)),
+            non_placement.logical_and(white_count.lt(v0::kLosePieceThreshold)),
             torch::full_like(winner_sign, 1),
             winner_sign);
 

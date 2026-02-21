@@ -1,69 +1,60 @@
 import random
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
 from src.game_state import GameState, Player
-from src.move_generator import generate_all_legal_moves, apply_move, MoveType
+from src.move_generator import MoveType, apply_move, generate_all_legal_moves
+
 
 class RandomAgent:
-    """随机智能体，随机选择一个合法走法"""
-    
+    """Random baseline agent that picks uniformly from legal moves."""
+
     def select_move(self, state: GameState) -> MoveType:
-        """从当前状态选择一个随机合法走法"""
         legal_moves = generate_all_legal_moves(state)
         if not legal_moves:
-            raise ValueError("没有合法走法可选")
+            raise ValueError("No legal moves available")
         return random.choice(legal_moves)
 
-def simulate_game(max_turns=1000):
-    """模拟一局游戏，两方都使用随机智能体"""
+
+def simulate_game(max_turns: int = 1000) -> List[GameState]:
+    """Simulate a random-vs-random game and return state history."""
+
     state = GameState()
     agent = RandomAgent()
-    
-    # 创建游戏历史记录
     history = [state.copy()]
-    
+
     for turn in range(max_turns):
-        # 获取当前玩家
         current_player = state.current_player
-        
-        # 选择走法
+
         try:
             move = agent.select_move(state)
-        except ValueError as e:
-            print(f"游戏结束：{e}")
+        except ValueError as exc:
+            print(f"Game ended: {exc}")
             break
-        
-        # 应用走法
+
         try:
             state = apply_move(state, move, quiet=True)
             history.append(state.copy())
-            
-            # 打印当前状态
-            print(f"回合 {turn+1}, {current_player.name} 执行: {move}")
+            print(f"Turn {turn + 1}, {current_player.name}: {move}")
             print(state)
-            
-            # 检查游戏是否结束
-            if state.count_player_pieces(Player.BLACK) == 0 and turn > 36:
-                print("游戏结束：白方获胜！")
+
+            winner = state.get_winner()
+            if winner == Player.WHITE:
+                print("Game over: WHITE wins")
                 break
-            elif state.count_player_pieces(Player.WHITE) == 0 and turn > 36:
-                print("游戏结束：黑方获胜！")
+            if winner == Player.BLACK:
+                print("Game over: BLACK wins")
                 break
-        except Exception as e:
-            print(f"走法应用错误: {e}")
+        except Exception as exc:
+            print(f"Move application error: {exc}")
             break
-    
+
     if turn == max_turns - 1:
-        print(f"游戏达到最大回合数 {max_turns}，强制结束")
-    
+        print(f"Reached max_turns={max_turns}, forced stop")
+
     return history
 
-# 测试代码
+
 if __name__ == "__main__":
-    # 设置随机种子以便重现结果
     random.seed(42)
-    
-    # 模拟一局游戏
     game_history = simulate_game(max_turns=200)
-    
-    # 输出游戏长度
-    print(f"游戏总共进行了 {len(game_history)-1} 个回合")
+    print(f"Total turns: {len(game_history) - 1}")

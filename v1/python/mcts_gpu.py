@@ -22,6 +22,7 @@ import torch
 
 import v0_core
 from src.game_state import GameState
+from src.neural_network import bucket_logits_to_scalar
 from v0.python.move_encoder import DEFAULT_ACTION_SPEC
 
 PLACEMENT_DIM = int(DEFAULT_ACTION_SPEC.placement_dim)
@@ -31,6 +32,7 @@ AUXILIARY_DIM = int(DEFAULT_ACTION_SPEC.auxiliary_dim)
 TOTAL_ACTION_DIM = int(DEFAULT_ACTION_SPEC.total_dim)
 MAX_MOVE_COUNT = int(GameState.MAX_MOVE_COUNT)
 NO_CAPTURE_DRAW_LIMIT = int(GameState.NO_CAPTURE_DRAW_LIMIT)
+LOSE_PIECE_THRESHOLD = int(GameState.LOSE_PIECE_THRESHOLD)
 PHASE_PLACEMENT = int(v0_core.Phase.PLACEMENT)
 SOFT_TAN_INPUT_CLAMP = float((math.pi * 0.5) - 1e-3)
 
@@ -646,6 +648,8 @@ class V1RootMCTS:
             return probs[:, 0] - probs[:, 2]
         if raw_values.dim() == 2 and raw_values.size(1) == 1:
             return raw_values[:, 0]
+        if raw_values.dim() == 2 and raw_values.size(1) >= 2:
+            return bucket_logits_to_scalar(raw_values, num_bins=int(raw_values.size(1)))
         return raw_values.view(-1)
 
     @staticmethod
@@ -654,7 +658,9 @@ class V1RootMCTS:
         black_count = batch.board.eq(1).sum(dim=(1, 2))
         white_count = batch.board.eq(-1).sum(dim=(1, 2))
         winner_mask = non_placement.logical_and(
-            black_count.eq(0).logical_or(white_count.eq(0))
+            black_count.lt(LOSE_PIECE_THRESHOLD).logical_or(
+                white_count.lt(LOSE_PIECE_THRESHOLD)
+            )
         )
         draw_mask = batch.move_count.ge(MAX_MOVE_COUNT).logical_or(
             batch.moves_since_capture.ge(NO_CAPTURE_DRAW_LIMIT)
@@ -677,6 +683,28 @@ class V1RootMCTS:
         )
         shaped = torch.tan(scaled)
         return torch.clamp(shaped, min=-1.0, max=1.0)
+
+    @staticmethod
+    def _child_values_to_parent_perspective(
+        child_values: torch.Tensor,
+        parent_players: torch.Tensor,
+        child_players: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert value(head) outputs on child states to parent-state perspective.
+
+        The network is trained with current-player perspective targets.
+        So sign should only flip when action application switches the side to move.
+        """
+        vals = child_values.to(torch.float32).view(-1)
+        parents = parent_players.to(torch.int64).view(-1)
+        children = child_players.to(torch.int64).view(-1)
+        if int(vals.numel()) != int(parents.numel()) or int(vals.numel()) != int(children.numel()):
+            raise ValueError(
+                "child/parent perspective tensors must align: "
+                f"values={int(vals.numel())}, parents={int(parents.numel())}, children={int(children.numel())}"
+            )
+        same_to_move = children.eq(parents)
+        return torch.where(same_to_move, vals, -vals)
 
     def _forward_model(
         self, inputs: torch.Tensor
@@ -951,16 +979,19 @@ class V1RootMCTS:
                 _, _, _, _, child_values = self._evaluate_batch(child_batch)
             else:
                 child_values = self._evaluate_values_only(child_batch)
-            child_leaf_values = (-child_values).to(torch.float32)
+            parent_player = state.current_player.index_select(0, parent_indices_all)
+            child_leaf_values = self._child_values_to_parent_perspective(
+                child_values=child_values,
+                parent_players=parent_player,
+                child_players=child_batch.current_player,
+            )
             terminal_child = self._terminal_mask_from_next_state(child_batch)
             if bool(terminal_child.any().item()):
                 soft_from_black = self._soft_tan_from_board_black(
                     child_batch.board,
                     soft_value_k=float(self.config.soft_value_k),
                 ).to(torch.float32)
-                parent_player = state.current_player.index_select(0, parent_indices_all).to(
-                    torch.float32
-                )
+                parent_player = parent_player.to(torch.float32)
                 parent_sign = torch.where(
                     parent_player.ge(0.0),
                     torch.ones_like(parent_player),

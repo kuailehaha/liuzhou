@@ -529,7 +529,7 @@ GameState ApplyCaptureSelection(const GameState& state, const Coord& position, b
     new_state.SetBoard(position.first, position.second, 0);
     new_state.pending_captures_remaining -= 1;
 
-    if (new_state.CountPlayerPieces(opponent) == 0) {
+    if (new_state.CountPlayerPieces(opponent) < kLosePieceThreshold) {
         if (!quiet) {
             // Placeholder for optional logging hook.
         }
@@ -624,7 +624,7 @@ GameState HandleNoMovesPhase3(const GameState& state, const Coord& stucked_playe
     }
 
     new_state.SetBoard(stucked_player_removes.first, stucked_player_removes.second, 0);
-    if (new_state.CountPlayerPieces(opponent) == 0) {
+    if (new_state.CountPlayerPieces(opponent) < kLosePieceThreshold) {
         if (!quiet) {
             // Optional logging hook.
         }
@@ -667,7 +667,7 @@ GameState ApplyCounterRemovalPhase3(const GameState& state, const Coord& opponen
     }
 
     new_state.SetBoard(opponent_removes.first, opponent_removes.second, 0);
-    if (new_state.CountPlayerPieces(stuck_player) == 0) {
+    if (new_state.CountPlayerPieces(stuck_player) < kLosePieceThreshold) {
         if (!quiet) {
             // Optional logging hook.
         }

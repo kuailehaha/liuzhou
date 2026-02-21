@@ -52,6 +52,20 @@ def test_v1_terminal_mask_next_state() -> None:
     assert terminal.tolist() == [True, True, True]
 
 
+def test_v1_child_value_perspective_alignment() -> None:
+    child_values = torch.tensor([0.2, -0.5, 0.8, -0.1], dtype=torch.float32)
+    parent_players = torch.tensor([1, 1, -1, -1], dtype=torch.int64)
+    child_players = torch.tensor([1, -1, -1, 1], dtype=torch.int64)
+    # Keep sign when side-to-move is unchanged; flip sign only on turn switch.
+    aligned = V1RootMCTS._child_values_to_parent_perspective(
+        child_values=child_values,
+        parent_players=parent_players,
+        child_players=child_players,
+    )
+    expected = torch.tensor([0.2, 0.5, 0.8, 0.1], dtype=torch.float32)
+    assert torch.allclose(aligned, expected, atol=1e-6, rtol=0.0)
+
+
 @pytest.mark.smoke
 def test_v1_tensor_pipeline_smoke() -> None:
     try:

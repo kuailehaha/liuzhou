@@ -66,6 +66,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         epochs=int(args.epochs),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
+        soft_label_alpha=float(args.soft_label_alpha),
         temperature_init=float(args.temperature_init),
         temperature_final=float(args.temperature_final),
         temperature_threshold=int(args.temperature_threshold),
@@ -116,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--soft_label_alpha", type=float, default=0.0)
 
     parser.add_argument("--temperature_init", type=float, default=1.0)
     parser.add_argument("--temperature_final", type=float, default=0.1)

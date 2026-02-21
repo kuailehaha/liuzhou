@@ -7,6 +7,7 @@ from src.move_generator import generate_all_legal_moves, MoveType
 
 # Number of input channels: player pieces, opponent pieces, mark indicators, and phase planes
 NUM_INPUT_CHANNELS = 11
+VALUE_BUCKET_BINS = 101
 
 
 
@@ -123,24 +124,25 @@ class PolicyHead(nn.Module):
         )
 
 class ValueHead(nn.Module):
-    """WDL (Win/Draw/Loss) value head.
+    """Bucketed value head.
 
-    Outputs raw logits of shape ``(B, 3)`` representing
-    ``[win, draw, loss]`` probabilities (before softmax).
+    Outputs raw logits of shape ``(B, K)`` where ``K=num_value_bins``.
     """
 
-    def __init__(self, in_channels: int, value_channels: int, mlp_channels: int):
+    def __init__(self, in_channels: int, value_channels: int, mlp_channels: int, num_value_bins: int = VALUE_BUCKET_BINS):
         super().__init__()
+        if int(num_value_bins) < 2:
+            raise ValueError("num_value_bins must be >= 2")
         self.conv1 = nn.Conv2d(in_channels, value_channels, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(value_channels)
         self.act1 = nn.ReLU(inplace=True)
         self.gpool = GlobalPool()
         self.fc1 = nn.Linear(3 * value_channels, mlp_channels, bias=True)
         self.act2 = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(mlp_channels, 3, bias=True)
+        self.fc2 = nn.Linear(mlp_channels, int(num_value_bins), bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return WDL logits ``(B, 3)`` — no activation applied."""
+        """Return bucket logits ``(B, K)``; no activation applied."""
         v = self.act1(self.bn1(self.conv1(x)))
         v = self.act2(self.fc1(self.gpool(v)))
         return self.fc2(v)
@@ -150,8 +152,12 @@ def wdl_to_scalar(wdl: torch.Tensor) -> torch.Tensor:
 
     Applies softmax then returns ``P_win - P_loss``.
     """
-    probs = torch.softmax(wdl, dim=-1)
-    return probs[..., 0] - probs[..., 2]
+    if wdl.size(-1) == 3:
+        probs = torch.softmax(wdl, dim=-1)
+        return probs[..., 0] - probs[..., 2]
+    if wdl.size(-1) == 1:
+        return wdl.squeeze(-1)
+    return bucket_logits_to_scalar(wdl, num_bins=int(wdl.size(-1)))
 
 
 def scalar_to_wdl(value: torch.Tensor) -> torch.Tensor:
@@ -167,6 +173,43 @@ def scalar_to_wdl(value: torch.Tensor) -> torch.Tensor:
     return torch.stack([w, d, l], dim=-1)
 
 
+def scalar_to_bucket_twohot(value: torch.Tensor, num_bins: int = VALUE_BUCKET_BINS) -> torch.Tensor:
+    """Convert scalar targets in ``[-1, 1]`` to two-hot bucket distributions.
+
+    Bucket centers are evenly spaced over ``[-1, 1]``.
+    """
+    bins = int(num_bins)
+    if bins < 2:
+        raise ValueError("num_bins must be >= 2")
+
+    value = value.squeeze(-1) if value.dim() > 1 and value.size(-1) == 1 else value
+    scalar = value.to(torch.float32).clamp(min=-1.0, max=1.0)
+    step = 2.0 / float(bins - 1)
+    u = (scalar + 1.0) / step
+    lo = torch.floor(u).to(torch.int64)
+    lo = torch.clamp(lo, min=0, max=bins - 1)
+    hi = torch.clamp(lo + 1, min=0, max=bins - 1)
+    frac = (u - lo.to(u.dtype)).clamp(min=0.0, max=1.0)
+    frac = torch.where(hi.eq(lo), torch.zeros_like(frac), frac)
+
+    target = torch.zeros((*scalar.shape, bins), dtype=torch.float32, device=scalar.device)
+    target.scatter_add_(-1, lo.unsqueeze(-1), (1.0 - frac).unsqueeze(-1))
+    target.scatter_add_(-1, hi.unsqueeze(-1), frac.unsqueeze(-1))
+    return target
+
+
+def bucket_logits_to_scalar(logits: torch.Tensor, num_bins: int = VALUE_BUCKET_BINS) -> torch.Tensor:
+    """Decode bucket logits to scalar value by probability-weighted expectation."""
+    bins = int(num_bins)
+    if bins < 2:
+        raise ValueError("num_bins must be >= 2")
+    if logits.size(-1) != bins:
+        bins = int(logits.size(-1))
+    probs = torch.softmax(logits, dim=-1)
+    centers = torch.linspace(-1.0, 1.0, steps=bins, device=logits.device, dtype=probs.dtype)
+    return (probs * centers).sum(dim=-1)
+
+
 class ChessNet(nn.Module):
     def __init__(
         self,
@@ -178,6 +221,7 @@ class ChessNet(nn.Module):
         policy_channels: int = 64,
         value_channels: int = 64,
         value_mlp_channels: int = 128,
+        value_bucket_bins: int = VALUE_BUCKET_BINS,
     ):
         super(ChessNet, self).__init__()
         self.board_size = board_size
@@ -194,20 +238,25 @@ class ChessNet(nn.Module):
         self.trunk_act = nn.ReLU(inplace=True)
 
         self.policy_head = PolicyHead(trunk_channels, policy_channels)
-        self.value_head = ValueHead(trunk_channels, value_channels, value_mlp_channels)
+        self.value_head = ValueHead(
+            trunk_channels,
+            value_channels,
+            value_mlp_channels,
+            num_value_bins=int(value_bucket_bins),
+        )
 
     def forward(self, x):
         # x: (batch_size, num_input_channels, board_size, board_size)
-        # Returns: (log_p1, log_p2, log_pmc, wdl_logits)
-        #   wdl_logits: (B, 3) raw logits for [win, draw, loss]
+        # Returns: (log_p1, log_p2, log_pmc, value_logits)
+        #   value_logits: (B, K) raw bucket logits over [-1, 1]
         x = self.stem_act(self.stem_bn(self.stem_conv(x)))
         for block in self.blocks:
             x = block(x)
         x = self.trunk_act(self.trunk_bn(x))
 
         log_policy_pos1, log_policy_pos2, log_policy_mark_capture = self.policy_head(x)
-        wdl_logits = self.value_head(x)
-        return log_policy_pos1, log_policy_pos2, log_policy_mark_capture, wdl_logits
+        value_logits = self.value_head(x)
+        return log_policy_pos1, log_policy_pos2, log_policy_mark_capture, value_logits
 
 def get_move_probabilities(
     log_policy_pos1: torch.Tensor,

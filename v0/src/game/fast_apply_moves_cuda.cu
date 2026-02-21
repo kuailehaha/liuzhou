@@ -423,7 +423,7 @@ __device__ void apply_no_moves_removal(
     }
 
     board[cell] = 0;
-    if (count_player_pieces(board, size, opponent_value) == 0) {
+    if (count_player_pieces(board, size, opponent_value) < kLosePieceThreshold) {
         return;
     }
 
@@ -460,7 +460,7 @@ __device__ void apply_capture_selection(
 
     board[cell] = 0;
     *pending_captures_remaining -= 1;
-    if (count_player_pieces(board, size, opponent_value) == 0 || *pending_captures_remaining > 0) {
+    if (count_player_pieces(board, size, opponent_value) < kLosePieceThreshold || *pending_captures_remaining > 0) {
         return;
     }
 
@@ -491,7 +491,7 @@ __device__ void apply_counter_removal(
     }
 
     board[cell] = 0;
-    if (count_player_pieces(board, size, stuck_player_value) == 0) {
+    if (count_player_pieces(board, size, stuck_player_value) < kLosePieceThreshold) {
         return;
     }
 

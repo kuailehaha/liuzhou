@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 
-from src.neural_network import scalar_to_wdl, wdl_to_scalar
+from src.neural_network import scalar_to_bucket_twohot
 from src.policy_batch import (
     batched_policy_loss,
     build_combined_logits,
@@ -208,13 +208,19 @@ def train_network_from_tensors(
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp_enabled):
-                log_p1, log_p2, log_pmc, wdl_logits = train_model(batch_states)
+                log_p1, log_p2, log_pmc, value_logits = train_model(batch_states)
 
-                wdl_hard = scalar_to_wdl(batch_values)
-                wdl_soft = scalar_to_wdl(batch_soft)
-                wdl_target = (1.0 - alpha) * wdl_hard + alpha * wdl_soft
-                wdl_log_probs = torch.log_softmax(wdl_logits, dim=-1)
-                value_loss = -(wdl_target * wdl_log_probs).sum(dim=-1).mean()
+                mixed_values = torch.clamp(
+                    (1.0 - alpha) * batch_values + alpha * batch_soft,
+                    min=-1.0,
+                    max=1.0,
+                )
+                bucket_target = scalar_to_bucket_twohot(
+                    mixed_values,
+                    num_bins=int(value_logits.size(1)),
+                ).to(torch.float32)
+                value_log_probs = torch.log_softmax(value_logits.to(torch.float32), dim=-1)
+                value_loss = -(bucket_target * value_log_probs).sum(dim=-1).mean()
 
                 combined_logits = build_combined_logits(
                     log_p1.view(log_p1.size(0), -1),
@@ -257,7 +263,7 @@ def train_network_from_tensors(
             total_valid_policy += valid_policy
 
             soft_abs_sum += float(batch_soft.abs().mean().item())
-            mix_abs_sum += float(wdl_to_scalar(wdl_target).abs().mean().item())
+            mix_abs_sum += float(mixed_values.abs().mean().item())
             mix_batches += 1
 
         if strategy == "ddp":

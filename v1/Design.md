@@ -1677,3 +1677,86 @@ Data-effectiveness standard fields (must be preserved in reports):
 - 第三阶段（文档与记录收敛）:
   - 将实测结果回填 `v1/Design.md` 与 `TODO.md`，标注是否达到“提高胜负样本占比”的验收门槛。
 
+### Draw-Collapse Recovery Update (2026-02-21, Windows RTX 3060)
+
+#### Local evidence snapshot (new)
+- Local 3-iteration runs (`self_play_games=64`, `mcts_simulations=16`, `self_play_opening_random_moves=8`) still show draw collapse instability:
+  - `v1/data/stage_runs/local_3iter_metrics_20260221_123116.json`:
+    - draw mean `100.00%`, decisive mean `0.00%`, value nonzero mean `0.00%`.
+  - `v1/data/stage_runs/local_3iter_metrics_20260221_130623.json`:
+    - draw mean `93.23%`, decisive mean `6.77%`, value nonzero mean `6.51%`, but with iteration-level fallback to `100%` draw.
+  - `v1/data/stage_runs/local_3iter_metrics_20260221_133447.json` (`soft_label_alpha=1.0`):
+    - draw mean `98.44%`, decisive mean `1.56%`, hard value nonzero mean `1.50%`;
+    - mixed value nonzero mean `84.17%` while decisive outcomes still collapse.
+- Interpretation:
+  - current soft-target densification is working numerically, but policy learning is still dominated by draw trajectories.
+  - draw collapse is now a training-objective/control issue (not a throughput bottleneck).
+
+### Vibe Coding Plan (2026-02-21): Draw-Collapse Recovery v2
+
+#### 1. 目标与范围
+- 目标:
+  - 在不改规则/编码的前提下，显著降低 draw collapse 发生概率，并提升 `decisive_game_ratio`。
+- 范围:
+  - 优先改 v1 训练目标与 self-play 调度策略，最小化新增开关。
+  - 不改 `README.md` / `rule_description.md` 定义的规则语义。
+
+#### 2. 影响面
+- `v1/train.py`
+  - 启用已有 `policy_draw_weight` 通道，不再硬编码为 `1.0`。
+  - 基于上一轮 self-play 指标自动计算下一轮 `policy_draw_weight` 与 `opening_random_moves`（无新增 CLI 必需项）。
+- `v1/python/train_bridge.py`
+  - 保持现有加权损失框架，补充训练日志字段（有效 draw 权重、有效样本权重统计）。
+- `v1/python/self_play_gpu_runner.py`
+  - 支持“坍缩恢复模式”下的自适应开局随机窗口（由 `train.py` 调度值驱动）。
+- `v1/python/mcts_gpu.py` 与 `v0/src/bindings/module.cpp`
+  - 同步 draw 终局软值修正公式，确保 MCTS 叶子值覆盖与终局回填一致。
+
+#### 3. 不变量
+- 规则不变量:
+  - 胜负/和棋判定、阶段流转、动作合法性完全不变。
+- 编码不变量:
+  - `TOTAL_ACTION_DIM`、动作索引语义和 policy target 编码不变。
+- 符号不变量:
+  - 黑方视角为正，白方严格取反；`value_targets/soft_value_targets` 写回符号保持一致。
+- 接口不变量:
+  - 维持 staged 入口和 payload 兼容；可增加指标字段但不破坏旧读取。
+
+#### 4. 风险点
+- 若 draw 样本降权过强，可能导致短期策略发散或过拟合少量 decisive 局面。
+- 若 draw 软值修正与 MCTS/Finalize 路径不同步，会出现搜索值与训练标签不一致。
+- 自适应开局随机窗口可能带来吞吐波动，需要设置上限并纳入 gate。
+
+#### 5. 验证方式
+- 三轮本地验收（Windows, `torchenv`, `scripts/local_train_v1_3iter.ps1`）:
+  - `draw_game_ratio` 三轮均值 `<= 95%`;
+  - `decisive_game_ratio` 三轮均值 `>= 5%`;
+  - `value_target_summary.nonzero_ratio` 三轮均值 `>= 8%`;
+  - `positions_per_sec` 不低于当前基线的 `85%`。
+- 坍缩保护验收:
+  - 不允许出现“连续两轮 `draw_rate=100%` 且 `decisive_games=0`”。
+- 泛化探针:
+  - 保留 `vs_random` 作为健康检查，不作为奖励目标。
+
+#### 6. 产出清单
+- 文档:
+  - `v1/Design.md`（本节）
+  - `TODO.md`（回填执行与结果）
+- 代码（下一改动集）:
+  - `v1/train.py`
+  - `v1/python/train_bridge.py`
+  - `v1/python/self_play_gpu_runner.py`
+  - `v1/python/mcts_gpu.py`
+  - `v0/src/bindings/module.cpp`
+  - `tests/v1/*`（新增或扩展回归）
+
+#### 7. 实现闭环
+- Phase A: 目标对齐
+  - 落地“draw 样本降权 + 自适应开局随机窗口”，并补全训练/自博弈指标日志。
+- Phase B: 语义一致
+  - 落地 draw 终局软值修正，确保 MCTS 终局覆盖与 finalize 回填使用同一公式。
+- Phase C: 回归验收
+  - 跑本地 3 轮与最小 staged 验证，产出 before/after JSON。
+- Phase D: 记录收敛
+  - 将结果回填 `v1/Design.md` 与 `TODO.md`，给出是否达到 gate 的结论。
+

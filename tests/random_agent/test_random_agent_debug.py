@@ -55,7 +55,7 @@ def _play_random_game(seed: int = 42, max_turns: int = 60) -> Tuple[bool, List[G
 
         history.append(state.copy())
 
-        if state.count_player_pieces(Player.BLACK) == 0 or state.count_player_pieces(Player.WHITE) == 0:
+        if state.get_winner() is not None:
             return True, history
 
     return True, history

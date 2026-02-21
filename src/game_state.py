@@ -27,6 +27,7 @@ class Player(Enum):
 class GameState:
     BOARD_SIZE = 6
     MAX_MOVE_COUNT = 144
+    LOSE_PIECE_THRESHOLD = 4
     NO_CAPTURE_DRAW_LIMIT = 36  # 18回合无吃子判和（每回合双方各一步 = 36 actions）
 
     def __init__(
@@ -163,9 +164,9 @@ class GameState:
         black_pieces = self.count_player_pieces(Player.BLACK)
         white_pieces = self.count_player_pieces(Player.WHITE)
 
-        if black_pieces == 0:
+        if black_pieces < self.LOSE_PIECE_THRESHOLD:
             return Player.WHITE
-        if white_pieces == 0:
+        if white_pieces < self.LOSE_PIECE_THRESHOLD:
             return Player.BLACK
         return None
 

@@ -24,24 +24,24 @@ def apply_placement_move(state: GameState, position: Tuple[int, int]) -> GameSta
     new_state = state.copy()
 
     if new_state.phase != Phase.PLACEMENT:
-        raise ValueError("当前不是落子阶段")
+        raise ValueError("褰撳墠涓嶆槸钀藉瓙闃舵")
 
     if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
-        raise ValueError("落子位置超出棋盘范围")
+        raise ValueError("钀藉瓙浣嶇疆瓒呭嚭妫嬬洏鑼冨洿")
 
     if new_state.board[r][c] != 0:
-        raise ValueError(f"位置 ({r}, {c}) 已有棋子")
+        raise ValueError(f"浣嶇疆 ({r}, {c}) 宸叉湁妫嬪瓙")
 
     current_player = new_state.current_player
     opponent_marked = (
         new_state.marked_white if current_player == Player.BLACK else new_state.marked_black
     )
     if (r, c) in opponent_marked:
-        raise ValueError(f"位置 ({r}, {c}) 已被对方标记，不能落")
+        raise ValueError(f"浣嶇疆 ({r}, {c}) 宸茶瀵规柟鏍囪锛屼笉鑳借惤")
 
     new_state.board[r][c] = current_player.value
 
-    # 检测是否形成形"    
+    # 妫€娴嬫槸鍚﹀舰鎴愬舰"    
     own_marked = (
         new_state.marked_black if current_player == Player.BLACK else new_state.marked_white
     )
@@ -109,9 +109,9 @@ def generate_mark_targets(state: GameState) -> List[Tuple[int, int]]:
 def apply_mark_selection(state: GameState, position: Tuple[int, int]) -> GameState:
     new_state = state.copy()
     if new_state.phase != Phase.MARK_SELECTION:
-        raise ValueError("当前不是标记选择阶段")
+        raise ValueError("褰撳墠涓嶆槸鏍囪閫夋嫨闃舵")
     if new_state.pending_marks_remaining <= 0:
-        raise ValueError("没有待完成的标记任务")
+        raise ValueError("娌℃湁寰呭畬鎴愮殑鏍囪浠诲姟")
 
     r, c = position
     opponent = new_state.current_player.opponent()
@@ -119,13 +119,14 @@ def apply_mark_selection(state: GameState, position: Tuple[int, int]) -> GameSta
     opponent_marked = new_state.marked_white if opponent == Player.WHITE else new_state.marked_black
 
     if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
-        raise ValueError("标记位置超出棋盘范围")
+        raise ValueError("鏍囪浣嶇疆瓒呭嚭妫嬬洏鑼冨洿")
     if new_state.board[r][c] != opponent_value:
-        raise ValueError("只能标记对方棋子")
+        raise ValueError("鍙兘鏍囪瀵规柟妫嬪瓙")
     if (r, c) in opponent_marked:
-        raise ValueError("该棋子已经被标记")
+        raise ValueError("璇ユ瀛愬凡缁忚鏍囪")
 
-    # 如果对方还有未构成形状的普通棋子，则不能标记形状中的棋"    opponent_normal_pieces = [
+    # 濡傛灉瀵规柟杩樻湁鏈瀯鎴愬舰鐘剁殑鏅€氭瀛愶紝鍒欎笉鑳芥爣璁板舰鐘朵腑鐨勬瀛?
+    opponent_normal_pieces = [
         (rr, cc)
         for rr in range(GameState.BOARD_SIZE)
         for cc in range(GameState.BOARD_SIZE)
@@ -138,7 +139,7 @@ def apply_mark_selection(state: GameState, position: Tuple[int, int]) -> GameSta
     if opponent_normal_unmarked and is_piece_in_shape(
         new_state.board, r, c, opponent_value, opponent_marked
     ):
-        raise ValueError("对方存在普通棋子时，不能标记其关键结构中的棋子")
+        raise ValueError("瀵规柟瀛樺湪鏅€氭瀛愭椂锛屼笉鑳芥爣璁板叾鍏抽敭缁撴瀯涓殑妫嬪瓙")
 
     if opponent == Player.WHITE:
         new_state.marked_white.add((r, c))
@@ -163,7 +164,7 @@ def apply_mark_selection(state: GameState, position: Tuple[int, int]) -> GameSta
 def process_phase2_removals(state: GameState) -> GameState:
     new_state = state.copy()
     if new_state.phase != Phase.REMOVAL:
-        raise ValueError("当前不是移除阶段")
+        raise ValueError("褰撳墠涓嶆槸绉婚櫎闃舵")
 
     if not new_state.marked_black and not new_state.marked_white:
         new_state.phase = Phase.FORCED_REMOVAL
@@ -212,7 +213,7 @@ def generate_movement_moves(state: GameState) -> List[Tuple[Tuple[int, int], Tup
 
 def has_legal_movement_moves(state: GameState) -> bool:
     if state.phase != Phase.MOVEMENT:
-        raise ValueError("当前不是走子阶段")
+        raise ValueError("褰撳墠涓嶆槸璧板瓙闃舵")
     return bool(generate_movement_moves(state))
 
 
@@ -224,14 +225,14 @@ def apply_movement_move(
     (r_from, c_from), (r_to, c_to) = move
     new_state = state.copy()
     if new_state.phase != Phase.MOVEMENT:
-        raise ValueError("当前不是走子阶段")
+        raise ValueError("褰撳墠涓嶆槸璧板瓙闃舵")
 
     if new_state.board[r_from][c_from] != new_state.current_player.value:
-        raise ValueError("起始位置不是当前玩家的棋")
+        raise ValueError("璧峰浣嶇疆涓嶆槸褰撳墠鐜╁鐨勬")
     if new_state.board[r_to][c_to] != 0:
-        raise ValueError("目标位置不是空位")
+        raise ValueError("鐩爣浣嶇疆涓嶆槸绌轰綅")
     if not ((abs(r_from - r_to) == 1 and c_from == c_to) or (abs(c_from - c_to) == 1 and r_from == r_to)):
-        raise ValueError("只能水平或垂直移动一")
+        raise ValueError("鍙兘姘村钩鎴栧瀭鐩寸Щ鍔ㄤ竴")
 
     new_state.board[r_to][c_to] = new_state.board[r_from][c_from]
     new_state.board[r_from][c_from] = 0
@@ -290,9 +291,9 @@ def apply_capture_selection(
 ) -> GameState:
     new_state = state.copy()
     if new_state.phase != Phase.CAPTURE_SELECTION:
-        raise ValueError("当前不是提子阶段")
+        raise ValueError("褰撳墠涓嶆槸鎻愬瓙闃舵")
     if new_state.pending_captures_remaining <= 0:
-        raise ValueError("没有待完成的提子任务")
+        raise ValueError("娌℃湁寰呭畬鎴愮殑鎻愬瓙浠诲姟")
 
     r, c = position
     opponent = new_state.current_player.opponent()
@@ -300,9 +301,9 @@ def apply_capture_selection(
     opponent_marked = new_state.marked_white if opponent == Player.WHITE else new_state.marked_black
 
     if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
-        raise ValueError("位置超出棋盘范围")
+        raise ValueError("浣嶇疆瓒呭嚭妫嬬洏鑼冨洿")
     if new_state.board[r][c] != opponent_value:
-        raise ValueError("只能提掉对方棋子")
+        raise ValueError("鍙兘鎻愭帀瀵规柟妫嬪瓙")
 
     opponent_normal_pieces = [
         (rr, cc)
@@ -314,14 +315,14 @@ def apply_capture_selection(
     if opponent_normal_pieces and is_piece_in_shape(
         new_state.board, r, c, opponent_value, opponent_marked
     ):
-        raise ValueError("对方还有普通棋子时，不能提关键结构中的棋子")
+        raise ValueError("瀵规柟杩樻湁鏅€氭瀛愭椂锛屼笉鑳芥彁鍏抽敭缁撴瀯涓殑妫嬪瓙")
 
     new_state.board[r][c] = 0
     new_state.pending_captures_remaining -= 1
 
-    if new_state.count_player_pieces(opponent) == 0:
+    if new_state.count_player_pieces(opponent) < GameState.LOSE_PIECE_THRESHOLD:
         if not quiet:
-            print(f"游戏结束！玩"{new_state.current_player.name} 获胜")
+            print(f"Game over! Player {new_state.current_player.name} wins")
         return new_state
 
     if new_state.pending_captures_remaining > 0:
@@ -338,31 +339,31 @@ def apply_forced_removal(state: GameState, piece_to_remove: Tuple[int, int]) -> 
     r, c = piece_to_remove
 
     if new_state.phase != Phase.FORCED_REMOVAL:
-        raise ValueError("当前不是强制移除阶段")
+        raise ValueError("褰撳墠涓嶆槸寮哄埗绉婚櫎闃舵")
 
     if new_state.forced_removals_done == 0:
         if new_state.current_player != Player.WHITE:
-            raise ValueError("强制移除顺序错误：应由白方先移除黑子")
+            raise ValueError("寮哄埗绉婚櫎椤哄簭閿欒锛氬簲鐢辩櫧鏂瑰厛绉婚櫎榛戝瓙")
         if new_state.board[r][c] != Player.BLACK.value:
-            raise ValueError("必须移除黑方棋子")
+            raise ValueError("蹇呴』绉婚櫎榛戞柟妫嬪瓙")
         if is_piece_in_shape(new_state.board, r, c, Player.BLACK.value, set()):
-            raise ValueError("构成方或洲的棋子不能被强制移")
+            raise ValueError("鏋勬垚鏂规垨娲茬殑妫嬪瓙涓嶈兘琚己鍒剁Щ")
         new_state.board[r][c] = 0
         new_state.forced_removals_done = 1
         new_state.current_player = Player.BLACK
     elif new_state.forced_removals_done == 1:
         if new_state.current_player != Player.BLACK:
-            raise ValueError("强制移除顺序错误：应由黑方移除白")
+            raise ValueError("寮哄埗绉婚櫎椤哄簭閿欒锛氬簲鐢遍粦鏂圭Щ闄ょ櫧")
         if new_state.board[r][c] != Player.WHITE.value:
-            raise ValueError("必须移除白方棋子")
+            raise ValueError("蹇呴』绉婚櫎鐧芥柟妫嬪瓙")
         if is_piece_in_shape(new_state.board, r, c, Player.WHITE.value, set()):
-            raise ValueError("构成方或洲的棋子不能被强制移")
+            raise ValueError("鏋勬垚鏂规垨娲茬殑妫嬪瓙涓嶈兘琚己鍒剁Щ")
         new_state.board[r][c] = 0
         new_state.forced_removals_done = 2
         new_state.phase = Phase.MOVEMENT
         new_state.current_player = Player.WHITE
     else:
-        raise RuntimeError("强制移除状态异")
+        raise RuntimeError("寮哄埗绉婚櫎鐘舵€佸紓")
 
     return new_state
 
@@ -374,16 +375,16 @@ def handle_no_moves_phase3(
 ) -> GameState:
     new_state = state.copy()
     if new_state.phase != Phase.MOVEMENT:
-        raise ValueError("无子可动处理只能在走子阶段触")
+        raise ValueError("鏃犲瓙鍙姩澶勭悊鍙兘鍦ㄨ蛋瀛愰樁娈佃Е")
 
     r, c = stucked_player_removes
     current_player = new_state.current_player
     opponent = current_player.opponent()
 
     if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
-        raise ValueError("位置超出棋盘范围")
+        raise ValueError("浣嶇疆瓒呭嚭妫嬬洏鑼冨洿")
     if new_state.board[r][c] != opponent.value:
-        raise ValueError("只能移除对方棋子")
+        raise ValueError("鍙兘绉婚櫎瀵规柟妫嬪瓙")
 
     opponent_normal_pieces = [
         (rr, cc)
@@ -395,13 +396,13 @@ def handle_no_moves_phase3(
     if opponent_normal_pieces and is_piece_in_shape(
         new_state.board, r, c, opponent.value, set()
     ):
-        raise ValueError("对方尚有普通棋子，不能移除结构中的棋子")
+        raise ValueError("瀵规柟灏氭湁鏅€氭瀛愶紝涓嶈兘绉婚櫎缁撴瀯涓殑妫嬪瓙")
 
     new_state.board[r][c] = 0
 
-    if new_state.count_player_pieces(opponent) == 0:
+    if new_state.count_player_pieces(opponent) < GameState.LOSE_PIECE_THRESHOLD:
         if not quiet:
-            print(f"游戏结束！玩"{current_player.name} 获胜")
+            print(f"Game over! Player {current_player.name} wins")
         return new_state
 
     new_state.phase = Phase.COUNTER_REMOVAL
@@ -418,15 +419,15 @@ def apply_counter_removal_phase3(
     r, c = opponent_removes
 
     if new_state.phase != Phase.COUNTER_REMOVAL:
-        raise ValueError("当前不是反制移除阶段")
+        raise ValueError("褰撳墠涓嶆槸鍙嶅埗绉婚櫎闃舵")
 
     remover = new_state.current_player
     stuck_player = remover.opponent()
 
     if not (0 <= r < GameState.BOARD_SIZE and 0 <= c < GameState.BOARD_SIZE):
-        raise ValueError("位置超出棋盘范围")
+        raise ValueError("浣嶇疆瓒呭嚭妫嬬洏鑼冨洿")
     if new_state.board[r][c] != stuck_player.value:
-        raise ValueError("只能移除被困住玩家的棋子")
+        raise ValueError("鍙兘绉婚櫎琚洶浣忕帺瀹剁殑妫嬪瓙")
 
     stuck_player_normal_pieces = [
         (rr, cc)
@@ -438,13 +439,13 @@ def apply_counter_removal_phase3(
     if stuck_player_normal_pieces and is_piece_in_shape(
         new_state.board, r, c, stuck_player.value, set()
     ):
-        raise ValueError("对方尚有普通棋子，不能移除结构中的棋子")
+        raise ValueError("瀵规柟灏氭湁鏅€氭瀛愶紝涓嶈兘绉婚櫎缁撴瀯涓殑妫嬪瓙")
 
     new_state.board[r][c] = 0
 
-    if new_state.count_player_pieces(stuck_player) == 0:
+    if new_state.count_player_pieces(stuck_player) < GameState.LOSE_PIECE_THRESHOLD:
         if not quiet:
-            print(f"游戏结束！玩"{remover.name} 获胜")
+            print(f"Game over! Player {remover.name} wins")
         return new_state
 
     new_state.phase = Phase.MOVEMENT
@@ -502,7 +503,7 @@ def check_lines(
 ) -> bool:
     size = len(board)
 
-    # 水平检"    count = 1
+    # 姘村钩妫€"    count = 1
     for dc in range(c - 1, -1, -1):
         if board[r][dc] == player_value and (r, dc) not in marked_set:
             count += 1
@@ -516,7 +517,7 @@ def check_lines(
     if count >= 6:
         return True
 
-    # 垂直检"    count = 1
+    # 鍨傜洿妫€"    count = 1
     for dr in range(r - 1, -1, -1):
         if board[dr][c] == player_value and (dr, c) not in marked_set:
             count += 1
@@ -586,7 +587,7 @@ def apply_move_phase1(
     new_state = apply_placement_move(state, move)
     if mark_positions:
         if new_state.phase != Phase.MARK_SELECTION:
-            raise ValueError("当前状态不需要标记，但传入了 mark_positions")
+            raise ValueError("褰撳墠鐘舵€佷笉闇€瑕佹爣璁帮紝浣嗕紶鍏ヤ簡 mark_positions")
         for pos in mark_positions:
             new_state = apply_mark_selection(new_state, pos)
     return new_state
@@ -611,7 +612,8 @@ def apply_move_phase3(
     new_state = apply_movement_move(state, move, quiet=quiet)
     if capture_positions:
         if new_state.phase != Phase.CAPTURE_SELECTION:
-            raise ValueError("当前状态不需要提子，但传入了 capture_positions")
+            raise ValueError("褰撳墠鐘舵€佷笉闇€瑕佹彁瀛愶紝浣嗕紶鍏ヤ簡 capture_positions")
         for pos in capture_positions:
             new_state = apply_capture_selection(new_state, pos, quiet=quiet)
     return new_state
+

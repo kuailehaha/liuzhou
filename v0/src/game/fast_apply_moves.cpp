@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "v0/game_state.hpp"
 #include "fast_legal_mask_common.hpp"
 
 namespace v0 {
@@ -462,7 +463,7 @@ void apply_no_moves_removal(
     }
 
     board[idx] = 0;
-    if (count_player_pieces(board, size, opponent_value) == 0) {
+    if (count_player_pieces(board, size, opponent_value) < kLosePieceThreshold) {
         return;
     }
 
@@ -504,7 +505,7 @@ void apply_capture_selection(
 
     board[idx] = 0;
     pending_captures_remaining -= 1;
-    if (count_player_pieces(board, size, opponent_value) == 0) {
+    if (count_player_pieces(board, size, opponent_value) < kLosePieceThreshold) {
         return;
     }
     if (pending_captures_remaining > 0) {
@@ -542,7 +543,7 @@ void apply_counter_removal(
     }
 
     board[idx] = 0;
-    if (count_player_pieces(board, size, stuck_player_value) == 0) {
+    if (count_player_pieces(board, size, stuck_player_value) < kLosePieceThreshold) {
         return;
     }
 

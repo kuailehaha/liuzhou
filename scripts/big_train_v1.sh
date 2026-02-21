@@ -25,6 +25,7 @@ EXPLORATION_WEIGHT="${EXPLORATION_WEIGHT:-1.0}"
 DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.3}"
 DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
 SOFT_VALUE_K="${SOFT_VALUE_K:-2.0}"
+SOFT_LABEL_ALPHA="${SOFT_LABEL_ALPHA:-1.0}"
 MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
 SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-6}"
@@ -58,8 +59,8 @@ if [[ "$PROFILE" == "stable" ]]; then
   : "${WEIGHT_DECAY:=1e-4}"
 elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${ITERATIONS:=80}"
-  : "${SELF_PLAY_GAMES:=524288}"
-  : "${MCTS_SIMULATIONS:=4096}"
+  : "${SELF_PLAY_GAMES:=2089952}"
+  : "${MCTS_SIMULATIONS:=1024}"
   : "${BATCH_SIZE:=16384}"
   : "${EPOCHS:=4}"
   : "${LR:=2e-4}"
@@ -146,6 +147,7 @@ echo "[big_train_v1] checkpoints=$CHECKPOINT_DIR"
 echo "[big_train_v1] run_dir=$RUN_DIR"
 echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
+echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA"
 echo "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
 if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
   echo "[big_train_v1] self_play_shard_dir=$SELF_PLAY_SHARD_DIR"
@@ -204,6 +206,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     --dirichlet_alpha "$DIRICHLET_ALPHA"
     --dirichlet_epsilon "$DIRICHLET_EPSILON"
     --soft_value_k "$SOFT_VALUE_K"
+    --soft_label_alpha "$SOFT_LABEL_ALPHA"
     --max_game_plies "$MAX_GAME_PLIES"
     --self_play_concurrent_games "$SELF_PLAY_CONCURRENT_GAMES"
     --self_play_opening_random_moves "$SELF_PLAY_OPENING_RANDOM_MOVES"
@@ -254,6 +257,18 @@ if isinstance(vsum, dict):
         f"nonzero={nonzero}/{total} ({nonzero_ratio*100.0:.2f}%), "
         f"positive={pos}, negative={neg}"
     )
+mvsum = data.get("mixed_value_target_summary")
+if isinstance(mvsum, dict):
+    m_nonzero = int(mvsum.get("nonzero_count", 0))
+    m_total = int(mvsum.get("total", 0))
+    m_pos = int(mvsum.get("positive_count", 0))
+    m_neg = int(mvsum.get("negative_count", 0))
+    m_nonzero_ratio = float(mvsum.get("nonzero_ratio", 0.0))
+    print(
+        "[big_train_v1] selfplay mixed value targets: "
+        f"nonzero={m_nonzero}/{m_total} ({m_nonzero_ratio*100.0:.2f}%), "
+        f"positive={m_pos}, negative={m_neg}"
+    )
 piece_delta = data.get("piece_delta_buckets")
 if isinstance(piece_delta, dict):
     bucket_total = 0
@@ -295,6 +310,7 @@ PY
       --epochs "$EPOCHS"
       --lr "$LR"
       --weight_decay "$WEIGHT_DECAY"
+      --soft_label_alpha "$SOFT_LABEL_ALPHA"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --checkpoint_name "$CKPT_NAME"
@@ -318,6 +334,7 @@ PY
       --epochs "$EPOCHS"
       --lr "$LR"
       --weight_decay "$WEIGHT_DECAY"
+      --soft_label_alpha "$SOFT_LABEL_ALPHA"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --checkpoint_name "$CKPT_NAME"

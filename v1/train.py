@@ -219,8 +219,8 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
     )
 
 
-def _compute_value_target_summary(samples: TensorSelfPlayBatch) -> Dict[str, Any]:
-    values = samples.value_targets.detach().to("cpu", dtype=torch.float32).view(-1)
+def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
+    values = values.detach().to("cpu", dtype=torch.float32).view(-1)
     total = int(values.numel())
     if total <= 0:
         return {
@@ -245,10 +245,28 @@ def _compute_value_target_summary(samples: TensorSelfPlayBatch) -> Dict[str, Any
     }
 
 
+def _compute_value_target_summary(samples: TensorSelfPlayBatch) -> Dict[str, Any]:
+    return _summarize_scalar_targets(samples.value_targets)
+
+
+def _compute_mixed_value_target_summary(
+    samples: TensorSelfPlayBatch,
+    soft_label_alpha: float,
+) -> Dict[str, Any]:
+    alpha = float(max(0.0, min(1.0, soft_label_alpha)))
+    mixed = torch.clamp(
+        (1.0 - alpha) * samples.value_targets + alpha * samples.soft_value_targets,
+        min=-1.0,
+        max=1.0,
+    )
+    return _summarize_scalar_targets(mixed)
+
+
 def _build_self_play_report(
     *,
     stats: SelfPlayV1Stats,
     value_target_summary: Dict[str, Any],
+    mixed_value_target_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload = stats.to_dict()
     games = max(1, int(stats.num_games))
@@ -263,6 +281,8 @@ def _build_self_play_report(
     payload["piece_delta_bucket_expected"] = int(stats.num_games)
     payload["piece_delta_bucket_coverage"] = float(piece_delta_bucket_total / games)
     payload["value_target_summary"] = dict(value_target_summary)
+    if isinstance(mixed_value_target_summary, dict):
+        payload["mixed_value_target_summary"] = dict(mixed_value_target_summary)
     return payload
 
 
@@ -270,6 +290,7 @@ def _print_self_play_summary(
     *,
     stats: SelfPlayV1Stats,
     value_target_summary: Dict[str, Any],
+    mixed_value_target_summary: Optional[Dict[str, Any]] = None,
 ) -> None:
     games = max(1, int(stats.num_games))
     decisive = int(stats.black_wins + stats.white_wins)
@@ -301,6 +322,16 @@ def _print_self_play_summary(
         f"pos={int(value_target_summary.get('positive_count', 0))} "
         f"neg={int(value_target_summary.get('negative_count', 0))}"
     )
+    if isinstance(mixed_value_target_summary, dict):
+        mixed_nonzero = int(mixed_value_target_summary.get("nonzero_count", 0))
+        mixed_total = int(mixed_value_target_summary.get("total", 0))
+        mixed_ratio = float(mixed_value_target_summary.get("nonzero_ratio", 0.0))
+        _print_rank0(
+            "[v1.train] selfplay mixed value targets "
+            f"nonzero={mixed_nonzero}/{mixed_total} ({mixed_ratio*100.0:.2f}%) "
+            f"pos={int(mixed_value_target_summary.get('positive_count', 0))} "
+            f"neg={int(mixed_value_target_summary.get('negative_count', 0))}"
+        )
 
 
 def _run_self_play_shard(
@@ -760,8 +791,37 @@ def _load_checkpoint_into_model(
         raise FileNotFoundError(f"Checkpoint not found: {load_checkpoint}")
     checkpoint = torch.load(load_checkpoint, map_location=map_location)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict, strict=True)
-    _print_rank0(f"[v1.train] loaded checkpoint: {load_checkpoint}")
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        _print_rank0(f"[v1.train] loaded checkpoint: {load_checkpoint}")
+        return
+    except RuntimeError as exc:
+        model_state = model.state_dict()
+        compatible: Dict[str, torch.Tensor] = {}
+        skipped: List[str] = []
+        for key, tensor in state_dict.items():
+            if key not in model_state:
+                skipped.append(key)
+                continue
+            if tuple(model_state[key].shape) != tuple(tensor.shape):
+                skipped.append(key)
+                continue
+            compatible[key] = tensor
+        missing, unexpected = model.load_state_dict(compatible, strict=False)
+        _print_rank0(
+            "[v1.train] loaded checkpoint with partial compatibility "
+            f"(strict load failed: {exc})."
+        )
+        if skipped:
+            preview = ",".join(skipped[:8])
+            suffix = "..." if len(skipped) > 8 else ""
+            _print_rank0(
+                f"[v1.train] skipped incompatible keys ({len(skipped)}): {preview}{suffix}"
+            )
+        if missing:
+            _print_rank0(f"[v1.train] missing keys after load ({len(missing)}).")
+        if unexpected:
+            _print_rank0(f"[v1.train] unexpected keys after load ({len(unexpected)}).")
 
 
 def _save_json(path: str, payload: Any) -> None:
@@ -970,6 +1030,7 @@ def train_pipeline_v1(
     epochs: int = 1,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
+    soft_label_alpha: float = 0.0,
     temperature_init: float = 1.0,
     temperature_final: float = 0.1,
     temperature_threshold: int = 10,
@@ -1053,6 +1114,7 @@ def train_pipeline_v1(
         _print_rank0(
             f"[v1.train] self_play_opening_random_moves={int(self_play_opening_random_moves)}"
         )
+        _print_rank0(f"[v1.train] soft_label_alpha={float(soft_label_alpha):.3f}")
         _print_rank0(f"[v1.train] train_devices={train_device_list}")
         _print_rank0(f"[v1.train] infer_devices={infer_device_list}")
         if int(self_play_concurrent_games) > 256:
@@ -1091,9 +1153,14 @@ def train_pipeline_v1(
                 self_play_shard_dir=shard_dir_arg,
             )
             value_target_summary = _compute_value_target_summary(samples)
+            mixed_value_target_summary = _compute_mixed_value_target_summary(
+                samples,
+                soft_label_alpha=float(soft_label_alpha),
+            )
             sp_report = _build_self_play_report(
                 stats=sp_stats,
                 value_target_summary=value_target_summary,
+                mixed_value_target_summary=mixed_value_target_summary,
             )
             output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
             _save_self_play_payload(
@@ -1110,6 +1177,7 @@ def train_pipeline_v1(
                     "self_play_concurrent_games": int(self_play_concurrent_games),
                     "self_play_opening_random_moves": int(self_play_opening_random_moves),
                     "value_target_summary": dict(value_target_summary),
+                    "mixed_value_target_summary": dict(mixed_value_target_summary),
                 },
                 )
             if self_play_stats_json:
@@ -1117,6 +1185,7 @@ def train_pipeline_v1(
             _print_self_play_summary(
                 stats=sp_stats,
                 value_target_summary=value_target_summary,
+                mixed_value_target_summary=mixed_value_target_summary,
             )
             _print_rank0(
                 f"[v1.train] selfplay saved: {output_path} "
@@ -1140,7 +1209,7 @@ def train_pipeline_v1(
                 epochs=epochs,
                 lr=lr,
                 weight_decay=weight_decay,
-                soft_label_alpha=0.0,
+                soft_label_alpha=float(soft_label_alpha),
                 policy_draw_weight=1.0,
                 device=str(primary_train_device),
                 use_amp=(primary_train_device.type == "cuda"),
@@ -1177,12 +1246,14 @@ def train_pipeline_v1(
                     "self_play_decisive_game_ratio": sp_stats_payload.get("decisive_game_ratio"),
                     "self_play_draw_game_ratio": sp_stats_payload.get("draw_game_ratio"),
                     "self_play_value_target_summary": sp_stats_payload.get("value_target_summary"),
+                    "self_play_mixed_value_target_summary": sp_stats_payload.get("mixed_value_target_summary"),
                     "train_devices": list(train_device_list),
                     "train_strategy": train_strategy_norm,
                     "train_time_sec": float(train_elapsed),
                     "train_avg_loss": last_epoch.get("avg_loss"),
                     "train_avg_policy_loss": last_epoch.get("avg_policy_loss"),
                     "train_avg_value_loss": last_epoch.get("avg_value_loss"),
+                    "train_soft_label_alpha": float(soft_label_alpha),
                     "checkpoint": ckpt_path,
                 }
                 metrics_path = str(metrics_output or os.path.join(checkpoint_dir, "training_metrics_v1.json"))
@@ -1245,6 +1316,10 @@ def train_pipeline_v1(
                 self_play_shard_dir=shard_dir_arg,
             )
             value_target_summary = _compute_value_target_summary(samples)
+            mixed_value_target_summary = _compute_mixed_value_target_summary(
+                samples,
+                soft_label_alpha=float(soft_label_alpha),
+            )
             sp_elapsed = time.perf_counter() - sp_start
 
             train_start = time.perf_counter()
@@ -1259,7 +1334,7 @@ def train_pipeline_v1(
                 epochs=epochs,
                 lr=lr,
                 weight_decay=weight_decay,
-                soft_label_alpha=0.0,
+                soft_label_alpha=float(soft_label_alpha),
                 policy_draw_weight=1.0,
                 device=str(primary_train_device),
                 use_amp=(primary_train_device.type == "cuda"),
@@ -1302,10 +1377,12 @@ def train_pipeline_v1(
                 ),
                 "draw_game_ratio": float(int(sp_stats.draws) / max(1, int(sp_stats.num_games))),
                 "value_target_summary": dict(value_target_summary),
+                "mixed_value_target_summary": dict(mixed_value_target_summary),
                 "train_time_sec": train_elapsed,
                 "train_avg_loss": last_epoch.get("avg_loss"),
                 "train_avg_policy_loss": last_epoch.get("avg_policy_loss"),
                 "train_avg_value_loss": last_epoch.get("avg_value_loss"),
+                "train_soft_label_alpha": float(soft_label_alpha),
                 "checkpoint": ckpt_path,
             }
             metrics.append(entry)
@@ -1325,12 +1402,14 @@ def train_pipeline_v1(
                         "self_play_concurrent_games": int(self_play_concurrent_games),
                         "self_play_opening_random_moves": int(self_play_opening_random_moves),
                         "value_target_summary": dict(value_target_summary),
+                        "mixed_value_target_summary": dict(mixed_value_target_summary),
                     },
                 )
 
             _print_self_play_summary(
                 stats=sp_stats,
                 value_target_summary=value_target_summary,
+                mixed_value_target_summary=mixed_value_target_summary,
             )
             _print_rank0(
                 "[v1.train] "
@@ -1362,6 +1441,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--soft_label_alpha", type=float, default=0.0)
     parser.add_argument("--temperature_init", type=float, default=1.0)
     parser.add_argument("--temperature_final", type=float, default=0.1)
     parser.add_argument("--temperature_threshold", type=int, default=10)
@@ -1470,6 +1550,7 @@ if __name__ == "__main__":
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        soft_label_alpha=args.soft_label_alpha,
         temperature_init=args.temperature_init,
         temperature_final=args.temperature_final,
         temperature_threshold=args.temperature_threshold,

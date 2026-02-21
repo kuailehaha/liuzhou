@@ -324,7 +324,7 @@ def apply_capture_selection(
     new_state.board[r][c] = 0
     new_state.pending_captures_remaining -= 1
 
-    if new_state.count_player_pieces(opponent) == 0:
+    if new_state.count_player_pieces(opponent) < GameState.LOSE_PIECE_THRESHOLD:
         if not quiet:
             print(f"游戏结束！玩家 {new_state.current_player.name} 获胜！")
         return new_state
@@ -404,7 +404,7 @@ def handle_no_moves_phase3(
 
     new_state.board[r][c] = 0
 
-    if new_state.count_player_pieces(opponent) == 0:
+    if new_state.count_player_pieces(opponent) < GameState.LOSE_PIECE_THRESHOLD:
         if not quiet:
             print(f"游戏结束！玩家 {current_player.name} 获胜！")
         return new_state
@@ -447,7 +447,7 @@ def apply_counter_removal_phase3(
 
     new_state.board[r][c] = 0
 
-    if new_state.count_player_pieces(stuck_player) == 0:
+    if new_state.count_player_pieces(stuck_player) < GameState.LOSE_PIECE_THRESHOLD:
         if not quiet:
             print(f"游戏结束！玩家 {remover.name} 获胜！")
         return new_state

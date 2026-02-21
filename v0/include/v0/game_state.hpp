@@ -12,6 +12,7 @@ namespace v0 {
 constexpr int kBoardSize = 6;
 constexpr int kCellCount = kBoardSize * kBoardSize;
 constexpr int kMaxMoveCount = 144;
+constexpr int kLosePieceThreshold = 4;
 constexpr int kNoCaptureDrawLimit = 36;  // 18回合无吃子判和
 
 inline int CellIndex(int row, int col) {
