@@ -130,6 +130,14 @@ if [[ "$TRAIN_STRATEGY" == "ddp" && "$TRAIN_NPROC" -le 1 ]]; then
   echo "[big_train_v1] TRAIN_STRATEGY=ddp needs >1 gpu; fallback to data_parallel"
   TRAIN_STRATEGY="data_parallel"
 fi
+TRAIN_TOTAL_CPU_THREADS="${TRAIN_TOTAL_CPU_THREADS:-200}"
+TRAIN_THREADS_PER_RANK="$TRAIN_TOTAL_CPU_THREADS"
+if [[ "$TRAIN_STRATEGY" == "ddp" && "$TRAIN_NPROC" -gt 0 ]]; then
+  TRAIN_THREADS_PER_RANK="$(( TRAIN_TOTAL_CPU_THREADS / TRAIN_NPROC ))"
+fi
+if [[ "$TRAIN_THREADS_PER_RANK" -lt 1 ]]; then
+  TRAIN_THREADS_PER_RANK=1
+fi
 
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
@@ -139,6 +147,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "[big_train_v1] run_tag=$RUN_TAG"
 echo "[big_train_v1] profile=$PROFILE train_strategy=$TRAIN_STRATEGY"
+echo "[big_train_v1] train_total_cpu_threads=$TRAIN_TOTAL_CPU_THREADS train_threads_per_rank=$TRAIN_THREADS_PER_RANK"
 echo "[big_train_v1] python=$PYTHON_BIN"
 echo "[big_train_v1] self_play_devices=$SELF_PLAY_DEVICES"
 echo "[big_train_v1] train_devices=$TRAIN_DEVICES"
@@ -319,6 +328,10 @@ PY
     if [[ -n "$LATEST_MODEL" && -f "$LATEST_MODEL" ]]; then
       DDP_CMD+=(--load_checkpoint "$LATEST_MODEL")
     fi
+    OMP_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
+    MKL_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
+    OPENBLAS_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
+    NUMEXPR_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
     CUDA_VISIBLE_DEVICES="$TRAIN_VISIBLE" "${DDP_CMD[@]}"
   else
     TRAIN_CMD=(
