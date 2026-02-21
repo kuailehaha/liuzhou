@@ -148,6 +148,28 @@ def _concat_self_play_batches_cpu(batches: List[TensorSelfPlayBatch]) -> TensorS
     )
 
 
+def _normalize_piece_delta_buckets(raw: Any) -> Dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for delta in range(-18, 19):
+        key = str(delta)
+        try:
+            out[key] = int(raw.get(key, 0) or 0)
+        except Exception:
+            out[key] = 0
+    return out
+
+
+def _merge_piece_delta_buckets(stats: List[SelfPlayV1Stats]) -> Dict[str, int]:
+    merged: Dict[str, int] = {str(delta): 0 for delta in range(-18, 19)}
+    for row in stats:
+        buckets = _normalize_piece_delta_buckets(row.piece_delta_buckets)
+        for key, value in buckets.items():
+            merged[key] = int(merged.get(key, 0) + int(value))
+    return merged
+
+
 def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> SelfPlayV1Stats:
     total_games = int(sum(int(s.num_games) for s in stats))
     total_positions = int(sum(int(s.num_positions) for s in stats))
@@ -156,6 +178,7 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
     draws = int(sum(int(s.draws) for s in stats))
     weighted_len_num = float(sum(float(s.avg_game_length) * float(s.num_games) for s in stats))
     avg_game_length = weighted_len_num / max(1.0, float(total_games))
+    piece_delta_buckets = _merge_piece_delta_buckets(stats)
 
     step_ms: Dict[str, float] = {}
     step_ratio: Dict[str, float] = {}
@@ -192,6 +215,7 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
         step_timing_ratio=step_ratio,
         step_timing_calls=step_calls,
         mcts_counters=counter_sum,
+        piece_delta_buckets=piece_delta_buckets,
     )
 
 
@@ -229,9 +253,15 @@ def _build_self_play_report(
     payload = stats.to_dict()
     games = max(1, int(stats.num_games))
     decisive = int(stats.black_wins + stats.white_wins)
+    piece_delta_buckets = _normalize_piece_delta_buckets(stats.piece_delta_buckets)
+    piece_delta_bucket_total = int(sum(int(v) for v in piece_delta_buckets.values()))
     payload["decisive_games"] = int(decisive)
     payload["decisive_game_ratio"] = float(decisive / games)
     payload["draw_game_ratio"] = float(int(stats.draws) / games)
+    payload["piece_delta_buckets"] = piece_delta_buckets
+    payload["piece_delta_bucket_total"] = int(piece_delta_bucket_total)
+    payload["piece_delta_bucket_expected"] = int(stats.num_games)
+    payload["piece_delta_bucket_coverage"] = float(piece_delta_bucket_total / games)
     payload["value_target_summary"] = dict(value_target_summary)
     return payload
 
@@ -248,10 +278,22 @@ def _print_self_play_summary(
     nonzero = int(value_target_summary.get("nonzero_count", 0))
     total = int(value_target_summary.get("total", 0))
     nonzero_ratio = float(value_target_summary.get("nonzero_ratio", 0.0))
+    piece_delta_buckets = _normalize_piece_delta_buckets(stats.piece_delta_buckets)
+    piece_delta_bucket_total = int(sum(int(v) for v in piece_delta_buckets.values()))
+    nonzero_bucket_tokens: List[str] = []
+    for delta in range(-18, 19):
+        count = int(piece_delta_buckets.get(str(delta), 0))
+        if count > 0:
+            nonzero_bucket_tokens.append(f"{delta}:{count}")
+    bucket_view = ",".join(nonzero_bucket_tokens) if nonzero_bucket_tokens else "none"
     _print_rank0(
         "[v1.train] selfplay outcomes "
         f"black_win={int(stats.black_wins)} white_win={int(stats.white_wins)} draw={int(stats.draws)} "
         f"decisive={decisive}/{games} ({decisive_ratio*100.0:.2f}%) draw_rate={draw_ratio*100.0:.2f}%"
+    )
+    _print_rank0(
+        "[v1.train] selfplay piece_delta buckets "
+        f"total={piece_delta_bucket_total}/{int(stats.num_games)} nonzero={{{bucket_view}}}"
     )
     _print_rank0(
         "[v1.train] selfplay value targets "
@@ -339,6 +381,7 @@ def _self_play_stats_from_payload(stats_payload: Dict[str, Any]) -> SelfPlayV1St
         if isinstance(mcts_counters_raw, dict)
         else {}
     )
+    piece_delta_buckets = _normalize_piece_delta_buckets(payload.get("piece_delta_buckets"))
     elapsed = max(1e-9, float(payload.get("elapsed_sec", 0.0) or 0.0))
     num_games = int(payload.get("num_games", 0) or 0)
     num_positions = int(payload.get("num_positions", 0) or 0)
@@ -356,6 +399,7 @@ def _self_play_stats_from_payload(stats_payload: Dict[str, Any]) -> SelfPlayV1St
         step_timing_ratio=step_timing_ratio,
         step_timing_calls=step_timing_calls,
         mcts_counters=mcts_counters,
+        piece_delta_buckets=piece_delta_buckets,
     )
 
 

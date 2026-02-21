@@ -20,7 +20,7 @@ Flow:
 
 Notes:
 - `result` is from BLACK perspective: +1 win / -1 loss / 0 draw.
-- `soft_value` is a material heuristic: tanh(k * material_delta).
+- `soft_value` is a material heuristic: `clip(tan(clip(k * material_delta, +/- (pi/2-eps))), [-1, 1])`.
 
 ## 2) Sample serialization
 

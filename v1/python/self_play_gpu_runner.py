@@ -13,6 +13,10 @@ import v0_core
 from .mcts_gpu import GpuStateBatch, TOTAL_ACTION_DIM, V1RootMCTS, V1RootMCTSConfig
 from .trajectory_buffer import TensorSelfPlayBatch, TensorTrajectoryBuffer
 
+_PIECE_DELTA_MIN = -18
+_PIECE_DELTA_MAX = 18
+_PIECE_DELTA_BUCKET_COUNT = (_PIECE_DELTA_MAX - _PIECE_DELTA_MIN) + 1
+
 
 @dataclass
 class SelfPlayV1Stats:
@@ -29,6 +33,7 @@ class SelfPlayV1Stats:
     step_timing_ratio: Dict[str, float]
     step_timing_calls: Dict[str, int]
     mcts_counters: Dict[str, int]
+    piece_delta_buckets: Dict[str, int]
 
     def to_dict(self) -> Dict[str, object]:
         payload: Dict[str, object] = {
@@ -46,6 +51,7 @@ class SelfPlayV1Stats:
         payload["step_timing_ratio"] = {k: float(v) for k, v in self.step_timing_ratio.items()}
         payload["step_timing_calls"] = {k: int(v) for k, v in self.step_timing_calls.items()}
         payload["mcts_counters"] = {k: int(v) for k, v in self.mcts_counters.items()}
+        payload["piece_delta_buckets"] = {k: int(v) for k, v in self.piece_delta_buckets.items()}
         return payload
 
 def self_play_v1_gpu(
@@ -106,6 +112,7 @@ def self_play_v1_gpu(
     )
 
     outcome_counts = torch.zeros((3,), dtype=torch.int64, device=dev)
+    piece_delta_hist = torch.zeros((_PIECE_DELTA_BUCKET_COUNT,), dtype=torch.int64, device=dev)
     game_lengths = torch.zeros((int(num_games),), dtype=torch.int64, device=dev)
     step_timing_ms: Dict[str, float] = {
         "root_puct_ms": 0.0,
@@ -252,6 +259,17 @@ def self_play_v1_gpu(
                 # Recompute terminal soft labels with v1 tan shaping so runtime behavior
                 # is aligned even if extension binaries are stale.
                 final_boards = states.board.index_select(0, finalize_slots)
+                black_count = final_boards.eq(1).sum(dim=(1, 2)).to(torch.int64)
+                white_count = final_boards.eq(-1).sum(dim=(1, 2)).to(torch.int64)
+                piece_delta = black_count - white_count
+                bucket_indices = torch.clamp(
+                    piece_delta - int(_PIECE_DELTA_MIN),
+                    min=0,
+                    max=int(_PIECE_DELTA_BUCKET_COUNT - 1),
+                )
+                piece_delta_hist.add_(
+                    torch.bincount(bucket_indices, minlength=int(_PIECE_DELTA_BUCKET_COUNT))
+                )
                 soft_local = V1RootMCTS._soft_tan_from_board_black(
                     final_boards,
                     soft_value_k=float(soft_value_k),
@@ -296,6 +314,11 @@ def self_play_v1_gpu(
     black_wins = int(outcome_counts[0].item())
     white_wins = int(outcome_counts[1].item())
     draws = int(outcome_counts[2].item())
+    piece_delta_hist_cpu = piece_delta_hist.to("cpu")
+    piece_delta_buckets = {
+        str(delta): int(piece_delta_hist_cpu[delta - int(_PIECE_DELTA_MIN)].item())
+        for delta in range(int(_PIECE_DELTA_MIN), int(_PIECE_DELTA_MAX) + 1)
+    }
     avg_len = float(game_lengths.to(torch.float32).mean().item())
     stats = SelfPlayV1Stats(
         num_games=num_games,
@@ -311,5 +334,6 @@ def self_play_v1_gpu(
         step_timing_ratio={k: float(step_timing_ratio.get(k, 0.0)) for k in tracked_keys},
         step_timing_calls={k: int(step_timing_calls.get(k, 0)) for k in tracked_keys},
         mcts_counters={k: int(v) for k, v in mcts_timing.get("counters", {}).items()},
+        piece_delta_buckets=piece_delta_buckets,
     )
     return batch, stats

@@ -254,6 +254,26 @@ if isinstance(vsum, dict):
         f"nonzero={nonzero}/{total} ({nonzero_ratio*100.0:.2f}%), "
         f"positive={pos}, negative={neg}"
     )
+piece_delta = data.get("piece_delta_buckets")
+if isinstance(piece_delta, dict):
+    bucket_total = 0
+    nonzero_tokens = []
+    for delta in range(-18, 19):
+        key = str(delta)
+        count = int(piece_delta.get(key, 0) or 0)
+        bucket_total += count
+        if count > 0:
+            nonzero_tokens.append(f"{delta}:{count}")
+    token_text = ",".join(nonzero_tokens) if nonzero_tokens else "none"
+    print(
+        "[big_train_v1] selfplay piece_delta buckets: "
+        f"total={bucket_total}/{games}, nonzero={{{token_text}}}"
+    )
+    if bucket_total != games:
+        print(
+            "[big_train_v1] warning: piece_delta bucket total mismatch "
+            f"total={bucket_total} expected={games}"
+        )
 PY
   fi
 

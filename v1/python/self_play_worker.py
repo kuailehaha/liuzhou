@@ -83,6 +83,18 @@ def _concat_self_play_batches_cpu(batches: List[TensorSelfPlayBatch]) -> TensorS
 
 
 def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float) -> SelfPlayV1Stats:
+    def _normalize_piece_delta_buckets(raw: Any) -> Dict[str, int]:
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, int] = {}
+        for delta in range(-18, 19):
+            key = str(delta)
+            try:
+                out[key] = int(raw.get(key, 0) or 0)
+            except Exception:
+                out[key] = 0
+        return out
+
     if not stats_list:
         elapsed = max(1e-9, float(elapsed_sec))
         return SelfPlayV1Stats(
@@ -99,6 +111,7 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
             step_timing_ratio={},
             step_timing_calls={},
             mcts_counters={},
+            piece_delta_buckets={str(delta): 0 for delta in range(-18, 19)},
         )
 
     total_games = int(sum(int(s.num_games) for s in stats_list))
@@ -114,6 +127,7 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
     step_timing_ms: Dict[str, float] = {}
     step_timing_calls: Dict[str, int] = {}
     mcts_counters: Dict[str, int] = {}
+    piece_delta_buckets: Dict[str, int] = {str(delta): 0 for delta in range(-18, 19)}
     for stats in stats_list:
         for k, v in stats.step_timing_ms.items():
             step_timing_ms[str(k)] = float(step_timing_ms.get(str(k), 0.0) + float(v))
@@ -121,6 +135,9 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
             step_timing_calls[str(k)] = int(step_timing_calls.get(str(k), 0) + int(v))
         for k, v in stats.mcts_counters.items():
             mcts_counters[str(k)] = int(mcts_counters.get(str(k), 0) + int(v))
+        buckets = _normalize_piece_delta_buckets(stats.piece_delta_buckets)
+        for key, value in buckets.items():
+            piece_delta_buckets[key] = int(piece_delta_buckets.get(key, 0) + int(value))
 
     tracked = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
     total_tracked = float(sum(float(step_timing_ms.get(k, 0.0)) for k in tracked))
@@ -147,6 +164,7 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
         step_timing_ratio=step_timing_ratio,
         step_timing_calls=step_timing_calls,
         mcts_counters=mcts_counters,
+        piece_delta_buckets=piece_delta_buckets,
     )
 
 
