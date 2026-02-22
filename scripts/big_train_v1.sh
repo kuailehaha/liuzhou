@@ -43,10 +43,10 @@ EVAL_BATCH_LEAVES="${EVAL_BATCH_LEAVES:-1024}"
 EVAL_INFER_BACKEND="${EVAL_INFER_BACKEND:-graph}"
 EVAL_INFER_BATCH_SIZE="${EVAL_INFER_BATCH_SIZE:-1024}"
 EVAL_INFER_WARMUP_ITERS="${EVAL_INFER_WARMUP_ITERS:-5}"
-EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-1}" # 0 | 1
+EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-0}" # 0 | 1
 EVAL_DEVICES="${EVAL_DEVICES:-$INFER_DEVICES}"
 EVAL_V1_CONCURRENT_GAMES="${EVAL_V1_CONCURRENT_GAMES:-8192}"
-EVAL_V1_OPENING_RANDOM_MOVES="${EVAL_V1_OPENING_RANDOM_MOVES:-6}"
+EVAL_V1_OPENING_RANDOM_MOVES="${EVAL_V1_OPENING_RANDOM_MOVES:-0}" # strict eval default: no random opening moves
 
 SELF_PLAY_ALLOC_CONF="${SELF_PLAY_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.95,max_split_size_mb:512}"
 SELF_PLAY_MEMORY_ANCHOR_MB="${SELF_PLAY_MEMORY_ANCHOR_MB:-0}"
@@ -374,40 +374,26 @@ vsum = data.get("value_target_summary")
 if isinstance(vsum, dict):
     nonzero = int(vsum.get("nonzero_count", 0))
     total = int(vsum.get("total", 0))
-    finite = int(vsum.get("finite_count", total))
-    nonfinite = int(vsum.get("nonfinite_count", 0))
     pos = int(vsum.get("positive_count", 0))
     neg = int(vsum.get("negative_count", 0))
     nonzero_ratio = float(vsum.get("nonzero_ratio", 0.0))
     print(
         "[big_train_v1] selfplay value targets: "
-        f"nonzero={nonzero}/{finite} ({nonzero_ratio*100.0:.2f}%), "
+        f"nonzero={nonzero}/{total} ({nonzero_ratio*100.0:.2f}%), "
         f"positive={pos}, negative={neg}"
     )
-    if nonfinite > 0:
-        print(
-            "[big_train_v1] warning: value targets contain non-finite values "
-            f"nonfinite={nonfinite}/{total}"
-        )
 mvsum = data.get("mixed_value_target_summary")
 if isinstance(mvsum, dict):
     m_nonzero = int(mvsum.get("nonzero_count", 0))
     m_total = int(mvsum.get("total", 0))
-    m_finite = int(mvsum.get("finite_count", m_total))
-    m_nonfinite = int(mvsum.get("nonfinite_count", 0))
     m_pos = int(mvsum.get("positive_count", 0))
     m_neg = int(mvsum.get("negative_count", 0))
     m_nonzero_ratio = float(mvsum.get("nonzero_ratio", 0.0))
     print(
         "[big_train_v1] selfplay mixed value targets: "
-        f"nonzero={m_nonzero}/{m_finite} ({m_nonzero_ratio*100.0:.2f}%), "
+        f"nonzero={m_nonzero}/{m_total} ({m_nonzero_ratio*100.0:.2f}%), "
         f"positive={m_pos}, negative={m_neg}"
     )
-    if m_nonfinite > 0:
-        print(
-            "[big_train_v1] warning: mixed value targets contain non-finite values "
-            f"nonfinite={m_nonfinite}/{m_total}"
-        )
 piece_delta = data.get("piece_delta_buckets")
 if isinstance(piece_delta, dict):
     bucket_total = 0
