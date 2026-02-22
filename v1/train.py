@@ -225,23 +225,31 @@ def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
     if total <= 0:
         return {
             "total": 0,
+            "finite_count": 0,
+            "nonfinite_count": 0,
             "nonzero_count": 0,
             "zero_count": 0,
             "positive_count": 0,
             "negative_count": 0,
             "nonzero_ratio": 0.0,
         }
-    positive = int(torch.count_nonzero(values > 0).item())
-    negative = int(torch.count_nonzero(values < 0).item())
+    finite_mask = torch.isfinite(values)
+    finite_count = int(torch.count_nonzero(finite_mask).item())
+    nonfinite_count = int(total - finite_count)
+    finite_values = values[finite_mask] if finite_count > 0 else values.new_empty((0,))
+    positive = int(torch.count_nonzero(finite_values > 0).item())
+    negative = int(torch.count_nonzero(finite_values < 0).item())
     nonzero = int(positive + negative)
-    zero = int(total - nonzero)
+    zero = int(finite_count - nonzero)
     return {
         "total": total,
+        "finite_count": finite_count,
+        "nonfinite_count": nonfinite_count,
         "nonzero_count": nonzero,
         "zero_count": zero,
         "positive_count": positive,
         "negative_count": negative,
-        "nonzero_ratio": float(nonzero / max(1, total)),
+        "nonzero_ratio": float(nonzero / max(1, finite_count)),
     }
 
 
@@ -298,6 +306,8 @@ def _print_self_play_summary(
     draw_ratio = float(int(stats.draws) / games)
     nonzero = int(value_target_summary.get("nonzero_count", 0))
     total = int(value_target_summary.get("total", 0))
+    finite = int(value_target_summary.get("finite_count", total))
+    nonfinite = int(value_target_summary.get("nonfinite_count", 0))
     nonzero_ratio = float(value_target_summary.get("nonzero_ratio", 0.0))
     piece_delta_buckets = _normalize_piece_delta_buckets(stats.piece_delta_buckets)
     piece_delta_bucket_total = int(sum(int(v) for v in piece_delta_buckets.values()))
@@ -318,20 +328,32 @@ def _print_self_play_summary(
     )
     _print_rank0(
         "[v1.train] selfplay value targets "
-        f"nonzero={nonzero}/{total} ({nonzero_ratio*100.0:.2f}%) "
+        f"nonzero={nonzero}/{finite} ({nonzero_ratio*100.0:.2f}%) "
         f"pos={int(value_target_summary.get('positive_count', 0))} "
         f"neg={int(value_target_summary.get('negative_count', 0))}"
     )
+    if nonfinite > 0:
+        _print_rank0(
+            "[v1.train] warning: selfplay value targets contain non-finite values "
+            f"nonfinite={nonfinite}/{total}"
+        )
     if isinstance(mixed_value_target_summary, dict):
         mixed_nonzero = int(mixed_value_target_summary.get("nonzero_count", 0))
         mixed_total = int(mixed_value_target_summary.get("total", 0))
+        mixed_finite = int(mixed_value_target_summary.get("finite_count", mixed_total))
+        mixed_nonfinite = int(mixed_value_target_summary.get("nonfinite_count", 0))
         mixed_ratio = float(mixed_value_target_summary.get("nonzero_ratio", 0.0))
         _print_rank0(
             "[v1.train] selfplay mixed value targets "
-            f"nonzero={mixed_nonzero}/{mixed_total} ({mixed_ratio*100.0:.2f}%) "
+            f"nonzero={mixed_nonzero}/{mixed_finite} ({mixed_ratio*100.0:.2f}%) "
             f"pos={int(mixed_value_target_summary.get('positive_count', 0))} "
             f"neg={int(mixed_value_target_summary.get('negative_count', 0))}"
         )
+        if mixed_nonfinite > 0:
+            _print_rank0(
+                "[v1.train] warning: selfplay mixed value targets contain non-finite values "
+                f"nonfinite={mixed_nonfinite}/{mixed_total}"
+            )
 
 
 def _run_self_play_shard(
@@ -1393,6 +1415,19 @@ def train_pipeline_v1(
                 f"input={self_play_input} local_positions={int(samples.num_samples)} "
                 f"global_positions={global_positions}"
             )
+            value_nonfinite = int(
+                torch.count_nonzero(torch.isfinite(samples.value_targets).logical_not()).item()
+            )
+            soft_nonfinite = int(
+                torch.count_nonzero(torch.isfinite(samples.soft_value_targets).logical_not()).item()
+            )
+            if value_nonfinite > 0 or soft_nonfinite > 0:
+                _print_rank0(
+                    "[v1.train] warning: loaded self-play targets contain non-finite values "
+                    f"value_nonfinite={value_nonfinite} "
+                    f"soft_nonfinite={soft_nonfinite} "
+                    f"local_positions={int(samples.num_samples)}"
+                )
             train_start = time.perf_counter()
             model.train()
             parallel_devices = (
@@ -1454,6 +1489,8 @@ def train_pipeline_v1(
                     "self_play_games": sp_stats_payload.get("num_games"),
                     "self_play_positions": int(global_positions),
                     "self_play_positions_local": int(samples.num_samples),
+                    "self_play_value_nonfinite_local": int(value_nonfinite),
+                    "self_play_soft_value_nonfinite_local": int(soft_nonfinite),
                     "self_play_decisive_games": sp_stats_payload.get("decisive_games"),
                     "self_play_decisive_game_ratio": sp_stats_payload.get("decisive_game_ratio"),
                     "self_play_draw_game_ratio": sp_stats_payload.get("draw_game_ratio"),

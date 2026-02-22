@@ -67,6 +67,24 @@ def _ddp_is_ready() -> bool:
     return bool(dist.is_available() and dist.is_initialized())
 
 
+def _all_ranks_true(flag: bool, *, strategy: str, device: torch.device) -> bool:
+    if str(strategy) != "ddp" or not _ddp_is_ready():
+        return bool(flag)
+    token = torch.tensor([1 if flag else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(token, op=dist.ReduceOp.MIN)
+    return bool(int(token.item()) == 1)
+
+
+def _grads_are_finite(module: nn.Module) -> bool:
+    for param in module.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        if not bool(torch.isfinite(grad).all().item()):
+            return False
+    return True
+
+
 def train_network_from_tensors(
     model,
     samples: TensorSelfPlayBatch,
@@ -170,6 +188,23 @@ def train_network_from_tensors(
     soft_targets = soft_src.to(device_obj, non_blocking=True).to(torch.float32).view(-1, 1)
     h2d_copy_sec = float(max(0.0, time.perf_counter() - copy_start))
 
+    # Guard against stale/unfinalized trajectories: drop rows with any non-finite target.
+    sample_finite = torch.isfinite(value_targets.squeeze(1))
+    sample_finite = sample_finite.logical_and(torch.isfinite(soft_targets.squeeze(1)))
+    sample_finite = sample_finite.logical_and(torch.isfinite(policy_targets).all(dim=1))
+    sample_finite = sample_finite.logical_and(
+        torch.isfinite(states.view(states.size(0), -1)).all(dim=1)
+    )
+    kept_samples = int(sample_finite.sum().item())
+    filtered_non_finite_samples = int(sample_finite.numel() - kept_samples)
+    if filtered_non_finite_samples > 0:
+        keep_idx = torch.nonzero(sample_finite, as_tuple=False).view(-1)
+        states = states.index_select(0, keep_idx)
+        legal_masks = legal_masks.index_select(0, keep_idx)
+        policy_targets = policy_targets.index_select(0, keep_idx)
+        value_targets = value_targets.index_select(0, keep_idx)
+        soft_targets = soft_targets.index_select(0, keep_idx)
+
     num_samples = int(states.shape[0])
     if num_samples <= 0:
         if strategy == "ddp":
@@ -201,6 +236,8 @@ def train_network_from_tensors(
         soft_abs_sum = 0.0
         mix_abs_sum = 0.0
         mix_batches = 0
+        skipped_non_finite_loss_batches = 0
+        skipped_non_finite_grad_batches = 0
 
         local_count = int(perm.numel())
         for start in range(0, local_count, bsz):
@@ -247,9 +284,29 @@ def train_network_from_tensors(
                 )
                 loss = policy_loss + value_loss
 
+            loss_is_finite = _all_ranks_true(
+                bool(torch.isfinite(loss).all().item()),
+                strategy=strategy,
+                device=device_obj,
+            )
+            if not loss_is_finite:
+                skipped_non_finite_loss_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             if loss.requires_grad:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
+                grads_finite = _all_ranks_true(
+                    _grads_are_finite(model),
+                    strategy=strategy,
+                    device=device_obj,
+                )
+                if not grads_finite:
+                    skipped_non_finite_grad_batches += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
                 scaler.step(optimizer)
                 scaler.update()
@@ -290,6 +347,8 @@ def train_network_from_tensors(
                     soft_abs_sum,
                     mix_abs_sum,
                     float(mix_batches),
+                    float(skipped_non_finite_loss_batches),
+                    float(skipped_non_finite_grad_batches),
                 ],
                 dtype=torch.float64,
                 device=device_obj,
@@ -304,6 +363,8 @@ def train_network_from_tensors(
             soft_abs_sum = float(reduced[6].item())
             mix_abs_sum = float(reduced[7].item())
             mix_batches = int(round(float(reduced[8].item())))
+            skipped_non_finite_loss_batches = int(round(float(reduced[9].item())))
+            skipped_non_finite_grad_batches = int(round(float(reduced[10].item())))
 
         avg_loss = total_loss_sum / max(1, total_seen)
         avg_policy_loss = policy_loss_sum / max(1e-8, total_policy_weight)
@@ -325,12 +386,17 @@ def train_network_from_tensors(
                 "avg_mix_abs": avg_mix_abs,
                 "parallel_strategy": strategy,
                 "ddp_world_size": ddp_world,
+                "skipped_non_finite_loss_batches": skipped_non_finite_loss_batches,
+                "skipped_non_finite_grad_batches": skipped_non_finite_grad_batches,
+                "filtered_non_finite_samples": filtered_non_finite_samples,
             }
         )
 
     return model, {
         "epoch_stats": epoch_stats,
         "num_samples": global_num_samples,
+        "num_samples_after_filter": int(num_samples),
+        "filtered_non_finite_samples": int(filtered_non_finite_samples),
         "parallel_strategy": strategy,
         "ddp_world_size": ddp_world,
         "timing": {

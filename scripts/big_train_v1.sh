@@ -26,9 +26,11 @@ DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.3}"
 DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
 SOFT_VALUE_K="${SOFT_VALUE_K:-2.0}"
 SOFT_LABEL_ALPHA="${SOFT_LABEL_ALPHA:-1.0}"
+SOFT_LABEL_ALPHA_FINAL="${SOFT_LABEL_ALPHA_FINAL:-0.0}"
 MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
 SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-6}"
+SELF_PLAY_OPENING_RANDOM_MOVES_FINAL="${SELF_PLAY_OPENING_RANDOM_MOVES_FINAL:-0}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
 
@@ -73,6 +75,115 @@ fi
 : "${INFER_BATCH_SIZE:=4096}"
 : "${INFER_WARMUP_ITERS:=20}"
 : "${INFER_ITERS:=80}"
+
+compute_curriculum_values() {
+  local iter_idx="$1"
+  "$PYTHON_BIN" - "$iter_idx" "$ITERATIONS" "$SELF_PLAY_OPENING_RANDOM_MOVES" "$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL" "$SOFT_LABEL_ALPHA" "$SOFT_LABEL_ALPHA_FINAL" <<'PY'
+import sys
+
+it = int(sys.argv[1])
+total = max(1, int(sys.argv[2]))
+opening_start = float(sys.argv[3])
+opening_final = float(sys.argv[4])
+alpha_start = float(sys.argv[5])
+alpha_final = float(sys.argv[6])
+
+if total <= 1:
+    progress = 1.0
+else:
+    progress = (it - 1) / float(total - 1)
+progress = max(0.0, min(1.0, progress))
+
+opening_now = int(round(opening_start + (opening_final - opening_start) * progress))
+opening_now = max(0, opening_now)
+
+alpha_now = alpha_start + (alpha_final - alpha_start) * progress
+alpha_now = max(0.0, min(1.0, alpha_now))
+
+print(f"{opening_now} {alpha_now:.6f}")
+PY
+}
+
+check_train_metrics_finite() {
+  local metrics_path="$1"
+  "$PYTHON_BIN" - "$metrics_path" <<'PY'
+import json
+import math
+import sys
+
+path = str(sys.argv[1])
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as exc:
+    print(f"[big_train_v1] warning: failed to load train metrics: {exc}")
+    raise SystemExit(1)
+
+row = None
+if isinstance(data, list) and data:
+    row = data[-1]
+elif isinstance(data, dict):
+    row = data
+
+if not isinstance(row, dict):
+    print("[big_train_v1] warning: train metrics payload missing train row.")
+    raise SystemExit(1)
+
+keys = ("train_avg_loss", "train_avg_policy_loss", "train_avg_value_loss")
+for key in keys:
+    value = row.get(key)
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        print(
+            "[big_train_v1] warning: non-finite training metric "
+            f"{key}={value!r}; reject candidate checkpoint."
+        )
+        raise SystemExit(1)
+
+raise SystemExit(0)
+PY
+}
+
+gating_accept_candidate() {
+  local eval_path="$1"
+  "$PYTHON_BIN" - "$eval_path" <<'PY'
+import json
+import sys
+
+path = str(sys.argv[1])
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+except Exception as exc:
+    print(f"[big_train_v1] warning: failed to load eval report for gating: {exc}")
+    raise SystemExit(1)
+
+rows = report.get("results")
+if not isinstance(rows, list):
+    print("[big_train_v1] warning: eval report has no results list for gating.")
+    raise SystemExit(1)
+
+target = None
+for row in rows:
+    if isinstance(row, dict) and str(row.get("name", "")).strip() == "vs_previous":
+        target = row
+        break
+
+if not isinstance(target, dict):
+    print("[big_train_v1] warning: gating requires vs_previous stats, but none were found.")
+    raise SystemExit(1)
+
+wins = int(target.get("wins", 0) or 0)
+losses = int(target.get("losses", 0) or 0)
+draws = int(target.get("draws", 0) or 0)
+accept = wins > losses
+decision = "accept" if accept else "reject"
+print(
+    "[big_train_v1] gating(vs_best): "
+    f"wins={wins} losses={losses} draws={draws} -> {decision}"
+)
+raise SystemExit(0 if accept else 1)
+PY
+}
 
 csv_count() {
   local csv="$1"
@@ -157,6 +268,8 @@ echo "[big_train_v1] run_dir=$RUN_DIR"
 echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
 echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA"
+echo "[big_train_v1] opening_random_schedule=$SELF_PLAY_OPENING_RANDOM_MOVES->$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL"
+echo "[big_train_v1] soft_label_alpha_schedule=$SOFT_LABEL_ALPHA->$SOFT_LABEL_ALPHA_FINAL"
 echo "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
 if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
   echo "[big_train_v1] self_play_shard_dir=$SELF_PLAY_SHARD_DIR"
@@ -173,6 +286,7 @@ if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
   echo "[big_train_v1] load checkpoint not found: $LATEST_MODEL" >&2
   exit 1
 fi
+BEST_MODEL="$LATEST_MODEL"
 
 GLOBAL_VISIBLE="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 echo "[big_train_v1] global CUDA_VISIBLE_DEVICES=$GLOBAL_VISIBLE"
@@ -185,6 +299,7 @@ if [[ "${CUDA_LAUNCH_BLOCKING:-0}" == "1" ]]; then
 fi
 
 for ((it = 1; it <= ITERATIONS; it++)); do
+  read -r CUR_OPENING_RANDOM_MOVES CUR_SOFT_LABEL_ALPHA <<< "$(compute_curriculum_values "$it")"
   ITER_TAG="$(printf "%03d" "$it")"
   SELFPLAY_FILE="${RUN_DIR}/selfplay_iter_${ITER_TAG}.pt"
   SELFPLAY_STATS_JSON="${RUN_DIR}/selfplay_iter_${ITER_TAG}.json"
@@ -193,10 +308,11 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   INFER_JSON="${RUN_DIR}/infer_iter_${ITER_TAG}.json"
   CKPT_NAME="model_iter_${ITER_TAG}.pt"
   CKPT_PATH="${CHECKPOINT_DIR}/${CKPT_NAME}"
-  PREV_MODEL_FOR_EVAL="$LATEST_MODEL"
+  BASE_MODEL_FOR_ITER="$BEST_MODEL"
 
   echo
   echo "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
+  echo "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA"
   echo "[big_train_v1] stage=selfplay output=$SELFPLAY_FILE"
   SP_CMD=(
     "$PYTHON_BIN" scripts/train_entry.py
@@ -215,10 +331,10 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     --dirichlet_alpha "$DIRICHLET_ALPHA"
     --dirichlet_epsilon "$DIRICHLET_EPSILON"
     --soft_value_k "$SOFT_VALUE_K"
-    --soft_label_alpha "$SOFT_LABEL_ALPHA"
+    --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
     --max_game_plies "$MAX_GAME_PLIES"
     --self_play_concurrent_games "$SELF_PLAY_CONCURRENT_GAMES"
-    --self_play_opening_random_moves "$SELF_PLAY_OPENING_RANDOM_MOVES"
+    --self_play_opening_random_moves "$CUR_OPENING_RANDOM_MOVES"
     --self_play_backend "$SELF_PLAY_BACKEND"
     --checkpoint_dir "$CHECKPOINT_DIR"
     --self_play_output "$SELFPLAY_FILE"
@@ -227,8 +343,8 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
     SP_CMD+=(--self_play_shard_dir "$SELF_PLAY_SHARD_DIR")
   fi
-  if [[ -n "$LATEST_MODEL" && -f "$LATEST_MODEL" ]]; then
-    SP_CMD+=(--load_checkpoint "$LATEST_MODEL")
+  if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
+    SP_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
   fi
   PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-$SELF_PLAY_ALLOC_CONF}" \
   V1_SELFPLAY_MEMORY_ANCHOR_MB="$SELF_PLAY_MEMORY_ANCHOR_MB" \
@@ -258,26 +374,40 @@ vsum = data.get("value_target_summary")
 if isinstance(vsum, dict):
     nonzero = int(vsum.get("nonzero_count", 0))
     total = int(vsum.get("total", 0))
+    finite = int(vsum.get("finite_count", total))
+    nonfinite = int(vsum.get("nonfinite_count", 0))
     pos = int(vsum.get("positive_count", 0))
     neg = int(vsum.get("negative_count", 0))
     nonzero_ratio = float(vsum.get("nonzero_ratio", 0.0))
     print(
         "[big_train_v1] selfplay value targets: "
-        f"nonzero={nonzero}/{total} ({nonzero_ratio*100.0:.2f}%), "
+        f"nonzero={nonzero}/{finite} ({nonzero_ratio*100.0:.2f}%), "
         f"positive={pos}, negative={neg}"
     )
+    if nonfinite > 0:
+        print(
+            "[big_train_v1] warning: value targets contain non-finite values "
+            f"nonfinite={nonfinite}/{total}"
+        )
 mvsum = data.get("mixed_value_target_summary")
 if isinstance(mvsum, dict):
     m_nonzero = int(mvsum.get("nonzero_count", 0))
     m_total = int(mvsum.get("total", 0))
+    m_finite = int(mvsum.get("finite_count", m_total))
+    m_nonfinite = int(mvsum.get("nonfinite_count", 0))
     m_pos = int(mvsum.get("positive_count", 0))
     m_neg = int(mvsum.get("negative_count", 0))
     m_nonzero_ratio = float(mvsum.get("nonzero_ratio", 0.0))
     print(
         "[big_train_v1] selfplay mixed value targets: "
-        f"nonzero={m_nonzero}/{m_total} ({m_nonzero_ratio*100.0:.2f}%), "
+        f"nonzero={m_nonzero}/{m_finite} ({m_nonzero_ratio*100.0:.2f}%), "
         f"positive={m_pos}, negative={m_neg}"
     )
+    if m_nonfinite > 0:
+        print(
+            "[big_train_v1] warning: mixed value targets contain non-finite values "
+            f"nonfinite={m_nonfinite}/{m_total}"
+        )
 piece_delta = data.get("piece_delta_buckets")
 if isinstance(piece_delta, dict):
     bucket_total = 0
@@ -319,14 +449,14 @@ PY
       --epochs "$EPOCHS"
       --lr "$LR"
       --weight_decay "$WEIGHT_DECAY"
-      --soft_label_alpha "$SOFT_LABEL_ALPHA"
+      --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
-    if [[ -n "$LATEST_MODEL" && -f "$LATEST_MODEL" ]]; then
-      DDP_CMD+=(--load_checkpoint "$LATEST_MODEL")
+    if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
+      DDP_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
     OMP_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
     MKL_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
@@ -347,29 +477,45 @@ PY
       --epochs "$EPOCHS"
       --lr "$LR"
       --weight_decay "$WEIGHT_DECAY"
-      --soft_label_alpha "$SOFT_LABEL_ALPHA"
+      --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
-    if [[ -n "$LATEST_MODEL" && -f "$LATEST_MODEL" ]]; then
-      TRAIN_CMD+=(--load_checkpoint "$LATEST_MODEL")
+    if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
+      TRAIN_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
     CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${TRAIN_CMD[@]}"
   fi
 
-  LATEST_MODEL="$CKPT_PATH"
-  if [[ ! -f "$LATEST_MODEL" ]]; then
-    echo "[big_train_v1] expected checkpoint missing: $LATEST_MODEL" >&2
+  CANDIDATE_MODEL="$CKPT_PATH"
+  if [[ ! -f "$CANDIDATE_MODEL" ]]; then
+    echo "[big_train_v1] expected checkpoint missing: $CANDIDATE_MODEL" >&2
     exit 1
   fi
+  CANDIDATE_VALID=1
+  if [[ -f "$TRAIN_METRICS_JSON" ]]; then
+    if ! check_train_metrics_finite "$TRAIN_METRICS_JSON"; then
+      CANDIDATE_VALID=0
+    fi
+  else
+    echo "[big_train_v1] warning: training metrics not found, reject candidate checkpoint."
+    CANDIDATE_VALID=0
+  fi
 
-  if [[ "$RUN_EVAL_STAGE" == "1" ]]; then
-    echo "[big_train_v1] stage=eval checkpoint=$LATEST_MODEL"
+  CANDIDATE_ACCEPTED=0
+
+  if [[ "$RUN_EVAL_STAGE" == "1" && "$CANDIDATE_VALID" == "1" ]]; then
+    EVAL_GAMES_VS_PREVIOUS_FOR_ITER="$EVAL_GAMES_VS_PREVIOUS"
+    if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" && "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER" -lt 2 ]]; then
+      EVAL_GAMES_VS_PREVIOUS_FOR_ITER=2
+      echo "[big_train_v1] gating requires vs_best games; bump eval_games_vs_previous to 2 for this iteration."
+    fi
+    echo "[big_train_v1] stage=eval checkpoint=$CANDIDATE_MODEL"
     EVAL_CMD=(
       "$PYTHON_BIN" scripts/eval_checkpoint.py
-      --challenger_checkpoint "$LATEST_MODEL"
+      --challenger_checkpoint "$CANDIDATE_MODEL"
       --device "$DEVICE"
       --eval_devices "$EVAL_DEVICES"
       --eval_workers "$EVAL_WORKERS"
@@ -377,7 +523,7 @@ PY
       --mcts_simulations "$EVAL_MCTS_SIMULATIONS"
       --temperature "$EVAL_TEMPERATURE"
       --eval_games_vs_random "$EVAL_GAMES_VS_RANDOM"
-      --eval_games_vs_previous "$EVAL_GAMES_VS_PREVIOUS"
+      --eval_games_vs_previous "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER"
       --batch_leaves "$EVAL_BATCH_LEAVES"
       --inference_backend "$EVAL_INFER_BACKEND"
       --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
@@ -389,10 +535,39 @@ PY
     if [[ "$EVAL_SAMPLE_MOVES" == "1" ]]; then
       EVAL_CMD+=(--sample_moves)
     fi
-    if [[ -n "$PREV_MODEL_FOR_EVAL" && -f "$PREV_MODEL_FOR_EVAL" ]]; then
-      EVAL_CMD+=(--previous_checkpoint "$PREV_MODEL_FOR_EVAL")
+    if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
+      EVAL_CMD+=(--previous_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
     CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_CMD[@]}"
+  fi
+
+  if [[ "$CANDIDATE_VALID" != "1" ]]; then
+    if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
+      echo "[big_train_v1] candidate rejected due non-finite train metrics; keep best checkpoint: $BASE_MODEL_FOR_ITER"
+      CANDIDATE_ACCEPTED=0
+    else
+      echo "[big_train_v1] no valid best checkpoint available after rejecting non-finite candidate." >&2
+      exit 1
+    fi
+  elif [[ -z "$BASE_MODEL_FOR_ITER" || ! -f "$BASE_MODEL_FOR_ITER" ]]; then
+    CANDIDATE_ACCEPTED=1
+    echo "[big_train_v1] bootstrap best checkpoint selected: $CANDIDATE_MODEL"
+  elif [[ "$RUN_EVAL_STAGE" != "1" ]]; then
+    CANDIDATE_ACCEPTED=1
+    echo "[big_train_v1] warning: RUN_EVAL_STAGE=0, gating skipped; promote candidate by default."
+  elif gating_accept_candidate "$EVAL_JSON"; then
+    CANDIDATE_ACCEPTED=1
+  else
+    CANDIDATE_ACCEPTED=0
+  fi
+
+  if [[ "$CANDIDATE_ACCEPTED" == "1" ]]; then
+    BEST_MODEL="$CANDIDATE_MODEL"
+  fi
+  LATEST_MODEL="$BEST_MODEL"
+  if [[ -z "$LATEST_MODEL" || ! -f "$LATEST_MODEL" ]]; then
+    echo "[big_train_v1] best checkpoint missing after gating: $LATEST_MODEL" >&2
+    exit 1
   fi
 
   if [[ "$RUN_INFER_STAGE" == "1" ]]; then
@@ -410,7 +585,7 @@ PY
       --infer_output "$INFER_JSON"
   fi
 
-  echo "[big_train_v1] iteration ${it} done checkpoint=$LATEST_MODEL"
+  echo "[big_train_v1] iteration ${it} done candidate=$CANDIDATE_MODEL best=$LATEST_MODEL"
 done
 
 echo
