@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -81,6 +82,7 @@ def train_network_from_tensors(
     grad_clip_norm: float = 1.0,
     parallel_devices: Optional[List[str]] = None,
     parallel_strategy: str = "data_parallel",
+    ddp_pre_sharded: bool = False,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train directly from tensor-native self-play output."""
 
@@ -145,7 +147,8 @@ def train_network_from_tensors(
         return model, {"epoch_stats": [], "num_samples": 0}
 
     # For DDP, shard on CPU first so each rank only transfers its local partition.
-    if strategy == "ddp" and ddp_world > 1:
+    shard_start = time.perf_counter()
+    if strategy == "ddp" and ddp_world > 1 and not bool(ddp_pre_sharded):
         states_src = samples.state_tensors[ddp_rank::ddp_world]
         legal_src = samples.legal_masks[ddp_rank::ddp_world]
         policy_src = samples.policy_targets[ddp_rank::ddp_world]
@@ -157,12 +160,15 @@ def train_network_from_tensors(
         policy_src = samples.policy_targets
         value_src = samples.value_targets
         soft_src = samples.soft_value_targets
+    cpu_shard_sec = float(max(0.0, time.perf_counter() - shard_start))
 
+    copy_start = time.perf_counter()
     states = states_src.to(device_obj, non_blocking=True).to(torch.float32)
     legal_masks = legal_src.to(device_obj, non_blocking=True).to(torch.bool)
     policy_targets = policy_src.to(device_obj, non_blocking=True).to(torch.float32)
     value_targets = value_src.to(device_obj, non_blocking=True).to(torch.float32).view(-1, 1)
     soft_targets = soft_src.to(device_obj, non_blocking=True).to(torch.float32).view(-1, 1)
+    h2d_copy_sec = float(max(0.0, time.perf_counter() - copy_start))
 
     num_samples = int(states.shape[0])
     if num_samples <= 0:
@@ -181,6 +187,8 @@ def train_network_from_tensors(
     draw_weight = float(max(0.0, policy_draw_weight))
     bsz = max(1, int(batch_size))
     epoch_stats: List[Dict[str, Any]] = []
+    first_batch_sec: float = 0.0
+    first_batch_recorded = False
 
     for epoch in range(max(1, int(epochs))):
         perm = _train_permutation(num_samples, device_obj)
@@ -196,6 +204,7 @@ def train_network_from_tensors(
 
         local_count = int(perm.numel())
         for start in range(0, local_count, bsz):
+            batch_start = time.perf_counter()
             end = min(start + bsz, local_count)
             idx = perm[start:end]
 
@@ -265,6 +274,9 @@ def train_network_from_tensors(
             soft_abs_sum += float(batch_soft.abs().mean().item())
             mix_abs_sum += float(mixed_values.abs().mean().item())
             mix_batches += 1
+            if not first_batch_recorded:
+                first_batch_sec = float(max(0.0, time.perf_counter() - batch_start))
+                first_batch_recorded = True
 
         if strategy == "ddp":
             reduced = torch.tensor(
@@ -321,4 +333,10 @@ def train_network_from_tensors(
         "num_samples": global_num_samples,
         "parallel_strategy": strategy,
         "ddp_world_size": ddp_world,
+        "timing": {
+            "cpu_shard_sec": float(cpu_shard_sec),
+            "h2d_copy_sec": float(h2d_copy_sec),
+            "first_batch_sec": float(first_batch_sec),
+            "ddp_pre_sharded": bool(ddp_pre_sharded),
+        },
     }

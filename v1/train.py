@@ -851,7 +851,95 @@ def _save_self_play_payload(
     torch.save(payload, path)
 
 
-def _load_self_play_payload(path: str) -> Tuple[TensorSelfPlayBatch, Dict[str, Any], Dict[str, Any]]:
+def _split_self_play_batch_cpu(
+    samples: TensorSelfPlayBatch,
+    num_shards: int,
+) -> List[TensorSelfPlayBatch]:
+    total = int(samples.num_samples)
+    if total <= 0:
+        return []
+    shard_count = max(1, min(int(num_shards), total))
+    shard_sizes = _split_games(total, shard_count)
+    out: List[TensorSelfPlayBatch] = []
+    start = 0
+    for size in shard_sizes:
+        end = start + int(size)
+        out.append(
+            TensorSelfPlayBatch(
+                state_tensors=samples.state_tensors[start:end].to("cpu"),
+                legal_masks=samples.legal_masks[start:end].to("cpu"),
+                policy_targets=samples.policy_targets[start:end].to("cpu"),
+                value_targets=samples.value_targets[start:end].to("cpu"),
+                soft_value_targets=samples.soft_value_targets[start:end].to("cpu"),
+            )
+        )
+        start = end
+    return out
+
+
+def _save_self_play_payload_sharded(
+    *,
+    path: str,
+    samples: TensorSelfPlayBatch,
+    stats: SelfPlayV1Stats,
+    metadata: Dict[str, Any],
+    num_shards: int,
+) -> int:
+    shard_batches = _split_self_play_batch_cpu(samples=samples, num_shards=int(num_shards))
+    if not shard_batches:
+        _save_self_play_payload(path=path, samples=samples, stats=stats, metadata=metadata)
+        return 0
+
+    out_dir = os.path.dirname(path) or "."
+    base_name = os.path.basename(path)
+    stem, ext = os.path.splitext(base_name)
+    ext = ext or ".pt"
+    os.makedirs(out_dir, exist_ok=True)
+
+    shard_files: List[str] = []
+    shard_sizes: List[int] = []
+    for shard_idx, shard_batch in enumerate(shard_batches):
+        shard_name = f"{stem}.shard{int(shard_idx):02d}{ext}"
+        shard_path = os.path.join(out_dir, shard_name)
+        shard_meta = dict(metadata)
+        shard_meta.update(
+            {
+                "payload_format": "v1_sharded_shard",
+                "shard_index": int(shard_idx),
+                "shard_count": int(len(shard_batches)),
+                "shard_num_samples": int(shard_batch.num_samples),
+                "source_manifest": str(path),
+            }
+        )
+        _save_self_play_payload(
+            path=shard_path,
+            samples=shard_batch,
+            stats=stats,
+            metadata=shard_meta,
+        )
+        shard_files.append(shard_name)
+        shard_sizes.append(int(shard_batch.num_samples))
+
+    manifest_payload = {
+        "payload_format": "v1_sharded_manifest",
+        "version": 1,
+        "num_samples": int(samples.num_samples),
+        "num_shards": int(len(shard_files)),
+        "shard_files": list(shard_files),
+        "shard_sizes": list(shard_sizes),
+        "stats": stats.to_dict(),
+        "metadata": dict(metadata),
+    }
+    torch.save(manifest_payload, path)
+    return int(len(shard_files))
+
+
+def _load_self_play_payload(
+    path: str,
+    *,
+    ddp_rank: Optional[int] = None,
+    ddp_world_size: Optional[int] = None,
+) -> Tuple[TensorSelfPlayBatch, Dict[str, Any], Dict[str, Any]]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Self-play payload not found: {path}")
     payload = torch.load(path, map_location="cpu")
@@ -859,6 +947,70 @@ def _load_self_play_payload(path: str) -> Tuple[TensorSelfPlayBatch, Dict[str, A
         return payload.to("cpu"), {}, {}
     if not isinstance(payload, dict):
         raise RuntimeError(f"Unsupported self-play payload format: {type(payload)!r}")
+
+    payload_format = str(payload.get("payload_format", "")).strip().lower()
+    if payload_format == "v1_sharded_manifest":
+        shard_files_raw = payload.get("shard_files")
+        if not isinstance(shard_files_raw, list) or not shard_files_raw:
+            raise RuntimeError(
+                f"Invalid sharded self-play manifest {path}: shard_files missing or empty."
+            )
+
+        resolved_shards: List[str] = []
+        base_dir = os.path.dirname(path) or "."
+        for entry in shard_files_raw:
+            shard_item = str(entry).strip()
+            if not shard_item:
+                continue
+            shard_path = shard_item if os.path.isabs(shard_item) else os.path.join(base_dir, shard_item)
+            resolved_shards.append(shard_path)
+        if not resolved_shards:
+            raise RuntimeError(f"No valid shard path resolved from manifest: {path}")
+
+        selected_indices = list(range(len(resolved_shards)))
+        selected_paths = list(resolved_shards)
+        if ddp_rank is not None and ddp_world_size is not None and int(ddp_world_size) > 1:
+            rank_i = int(ddp_rank)
+            world_i = int(ddp_world_size)
+            if rank_i < 0 or rank_i >= world_i:
+                raise RuntimeError(f"Invalid ddp rank/world for shard load: rank={rank_i}, world={world_i}")
+            selected_indices = [i for i in range(len(resolved_shards)) if (i % world_i) == rank_i]
+            selected_paths = [resolved_shards[i] for i in selected_indices]
+            if not selected_paths:
+                raise RuntimeError(
+                    f"DDP rank={rank_i} got no shard from manifest={path} "
+                    f"(world={world_i}, num_shards={len(resolved_shards)})."
+                )
+
+        shard_batches: List[TensorSelfPlayBatch] = []
+        for shard_path in selected_paths:
+            shard_batch, _stats_ignored, _meta_ignored = _load_self_play_payload(
+                shard_path,
+                ddp_rank=None,
+                ddp_world_size=None,
+            )
+            shard_batches.append(shard_batch)
+        merged = _concat_self_play_batches_cpu(shard_batches)
+
+        stats_payload = payload.get("stats")
+        if not isinstance(stats_payload, dict):
+            stats_payload = {}
+        metadata_payload = payload.get("metadata")
+        if not isinstance(metadata_payload, dict):
+            metadata_payload = {}
+        metadata_payload = dict(metadata_payload)
+        metadata_payload.update(
+            {
+                "payload_sharded_manifest": True,
+                "payload_format": "v1_sharded_manifest",
+                "manifest_path": str(path),
+                "manifest_num_shards": int(len(resolved_shards)),
+                "loaded_shard_indices": [int(x) for x in selected_indices],
+                "loaded_shard_count": int(len(selected_indices)),
+                "loaded_num_samples": int(merged.num_samples),
+            }
+        )
+        return merged, stats_payload, metadata_payload
 
     required = [
         "state_tensors",
@@ -1124,11 +1276,19 @@ def train_pipeline_v1(
             )
 
         model = _build_model()
+        checkpoint_load_start = time.perf_counter()
         _load_checkpoint_into_model(
             model=model,
             load_checkpoint=load_checkpoint,
             map_location=primary_train_device,
         )
+        checkpoint_load_sec = float(max(0.0, time.perf_counter() - checkpoint_load_start))
+        if load_checkpoint:
+            _print_rank0(
+                "[v1.train] timing "
+                f"checkpoint_load_sec={checkpoint_load_sec:.3f} "
+                f"checkpoint={load_checkpoint}"
+            )
         model.to(primary_train_device)
 
         if stage_norm == "selfplay":
@@ -1163,22 +1323,33 @@ def train_pipeline_v1(
                 mixed_value_target_summary=mixed_value_target_summary,
             )
             output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
-            _save_self_play_payload(
-                path=output_path,
-                samples=samples,
-                stats=sp_stats,
-                metadata={
-                    "stage": "selfplay",
-                    "self_play_devices": list(self_play_device_list),
-                    "self_play_backend": backend_arg if backend_arg is not None else "auto",
-                    "self_play_shard_dir": shard_dir_arg,
-                    "mcts_simulations": int(mcts_simulations),
-                    "self_play_games": int(self_play_games),
-                    "self_play_concurrent_games": int(self_play_concurrent_games),
-                    "self_play_opening_random_moves": int(self_play_opening_random_moves),
-                    "value_target_summary": dict(value_target_summary),
-                    "mixed_value_target_summary": dict(mixed_value_target_summary),
-                },
+            payload_metadata = {
+                "stage": "selfplay",
+                "self_play_devices": list(self_play_device_list),
+                "self_play_backend": backend_arg if backend_arg is not None else "auto",
+                "self_play_shard_dir": shard_dir_arg,
+                "mcts_simulations": int(mcts_simulations),
+                "self_play_games": int(self_play_games),
+                "self_play_concurrent_games": int(self_play_concurrent_games),
+                "self_play_opening_random_moves": int(self_play_opening_random_moves),
+                "value_target_summary": dict(value_target_summary),
+                "mixed_value_target_summary": dict(mixed_value_target_summary),
+            }
+            saved_shards = 0
+            if len(self_play_device_list) > 1:
+                saved_shards = _save_self_play_payload_sharded(
+                    path=output_path,
+                    samples=samples,
+                    stats=sp_stats,
+                    metadata=payload_metadata,
+                    num_shards=len(self_play_device_list),
+                )
+            else:
+                _save_self_play_payload(
+                    path=output_path,
+                    samples=samples,
+                    stats=sp_stats,
+                    metadata=payload_metadata,
                 )
             if self_play_stats_json:
                 _save_json(str(self_play_stats_json), sp_report)
@@ -1191,16 +1362,46 @@ def train_pipeline_v1(
                 f"[v1.train] selfplay saved: {output_path} "
                 f"(games={sp_stats.num_games}, positions={sp_stats.num_positions})"
             )
+            if saved_shards > 0:
+                _print_rank0(
+                    "[v1.train] selfplay payload format=sharded_manifest "
+                    f"num_shards={saved_shards}"
+                )
             return
 
         if stage_norm == "train":
             if not self_play_input:
                 raise ValueError("stage='train' requires --self_play_input.")
-            samples, sp_stats_payload, _sp_meta = _load_self_play_payload(str(self_play_input))
+            ddp_load_rank: Optional[int] = None
+            ddp_load_world: Optional[int] = None
+            if train_strategy_norm == "ddp" and _dist_ready():
+                ddp_load_rank = int(dist.get_rank())
+                ddp_load_world = int(dist.get_world_size())
+            payload_load_start = time.perf_counter()
+            samples, sp_stats_payload, _sp_meta = _load_self_play_payload(
+                str(self_play_input),
+                ddp_rank=ddp_load_rank,
+                ddp_world_size=ddp_load_world,
+            )
+            payload_load_sec = float(max(0.0, time.perf_counter() - payload_load_start))
+            global_positions = int(sp_stats_payload.get("num_positions", 0) or 0)
+            if global_positions <= 0:
+                global_positions = int(samples.num_samples)
+            _print_rank0(
+                "[v1.train] timing "
+                f"selfplay_payload_load_sec={payload_load_sec:.3f} "
+                f"input={self_play_input} local_positions={int(samples.num_samples)} "
+                f"global_positions={global_positions}"
+            )
             train_start = time.perf_counter()
             model.train()
             parallel_devices = (
                 train_device_list if (train_strategy_norm == "data_parallel" and len(train_device_list) > 1) else None
+            )
+            ddp_pre_sharded = bool(
+                train_strategy_norm == "ddp"
+                and isinstance(_sp_meta, dict)
+                and bool(_sp_meta.get("payload_sharded_manifest", False))
             )
             model, train_metrics = train_network_from_tensors(
                 model=model,
@@ -1215,8 +1416,18 @@ def train_pipeline_v1(
                 use_amp=(primary_train_device.type == "cuda"),
                 parallel_devices=parallel_devices,
                 parallel_strategy=train_strategy_norm,
+                ddp_pre_sharded=ddp_pre_sharded,
             )
             train_elapsed = time.perf_counter() - train_start
+            train_bridge_timing = train_metrics.get("timing", {})
+            if isinstance(train_bridge_timing, dict) and train_bridge_timing:
+                _print_rank0(
+                    "[v1.train] timing "
+                    f"cpu_shard_sec={float(train_bridge_timing.get('cpu_shard_sec', 0.0)):.3f} "
+                    f"h2d_copy_sec={float(train_bridge_timing.get('h2d_copy_sec', 0.0)):.3f} "
+                    f"first_batch_sec={float(train_bridge_timing.get('first_batch_sec', 0.0)):.3f} "
+                    f"ddp_pre_sharded={bool(train_bridge_timing.get('ddp_pre_sharded', False))}"
+                )
             if _dist_ready():
                 dist.barrier()
             if _is_rank0():
@@ -1241,7 +1452,8 @@ def train_pipeline_v1(
                     "stage": "train",
                     "self_play_input": str(self_play_input),
                     "self_play_games": sp_stats_payload.get("num_games"),
-                    "self_play_positions": samples.num_samples,
+                    "self_play_positions": int(global_positions),
+                    "self_play_positions_local": int(samples.num_samples),
                     "self_play_decisive_games": sp_stats_payload.get("decisive_games"),
                     "self_play_decisive_game_ratio": sp_stats_payload.get("decisive_game_ratio"),
                     "self_play_draw_game_ratio": sp_stats_payload.get("draw_game_ratio"),
@@ -1249,10 +1461,16 @@ def train_pipeline_v1(
                     "self_play_mixed_value_target_summary": sp_stats_payload.get("mixed_value_target_summary"),
                     "train_devices": list(train_device_list),
                     "train_strategy": train_strategy_norm,
+                    "checkpoint_load_sec": float(checkpoint_load_sec),
+                    "self_play_payload_load_sec": float(payload_load_sec),
                     "train_time_sec": float(train_elapsed),
                     "train_avg_loss": last_epoch.get("avg_loss"),
                     "train_avg_policy_loss": last_epoch.get("avg_policy_loss"),
                     "train_avg_value_loss": last_epoch.get("avg_value_loss"),
+                    "train_cpu_shard_sec": train_bridge_timing.get("cpu_shard_sec"),
+                    "train_h2d_copy_sec": train_bridge_timing.get("h2d_copy_sec"),
+                    "train_first_batch_sec": train_bridge_timing.get("first_batch_sec"),
+                    "ddp_pre_sharded": bool(train_bridge_timing.get("ddp_pre_sharded", False)),
                     "train_soft_label_alpha": float(soft_label_alpha),
                     "checkpoint": ckpt_path,
                 }
