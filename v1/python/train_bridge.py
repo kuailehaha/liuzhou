@@ -221,6 +221,15 @@ def train_network_from_tensors(
     alpha = float(max(0.0, min(1.0, soft_label_alpha)))
     draw_weight = float(max(0.0, policy_draw_weight))
     bsz = max(1, int(batch_size))
+    local_batch_count = int((num_samples + bsz - 1) // bsz)
+    synced_batch_count = int(local_batch_count)
+    if strategy == "ddp" and ddp_world > 1:
+        # Keep per-rank collective order identical by forcing the same number of steps.
+        batch_count_token = torch.tensor([local_batch_count], dtype=torch.int64, device=device_obj)
+        dist.all_reduce(batch_count_token, op=dist.ReduceOp.MIN)
+        synced_batch_count = int(max(0, int(batch_count_token.item())))
+    sync_sample_cap = int(synced_batch_count * bsz)
+    dropped_samples_for_sync = int(max(0, num_samples - sync_sample_cap))
     epoch_stats: List[Dict[str, Any]] = []
     first_batch_sec: float = 0.0
     first_batch_recorded = False
@@ -240,7 +249,10 @@ def train_network_from_tensors(
         skipped_non_finite_grad_batches = 0
 
         local_count = int(perm.numel())
-        for start in range(0, local_count, bsz):
+        for step_idx in range(synced_batch_count):
+            start = int(step_idx * bsz)
+            if start >= local_count:
+                break
             batch_start = time.perf_counter()
             end = min(start + bsz, local_count)
             idx = perm[start:end]
@@ -386,6 +398,9 @@ def train_network_from_tensors(
                 "avg_mix_abs": avg_mix_abs,
                 "parallel_strategy": strategy,
                 "ddp_world_size": ddp_world,
+                "local_batch_count": int(local_batch_count),
+                "synced_batch_count": int(synced_batch_count),
+                "dropped_samples_for_sync": int(dropped_samples_for_sync),
                 "skipped_non_finite_loss_batches": skipped_non_finite_loss_batches,
                 "skipped_non_finite_grad_batches": skipped_non_finite_grad_batches,
                 "filtered_non_finite_samples": filtered_non_finite_samples,
@@ -399,6 +414,9 @@ def train_network_from_tensors(
         "filtered_non_finite_samples": int(filtered_non_finite_samples),
         "parallel_strategy": strategy,
         "ddp_world_size": ddp_world,
+        "local_batch_count": int(local_batch_count),
+        "synced_batch_count": int(synced_batch_count),
+        "dropped_samples_for_sync": int(dropped_samples_for_sync),
         "timing": {
             "cpu_shard_sec": float(cpu_shard_sec),
             "h2d_copy_sec": float(h2d_copy_sec),

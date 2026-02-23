@@ -120,6 +120,18 @@ def _split_games(total_games: int, parts: int) -> List[int]:
     return out
 
 
+def _resolve_staged_selfplay_seed(explicit_seed: Optional[int] = None) -> int:
+    """Resolve deterministic seed for stage=selfplay runs."""
+    if explicit_seed is None:
+        return 1
+    seed_i = int(explicit_seed)
+    if seed_i <= 0:
+        raise ValueError(
+            f"self_play_iteration_seed must be positive when provided, got {seed_i}"
+        )
+    return seed_i
+
+
 def _concat_self_play_batches_cpu(batches: List[TensorSelfPlayBatch]) -> TensorSelfPlayBatch:
     if not batches:
         empty_state = torch.empty(
@@ -1225,6 +1237,7 @@ def train_pipeline_v1(
     load_checkpoint: Optional[str] = None,
     stage: str = "all",
     self_play_output: Optional[str] = None,
+    self_play_iteration_seed: Optional[int] = None,
     self_play_input: Optional[str] = None,
     self_play_stats_json: Optional[str] = None,
     checkpoint_name: Optional[str] = None,
@@ -1291,6 +1304,12 @@ def train_pipeline_v1(
         _print_rank0(f"[v1.train] soft_label_alpha={float(soft_label_alpha):.3f}")
         _print_rank0(f"[v1.train] train_devices={train_device_list}")
         _print_rank0(f"[v1.train] infer_devices={infer_device_list}")
+        stage_selfplay_seed = 1
+        if stage_norm == "selfplay":
+            stage_selfplay_seed = _resolve_staged_selfplay_seed(
+                explicit_seed=self_play_iteration_seed,
+            )
+            _print_rank0(f"[v1.train] self_play_iteration_seed={int(stage_selfplay_seed)}")
         if int(self_play_concurrent_games) > 256:
             _print_rank0(
                 "[v1.train] warning: self_play_concurrent_games is very high; "
@@ -1330,7 +1349,7 @@ def train_pipeline_v1(
                 opening_random_moves=int(self_play_opening_random_moves),
                 max_game_plies=int(max_game_plies),
                 concurrent_games_per_device=int(self_play_concurrent_games),
-                iteration_seed=1,
+                iteration_seed=int(stage_selfplay_seed),
                 self_play_backend=backend_arg,
                 self_play_shard_dir=shard_dir_arg,
             )
@@ -1344,6 +1363,7 @@ def train_pipeline_v1(
                 value_target_summary=value_target_summary,
                 mixed_value_target_summary=mixed_value_target_summary,
             )
+            sp_report["self_play_iteration_seed"] = int(stage_selfplay_seed)
             output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
             payload_metadata = {
                 "stage": "selfplay",
@@ -1354,6 +1374,7 @@ def train_pipeline_v1(
                 "self_play_games": int(self_play_games),
                 "self_play_concurrent_games": int(self_play_concurrent_games),
                 "self_play_opening_random_moves": int(self_play_opening_random_moves),
+                "self_play_iteration_seed": int(stage_selfplay_seed),
                 "value_target_summary": dict(value_target_summary),
                 "mixed_value_target_summary": dict(mixed_value_target_summary),
             }
@@ -1753,6 +1774,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to save self-play tensor payload (for stage=selfplay, optional for stage=all).",
     )
     parser.add_argument(
+        "--self_play_iteration_seed",
+        type=int,
+        default=None,
+        help="Optional explicit self-play iteration seed (stage=selfplay).",
+    )
+    parser.add_argument(
         "--self_play_input",
         type=str,
         default=None,
@@ -1825,6 +1852,7 @@ if __name__ == "__main__":
         max_game_plies=args.max_game_plies,
         load_checkpoint=args.load_checkpoint,
         self_play_output=args.self_play_output,
+        self_play_iteration_seed=args.self_play_iteration_seed,
         self_play_input=args.self_play_input,
         self_play_stats_json=args.self_play_stats_json,
         checkpoint_name=args.checkpoint_name,

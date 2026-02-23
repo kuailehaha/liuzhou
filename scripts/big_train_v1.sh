@@ -308,7 +308,8 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   INFER_JSON="${RUN_DIR}/infer_iter_${ITER_TAG}.json"
   CKPT_NAME="model_iter_${ITER_TAG}.pt"
   CKPT_PATH="${CHECKPOINT_DIR}/${CKPT_NAME}"
-  BASE_MODEL_FOR_ITER="$BEST_MODEL"
+  BASE_MODEL_FOR_ITER="$LATEST_MODEL"
+  GATING_BASE_MODEL="$BEST_MODEL"
 
   echo
   echo "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
@@ -338,6 +339,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     --self_play_backend "$SELF_PLAY_BACKEND"
     --checkpoint_dir "$CHECKPOINT_DIR"
     --self_play_output "$SELFPLAY_FILE"
+    --self_play_iteration_seed "$it"
     --self_play_stats_json "$SELFPLAY_STATS_JSON"
   )
   if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
@@ -494,7 +496,7 @@ PY
 
   if [[ "$RUN_EVAL_STAGE" == "1" && "$CANDIDATE_VALID" == "1" ]]; then
     EVAL_GAMES_VS_PREVIOUS_FOR_ITER="$EVAL_GAMES_VS_PREVIOUS"
-    if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" && "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER" -lt 2 ]]; then
+    if [[ -n "$GATING_BASE_MODEL" && -f "$GATING_BASE_MODEL" && "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER" -lt 2 ]]; then
       EVAL_GAMES_VS_PREVIOUS_FOR_ITER=2
       echo "[big_train_v1] gating requires vs_best games; bump eval_games_vs_previous to 2 for this iteration."
     fi
@@ -521,21 +523,21 @@ PY
     if [[ "$EVAL_SAMPLE_MOVES" == "1" ]]; then
       EVAL_CMD+=(--sample_moves)
     fi
-    if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
-      EVAL_CMD+=(--previous_checkpoint "$BASE_MODEL_FOR_ITER")
+    if [[ -n "$GATING_BASE_MODEL" && -f "$GATING_BASE_MODEL" ]]; then
+      EVAL_CMD+=(--previous_checkpoint "$GATING_BASE_MODEL")
     fi
     CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_CMD[@]}"
   fi
 
   if [[ "$CANDIDATE_VALID" != "1" ]]; then
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
-      echo "[big_train_v1] candidate rejected due non-finite train metrics; keep best checkpoint: $BASE_MODEL_FOR_ITER"
+      echo "[big_train_v1] candidate rejected due non-finite train metrics; keep latest checkpoint: $BASE_MODEL_FOR_ITER"
       CANDIDATE_ACCEPTED=0
     else
-      echo "[big_train_v1] no valid best checkpoint available after rejecting non-finite candidate." >&2
+      echo "[big_train_v1] no valid latest checkpoint available after rejecting non-finite candidate." >&2
       exit 1
     fi
-  elif [[ -z "$BASE_MODEL_FOR_ITER" || ! -f "$BASE_MODEL_FOR_ITER" ]]; then
+  elif [[ -z "$GATING_BASE_MODEL" || ! -f "$GATING_BASE_MODEL" ]]; then
     CANDIDATE_ACCEPTED=1
     echo "[big_train_v1] bootstrap best checkpoint selected: $CANDIDATE_MODEL"
   elif [[ "$RUN_EVAL_STAGE" != "1" ]]; then
@@ -550,9 +552,15 @@ PY
   if [[ "$CANDIDATE_ACCEPTED" == "1" ]]; then
     BEST_MODEL="$CANDIDATE_MODEL"
   fi
-  LATEST_MODEL="$BEST_MODEL"
+  if [[ "$CANDIDATE_VALID" == "1" ]]; then
+    LATEST_MODEL="$CANDIDATE_MODEL"
+  fi
   if [[ -z "$LATEST_MODEL" || ! -f "$LATEST_MODEL" ]]; then
-    echo "[big_train_v1] best checkpoint missing after gating: $LATEST_MODEL" >&2
+    echo "[big_train_v1] latest checkpoint missing after iteration: $LATEST_MODEL" >&2
+    exit 1
+  fi
+  if [[ -n "$BEST_MODEL" && ! -f "$BEST_MODEL" ]]; then
+    echo "[big_train_v1] best checkpoint missing after iteration: $BEST_MODEL" >&2
     exit 1
   fi
 
@@ -571,10 +579,11 @@ PY
       --infer_output "$INFER_JSON"
   fi
 
-  echo "[big_train_v1] iteration ${it} done candidate=$CANDIDATE_MODEL best=$LATEST_MODEL"
+  echo "[big_train_v1] iteration ${it} done candidate=$CANDIDATE_MODEL latest=$LATEST_MODEL best=$BEST_MODEL"
 done
 
 echo
 echo "[big_train_v1] completed all iterations."
 echo "[big_train_v1] final_checkpoint=$LATEST_MODEL"
+echo "[big_train_v1] final_best_checkpoint=$BEST_MODEL"
 echo "[big_train_v1] log_file=$LOG_FILE"

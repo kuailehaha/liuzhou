@@ -86,6 +86,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         max_game_plies=int(args.max_game_plies),
         load_checkpoint=args.load_checkpoint,
         self_play_output=args.self_play_output,
+        self_play_iteration_seed=args.self_play_iteration_seed,
         self_play_input=args.self_play_input,
         self_play_stats_json=args.self_play_stats_json,
         checkpoint_name=args.checkpoint_name,
@@ -170,6 +171,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="v1 self-play payload output path.",
+    )
+    parser.add_argument(
+        "--self_play_iteration_seed",
+        type=int,
+        default=None,
+        help="Optional explicit v1 self-play iteration seed.",
     )
     parser.add_argument(
         "--self_play_input",
