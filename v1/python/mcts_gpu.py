@@ -33,7 +33,9 @@ TOTAL_ACTION_DIM = int(DEFAULT_ACTION_SPEC.total_dim)
 MAX_MOVE_COUNT = int(GameState.MAX_MOVE_COUNT)
 NO_CAPTURE_DRAW_LIMIT = int(GameState.NO_CAPTURE_DRAW_LIMIT)
 LOSE_PIECE_THRESHOLD = int(GameState.LOSE_PIECE_THRESHOLD)
-PHASE_PLACEMENT = int(v0_core.Phase.PLACEMENT)
+PHASE_MOVEMENT = int(v0_core.Phase.MOVEMENT)
+PHASE_CAPTURE_SELECTION = int(v0_core.Phase.CAPTURE_SELECTION)
+PHASE_COUNTER_REMOVAL = int(v0_core.Phase.COUNTER_REMOVAL)
 SOFT_TAN_INPUT_CLAMP = float((math.pi * 0.5) - 1e-3)
 
 @dataclass
@@ -654,10 +656,14 @@ class V1RootMCTS:
 
     @staticmethod
     def _terminal_mask_from_next_state(batch: GpuStateBatch) -> torch.Tensor:
-        non_placement = batch.phase.ne(PHASE_PLACEMENT)
+        post_movement_phase = (
+            batch.phase.eq(PHASE_MOVEMENT)
+            .logical_or(batch.phase.eq(PHASE_CAPTURE_SELECTION))
+            .logical_or(batch.phase.eq(PHASE_COUNTER_REMOVAL))
+        )
         black_count = batch.board.eq(1).sum(dim=(1, 2))
         white_count = batch.board.eq(-1).sum(dim=(1, 2))
-        winner_mask = non_placement.logical_and(
+        winner_mask = post_movement_phase.logical_and(
             black_count.lt(LOSE_PIECE_THRESHOLD).logical_or(
                 white_count.lt(LOSE_PIECE_THRESHOLD)
             )

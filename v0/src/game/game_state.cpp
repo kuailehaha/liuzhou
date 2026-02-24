@@ -57,7 +57,10 @@ MarkSet& GameState::Marks(Player player) {
 }
 
 std::optional<Player> GameState::GetWinner() const {
-    if (phase == Phase::kPlacement) {
+    if (
+        phase != Phase::kMovement &&
+        phase != Phase::kCaptureSelection &&
+        phase != Phase::kCounterRemoval) {
         return std::nullopt;
     }
     int black_pieces = CountPlayerPieces(Player::kBlack);

@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 
-from src.game_state import GameState, Player
+from src.game_state import GameState, Phase, Player
 from src.move_generator import apply_move
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 
@@ -363,7 +363,12 @@ def self_play_single_game_v0(
             return _finalize(result, soft_value)
 
         root_value = float(mcts.get_root_value())
-        if enable_resign and move_count >= resign_min_moves:
+        movement_started = state.phase in (
+            Phase.MOVEMENT,
+            Phase.CAPTURE_SELECTION,
+            Phase.COUNTER_REMOVAL,
+        )
+        if enable_resign and movement_started and move_count >= resign_min_moves:
             if root_value <= resign_threshold:
                 resign_count += 1
                 if resign_count >= resign_consecutive:

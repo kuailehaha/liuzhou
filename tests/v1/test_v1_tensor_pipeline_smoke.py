@@ -28,7 +28,7 @@ def test_v1_soft_tan_range_and_sign() -> None:
 
 def test_v1_terminal_mask_next_state() -> None:
     board = torch.zeros((3, 6, 6), dtype=torch.int8)
-    board[0, 0, 0] = 1  # white pieces are zero in non-placement -> terminal winner
+    board[0, 0, 0] = 1  # white pieces are zero but mark-selection is still pre-movement
     board[1, 0, 0] = 1
     board[1, 0, 1] = -1
     board[2, 0, 0] = 1
@@ -49,7 +49,7 @@ def test_v1_terminal_mask_next_state() -> None:
         moves_since_capture=torch.tensor([0, 0, GameState.NO_CAPTURE_DRAW_LIMIT], dtype=torch.int64),
     )
     terminal = V1RootMCTS._terminal_mask_from_next_state(batch)
-    assert terminal.tolist() == [True, True, True]
+    assert terminal.tolist() == [False, True, True]
 
 
 def test_v1_child_value_perspective_alignment() -> None:

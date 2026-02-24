@@ -826,15 +826,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SelfPlayStepInplace(
         auto updated_plies = plies.index_select(0, valid_slots);
 
         auto winner_sign = torch::zeros({valid_slots.size(0)}, torch::TensorOptions().dtype(torch::kInt8).device(device));
-        auto non_placement = next_phase.ne(static_cast<int64_t>(v0::Phase::kPlacement));
+        auto post_movement_phase = next_phase.eq(static_cast<int64_t>(v0::Phase::kMovement))
+            .logical_or(next_phase.eq(static_cast<int64_t>(v0::Phase::kCaptureSelection)))
+            .logical_or(next_phase.eq(static_cast<int64_t>(v0::Phase::kCounterRemoval)));
         auto black_count = valid_board.eq(1).sum({1, 2});
         auto white_count = valid_board.eq(-1).sum({1, 2});
         winner_sign = torch::where(
-            non_placement.logical_and(black_count.lt(v0::kLosePieceThreshold)),
+            post_movement_phase.logical_and(black_count.lt(v0::kLosePieceThreshold)),
             torch::full_like(winner_sign, -1),
             winner_sign);
         winner_sign = torch::where(
-            non_placement.logical_and(white_count.lt(v0::kLosePieceThreshold)),
+            post_movement_phase.logical_and(white_count.lt(v0::kLosePieceThreshold)),
             torch::full_like(winner_sign, 1),
             winner_sign);
 

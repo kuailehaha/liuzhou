@@ -88,6 +88,13 @@ class GameState:
         return (self.move_count >= self.MAX_MOVE_COUNT or
                 self.moves_since_capture >= self.NO_CAPTURE_DRAW_LIMIT)
 
+    def has_entered_movement_stage(self) -> bool:
+        return self.phase in (
+            Phase.MOVEMENT,
+            Phase.CAPTURE_SELECTION,
+            Phase.COUNTER_REMOVAL,
+        )
+
     def is_board_full(self) -> bool:
         return all(cell != 0 for row in self.board for cell in row)
 
@@ -157,8 +164,8 @@ class GameState:
 
     def get_winner(self) -> Optional[Player]:
         """若有一方棋子被提光，返回获胜方，否则返回 None。"""
-        if self.phase == Phase.PLACEMENT:
-            # 落子阶段不判胜负
+        if not self.has_entered_movement_stage():
+            # Do not adjudicate winner before movement stage starts.
             return None
 
         black_pieces = self.count_player_pieces(Player.BLACK)
