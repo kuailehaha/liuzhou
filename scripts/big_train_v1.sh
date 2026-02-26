@@ -47,6 +47,11 @@ EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-0}" # 0 | 1
 EVAL_DEVICES="${EVAL_DEVICES:-$INFER_DEVICES}"
 EVAL_V1_CONCURRENT_GAMES="${EVAL_V1_CONCURRENT_GAMES:-8192}"
 EVAL_V1_OPENING_RANDOM_MOVES="${EVAL_V1_OPENING_RANDOM_MOVES:-0}" # strict eval default: no random opening moves
+EVAL_VS_RANDOM_TEMPERATURE="${EVAL_VS_RANDOM_TEMPERATURE:-0.0}"
+EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES="${EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES:-0}"
+EVAL_VS_PREVIOUS_TEMPERATURE="${EVAL_VS_PREVIOUS_TEMPERATURE:-$EVAL_TEMPERATURE}"
+EVAL_VS_PREVIOUS_SAMPLE_MOVES="${EVAL_VS_PREVIOUS_SAMPLE_MOVES:-1}" # 0 | 1
+EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES="${EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES:-4}"
 
 SELF_PLAY_ALLOC_CONF="${SELF_PLAY_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.95,max_split_size_mb:512}"
 SELF_PLAY_MEMORY_ANCHOR_MB="${SELF_PLAY_MEMORY_ANCHOR_MB:-0}"
@@ -279,6 +284,8 @@ echo "[big_train_v1] eval_games_vs_random=$EVAL_GAMES_VS_RANDOM eval_games_vs_pr
 echo "[big_train_v1] eval_devices=$EVAL_DEVICES eval_workers=$EVAL_WORKERS eval_mcts_sims=$EVAL_MCTS_SIMULATIONS"
 echo "[big_train_v1] eval_v1_concurrent_games=$EVAL_V1_CONCURRENT_GAMES"
 echo "[big_train_v1] eval_v1_opening_random_moves=$EVAL_V1_OPENING_RANDOM_MOVES eval_sample_moves=$EVAL_SAMPLE_MOVES"
+echo "[big_train_v1] eval_vs_random temperature=$EVAL_VS_RANDOM_TEMPERATURE opening_random_moves=$EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES"
+echo "[big_train_v1] eval_vs_previous temperature=$EVAL_VS_PREVIOUS_TEMPERATURE sample_moves=$EVAL_VS_PREVIOUS_SAMPLE_MOVES opening_random_moves=$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
 echo "[big_train_v1] selfplay_alloc_conf=$SELF_PLAY_ALLOC_CONF selfplay_memory_anchor_mb=$SELF_PLAY_MEMORY_ANCHOR_MB"
 
 LATEST_MODEL="${LOAD_CHECKPOINT:-}"
@@ -495,38 +502,61 @@ PY
   CANDIDATE_ACCEPTED=0
 
   if [[ "$RUN_EVAL_STAGE" == "1" && "$CANDIDATE_VALID" == "1" ]]; then
-    EVAL_GAMES_VS_PREVIOUS_FOR_ITER="$EVAL_GAMES_VS_PREVIOUS"
-    if [[ -n "$GATING_BASE_MODEL" && -f "$GATING_BASE_MODEL" && "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER" -lt 2 ]]; then
-      EVAL_GAMES_VS_PREVIOUS_FOR_ITER=2
-      echo "[big_train_v1] gating requires vs_best games; bump eval_games_vs_previous to 2 for this iteration."
+    if [[ "$EVAL_GAMES_VS_RANDOM" -gt 0 ]]; then
+      echo "[big_train_v1] stage=eval_vs_random checkpoint=$CANDIDATE_MODEL"
+      EVAL_RANDOM_CMD=(
+        "$PYTHON_BIN" scripts/eval_checkpoint.py
+        --challenger_checkpoint "$CANDIDATE_MODEL"
+        --device "$DEVICE"
+        --eval_devices "$EVAL_DEVICES"
+        --eval_workers "$EVAL_WORKERS"
+        --backend "$EVAL_BACKEND"
+        --mcts_simulations "$EVAL_MCTS_SIMULATIONS"
+        --temperature "$EVAL_VS_RANDOM_TEMPERATURE"
+        --eval_games_vs_random "$EVAL_GAMES_VS_RANDOM"
+        --eval_games_vs_previous 0
+        --batch_leaves "$EVAL_BATCH_LEAVES"
+        --inference_backend "$EVAL_INFER_BACKEND"
+        --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
+        --inference_warmup_iters "$EVAL_INFER_WARMUP_ITERS"
+        --v1_concurrent_games "$EVAL_V1_CONCURRENT_GAMES"
+        --v1_opening_random_moves "$EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES"
+      )
+      CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_RANDOM_CMD[@]}"
     fi
-    echo "[big_train_v1] stage=eval checkpoint=$CANDIDATE_MODEL"
-    EVAL_CMD=(
-      "$PYTHON_BIN" scripts/eval_checkpoint.py
-      --challenger_checkpoint "$CANDIDATE_MODEL"
-      --device "$DEVICE"
-      --eval_devices "$EVAL_DEVICES"
-      --eval_workers "$EVAL_WORKERS"
-      --backend "$EVAL_BACKEND"
-      --mcts_simulations "$EVAL_MCTS_SIMULATIONS"
-      --temperature "$EVAL_TEMPERATURE"
-      --eval_games_vs_random "$EVAL_GAMES_VS_RANDOM"
-      --eval_games_vs_previous "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER"
-      --batch_leaves "$EVAL_BATCH_LEAVES"
-      --inference_backend "$EVAL_INFER_BACKEND"
-      --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
-      --inference_warmup_iters "$EVAL_INFER_WARMUP_ITERS"
-      --v1_concurrent_games "$EVAL_V1_CONCURRENT_GAMES"
-      --v1_opening_random_moves "$EVAL_V1_OPENING_RANDOM_MOVES"
-      --output_json "$EVAL_JSON"
-    )
-    if [[ "$EVAL_SAMPLE_MOVES" == "1" ]]; then
-      EVAL_CMD+=(--sample_moves)
-    fi
+
     if [[ -n "$GATING_BASE_MODEL" && -f "$GATING_BASE_MODEL" ]]; then
-      EVAL_CMD+=(--previous_checkpoint "$GATING_BASE_MODEL")
+      EVAL_GAMES_VS_PREVIOUS_FOR_ITER="$EVAL_GAMES_VS_PREVIOUS"
+      if [[ "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER" -lt 2 ]]; then
+        EVAL_GAMES_VS_PREVIOUS_FOR_ITER=2
+        echo "[big_train_v1] gating requires vs_best games; bump eval_games_vs_previous to 2 for this iteration."
+      fi
+      echo "[big_train_v1] stage=eval_vs_previous checkpoint=$CANDIDATE_MODEL previous=$GATING_BASE_MODEL"
+      EVAL_PREV_CMD=(
+        "$PYTHON_BIN" scripts/eval_checkpoint.py
+        --challenger_checkpoint "$CANDIDATE_MODEL"
+        --previous_checkpoint "$GATING_BASE_MODEL"
+        --device "$DEVICE"
+        --eval_devices "$EVAL_DEVICES"
+        --eval_workers "$EVAL_WORKERS"
+        --backend "$EVAL_BACKEND"
+        --mcts_simulations "$EVAL_MCTS_SIMULATIONS"
+        --temperature "$EVAL_VS_PREVIOUS_TEMPERATURE"
+        --eval_games_vs_random 0
+        --eval_games_vs_previous "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER"
+        --batch_leaves "$EVAL_BATCH_LEAVES"
+        --inference_backend "$EVAL_INFER_BACKEND"
+        --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
+        --inference_warmup_iters "$EVAL_INFER_WARMUP_ITERS"
+        --v1_concurrent_games "$EVAL_V1_CONCURRENT_GAMES"
+        --v1_opening_random_moves "$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
+        --output_json "$EVAL_JSON"
+      )
+      if [[ "$EVAL_VS_PREVIOUS_SAMPLE_MOVES" == "1" ]]; then
+        EVAL_PREV_CMD+=(--sample_moves)
+      fi
+      CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_PREV_CMD[@]}"
     fi
-    CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_CMD[@]}"
   fi
 
   if [[ "$CANDIDATE_VALID" != "1" ]]; then
