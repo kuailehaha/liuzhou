@@ -1,5 +1,40 @@
 # MEMORY
 
+## Current Conclusions (2026-02-26)
+
+### 1) Strength Milestone (Large-Scale V1 Run)
+- Training log anchor: `logs/big_train_v1_20260223_173954.log`.
+- `vs_random` reached a peak of `99.80%` (1000 games).
+- Effective self-play signal improved substantially in the same run:
+  - early: `decisive_games=6443/522488 (1.23%)`, `draw_rate=98.77%`
+  - later: `decisive_games=426988/522488 (81.72%)`, `draw_rate=18.28%`
+
+### 2) Tournament Ground Truth
+- Tournament anchors:
+  - `logs/v1_tournament_80models.log`
+  - `logs/v1_tournament_80models.json`
+- 80-model championship winner is `model_iter_032.pt`.
+- Final stage (`final_4_to_1`) qualification confirms `model_iter_032.pt` as champion.
+
+### 3) Correlation Check: Tournament vs Random-Agent Metric
+- Correlation between tournament strength and `vs_random` **raw win%** is weak.
+- Correlation between tournament strength and `vs_random` **win-loss** metric (`win% - loss%`) is also weak in the current 80-model sample.
+- Practical implication:
+  - keep `vs_random` as a health/probe metric;
+  - treat tournament ranking (plus Elo/BT fit) as primary strength signal.
+
+### 4) Engineering Status
+- V1 acceleration is stable at high gain relative to v0 (multiple validations in `results/v1_validation_*.json` show ~25x-28x best-case speedup, with some configs near 30x).
+- Current training script already includes:
+  - opening-random annealing,
+  - soft-label annealing,
+  - non-finite filtering/guards,
+  - wins-over-losses gating.
+
+### 5) Next Priority
+- Add LR scheduler in v1 training path to address the "more data but limited strength gain" regime.
+- Continue strength-oriented tuning with fixed compute budget and tournament-based evaluation.
+
 ## Temporary Conclusions (2026-02-11)
 
 ### 1) Root Cause Fixed: Policy Index Misalignment

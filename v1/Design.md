@@ -2,6 +2,51 @@
 Date: 2026-02-16  
 Scope: Design for migrating v0 CPU-bottleneck self-play to a GPU-first v1 pipeline.
 
+## Addendum (2026-02-26): Strength-Iteration Status
+
+This addendum records the latest strength-oriented outcomes after the acceleration phase and is the current reference for training priorities.
+
+### A) Verified outcomes
+
+- Large-scale training anchor: `logs/big_train_v1_20260223_173954.log`
+  - `vs_random` peak reached `99.80%` (1000 games).
+  - Self-play decisive ratio improved from `1.23%` to `81.72%` in the same run.
+- Tournament anchor:
+  - `logs/v1_tournament_80models.log`
+  - `logs/v1_tournament_80models.json`
+  - 80-model champion is `model_iter_032.pt`.
+- Throughput anchor:
+  - `results/v1_validation_latest_newcriteria_topk.json`
+  - `results/v1_validation_latest_newcriteria.json`
+  - v1 achieved about `25x-28x` best-case speedup vs v0 worker-1 baseline (some configs near 30x).
+
+### B) Metric correlation check (tournament vs random-agent probe)
+
+Using `logs/big_train_v1_20260223_173954.log` + `logs/v1_tournament_80models.json`:
+
+- `vs_random` raw win-rate has weak correlation with tournament strength ranking.
+  - example (all 80 models): Elo vs win-rate `pearson=-0.1298`, `spearman=-0.1808`.
+- `vs_random` win-loss metric (`win% - loss%`, aligned with tournament判胜口径) also shows weak correlation with tournament/Elo.
+  - example (all 80 models): Elo vs win-loss `pearson=-0.1266`, `spearman=-0.1752`.
+
+Decision:
+- Keep `vs_random` as a health probe.
+- Use tournament ranking (plus Elo/BT fit) as the primary strength signal for model selection.
+
+### C) Current bottleneck after acceleration
+
+The bottleneck is no longer pure throughput. The current issue is strength scaling efficiency: adding compute/data does not always convert into stable strength gains.
+
+### D) Immediate next tasks
+
+1. Add LR scheduler in the v1 train path (minimal surface change, staged/DDP-compatible).
+2. Keep draw-control optimization on the objective side (without rule changes).
+3. Evaluate replay-window expansion with explicit memory and fault-tolerance bounds before enabling at scale.
+4. Maintain a unified KPI gate:
+   - tournament/Elo trend,
+   - `vs_random` win-loss trend,
+   - self-play effective-signal trend (`decisive_game_ratio`, `value_target_summary.nonzero_ratio`).
+
 ## User Requirement (Original Message, English Copy)
 The user requested full delegated execution on a Windows machine, including:
 - Run any smoke tests and add scripts in-repo for efficiency/functional checks.

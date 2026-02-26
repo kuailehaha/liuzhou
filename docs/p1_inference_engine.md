@@ -8,10 +8,36 @@
 - ✅ TorchScript 导出在 self-play/train 路径内“每次 run 只发生一次”，避免 per-game trace/capture
 - ✅ parity：Graph vs TS 的 forward parity test 通过；MCTS 的稳定对齐测试固定走 `py` backend
 
-## 性能验收（待填数据）
+## 性能验收（已回填，TS 待补）
 
-- 非独占 GPU 环境下，建议多次测量取中位数
-- Graph vs TS 的 `avg_ms` / `positions/s` / `speedup`：TBD（待回填）
+- 结果锚点：
+  - `results/v1_gpu_matrix_8_16_32_64_py_graph_after_r1.json`
+  - `results/v1_validation_workers_graph_128_after_r1.json`
+
+### Graph vs Py（R1 后同配置对照，threads=1）
+
+| concurrent_games | py positions/s | graph positions/s | graph相对py | py功耗均值 | graph功耗均值 |
+|---|---:|---:|---:|---:|---:|
+| 8  | 100.45 | 128.74 | +28.16% | 27.48W | 37.68W |
+| 16 | 149.37 | 149.36 | -0.01%  | 24.77W | 38.95W |
+| 32 | 154.65 | 147.05 | -4.91%  | 24.31W | 39.34W |
+| 64 | 137.43 | 133.29 | -3.01%  | 24.35W | 39.44W |
+
+结论：
+- Graph 在低并发（cg=8）下吞吐提升明显，并显著提高 GPU 功耗与时钟占用。
+- 中高并发（cg=16/32/64）下，吞吐优势不稳定，需结合 workload 选择后端。
+
+### 固定工况补充（Graph 验证）
+
+- 在 `results/v1_validation_workers_graph_128_after_r1.json` 中：
+  - `speedup_best_v1_vs_v0_worker1 = 12.90`
+  - `power_delta_best_v1_minus_v0_worker1_w = +20.35W`
+- 说明 Graph 路径在 R1 阶段已达到“明显提速 + 更高计算负载”的验收目标。
+
+### TS 路径状态
+
+- TS 路径功能可用（见功能验收），但当前文档尚未补齐与 Graph 的同工况批量对照表。
+- 后续补充项：在同 `concurrent_games`、同 `mcts_simulations` 下给出 TS/Graph/py 三路中位数对比。
 
 ## 范围声明
 

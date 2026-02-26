@@ -17,6 +17,7 @@
 可以通过查看git log\git status来判断是否已经提交对话中的修改。
 你的一切判断和计划应当从当前代码实现出发。得到问题后，你应当首先查看代码有无相关改动，在理解代码的基础上进行回复和下一步操作。
 进行代码优化时，你应当从框架入手，调整收效最大的模块或流程，而不是改变实验条件或改变特定实现方式。
+训练日志文件名时间戳默认使用 UTC；如需和本地时间对齐，按 UTC+8 换算后再进行“修改前后”归因分析。
 
 ## 项目速览
 
@@ -95,6 +96,8 @@
 - `scripts/`：训练/运行辅助脚本
   - `big_train_v1.sh`：V1 大规模 staged 训练脚本（selfplay -> train -> eval -> infer）
   - `train_entry.py`：统一训练入口（`--pipeline {v0,v1}`）
+  - `tournament_v1_eval.py`：V1 模型锦标赛评估脚本（多阶段淘汰/循环赛）
+  - `local_train_v1_3iter.ps1`：本地小规模 3 轮快速回归脚本（Windows）
   - `toy_train.sh`：统一 toy 训练脚本（通过 `PIPELINE=v0|v1` 选择）
   - `toy_train_v1.sh`：V1 toy 训练包装脚本
   - `optimized_train.sh`：大规模优化训练脚本
@@ -125,12 +128,25 @@
 - 主评估入口：`scripts/eval_checkpoint.py --backend v1`，并结合 `--v1_concurrent_games`、`--v1_opening_random_moves`。
 - V1 staged 运行：`--stage selfplay/train/infer`；`train_strategy=ddp` 需采用 staged 方式。
 - 性能与回归：`tools/validate_v1_claims.py`、`tools/sweep_v1_gpu_matrix.py`、`tests/v1/test_v1_tensor_pipeline_smoke.py`。
+- 强度评估口径：`vs_random` 以 `win-loss` 视角使用（与锦标赛判胜口径一致），模型选择以锦标赛/Elo 为主。
+- 训练基线约定：每轮训练基于 `latest` 连续推进，`best` 仅用于 gating 与棋力对照保存。
 
-## 当前优先级（2026-02-20）
+### 评估与选模约定（关键）
 
-- 结论：V1 训练加速链路已完成（多卡自博弈分片 + staged 训练 + DDP + v1 eval）。
-- 当前主瓶颈：自博弈数据有效性不足（高和棋率导致 `value_target_summary.nonzero_ratio` 过低）。
-- 下一阶段目标：从奖励机制层面改造 V1 自博弈，提升有效样本占比并保持吞吐与稳定性。
+- `gating` 判定标准：仅要求候选模型在 `vs_previous(vs_best)` 中 `wins > losses`，和棋不计入通过条件。
+- `vs_random`：默认使用确定性评估（`temperature=0`，`opening_random_moves=0`），用于回归探针和健康度监控。
+- `vs_previous`：默认保持可分辨性（非零温度 + 采样），避免出现 `0-0-1000`/`0-500-500` 这类退化离散分布主导判断。
+- 评估输出约定：`vs_random` 与 `vs_previous` 输出分离；用于 gating 的 `output_json` 只承载 `vs_previous` 结果，避免覆盖/串扰。
+- 若调整以上默认评估行为，必须同步更新 `scripts/big_train_v1.sh` 的启动日志打印项，确保日志可直接追溯参数。
+
+## 当前优先级（2026-02-26）
+
+- 结论：V1 训练加速链路已完成，并具备单节点大规模训练能力。
+- 当前主问题：棋力随数据/算力增长的转化效率不稳定，不再是纯吞吐瓶颈。
+- 下一阶段目标：
+  - 在 v1 训练链路加入 LR scheduler。
+  - 继续优化 draw 倾向控制（不改规则）。
+  - 采用锦标赛/Elo + `vs_random(win-loss)` + 自博弈有效样本的联合 KPI 评估。
 
 ## Vibe Coding 计划内容
 
