@@ -6,7 +6,7 @@
 
 [1]: https://zh.wikipedia.org/wiki/%E6%96%B9%E6%A3%8B
 
-任何建议或帮助，请联系[我](mailto:kuailepapa@gmail.com)
+任何建议或帮助，请联系[我](mailto:kuailepapa@gmail.com)。
 
 
 ## 📰 里程碑（News）
