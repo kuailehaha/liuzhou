@@ -77,13 +77,15 @@ else
   exit 1
 fi
 
+: "${LR_COSINE_FINAL_SCALE:=1.0}" # 1.0 keeps fixed LR; e.g. 0.25 anneals to 25% at last iter.
 : "${INFER_BATCH_SIZE:=4096}"
 : "${INFER_WARMUP_ITERS:=20}"
 : "${INFER_ITERS:=80}"
 
 compute_curriculum_values() {
   local iter_idx="$1"
-  "$PYTHON_BIN" - "$iter_idx" "$ITERATIONS" "$SELF_PLAY_OPENING_RANDOM_MOVES" "$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL" "$SOFT_LABEL_ALPHA" "$SOFT_LABEL_ALPHA_FINAL" <<'PY'
+  "$PYTHON_BIN" - "$iter_idx" "$ITERATIONS" "$SELF_PLAY_OPENING_RANDOM_MOVES" "$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL" "$SOFT_LABEL_ALPHA" "$SOFT_LABEL_ALPHA_FINAL" "$LR" "$LR_COSINE_FINAL_SCALE" <<'PY'
+import math
 import sys
 
 it = int(sys.argv[1])
@@ -92,6 +94,10 @@ opening_start = float(sys.argv[3])
 opening_final = float(sys.argv[4])
 alpha_start = float(sys.argv[5])
 alpha_final = float(sys.argv[6])
+lr_start = float(sys.argv[7])
+lr_final_scale = float(sys.argv[8])
+lr_final_scale = max(0.0, min(1.0, lr_final_scale))
+lr_final = lr_start * lr_final_scale
 
 if total <= 1:
     progress = 1.0
@@ -105,7 +111,11 @@ opening_now = max(0, opening_now)
 alpha_now = alpha_start + (alpha_final - alpha_start) * progress
 alpha_now = max(0.0, min(1.0, alpha_now))
 
-print(f"{opening_now} {alpha_now:.6f}")
+cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+lr_now = lr_final + (lr_start - lr_final) * cosine
+lr_now = max(0.0, lr_now)
+
+print(f"{opening_now} {alpha_now:.6f} {lr_now:.12g}")
 PY
 }
 
@@ -273,6 +283,7 @@ echo "[big_train_v1] run_dir=$RUN_DIR"
 echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
 echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA"
+echo "[big_train_v1] lr=$LR lr_cosine_final_scale=$LR_COSINE_FINAL_SCALE"
 echo "[big_train_v1] opening_random_schedule=$SELF_PLAY_OPENING_RANDOM_MOVES->$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL"
 echo "[big_train_v1] soft_label_alpha_schedule=$SOFT_LABEL_ALPHA->$SOFT_LABEL_ALPHA_FINAL"
 echo "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
@@ -306,7 +317,7 @@ if [[ "${CUDA_LAUNCH_BLOCKING:-0}" == "1" ]]; then
 fi
 
 for ((it = 1; it <= ITERATIONS; it++)); do
-  read -r CUR_OPENING_RANDOM_MOVES CUR_SOFT_LABEL_ALPHA <<< "$(compute_curriculum_values "$it")"
+  read -r CUR_OPENING_RANDOM_MOVES CUR_SOFT_LABEL_ALPHA CUR_LR <<< "$(compute_curriculum_values "$it")"
   ITER_TAG="$(printf "%03d" "$it")"
   SELFPLAY_FILE="${RUN_DIR}/selfplay_iter_${ITER_TAG}.pt"
   SELFPLAY_STATS_JSON="${RUN_DIR}/selfplay_iter_${ITER_TAG}.json"
@@ -320,7 +331,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
 
   echo
   echo "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
-  echo "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA"
+  echo "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA lr=$CUR_LR"
   echo "[big_train_v1] stage=selfplay output=$SELFPLAY_FILE"
   SP_CMD=(
     "$PYTHON_BIN" scripts/train_entry.py
@@ -442,7 +453,7 @@ PY
       --train_strategy ddp
       --batch_size "$BATCH_SIZE"
       --epochs "$EPOCHS"
-      --lr "$LR"
+      --lr "$CUR_LR"
       --weight_decay "$WEIGHT_DECAY"
       --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
       --checkpoint_dir "$CHECKPOINT_DIR"
@@ -470,7 +481,7 @@ PY
       --train_strategy "$TRAIN_STRATEGY"
       --batch_size "$BATCH_SIZE"
       --epochs "$EPOCHS"
-      --lr "$LR"
+      --lr "$CUR_LR"
       --weight_decay "$WEIGHT_DECAY"
       --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
       --checkpoint_dir "$CHECKPOINT_DIR"
