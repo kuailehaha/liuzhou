@@ -10,7 +10,7 @@
 
 * 2025-10-29：完成 legacy 主体框架搭建并通过运行验证。
 
-  * GeForce RTX 3060训练3小时，即可以81%-11%-8% (win-draw-lose，200 eval game) 战胜 Random Agent。
+  * GeForce RTX 3060训练3小时，即可以81%-11%-8% (win-draw-lose，200 eval game，最大允许回合500) 战胜 Random Agent。
 
 * 2025-12-27：完成 v0 主体框架搭建并通过运行验证。
 
@@ -18,10 +18,10 @@
 
 * 2026-02-26：v1 训练主线进入“强度迭代”阶段（大规模训练 + 锦标赛验证）。
 
-  * 在 `logs/big_train_v1_20260223_173954.log` 中，`vs_random` 最高达到 `99.80%`（1000 局）。
+  * 测试 `vs_random` 达到 `99.80%`（1000 局，最大允许回合144，超过36回合双方没有子力减损判为平局）。
   * 同一训练中，自博弈 `decisive_games` 从 `1.23%` 提升到 `81.72%`，有效胜负样本显著增加。
   * 80 模型锦标赛冠军为 `model_iter_032.pt`（`logs/v1_tournament_80models.json`）。
-  * v1 相对 v0 的速度提升在验证集中达到 `~25x-28x`（部分工况接近 `30x`），训练吞吐已达到单节点集群可扩展规模。
+  * v1 相对 v0 的速度提升在验证集中达到 `~25x-28x`，训练吞吐已达到单节点集群可扩展规模。
 
 ## 🎯 当前目标（2026-02）
 
@@ -154,170 +154,22 @@
 在编写测试、调试游戏逻辑或将引擎移植到其他语言时，请以此文档为权威参考。
 
 
-## ⚡ 性能对比（V0 C++ Core vs Legacy Python）
+## 🚀 V1 训练与评估入口（当前主线）
 
-使用 `tools/benchmark_self_play.py` 进行性能基准测试，对比 v0（C++ 核心）与 legacy（纯 Python）实现的自博弈性能。
+- 训练主脚本：`scripts/big_train_v1.sh`
+- 统一入口：`scripts/train_entry.py --pipeline v1`
+- 单点评估：`scripts/eval_checkpoint.py --backend v1`
+- 锦标赛评估：`scripts/tournament_v1_eval.py`
+- 本地快速回归（Windows）：`scripts/local_train_v1_3iter.ps1`
 
-**测试环境**: Linux H20, CUDA, 2局游戏, 200次MCTS模拟/步
-
-```bash
-# 分别运行两个版本的性能分析
-python -m cProfile -s cumtime -m tools.benchmark_self_play --num-games 2 --mcts-simulations 200 --device cuda --skip-legacy
-python -m cProfile -s cumtime -m tools.benchmark_self_play --num-games 2 --mcts-simulations 200 --device cuda --skip-v0
-```
-
-### 总体对比
-
-| 指标 | Legacy | V0 | 提升 |
-|------|--------|-----|------|
-| **总时间** | 74.65秒 | 16.43秒 | **4.5倍** |
-| **cProfile时间** | 72.7秒 | 7.5秒 | **9.7倍** |
-| **函数调用次数** | 8670万 | 378万 | **减少23倍** |
-| **positions/sec** | 5.36 | 23.44 | **4.4倍** |
-
-### Legacy 版本热点
-
-| 函数 | 累计时间 | 调用次数 |
-|------|---------|---------|
-| `mcts.py:expand` | 26.5秒 | 78,910 |
-| `move_generator.py:apply_move` | 22.7秒 | 686,095 |
-| `neural_network.py:get_move_probabilities` | 16.6秒 | 78,910 |
-| `rule_engine.py:check_squares` | 11.0秒 | 1,582,834 |
-
-### V0 版本热点
-
-| 函数 | 累计时间 | 调用次数 |
-|------|---------|---------|
-| `neural_network.py:forward` | 4.2秒 | 2,661 |
-| `torch.conv2d` | 1.9秒 | 26,610 |
-| 模块导入 | 2.5秒 | 160 |
-
-### 关键发现
-
-1. **V0 几乎没有规则引擎开销** — `rule_engine.py` 系列函数在 Legacy 占用 ~40秒，V0 完全用 C++ 实现
-2. **V0 的 MCTS 逻辑不可见** — 核心搜索已移至 C++
-3. **V0 主要瓶颈在神经网络推理** — 游戏逻辑已高度优化，NN 推理占 V0 总时间的 ~55%
-4. **V0 的 NN 调用次数更少** — 从 5,136 次降到 2,661 次（批量推理优化）
+建议优先使用 staged 流程（`selfplay -> train -> eval -> infer`）进行大规模训练与验证。
 
 ---
 
-## 🧩 推理后端选择（graph/ts/py）
+## 📂 代码结构（当前维护）
 
-默认后端是 `graph`（CUDA Graph 固定 batch=512）。同时支持 `ts`（TorchScript）与 `py`（Python 回调）。
-
-关键参数：
-
-- `--inference_backend graph|ts|py`（兼容 `--inference-backend`）
-- `--torchscript_path`（可选；不填则自动导出一次并复用）
-- `--torchscript_dtype float16|bfloat16|float32`
-
-Graph 前置条件：
-
-- 固定 batch=512、固定 dtype
-- 预分配输入/输出 buffer
-- capture 发生在非默认 stream
-
-最短可运行命令：
-
-```bash
-# graph 默认后端（自博弈 benchmark）
-python -m tools.benchmark_self_play --num-games 2 --mcts-simulations 200 --device cuda --skip-legacy
-
-# TorchScript 后端（显式指定 path）
-python scripts/export_torchscript.py --output v0/build/model.ts.pt --device cuda --dtype float16 --batch-size 512
-python -m tools.benchmark_self_play --num-games 2 --mcts-simulations 200 --device cuda --skip-legacy \
-  --inference-backend ts --torchscript-path v0/build/model.ts.pt --torchscript-dtype float16
-```
-
----
-
-## 📂 代码结构（Code Structure）
-
-项目有三套实现：Legacy（纯 Python，`src/`）、V0（C++/CUDA 高性能核心，`v0/`）和 V1（训练主线，`v1/`）。当前大规模训练主线为 V1；V0 与 Legacy 用于功能验证、对照与底层能力复用。
-
----
-
-### 🧠 核心游戏逻辑（Core Game Logic）— Legacy (`src/`)
-
-* **`src/game_state.py`** —— 定义 `GameState` 容器、阶段枚举（phase enum）、玩家枚举（player enum）以及辅助方法（如复制、统计棋子数量、待标记/待捕获计数器等）。
-  这是全局使用的**标准游戏状态快照**。
-
-* **`src/rule_engine.py`** —— 实现每个原子阶段的状态转换逻辑：落子、标记选择、移除、移动、捕获选择、强制移除、反移除等。
-  同时包含形状检测逻辑（`detect_shape_formed`、`is_piece_in_shape`）以及兼容旧代码的封装函数（`apply_move_phase1/3`）。
-
-* **`src/move_generator.py`** —— 生成当前阶段的合法动作（并可直接执行）。
-  调度对应的 rule engine 函数，保持对外接口 `generate_all_legal_moves` / `apply_move` 的稳定性，供 MCTS 与训练循环使用。
-
----
-
-### ⚡ C++/CUDA 高性能核心 — V0 (`v0/`)
-
-* **`v0/src/rules/rule_engine.cpp`** —— C++ 原生规则引擎，镜像 `src/rule_engine.py` 全部阶段逻辑。
-* **`v0/src/moves/move_generator.cpp`** —— C++ 动作生成器，含动作编码/解码（`ActionCode`）。
-* **`v0/src/game/`** —— `GameState` (C++)、`TensorStateBatch` 批量状态、`fast_legal_mask` / `fast_apply_moves`（CPU + CUDA 内核）。
-* **`v0/src/mcts/mcts_core.cpp`** —— 批量 MCTS 搜索核心（selection/expansion/backprop），配合 `eval_batcher.cpp` 实现异步批量推理。
-* **`v0/src/net/`** —— 网络编码（`states_to_model_input`）、`InferenceEngine`（CUDA Graph 固定 batch=512）、`project_policy_logits_fast`（C++ masked softmax）。
-* **`v0/python/`** —— Python 封装层：`mcts.py`（MCTSCore 封装）、`self_play_runner.py`（自博弈入口）、`move_encoder.py`（动作编码）、`state_batch.py` 等。
-* **`v0/train.py`** —— V0 训练主脚本（AlphaZero 循环：自博弈 → 训练 → 评估）。
-
-详细迁移状态见 `v0/cpprefactor.md`。
-
----
-
-### 🧩 学习与搜索（Learning & Search）
-
-* **`src/neural_network.py`** —— 实现 AlphaZero 风格的网络（包含三个策略头 + 一个价值头）：`pos1` 负责落子/移动终点选择，`pos2` 负责移动起点，`mark_capture` 统一负责各类提子/吃子/标记目标的定位。模块还提供张量转换工具与 `get_move_probabilities` 方法。
-  是训练与 MCTS 搜索的核心模块。
-
-* **`src/mcts.py`** —— Legacy Monte Carlo 树搜索实现（纯 Python）。V0 管线使用 `v0/python/mcts.py`（C++ MCTSCore 封装）。
-
-* **`src/train.py`** —— 训练循环的核心实现（`train_network`），V0 管线通过 `v0/train.py` 调度自博弈和评估后调用此模块完成训练。
-
-* **`src/evaluate.py`** —— 工具模块，用于让模型与基线（随机代理或历史最优模型）对战进行离线评估。
-
-* **`src/policy_batch.py`** —— 训练阶段策略损失批量化，动作编码与 v0 `ActionEncodingSpec` 一致（total_dim=220）。
-
----
-
-### 数据流程图（V0 管线）
-
-```
-训练迭代开始 (v0/train.py)
-    ↓
-[自博弈阶段] — v0/python/self_play_runner.py
-    ├─ self_play_v0() — 多 worker 并行
-    │   ├─ self_play_single_game_v0() (每局)
-    │   │   ├─ 初始化: GameState(), FastMCTS(MCTSCore C++)
-    │   │   └─ 游戏循环 (每步):
-    │   │       ├─ mcts.search(state)
-    │   │       │   ├─ MCTSCore C++ 批量搜索:
-    │   │       │   │   ├─ Selection (PUCT)
-    │   │       │   │   ├─ Expansion:
-    │   │       │   │   │   ├─ C++ generate_all_legal_moves
-    │   │       │   │   │   ├─ states_to_model_input (C++ encoding)
-    │   │       │   │   │   ├─ InferenceEngine/CUDA Graph forward
-    │   │       │   │   │   ├─ project_policy_logits_fast (C++)
-    │   │       │   │   │   └─ fast_apply_moves (CPU/CUDA)
-    │   │       │   │   └─ Backpropagation
-    │   │       │   └─ 提取根策略 (基于访问次数)
-    │   │       ├─ 保存 (state, policy)
-    │   │       ├─ 采样动作 + apply_move()
-    │   │       └─ mcts.advance_root()
-    │   └─ 返回 training_data
-    ↓
-[训练阶段] — src/train.py (train_network)
-    ├─ 数据转换: (state, policy, value, soft_value)
-    ├─ 批量化策略损失 (src/policy_batch.py):
-    │   ├─ build_combined_logits → masked_log_softmax → KL
-    │   └─ legal_mask + target_dense (total_dim=220)
-    ├─ DataLoader + 训练循环
-    └─ 更新模型权重
-    ↓
-[评估阶段] — src/evaluate.py
-    ├─ 与 RandomAgent 对战
-    ├─ 与上一迭代模型对战 (--eval_games_vs_previous)
-    ├─ 与 BestModel 对战
-    └─ 决定是否更新 best_model.pt
-    ↓
-保存检查点 → 下一迭代
-```
+- `v1/`：当前训练主线（self-play、训练桥接、MCTS GPU、轨迹缓存、设计文档）。
+- `scripts/`：训练调度、评估、锦标赛与导出脚本。
+- `tools/`：性能剖析、验证与诊断工具。
+- `tests/`：规则回归、集成测试与 v1 流水线 smoke 测试。
+- `src/`、`v0/`：保留用于规则参考、功能验证与底层能力复用，不作为当前训练主叙事。
