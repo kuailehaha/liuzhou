@@ -17,6 +17,9 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints_v1_big}"
 RUN_ROOT="${RUN_ROOT:-./v1/data/stage_runs}"
 RUN_INFER_STAGE="${RUN_INFER_STAGE:-1}"
 RUN_EVAL_STAGE="${RUN_EVAL_STAGE:-1}"
+LEGACY_LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-}"
+TRAIN_BASE_MODEL="${TRAIN_BASE_MODEL:-}"
+BEST_PREVIOUS_MODEL="${BEST_PREVIOUS_MODEL:-$TRAIN_BASE_MODEL}"
 
 TEMPERATURE_INIT="${TEMPERATURE_INIT:-1.0}"
 TEMPERATURE_FINAL="${TEMPERATURE_FINAL:-0.1}"
@@ -29,7 +32,7 @@ SOFT_LABEL_ALPHA="${SOFT_LABEL_ALPHA:-1.0}"
 SOFT_LABEL_ALPHA_FINAL="${SOFT_LABEL_ALPHA_FINAL:-1.0}"
 MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
-SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-6}"
+SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-0}"
 SELF_PLAY_OPENING_RANDOM_MOVES_FINAL="${SELF_PLAY_OPENING_RANDOM_MOVES_FINAL:-0}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
@@ -49,9 +52,9 @@ EVAL_V1_CONCURRENT_GAMES="${EVAL_V1_CONCURRENT_GAMES:-8192}"
 EVAL_V1_OPENING_RANDOM_MOVES="${EVAL_V1_OPENING_RANDOM_MOVES:-0}" # strict eval default: no random opening moves
 EVAL_VS_RANDOM_TEMPERATURE="${EVAL_VS_RANDOM_TEMPERATURE:-0.0}"
 EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES="${EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES:-0}"
-EVAL_VS_PREVIOUS_TEMPERATURE="${EVAL_VS_PREVIOUS_TEMPERATURE:-$EVAL_TEMPERATURE}"
+EVAL_VS_PREVIOUS_TEMPERATURE="${EVAL_VS_PREVIOUS_TEMPERATURE:-1.0}"
 EVAL_VS_PREVIOUS_SAMPLE_MOVES="${EVAL_VS_PREVIOUS_SAMPLE_MOVES:-1}" # 0 | 1
-EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES="${EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES:-4}"
+EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES="${EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES:-0}"
 
 SELF_PLAY_ALLOC_CONF="${SELF_PLAY_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.95,max_split_size_mb:512}"
 SELF_PLAY_MEMORY_ANCHOR_MB="${SELF_PLAY_MEMORY_ANCHOR_MB:-0}"
@@ -77,7 +80,7 @@ else
   exit 1
 fi
 
-: "${LR_COSINE_FINAL_SCALE:=1.0}" # 1.0 keeps fixed LR; e.g. 0.25 anneals to 25% at last iter.
+: "${LR_COSINE_FINAL_SCALE:=0.5}" # 1.0 keeps fixed LR; e.g. 0.25 anneals to 25% at last iter.
 : "${INFER_BATCH_SIZE:=4096}"
 : "${INFER_WARMUP_ITERS:=20}"
 : "${INFER_ITERS:=80}"
@@ -193,7 +196,7 @@ draws = int(target.get("draws", 0) or 0)
 accept = wins > losses
 decision = "accept" if accept else "reject"
 print(
-    "[big_train_v1] gating(vs_best): "
+    "[big_train_v1] gating(vs_best_previous): "
     f"wins={wins} losses={losses} draws={draws} -> {decision}"
 )
 raise SystemExit(0 if accept else 1)
@@ -280,6 +283,8 @@ echo "[big_train_v1] train_devices=$TRAIN_DEVICES"
 echo "[big_train_v1] infer_devices=$INFER_DEVICES"
 echo "[big_train_v1] checkpoints=$CHECKPOINT_DIR"
 echo "[big_train_v1] run_dir=$RUN_DIR"
+echo "[big_train_v1] train_base_model=${TRAIN_BASE_MODEL:-none}"
+echo "[big_train_v1] best_previous_model_init=${BEST_PREVIOUS_MODEL:-none}"
 echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
 echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA"
@@ -299,12 +304,21 @@ echo "[big_train_v1] eval_vs_random temperature=$EVAL_VS_RANDOM_TEMPERATURE open
 echo "[big_train_v1] eval_vs_previous temperature=$EVAL_VS_PREVIOUS_TEMPERATURE sample_moves=$EVAL_VS_PREVIOUS_SAMPLE_MOVES opening_random_moves=$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
 echo "[big_train_v1] selfplay_alloc_conf=$SELF_PLAY_ALLOC_CONF selfplay_memory_anchor_mb=$SELF_PLAY_MEMORY_ANCHOR_MB"
 
-LATEST_MODEL="${LOAD_CHECKPOINT:-}"
-if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
-  echo "[big_train_v1] load checkpoint not found: $LATEST_MODEL" >&2
+if [[ -n "$LEGACY_LOAD_CHECKPOINT" && -z "$TRAIN_BASE_MODEL" && -z "${BEST_PREVIOUS_MODEL:-}" ]]; then
+  echo "[big_train_v1] LOAD_CHECKPOINT is no longer auto-wired. Set TRAIN_BASE_MODEL and optionally BEST_PREVIOUS_MODEL explicitly." >&2
   exit 1
 fi
-BEST_MODEL="$LATEST_MODEL"
+
+LATEST_MODEL="$TRAIN_BASE_MODEL"
+if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
+  echo "[big_train_v1] train base checkpoint not found: $LATEST_MODEL" >&2
+  exit 1
+fi
+BEST_MODEL="$BEST_PREVIOUS_MODEL"
+if [[ -n "$BEST_MODEL" && ! -f "$BEST_MODEL" ]]; then
+  echo "[big_train_v1] best previous checkpoint not found: $BEST_MODEL" >&2
+  exit 1
+fi
 
 GLOBAL_VISIBLE="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 echo "[big_train_v1] global CUDA_VISIBLE_DEVICES=$GLOBAL_VISIBLE"
@@ -540,9 +554,9 @@ PY
       EVAL_GAMES_VS_PREVIOUS_FOR_ITER="$EVAL_GAMES_VS_PREVIOUS"
       if [[ "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER" -lt 2 ]]; then
         EVAL_GAMES_VS_PREVIOUS_FOR_ITER=2
-        echo "[big_train_v1] gating requires vs_best games; bump eval_games_vs_previous to 2 for this iteration."
+        echo "[big_train_v1] gating requires vs_best_previous games; bump eval_games_vs_previous to 2 for this iteration."
       fi
-      echo "[big_train_v1] stage=eval_vs_previous checkpoint=$CANDIDATE_MODEL previous=$GATING_BASE_MODEL"
+      echo "[big_train_v1] stage=eval_vs_previous checkpoint=$CANDIDATE_MODEL best_previous=$GATING_BASE_MODEL"
       EVAL_PREV_CMD=(
         "$PYTHON_BIN" scripts/eval_checkpoint.py
         --challenger_checkpoint "$CANDIDATE_MODEL"
@@ -580,7 +594,7 @@ PY
     fi
   elif [[ -z "$GATING_BASE_MODEL" || ! -f "$GATING_BASE_MODEL" ]]; then
     CANDIDATE_ACCEPTED=1
-    echo "[big_train_v1] bootstrap best checkpoint selected: $CANDIDATE_MODEL"
+    echo "[big_train_v1] bootstrap best_previous checkpoint selected: $CANDIDATE_MODEL"
   elif [[ "$RUN_EVAL_STAGE" != "1" ]]; then
     CANDIDATE_ACCEPTED=1
     echo "[big_train_v1] warning: RUN_EVAL_STAGE=0, gating skipped; promote candidate by default."
@@ -592,6 +606,8 @@ PY
 
   if [[ "$CANDIDATE_ACCEPTED" == "1" ]]; then
     BEST_MODEL="$CANDIDATE_MODEL"
+  elif [[ "$CANDIDATE_VALID" == "1" ]]; then
+    echo "[big_train_v1] candidate did not beat best_previous; keep training from latest candidate and retain best_previous for gating."
   fi
   if [[ "$CANDIDATE_VALID" == "1" ]]; then
     LATEST_MODEL="$CANDIDATE_MODEL"
@@ -620,11 +636,11 @@ PY
       --infer_output "$INFER_JSON"
   fi
 
-  echo "[big_train_v1] iteration ${it} done candidate=$CANDIDATE_MODEL latest=$LATEST_MODEL best=$BEST_MODEL"
+  echo "[big_train_v1] iteration ${it} done candidate=$CANDIDATE_MODEL latest=$LATEST_MODEL best_previous=$BEST_MODEL"
 done
 
 echo
 echo "[big_train_v1] completed all iterations."
 echo "[big_train_v1] final_checkpoint=$LATEST_MODEL"
-echo "[big_train_v1] final_best_checkpoint=$BEST_MODEL"
+echo "[big_train_v1] final_best_previous_checkpoint=$BEST_MODEL"
 echo "[big_train_v1] log_file=$LOG_FILE"
