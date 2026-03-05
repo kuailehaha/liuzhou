@@ -156,54 +156,54 @@ nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw,memory.used,pstate 
 #   --plot-stability \
 #   --output-json "$OUT_DIR/stable_v1_180s.json"
 
-echo "[step] power-efficiency probe (v1, target >=400W on H20)"
-echo "[step] profile: sims=8192, cg=512, batch=1024, sample_moves=false, finalize_graph=on"
-V1_FINALIZE_GRAPH_MAX_ENTRIES=256 \
-"$PYTHON_BIN" tools/run_selfplay_workload.py \
-  --mode v1 \
-  --device "$DEVICE" \
-  --seed "$SEED" \
-  --duration-sec "${POWER_PROBE_DURATION_SEC:-180}" \
-  --num-games-per-iter 512 \
-  --mcts-simulations "${POWER_PROBE_MCTS_SIMS:-8192}" \
-  --v1-threads 8 \
-  --v1-concurrent-games 512 \
-  --v1-child-eval-mode value_only \
-  --v1-sample-moves false \
-  --v1-finalize-graph on \
-  --v1-inference-backend py \
-  --v1-inference-batch-size 2048 \
-  --v1-inference-warmup-iters 5 \
-  --collect-step-timing \
-  --plot-step-breakdown \
-  --plot-stability \
-  --output-json "$OUT_DIR/power_probe_v1_400w_target.json"
+# echo "[step] power-efficiency probe (v1, target >=400W on H20)"
+# echo "[step] profile: sims=8192, cg=512, batch=1024, sample_moves=false, finalize_graph=on"
+# V1_FINALIZE_GRAPH_MAX_ENTRIES=256 \
+# "$PYTHON_BIN" tools/run_selfplay_workload.py \
+#   --mode v1 \
+#   --device "$DEVICE" \
+#   --seed "$SEED" \
+#   --duration-sec "${POWER_PROBE_DURATION_SEC:-180}" \
+#   --num-games-per-iter 512 \
+#   --mcts-simulations "${POWER_PROBE_MCTS_SIMS:-8192}" \
+#   --v1-threads 8 \
+#   --v1-concurrent-games 512 \
+#   --v1-child-eval-mode value_only \
+#   --v1-sample-moves false \
+#   --v1-finalize-graph on \
+#   --v1-inference-backend py \
+#   --v1-inference-batch-size 2048 \
+#   --v1-inference-warmup-iters 5 \
+#   --collect-step-timing \
+#   --plot-step-breakdown \
+#   --plot-stability \
+#   --output-json "$OUT_DIR/power_probe_v1_400w_target.json"
 
-if command -v nsys >/dev/null 2>&1; then
-  for CG in 32 64; do
-    for FG in off on; do
-      echo "[step] nsys v1 cg=$CG finalize_graph=$FG"
-      "$PYTHON_BIN" tools/nsys_v0_v1_compare.py \
-        --device "$DEVICE" \
-        --seed "$SEED" \
-        --duration-sec "$NSYS_DURATION_SEC" \
-        --num-games-per-iter 64 \
-        --mcts-simulations "$MCTS_SIMS" \
-        --v1-threads 1 \
-        --v1-concurrent-games "$CG" \
-        --v1-child-eval-mode value_only \
-        --v1-sample-moves false \
-        --v1-finalize-graph "$FG" \
-        --v1-inference-backend py \
-        --v1-inference-batch-size 512 \
-        --v1-inference-warmup-iters 5 \
-        --profile-modes v1 \
-        --output-dir "$OUT_DIR/nsys_v1_cg${CG}_${FG}"
-    done
-  done
-else
-  echo "[warn] nsys not found, skip nsys profile stage"
-fi
+# if command -v nsys >/dev/null 2>&1; then
+#   for CG in 32 64; do
+#     for FG in off on; do
+#       echo "[step] nsys v1 cg=$CG finalize_graph=$FG"
+#       "$PYTHON_BIN" tools/nsys_v0_v1_compare.py \
+#         --device "$DEVICE" \
+#         --seed "$SEED" \
+#         --duration-sec "$NSYS_DURATION_SEC" \
+#         --num-games-per-iter 64 \
+#         --mcts-simulations "$MCTS_SIMS" \
+#         --v1-threads 1 \
+#         --v1-concurrent-games "$CG" \
+#         --v1-child-eval-mode value_only \
+#         --v1-sample-moves false \
+#         --v1-finalize-graph "$FG" \
+#         --v1-inference-backend py \
+#         --v1-inference-batch-size 512 \
+#         --v1-inference-warmup-iters 5 \
+#         --profile-modes v1 \
+#         --output-dir "$OUT_DIR/nsys_v1_cg${CG}_${FG}"
+#     done
+#   done
+# else
+#   echo "[warn] nsys not found, skip nsys profile stage"
+# fi
 
-find "$OUT_DIR" -type f | sort > "$OUT_DIR/files.txt"
-echo "[done] all outputs saved under: $OUT_DIR"
+# find "$OUT_DIR" -type f | sort > "$OUT_DIR/files.txt"
+# echo "[done] all outputs saved under: $OUT_DIR"

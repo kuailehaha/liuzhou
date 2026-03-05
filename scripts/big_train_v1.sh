@@ -13,7 +13,7 @@ SELF_PLAY_DEVICES="${SELF_PLAY_DEVICES:-cuda:0,cuda:1,cuda:2,cuda:3}"
 TRAIN_DEVICES="${TRAIN_DEVICES:-cuda:0,cuda:1,cuda:2,cuda:3}"
 INFER_DEVICES="${INFER_DEVICES:-cuda:0,cuda:1,cuda:2,cuda:3}"
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints_v1_big}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints_v1_big_1}"
 RUN_ROOT="${RUN_ROOT:-./v1/data/stage_runs}"
 RUN_INFER_STAGE="${RUN_INFER_STAGE:-1}"
 RUN_EVAL_STAGE="${RUN_EVAL_STAGE:-1}"
@@ -27,15 +27,24 @@ TEMPERATURE_THRESHOLD="${TEMPERATURE_THRESHOLD:-10}"
 EXPLORATION_WEIGHT="${EXPLORATION_WEIGHT:-1.0}"
 DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.3}"
 DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
-SOFT_VALUE_K="${SOFT_VALUE_K:-2.0}"
-SOFT_LABEL_ALPHA="${SOFT_LABEL_ALPHA:-1.0}"
-SOFT_LABEL_ALPHA_FINAL="${SOFT_LABEL_ALPHA_FINAL:-1.0}"
+SOFT_VALUE_K="${SOFT_VALUE_K:-5.0}"
+SOFT_LABEL_ALPHA="${SOFT_LABEL_ALPHA:-0.1}"
+SOFT_LABEL_ALPHA_FINAL="${SOFT_LABEL_ALPHA_FINAL:-0.1}"
+ANTI_DRAW_PENALTY="${ANTI_DRAW_PENALTY:--0.05}"
+POLICY_DRAW_WEIGHT="${POLICY_DRAW_WEIGHT:-1.0}"
+POLICY_DRAW_WEIGHT_FINAL="${POLICY_DRAW_WEIGHT_FINAL:-0.5}"
 MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
-SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-0}"
-SELF_PLAY_OPENING_RANDOM_MOVES_FINAL="${SELF_PLAY_OPENING_RANDOM_MOVES_FINAL:-0}"
+SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-4}"
+SELF_PLAY_OPENING_RANDOM_MOVES_FINAL="${SELF_PLAY_OPENING_RANDOM_MOVES_FINAL:-4}"
+REPLAY_WINDOW="${REPLAY_WINDOW:-4}"
+WARMUP_STEPS="${WARMUP_STEPS:-100}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
+
+EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-1000}"
+EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-1000}"
+EVAL_BASELINE_CHECKPOINT="${EVAL_BASELINE_CHECKPOINT:-}"
 
 EVAL_GAMES_VS_RANDOM="${EVAL_GAMES_VS_RANDOM:-1000}"
 EVAL_GAMES_VS_PREVIOUS="${EVAL_GAMES_VS_PREVIOUS:-1000}"
@@ -73,8 +82,8 @@ elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${MCTS_SIMULATIONS:=65536}"
   : "${BATCH_SIZE:=16384}"
   : "${EPOCHS:=4}"
-  : "${LR:=2e-4}"
-  : "${WEIGHT_DECAY:=1e-4}"
+  : "${LR:=1e-4}"
+  : "${WEIGHT_DECAY:=5e-5}"
 else
   echo "[big_train_v1] unsupported PROFILE=$PROFILE (use stable/aggressive)" >&2
   exit 1
@@ -87,7 +96,7 @@ fi
 
 compute_curriculum_values() {
   local iter_idx="$1"
-  "$PYTHON_BIN" - "$iter_idx" "$ITERATIONS" "$SELF_PLAY_OPENING_RANDOM_MOVES" "$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL" "$SOFT_LABEL_ALPHA" "$SOFT_LABEL_ALPHA_FINAL" "$LR" "$LR_COSINE_FINAL_SCALE" <<'PY'
+  "$PYTHON_BIN" - "$iter_idx" "$ITERATIONS" "$SELF_PLAY_OPENING_RANDOM_MOVES" "$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL" "$SOFT_LABEL_ALPHA" "$SOFT_LABEL_ALPHA_FINAL" "$LR" "$LR_COSINE_FINAL_SCALE" "$POLICY_DRAW_WEIGHT" "$POLICY_DRAW_WEIGHT_FINAL" <<'PY'
 import math
 import sys
 
@@ -101,6 +110,8 @@ lr_start = float(sys.argv[7])
 lr_final_scale = float(sys.argv[8])
 lr_final_scale = max(0.0, min(1.0, lr_final_scale))
 lr_final = lr_start * lr_final_scale
+pdw_start = float(sys.argv[9])
+pdw_final = float(sys.argv[10])
 
 if total <= 1:
     progress = 1.0
@@ -118,7 +129,10 @@ cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
 lr_now = lr_final + (lr_start - lr_final) * cosine
 lr_now = max(0.0, lr_now)
 
-print(f"{opening_now} {alpha_now:.6f} {lr_now:.12g}")
+pdw_now = pdw_final + (pdw_start - pdw_final) * cosine
+pdw_now = max(0.0, pdw_now)
+
+print(f"{opening_now} {alpha_now:.6f} {lr_now:.12g} {pdw_now:.6f}")
 PY
 }
 
@@ -287,8 +301,11 @@ echo "[big_train_v1] train_base_model=${TRAIN_BASE_MODEL:-none}"
 echo "[big_train_v1] best_previous_model_init=${BEST_PREVIOUS_MODEL:-none}"
 echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
-echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA"
-echo "[big_train_v1] lr=$LR lr_cosine_final_scale=$LR_COSINE_FINAL_SCALE"
+echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA anti_draw_penalty=$ANTI_DRAW_PENALTY"
+echo "[big_train_v1] soft_value_k=$SOFT_VALUE_K"
+echo "[big_train_v1] policy_draw_weight=$POLICY_DRAW_WEIGHT->$POLICY_DRAW_WEIGHT_FINAL"
+echo "[big_train_v1] lr=$LR lr_cosine_final_scale=$LR_COSINE_FINAL_SCALE warmup_steps=$WARMUP_STEPS"
+echo "[big_train_v1] replay_window=$REPLAY_WINDOW"
 echo "[big_train_v1] opening_random_schedule=$SELF_PLAY_OPENING_RANDOM_MOVES->$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL"
 echo "[big_train_v1] soft_label_alpha_schedule=$SOFT_LABEL_ALPHA->$SOFT_LABEL_ALPHA_FINAL"
 echo "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
@@ -330,22 +347,45 @@ if [[ "${CUDA_LAUNCH_BLOCKING:-0}" == "1" ]]; then
   fi
 fi
 
+OPTIMIZER_STATE_PATH="${CHECKPOINT_DIR}/optimizer_state.pt"
+
 for ((it = 1; it <= ITERATIONS; it++)); do
-  read -r CUR_OPENING_RANDOM_MOVES CUR_SOFT_LABEL_ALPHA CUR_LR <<< "$(compute_curriculum_values "$it")"
+  read -r CUR_OPENING_RANDOM_MOVES CUR_SOFT_LABEL_ALPHA CUR_LR CUR_POLICY_DRAW_WEIGHT <<< "$(compute_curriculum_values "$it")"
   ITER_TAG="$(printf "%03d" "$it")"
   SELFPLAY_FILE="${RUN_DIR}/selfplay_iter_${ITER_TAG}.pt"
   SELFPLAY_STATS_JSON="${RUN_DIR}/selfplay_iter_${ITER_TAG}.json"
   TRAIN_METRICS_JSON="${RUN_DIR}/train_iter_${ITER_TAG}.json"
   EVAL_JSON="${RUN_DIR}/eval_iter_${ITER_TAG}.json"
+  EVAL_BASELINE_JSON="${RUN_DIR}/eval_baseline_iter_${ITER_TAG}.json"
+  EVAL_SELF_JSON="${RUN_DIR}/eval_self_iter_${ITER_TAG}.json"
   INFER_JSON="${RUN_DIR}/infer_iter_${ITER_TAG}.json"
   CKPT_NAME="model_iter_${ITER_TAG}.pt"
   CKPT_PATH="${CHECKPOINT_DIR}/${CKPT_NAME}"
   BASE_MODEL_FOR_ITER="$LATEST_MODEL"
   GATING_BASE_MODEL="$BEST_MODEL"
 
+  # Build replay input list from previous iterations (sliding window).
+  REPLAY_INPUTS=""
+  if [[ "$REPLAY_WINDOW" -gt 1 ]]; then
+    REPLAY_PARTS=()
+    for ((rw = it - 1; rw >= 1 && rw >= it - REPLAY_WINDOW + 1; rw--)); do
+      RW_TAG="$(printf "%03d" "$rw")"
+      RW_FILE="${RUN_DIR}/selfplay_iter_${RW_TAG}.pt"
+      if [[ -f "$RW_FILE" ]]; then
+        REPLAY_PARTS+=("$RW_FILE")
+      fi
+    done
+    if [[ ${#REPLAY_PARTS[@]} -gt 0 ]]; then
+      REPLAY_INPUTS="$(IFS=','; echo "${REPLAY_PARTS[*]}")"
+    fi
+  fi
+
   echo
   echo "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
-  echo "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA lr=$CUR_LR"
+  echo "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA lr=$CUR_LR policy_draw_weight=$CUR_POLICY_DRAW_WEIGHT"
+  if [[ -n "$REPLAY_INPUTS" ]]; then
+    echo "[big_train_v1] replay_inputs=$REPLAY_INPUTS"
+  fi
   echo "[big_train_v1] stage=selfplay output=$SELFPLAY_FILE"
   SP_CMD=(
     "$PYTHON_BIN" scripts/train_entry.py
@@ -470,11 +510,18 @@ PY
       --lr "$CUR_LR"
       --weight_decay "$WEIGHT_DECAY"
       --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
+      --anti_draw_penalty "$ANTI_DRAW_PENALTY"
+      --policy_draw_weight "$CUR_POLICY_DRAW_WEIGHT"
+      --warmup_steps "$WARMUP_STEPS"
+      --optimizer_state_path "$OPTIMIZER_STATE_PATH"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
+    if [[ -n "$REPLAY_INPUTS" ]]; then
+      DDP_CMD+=(--self_play_replay_inputs "$REPLAY_INPUTS")
+    fi
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
       DDP_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
@@ -498,11 +545,18 @@ PY
       --lr "$CUR_LR"
       --weight_decay "$WEIGHT_DECAY"
       --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
+      --anti_draw_penalty "$ANTI_DRAW_PENALTY"
+      --policy_draw_weight "$CUR_POLICY_DRAW_WEIGHT"
+      --warmup_steps "$WARMUP_STEPS"
+      --optimizer_state_path "$OPTIMIZER_STATE_PATH"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
+    if [[ -n "$REPLAY_INPUTS" ]]; then
+      TRAIN_CMD+=(--self_play_replay_inputs "$REPLAY_INPUTS")
+    fi
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
       TRAIN_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
@@ -581,6 +635,68 @@ PY
         EVAL_PREV_CMD+=(--sample_moves)
       fi
       CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_PREV_CMD[@]}"
+    fi
+
+    # Extra eval: vs fixed baseline (iter_001 or user-specified anchor).
+    BASELINE_CKPT="${EVAL_BASELINE_CHECKPOINT}"
+    if [[ -z "$BASELINE_CKPT" ]]; then
+      BASELINE_CKPT="${CHECKPOINT_DIR}/model_iter_001.pt"
+    fi
+    if [[ "$EVAL_GAMES_VS_BASELINE" -gt 0 && -f "$BASELINE_CKPT" && "$BASELINE_CKPT" != "$CANDIDATE_MODEL" ]]; then
+      echo "[big_train_v1] stage=eval_vs_baseline checkpoint=$CANDIDATE_MODEL baseline=$BASELINE_CKPT"
+      EVAL_BASE_CMD=(
+        "$PYTHON_BIN" scripts/eval_checkpoint.py
+        --challenger_checkpoint "$CANDIDATE_MODEL"
+        --previous_checkpoint "$BASELINE_CKPT"
+        --device "$DEVICE"
+        --eval_devices "$EVAL_DEVICES"
+        --eval_workers "$EVAL_WORKERS"
+        --backend "$EVAL_BACKEND"
+        --mcts_simulations "$EVAL_MCTS_SIMULATIONS"
+        --temperature "$EVAL_VS_PREVIOUS_TEMPERATURE"
+        --eval_games_vs_random 0
+        --eval_games_vs_previous "$EVAL_GAMES_VS_BASELINE"
+        --batch_leaves "$EVAL_BATCH_LEAVES"
+        --inference_backend "$EVAL_INFER_BACKEND"
+        --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
+        --inference_warmup_iters "$EVAL_INFER_WARMUP_ITERS"
+        --v1_concurrent_games "$EVAL_V1_CONCURRENT_GAMES"
+        --v1_opening_random_moves "$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
+        --output_json "$EVAL_BASELINE_JSON"
+      )
+      if [[ "$EVAL_VS_PREVIOUS_SAMPLE_MOVES" == "1" ]]; then
+        EVAL_BASE_CMD+=(--sample_moves)
+      fi
+      CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_BASE_CMD[@]}"
+    fi
+
+    # Extra eval: vs self (draw rate monitor).
+    if [[ "$EVAL_GAMES_VS_SELF" -gt 0 ]]; then
+      echo "[big_train_v1] stage=eval_vs_self checkpoint=$CANDIDATE_MODEL"
+      EVAL_SELF_CMD=(
+        "$PYTHON_BIN" scripts/eval_checkpoint.py
+        --challenger_checkpoint "$CANDIDATE_MODEL"
+        --previous_checkpoint "$CANDIDATE_MODEL"
+        --device "$DEVICE"
+        --eval_devices "$EVAL_DEVICES"
+        --eval_workers "$EVAL_WORKERS"
+        --backend "$EVAL_BACKEND"
+        --mcts_simulations "$EVAL_MCTS_SIMULATIONS"
+        --temperature "$EVAL_VS_PREVIOUS_TEMPERATURE"
+        --eval_games_vs_random 0
+        --eval_games_vs_previous "$EVAL_GAMES_VS_SELF"
+        --batch_leaves "$EVAL_BATCH_LEAVES"
+        --inference_backend "$EVAL_INFER_BACKEND"
+        --inference_batch_size "$EVAL_INFER_BATCH_SIZE"
+        --inference_warmup_iters "$EVAL_INFER_WARMUP_ITERS"
+        --v1_concurrent_games "$EVAL_V1_CONCURRENT_GAMES"
+        --v1_opening_random_moves "$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
+        --output_json "$EVAL_SELF_JSON"
+      )
+      if [[ "$EVAL_VS_PREVIOUS_SAMPLE_MOVES" == "1" ]]; then
+        EVAL_SELF_CMD+=(--sample_moves)
+      fi
+      CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_SELF_CMD[@]}"
     fi
   fi
 

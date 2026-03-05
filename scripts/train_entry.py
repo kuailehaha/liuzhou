@@ -67,6 +67,8 @@ def _run_v1(args: argparse.Namespace) -> int:
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         soft_label_alpha=float(args.soft_label_alpha),
+        anti_draw_penalty=float(args.anti_draw_penalty),
+        policy_draw_weight=float(args.policy_draw_weight),
         temperature_init=float(args.temperature_init),
         temperature_final=float(args.temperature_final),
         temperature_threshold=int(args.temperature_threshold),
@@ -88,9 +90,12 @@ def _run_v1(args: argparse.Namespace) -> int:
         self_play_output=args.self_play_output,
         self_play_iteration_seed=args.self_play_iteration_seed,
         self_play_input=args.self_play_input,
+        self_play_replay_inputs=args.self_play_replay_inputs,
         self_play_stats_json=args.self_play_stats_json,
         checkpoint_name=args.checkpoint_name,
         metrics_output=args.metrics_output,
+        optimizer_state_path=args.optimizer_state_path,
+        warmup_steps=int(args.warmup_steps),
         infer_devices=args.infer_devices,
         infer_batch_size=int(args.infer_batch_size),
         infer_warmup_iters=int(args.infer_warmup_iters),
@@ -119,6 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--soft_label_alpha", type=float, default=0.0)
+    parser.add_argument("--anti_draw_penalty", type=float, default=0.0)
+    parser.add_argument("--policy_draw_weight", type=float, default=1.0)
 
     parser.add_argument("--temperature_init", type=float, default=1.0)
     parser.add_argument("--temperature_final", type=float, default=0.1)
@@ -184,6 +191,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="v1 self-play payload input path.",
     )
+    parser.add_argument(
+        "--self_play_replay_inputs",
+        type=str,
+        default=None,
+        help="Comma-separated paths to historical self-play payloads for replay buffer.",
+    )
+    parser.add_argument(
+        "--optimizer_state_path",
+        type=str,
+        default=None,
+        help="Path to save/load optimizer state for training continuity.",
+    )
+    parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument(
         "--self_play_stats_json",
         type=str,

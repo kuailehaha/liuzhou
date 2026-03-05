@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,13 +95,16 @@ def train_network_from_tensors(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     soft_label_alpha: float = 0.0,
+    anti_draw_penalty: float = 0.0,
     policy_draw_weight: float = 1.0,
     device: str = "cpu",
     use_amp: bool = True,
     grad_clip_norm: float = 1.0,
+    warmup_steps: int = 100,
     parallel_devices: Optional[List[str]] = None,
     parallel_strategy: str = "data_parallel",
     ddp_pre_sharded: bool = False,
+    optimizer_state_path: Optional[str] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train directly from tensor-native self-play output."""
 
@@ -215,26 +219,50 @@ def train_network_from_tensors(
         return model, {"epoch_stats": [], "num_samples": 0}
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer_loaded = False
+    if optimizer_state_path and os.path.exists(optimizer_state_path):
+        try:
+            opt_state = torch.load(optimizer_state_path, map_location=device_obj)
+            optimizer.load_state_dict(opt_state)
+            for pg in optimizer.param_groups:
+                pg["lr"] = float(lr)
+            optimizer_loaded = True
+        except Exception:
+            pass
     use_amp_enabled = bool(use_amp and device_obj.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp_enabled)
 
     alpha = float(max(0.0, min(1.0, soft_label_alpha)))
+    anti_draw = float(anti_draw_penalty)
     draw_weight = float(max(0.0, policy_draw_weight))
     bsz = max(1, int(batch_size))
     local_batch_count = int((num_samples + bsz - 1) // bsz)
     synced_batch_count = int(local_batch_count)
     if strategy == "ddp" and ddp_world > 1:
-        # Keep per-rank collective order identical by forcing the same number of steps.
         batch_count_token = torch.tensor([local_batch_count], dtype=torch.int64, device=device_obj)
         dist.all_reduce(batch_count_token, op=dist.ReduceOp.MIN)
         synced_batch_count = int(max(0, int(batch_count_token.item())))
     sync_sample_cap = int(synced_batch_count * bsz)
     dropped_samples_for_sync = int(max(0, num_samples - sync_sample_cap))
+
+    num_epochs = max(1, int(epochs))
+    total_train_steps = int(synced_batch_count * num_epochs)
+    warmup_n = min(max(0, int(warmup_steps)), total_train_steps // 2)
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_n:
+            return (step + 1) / max(1, warmup_n)
+        progress = (step - warmup_n) / max(1, total_train_steps - warmup_n)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    global_step = 0
+
     epoch_stats: List[Dict[str, Any]] = []
     first_batch_sec: float = 0.0
     first_batch_recorded = False
 
-    for epoch in range(max(1, int(epochs))):
+    for epoch in range(num_epochs):
         perm = _train_permutation(num_samples, device_obj)
         total_loss_sum = 0.0
         policy_loss_sum = 0.0
@@ -262,6 +290,11 @@ def train_network_from_tensors(
             batch_policy = policy_targets.index_select(0, idx)
             batch_values = value_targets.index_select(0, idx)
             batch_soft = soft_targets.index_select(0, idx)
+
+            if abs(anti_draw) > 1e-9:
+                draw_mask_ad = batch_values.abs().lt(1e-8)
+                batch_values = batch_values.clone()
+                batch_values[draw_mask_ad] = anti_draw
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -304,6 +337,8 @@ def train_network_from_tensors(
             if not loss_is_finite:
                 skipped_non_finite_loss_batches += 1
                 optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                scheduler.step()
                 continue
 
             if loss.requires_grad:
@@ -318,10 +353,15 @@ def train_network_from_tensors(
                     skipped_non_finite_grad_batches += 1
                     optimizer.zero_grad(set_to_none=True)
                     scaler.update()
+                    global_step += 1
+                    scheduler.step()
                     continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
                 scaler.step(optimizer)
                 scaler.update()
+
+            global_step += 1
+            scheduler.step()
 
             draw_mask = batch_values.abs().squeeze(1) < 1e-8
             policy_weights = torch.where(
@@ -407,6 +447,12 @@ def train_network_from_tensors(
             }
         )
 
+    if optimizer_state_path and (strategy != "ddp" or ddp_rank == 0):
+        try:
+            torch.save(optimizer.state_dict(), optimizer_state_path)
+        except Exception:
+            pass
+
     return model, {
         "epoch_stats": epoch_stats,
         "num_samples": global_num_samples,
@@ -417,6 +463,10 @@ def train_network_from_tensors(
         "local_batch_count": int(local_batch_count),
         "synced_batch_count": int(synced_batch_count),
         "dropped_samples_for_sync": int(dropped_samples_for_sync),
+        "optimizer_loaded": bool(optimizer_loaded),
+        "anti_draw_penalty": float(anti_draw),
+        "warmup_steps": int(warmup_n),
+        "total_train_steps": int(total_train_steps),
         "timing": {
             "cpu_shard_sec": float(cpu_shard_sec),
             "h2d_copy_sec": float(h2d_copy_sec),

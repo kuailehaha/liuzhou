@@ -1217,6 +1217,8 @@ def train_pipeline_v1(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     soft_label_alpha: float = 0.0,
+    anti_draw_penalty: float = 0.0,
+    policy_draw_weight: float = 1.0,
     temperature_init: float = 1.0,
     temperature_final: float = 0.1,
     temperature_threshold: int = 10,
@@ -1239,9 +1241,12 @@ def train_pipeline_v1(
     self_play_output: Optional[str] = None,
     self_play_iteration_seed: Optional[int] = None,
     self_play_input: Optional[str] = None,
+    self_play_replay_inputs: Optional[str] = None,
     self_play_stats_json: Optional[str] = None,
     checkpoint_name: Optional[str] = None,
     metrics_output: Optional[str] = None,
+    optimizer_state_path: Optional[str] = None,
+    warmup_steps: int = 100,
     infer_devices: Optional[str] = None,
     infer_batch_size: int = 4096,
     infer_warmup_iters: int = 20,
@@ -1426,6 +1431,42 @@ def train_pipeline_v1(
                 ddp_rank=ddp_load_rank,
                 ddp_world_size=ddp_load_world,
             )
+            replay_inputs_str = str(self_play_replay_inputs or "").strip()
+            replay_files = [f.strip() for f in replay_inputs_str.split(",") if f.strip()] if replay_inputs_str else []
+            replay_files = [f for f in replay_files if os.path.exists(f)]
+            if replay_files:
+                primary_n = int(samples.num_samples)
+                replay_budget = primary_n
+                per_file_budget = max(1, replay_budget // len(replay_files))
+                replay_batches: List[TensorSelfPlayBatch] = [samples]
+                for rf in replay_files:
+                    try:
+                        rb, _rs, _rm = _load_self_play_payload(
+                            rf, ddp_rank=ddp_load_rank, ddp_world_size=ddp_load_world,
+                        )
+                        rn = int(rb.num_samples)
+                        if rn > per_file_budget:
+                            perm_r = torch.randperm(rn)[:per_file_budget]
+                            rb = TensorSelfPlayBatch(
+                                state_tensors=rb.state_tensors.index_select(0, perm_r),
+                                legal_masks=rb.legal_masks.index_select(0, perm_r),
+                                policy_targets=rb.policy_targets.index_select(0, perm_r),
+                                value_targets=rb.value_targets.index_select(0, perm_r),
+                                soft_value_targets=rb.soft_value_targets.index_select(0, perm_r),
+                            )
+                        replay_batches.append(rb)
+                        _print_rank0(
+                            f"[v1.train] replay loaded {rf} "
+                            f"sampled={int(rb.num_samples)}/{rn}"
+                        )
+                    except Exception as exc:
+                        _print_rank0(f"[v1.train] warning: replay load failed for {rf}: {exc}")
+                if len(replay_batches) > 1:
+                    samples = _concat_self_play_batches_cpu(replay_batches)
+                    _print_rank0(
+                        f"[v1.train] replay merged: primary={primary_n} "
+                        f"replay_files={len(replay_files)} total={int(samples.num_samples)}"
+                    )
             payload_load_sec = float(max(0.0, time.perf_counter() - payload_load_start))
             global_positions = int(sp_stats_payload.get("num_positions", 0) or 0)
             if global_positions <= 0:
@@ -1458,6 +1499,7 @@ def train_pipeline_v1(
                 train_strategy_norm == "ddp"
                 and isinstance(_sp_meta, dict)
                 and bool(_sp_meta.get("payload_sharded_manifest", False))
+                and not replay_files
             )
             model, train_metrics = train_network_from_tensors(
                 model=model,
@@ -1467,12 +1509,15 @@ def train_pipeline_v1(
                 lr=lr,
                 weight_decay=weight_decay,
                 soft_label_alpha=float(soft_label_alpha),
-                policy_draw_weight=1.0,
+                anti_draw_penalty=float(anti_draw_penalty),
+                policy_draw_weight=float(policy_draw_weight),
                 device=str(primary_train_device),
                 use_amp=(primary_train_device.type == "cuda"),
                 parallel_devices=parallel_devices,
                 parallel_strategy=train_strategy_norm,
                 ddp_pre_sharded=ddp_pre_sharded,
+                optimizer_state_path=optimizer_state_path,
+                warmup_steps=int(warmup_steps),
             )
             train_elapsed = time.perf_counter() - train_start
             train_bridge_timing = train_metrics.get("timing", {})
@@ -1718,6 +1763,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--soft_label_alpha", type=float, default=0.0)
+    parser.add_argument("--anti_draw_penalty", type=float, default=0.0)
+    parser.add_argument("--policy_draw_weight", type=float, default=1.0)
     parser.add_argument("--temperature_init", type=float, default=1.0)
     parser.add_argument("--temperature_final", type=float, default=0.1)
     parser.add_argument("--temperature_threshold", type=int, default=10)
@@ -1786,6 +1833,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to load self-play tensor payload (required for stage=train).",
     )
     parser.add_argument(
+        "--self_play_replay_inputs",
+        type=str,
+        default=None,
+        help="Comma-separated paths to historical self-play payloads for replay buffer.",
+    )
+    parser.add_argument(
+        "--optimizer_state_path",
+        type=str,
+        default=None,
+        help="Path to save/load optimizer state for training continuity.",
+    )
+    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument(
         "--self_play_stats_json",
         type=str,
         default=None,
@@ -1833,6 +1893,8 @@ if __name__ == "__main__":
         lr=args.lr,
         weight_decay=args.weight_decay,
         soft_label_alpha=args.soft_label_alpha,
+        anti_draw_penalty=args.anti_draw_penalty,
+        policy_draw_weight=args.policy_draw_weight,
         temperature_init=args.temperature_init,
         temperature_final=args.temperature_final,
         temperature_threshold=args.temperature_threshold,
@@ -1854,9 +1916,12 @@ if __name__ == "__main__":
         self_play_output=args.self_play_output,
         self_play_iteration_seed=args.self_play_iteration_seed,
         self_play_input=args.self_play_input,
+        self_play_replay_inputs=args.self_play_replay_inputs,
         self_play_stats_json=args.self_play_stats_json,
         checkpoint_name=args.checkpoint_name,
         metrics_output=args.metrics_output,
+        optimizer_state_path=args.optimizer_state_path,
+        warmup_steps=args.warmup_steps,
         infer_devices=args.infer_devices,
         infer_batch_size=args.infer_batch_size,
         infer_warmup_iters=args.infer_warmup_iters,
