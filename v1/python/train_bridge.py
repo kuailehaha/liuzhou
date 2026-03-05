@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
+import torch.utils.data
 
 from src.neural_network import scalar_to_bucket_twohot
 from src.policy_batch import (
@@ -472,5 +473,332 @@ def train_network_from_tensors(
             "h2d_copy_sec": float(h2d_copy_sec),
             "first_batch_sec": float(first_batch_sec),
             "ddp_pre_sharded": bool(ddp_pre_sharded),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Streaming training path — data arrives via DataLoader, never fully in RAM
+# ---------------------------------------------------------------------------
+
+def train_network_streaming(
+    model,
+    dataloader: torch.utils.data.DataLoader,
+    *,
+    total_samples: int,
+    batch_size: int = 512,
+    epochs: int = 1,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    soft_label_alpha: float = 0.0,
+    anti_draw_penalty: float = 0.0,
+    policy_draw_weight: float = 1.0,
+    device: str = "cpu",
+    use_amp: bool = True,
+    grad_clip_norm: float = 1.0,
+    warmup_steps: int = 100,
+    parallel_devices: Optional[List[str]] = None,
+    parallel_strategy: str = "data_parallel",
+    optimizer_state_path: Optional[str] = None,
+    streaming_workers: int = 8,
+) -> Tuple[Any, Dict[str, Any]]:
+    """Train from a streaming DataLoader — data is loaded on-the-fly per batch."""
+
+    device_obj = torch.device(device)
+    strategy_raw = str(parallel_strategy).strip().lower()
+    if strategy_raw in {"dp", "data_parallel"}:
+        strategy = "data_parallel"
+    elif strategy_raw in {"none", "single"}:
+        strategy = "none"
+    elif strategy_raw == "ddp":
+        strategy = "ddp"
+    else:
+        raise ValueError(f"Unsupported parallel_strategy={parallel_strategy!r}")
+
+    ddp_rank = 0
+    ddp_world = 1
+    if strategy == "ddp":
+        if not _ddp_is_ready():
+            raise RuntimeError("parallel_strategy='ddp' requires torch.distributed init.")
+        if device_obj.type != "cuda":
+            raise RuntimeError("parallel_strategy='ddp' requires CUDA.")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device_obj = torch.device(f"cuda:{local_rank}")
+        ddp_rank = int(dist.get_rank())
+        ddp_world = int(dist.get_world_size())
+
+    model.to(device_obj)
+    model.train()
+    train_model: nn.Module = model
+    if strategy == "ddp":
+        train_model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device_obj.index],
+            output_device=device_obj.index,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+    elif strategy == "data_parallel":
+        parallel_device_ids = _resolve_parallel_cuda_device_ids(
+            primary_device=device_obj,
+            parallel_devices=parallel_devices,
+        )
+        if parallel_device_ids:
+            train_model = nn.DataParallel(
+                model,
+                device_ids=parallel_device_ids,
+                output_device=parallel_device_ids[0],
+            )
+
+    bsz = max(1, int(batch_size))
+    est_batches_per_epoch = max(1, (total_samples + bsz - 1) // bsz)
+
+    if strategy == "ddp" and ddp_world > 1:
+        bc_token = torch.tensor([est_batches_per_epoch], dtype=torch.int64, device=device_obj)
+        dist.all_reduce(bc_token, op=dist.ReduceOp.MIN)
+        est_batches_per_epoch = int(max(1, int(bc_token.item())))
+
+    num_epochs = max(1, int(epochs))
+    total_train_steps = int(est_batches_per_epoch * num_epochs)
+    warmup_n = min(max(0, int(warmup_steps)), total_train_steps // 2)
+
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer_loaded = False
+    if optimizer_state_path and os.path.exists(optimizer_state_path):
+        try:
+            opt_state = torch.load(optimizer_state_path, map_location=device_obj)
+            optimizer.load_state_dict(opt_state)
+            for pg in optimizer.param_groups:
+                pg["lr"] = float(lr)
+            optimizer_loaded = True
+        except Exception:
+            pass
+
+    use_amp_enabled = bool(use_amp and device_obj.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp_enabled)
+
+    alpha = float(max(0.0, min(1.0, soft_label_alpha)))
+    anti_draw = float(anti_draw_penalty)
+    draw_weight = float(max(0.0, policy_draw_weight))
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_n:
+            return (step + 1) / max(1, warmup_n)
+        progress = (step - warmup_n) / max(1, total_train_steps - warmup_n)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    global_step = 0
+
+    epoch_stats: List[Dict[str, Any]] = []
+    first_batch_sec: float = 0.0
+    first_batch_recorded = False
+    total_filtered = 0
+    total_samples_seen_all = 0
+
+    for epoch in range(num_epochs):
+        total_loss_sum = 0.0
+        policy_loss_sum = 0.0
+        value_loss_sum = 0.0
+        total_seen = 0
+        total_policy_weight = 0.0
+        total_valid_policy = 0
+        soft_abs_sum = 0.0
+        mix_abs_sum = 0.0
+        mix_batches = 0
+        skipped_non_finite_loss = 0
+        skipped_non_finite_grad = 0
+        batches_this_epoch = 0
+
+        for batch_tuple in dataloader:
+            if batches_this_epoch >= est_batches_per_epoch:
+                break
+
+            batch_start = time.perf_counter()
+
+            b_states, b_masks, b_policy, b_values, b_soft = batch_tuple
+            b_states = b_states.to(device_obj, non_blocking=True).float()
+            b_masks = b_masks.to(device_obj, non_blocking=True).bool()
+            b_policy = b_policy.to(device_obj, non_blocking=True).float()
+            b_values = b_values.to(device_obj, non_blocking=True).float().view(-1, 1)
+            b_soft = b_soft.to(device_obj, non_blocking=True).float().view(-1, 1)
+
+            finite_mask = torch.isfinite(b_values.squeeze(1))
+            finite_mask &= torch.isfinite(b_soft.squeeze(1))
+            finite_mask &= torch.isfinite(b_policy).all(dim=1)
+            finite_mask &= torch.isfinite(b_states.view(b_states.size(0), -1)).all(dim=1)
+            n_bad = int((~finite_mask).sum().item())
+            if n_bad > 0:
+                total_filtered += n_bad
+                keep = finite_mask.nonzero(as_tuple=False).view(-1)
+                if keep.numel() == 0:
+                    batches_this_epoch += 1
+                    global_step += 1
+                    scheduler.step()
+                    continue
+                b_states = b_states.index_select(0, keep)
+                b_masks = b_masks.index_select(0, keep)
+                b_policy = b_policy.index_select(0, keep)
+                b_values = b_values.index_select(0, keep)
+                b_soft = b_soft.index_select(0, keep)
+
+            if abs(anti_draw) > 1e-9:
+                draw_mask_ad = b_values.abs().lt(1e-8)
+                b_values = b_values.clone()
+                b_values[draw_mask_ad] = anti_draw
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast("cuda", enabled=use_amp_enabled):
+                log_p1, log_p2, log_pmc, value_logits = train_model(b_states)
+
+                mixed_values = torch.clamp(
+                    (1.0 - alpha) * b_values + alpha * b_soft,
+                    min=-1.0, max=1.0,
+                )
+                bucket_target = scalar_to_bucket_twohot(
+                    mixed_values, num_bins=int(value_logits.size(1)),
+                ).to(torch.float32)
+                value_log_probs = torch.log_softmax(value_logits.to(torch.float32), dim=-1)
+                value_loss = -(bucket_target * value_log_probs).sum(dim=-1).mean()
+
+                combined_logits = build_combined_logits(
+                    log_p1.view(log_p1.size(0), -1),
+                    log_p2.view(log_p2.size(0), -1),
+                    log_pmc.view(log_pmc.size(0), -1),
+                    board_size=6,
+                )
+                log_probs = masked_log_softmax(combined_logits, b_masks, dim=1)
+                p_loss = batched_policy_loss(log_probs, b_policy, b_masks, b_values, draw_weight)
+                loss = p_loss + value_loss
+
+            loss_ok = _all_ranks_true(
+                bool(torch.isfinite(loss).all().item()),
+                strategy=strategy, device=device_obj,
+            )
+            if not loss_ok:
+                skipped_non_finite_loss += 1
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                scheduler.step()
+                batches_this_epoch += 1
+                continue
+
+            if loss.requires_grad:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grads_ok = _all_ranks_true(
+                    _grads_are_finite(model),
+                    strategy=strategy, device=device_obj,
+                )
+                if not grads_ok:
+                    skipped_non_finite_grad += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    global_step += 1
+                    scheduler.step()
+                    batches_this_epoch += 1
+                    continue
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
+                scaler.step(optimizer)
+                scaler.update()
+
+            global_step += 1
+            scheduler.step()
+            batches_this_epoch += 1
+
+            bc = int(b_states.size(0))
+            draw_m = b_values.abs().squeeze(1) < 1e-8
+            pw = torch.where(draw_m, b_values.new_full((), draw_weight), b_values.new_ones(()))
+            ws = float(pw.sum().item())
+            vp = int((b_policy.sum(dim=1) > 1e-8).sum().item())
+
+            total_seen += bc
+            total_loss_sum += float(loss.item()) * bc
+            policy_loss_sum += float(p_loss.item()) * ws
+            value_loss_sum += float(value_loss.item()) * bc
+            total_policy_weight += ws
+            total_valid_policy += vp
+            soft_abs_sum += float(b_soft.abs().mean().item())
+            mix_abs_sum += float(mixed_values.abs().mean().item())
+            mix_batches += 1
+
+            if not first_batch_recorded:
+                first_batch_sec = float(max(0.0, time.perf_counter() - batch_start))
+                first_batch_recorded = True
+
+        if strategy == "ddp":
+            reduced = torch.tensor(
+                [
+                    total_loss_sum, policy_loss_sum, value_loss_sum,
+                    float(total_seen), total_policy_weight, float(total_valid_policy),
+                    soft_abs_sum, mix_abs_sum, float(mix_batches),
+                    float(skipped_non_finite_loss), float(skipped_non_finite_grad),
+                ],
+                dtype=torch.float64, device=device_obj,
+            )
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+            total_loss_sum = float(reduced[0].item())
+            policy_loss_sum = float(reduced[1].item())
+            value_loss_sum = float(reduced[2].item())
+            total_seen = int(round(float(reduced[3].item())))
+            total_policy_weight = float(reduced[4].item())
+            total_valid_policy = int(round(float(reduced[5].item())))
+            soft_abs_sum = float(reduced[6].item())
+            mix_abs_sum = float(reduced[7].item())
+            mix_batches = int(round(float(reduced[8].item())))
+            skipped_non_finite_loss = int(round(float(reduced[9].item())))
+            skipped_non_finite_grad = int(round(float(reduced[10].item())))
+
+        total_samples_seen_all += total_seen
+        avg_loss = total_loss_sum / max(1, total_seen)
+        avg_policy = policy_loss_sum / max(1e-8, total_policy_weight)
+        avg_value = value_loss_sum / max(1, total_seen)
+        avg_soft_abs = soft_abs_sum / max(1, mix_batches)
+        avg_mix_abs = mix_abs_sum / max(1, mix_batches)
+
+        epoch_stats.append({
+            "epoch": epoch + 1,
+            "avg_loss": avg_loss,
+            "avg_policy_loss": avg_policy,
+            "avg_value_loss": avg_value,
+            "samples": total_seen,
+            "valid_policy_samples": total_valid_policy,
+            "policy_weight_sum": total_policy_weight,
+            "soft_alpha": alpha,
+            "avg_soft_abs": avg_soft_abs,
+            "avg_mix_abs": avg_mix_abs,
+            "parallel_strategy": strategy,
+            "ddp_world_size": ddp_world,
+            "batches_this_epoch": batches_this_epoch,
+            "est_batches_per_epoch": est_batches_per_epoch,
+            "skipped_non_finite_loss_batches": skipped_non_finite_loss,
+            "skipped_non_finite_grad_batches": skipped_non_finite_grad,
+            "filtered_non_finite_samples": total_filtered,
+        })
+
+    if optimizer_state_path and (strategy != "ddp" or ddp_rank == 0):
+        try:
+            torch.save(optimizer.state_dict(), optimizer_state_path)
+        except Exception:
+            pass
+
+    return model, {
+        "epoch_stats": epoch_stats,
+        "num_samples": total_samples,
+        "num_samples_after_filter": total_samples_seen_all,
+        "filtered_non_finite_samples": total_filtered,
+        "parallel_strategy": strategy,
+        "ddp_world_size": ddp_world,
+        "est_batches_per_epoch": est_batches_per_epoch,
+        "optimizer_loaded": bool(optimizer_loaded),
+        "anti_draw_penalty": float(anti_draw),
+        "warmup_steps": int(warmup_n),
+        "total_train_steps": int(total_train_steps),
+        "streaming": True,
+        "streaming_workers": int(streaming_workers),
+        "timing": {
+            "first_batch_sec": float(first_batch_sec),
         },
     }

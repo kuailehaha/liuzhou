@@ -41,6 +41,8 @@ REPLAY_WINDOW="${REPLAY_WINDOW:-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
+STREAMING_LOAD="${STREAMING_LOAD:-1}"       # 1=streaming DataLoader, 0=monolithic load
+STREAMING_WORKERS="${STREAMING_WORKERS:-8}" # DataLoader num_workers
 
 EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-1000}"
 EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-1000}"
@@ -264,6 +266,35 @@ build_local_cuda_list() {
   )
 }
 
+STAGE_MAX_RETRIES="${STAGE_MAX_RETRIES:-2}"
+
+run_with_retry() {
+  local stage_label="$1"
+  shift
+  local max_retries="$STAGE_MAX_RETRIES"
+  local attempt=0
+  local rc=0
+  while [[ "$attempt" -le "$max_retries" ]]; do
+    attempt=$((attempt + 1))
+    rc=0
+    "$@" && return 0 || rc=$?
+    echo "[big_train_v1] $stage_label failed (exit_code=$rc, attempt=$attempt/$((max_retries + 1)))" >&2
+    echo "[big_train_v1] diagnostics for $stage_label failure:" >&2
+    echo "[big_train_v1]   date=$(date '+%Y-%m-%d %H:%M:%S')" >&2
+    free -h 2>/dev/null | head -3 >&2 || true
+    dmesg -T 2>/dev/null | tail -20 >&2 || true
+    if [[ "$attempt" -le "$max_retries" ]]; then
+      local sleep_sec=$((attempt * 5))
+      echo "[big_train_v1] retrying $stage_label in ${sleep_sec}s ..." >&2
+      sleep "$sleep_sec"
+      sync 2>/dev/null || true
+      echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    fi
+  done
+  echo "[big_train_v1] $stage_label exhausted retries ($((max_retries + 1)) attempts), aborting" >&2
+  return "$rc"
+}
+
 if [[ -z "${EVAL_WORKERS:-}" ]]; then
   EVAL_WORKERS="$(csv_count "$EVAL_DEVICES")"
 fi
@@ -305,6 +336,7 @@ echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA anti_draw_penalty=$ANTI_
 echo "[big_train_v1] soft_value_k=$SOFT_VALUE_K"
 echo "[big_train_v1] policy_draw_weight=$POLICY_DRAW_WEIGHT->$POLICY_DRAW_WEIGHT_FINAL"
 echo "[big_train_v1] lr=$LR lr_cosine_final_scale=$LR_COSINE_FINAL_SCALE warmup_steps=$WARMUP_STEPS"
+echo "[big_train_v1] streaming_load=$STREAMING_LOAD streaming_workers=$STREAMING_WORKERS"
 echo "[big_train_v1] replay_window=$REPLAY_WINDOW"
 echo "[big_train_v1] opening_random_schedule=$SELF_PLAY_OPENING_RANDOM_MOVES->$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL"
 echo "[big_train_v1] soft_label_alpha_schedule=$SOFT_LABEL_ALPHA->$SOFT_LABEL_ALPHA_FINAL"
@@ -420,9 +452,10 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
     SP_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
   fi
-  PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-$SELF_PLAY_ALLOC_CONF}" \
-  V1_SELFPLAY_MEMORY_ANCHOR_MB="$SELF_PLAY_MEMORY_ANCHOR_MB" \
-  CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${SP_CMD[@]}"
+  run_with_retry "selfplay(iter=$it)" \
+    env PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-$SELF_PLAY_ALLOC_CONF}" \
+    V1_SELFPLAY_MEMORY_ANCHOR_MB="$SELF_PLAY_MEMORY_ANCHOR_MB" \
+    CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${SP_CMD[@]}"
 
   if [[ -f "$SELFPLAY_STATS_JSON" ]]; then
     "$PYTHON_BIN" - "$SELFPLAY_STATS_JSON" <<'PY'
@@ -513,6 +546,8 @@ PY
       --anti_draw_penalty "$ANTI_DRAW_PENALTY"
       --policy_draw_weight "$CUR_POLICY_DRAW_WEIGHT"
       --warmup_steps "$WARMUP_STEPS"
+      --streaming_load "$STREAMING_LOAD"
+      --streaming_workers "$STREAMING_WORKERS"
       --optimizer_state_path "$OPTIMIZER_STATE_PATH"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
@@ -525,11 +560,12 @@ PY
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
       DDP_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
-    OMP_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
-    MKL_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
-    OPENBLAS_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
-    NUMEXPR_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
-    CUDA_VISIBLE_DEVICES="$TRAIN_VISIBLE" "${DDP_CMD[@]}"
+    run_with_retry "train-ddp(iter=$it)" \
+      env OMP_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
+      MKL_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
+      OPENBLAS_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
+      NUMEXPR_NUM_THREADS="$TRAIN_THREADS_PER_RANK" \
+      CUDA_VISIBLE_DEVICES="$TRAIN_VISIBLE" "${DDP_CMD[@]}"
   else
     TRAIN_CMD=(
       "$PYTHON_BIN" scripts/train_entry.py
@@ -548,6 +584,8 @@ PY
       --anti_draw_penalty "$ANTI_DRAW_PENALTY"
       --policy_draw_weight "$CUR_POLICY_DRAW_WEIGHT"
       --warmup_steps "$WARMUP_STEPS"
+      --streaming_load "$STREAMING_LOAD"
+      --streaming_workers "$STREAMING_WORKERS"
       --optimizer_state_path "$OPTIMIZER_STATE_PATH"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
@@ -560,7 +598,8 @@ PY
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
       TRAIN_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
-    CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${TRAIN_CMD[@]}"
+    run_with_retry "train(iter=$it)" \
+      env CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${TRAIN_CMD[@]}"
   fi
 
   CANDIDATE_MODEL="$CKPT_PATH"

@@ -96,6 +96,8 @@ def _run_v1(args: argparse.Namespace) -> int:
         metrics_output=args.metrics_output,
         optimizer_state_path=args.optimizer_state_path,
         warmup_steps=int(args.warmup_steps),
+        streaming_load=bool(int(args.streaming_load)),
+        streaming_workers=int(args.streaming_workers),
         infer_devices=args.infer_devices,
         infer_batch_size=int(args.infer_batch_size),
         infer_warmup_iters=int(args.infer_warmup_iters),
@@ -204,6 +206,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to save/load optimizer state for training continuity.",
     )
     parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--streaming_load", type=int, default=1, help="1=streaming DataLoader, 0=monolithic load.")
+    parser.add_argument("--streaming_workers", type=int, default=8, help="DataLoader num_workers for streaming mode.")
     parser.add_argument(
         "--self_play_stats_json",
         type=str,

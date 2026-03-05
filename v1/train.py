@@ -21,7 +21,7 @@ from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 from v1.python.mcts_gpu import TOTAL_ACTION_DIM
 from v1.python.self_play_gpu_runner import SelfPlayV1Stats, self_play_v1_gpu
 from v1.python.self_play_worker import run_self_play_worker
-from v1.python.train_bridge import train_network_from_tensors
+from v1.python.train_bridge import train_network_from_tensors, train_network_streaming
 from v1.python.trajectory_buffer import TensorSelfPlayBatch
 
 
@@ -968,6 +968,60 @@ def _save_self_play_payload_sharded(
     return int(len(shard_files))
 
 
+_LOAD_RETRY_ATTEMPTS = 3
+_LOAD_RETRY_DELAY_SEC = 2.0
+_PARALLEL_LOAD_WORKERS = 8
+
+
+def _torch_load_with_retry(
+    path: str,
+    *,
+    max_attempts: int = _LOAD_RETRY_ATTEMPTS,
+    delay_sec: float = _LOAD_RETRY_DELAY_SEC,
+) -> Any:
+    """Load a torch file with retries for transient IO errors."""
+    import gc
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return torch.load(path, map_location="cpu")
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                _print_rank0(
+                    f"[v1.train] warning: torch.load failed for {path} "
+                    f"(attempt {attempt + 1}/{max_attempts}): {exc}"
+                )
+                gc.collect()
+                time.sleep(delay_sec * (attempt + 1))
+    raise RuntimeError(
+        f"Failed to load {path} after {max_attempts} attempts"
+    ) from last_exc
+
+
+def _load_single_shard(path: str) -> TensorSelfPlayBatch:
+    """Load a single shard file into a TensorSelfPlayBatch (CPU)."""
+    payload = _torch_load_with_retry(path)
+    if isinstance(payload, TensorSelfPlayBatch):
+        return payload.to("cpu")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unsupported shard format in {path}: {type(payload)!r}")
+    required = ["state_tensors", "legal_masks", "policy_targets", "value_targets", "soft_value_targets"]
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise RuntimeError(f"Missing keys in shard {path}: {missing}")
+    batch = TensorSelfPlayBatch(
+        state_tensors=payload["state_tensors"].to("cpu"),
+        legal_masks=payload["legal_masks"].to("cpu"),
+        policy_targets=payload["policy_targets"].to("cpu"),
+        value_targets=payload["value_targets"].to("cpu"),
+        soft_value_targets=payload["soft_value_targets"].to("cpu"),
+    )
+    del payload
+    return batch
+
+
 def _load_self_play_payload(
     path: str,
     *,
@@ -976,7 +1030,7 @@ def _load_self_play_payload(
 ) -> Tuple[TensorSelfPlayBatch, Dict[str, Any], Dict[str, Any]]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Self-play payload not found: {path}")
-    payload = torch.load(path, map_location="cpu")
+    payload = _torch_load_with_retry(path)
     if isinstance(payload, TensorSelfPlayBatch):
         return payload.to("cpu"), {}, {}
     if not isinstance(payload, dict):
@@ -1016,15 +1070,21 @@ def _load_self_play_payload(
                     f"(world={world_i}, num_shards={len(resolved_shards)})."
                 )
 
-        shard_batches: List[TensorSelfPlayBatch] = []
-        for shard_path in selected_paths:
-            shard_batch, _stats_ignored, _meta_ignored = _load_self_play_payload(
-                shard_path,
-                ddp_rank=None,
-                ddp_world_size=None,
-            )
-            shard_batches.append(shard_batch)
-        merged = _concat_self_play_batches_cpu(shard_batches)
+        if len(selected_paths) > 1:
+            workers = min(_PARALLEL_LOAD_WORKERS, len(selected_paths))
+            shard_batches: List[Optional[TensorSelfPlayBatch]] = [None] * len(selected_paths)
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="shard-load") as pool:
+                future_map = {
+                    pool.submit(_load_single_shard, sp): idx
+                    for idx, sp in enumerate(selected_paths)
+                }
+                for future in as_completed(future_map):
+                    idx = future_map[future]
+                    shard_batches[idx] = future.result()
+            valid_batches = [b for b in shard_batches if b is not None]
+        else:
+            valid_batches = [_load_single_shard(selected_paths[0])]
+        merged = _concat_self_play_batches_cpu(valid_batches)
 
         stats_payload = payload.get("stats")
         if not isinstance(stats_payload, dict):
@@ -1064,12 +1124,9 @@ def _load_self_play_payload(
         value_targets=payload["value_targets"].to("cpu"),
         soft_value_targets=payload["soft_value_targets"].to("cpu"),
     )
-    stats_payload = payload.get("stats")
-    if not isinstance(stats_payload, dict):
-        stats_payload = {}
-    metadata_payload = payload.get("metadata")
-    if not isinstance(metadata_payload, dict):
-        metadata_payload = {}
+    del payload
+    stats_payload: Dict[str, Any] = {}
+    metadata_payload: Dict[str, Any] = {}
     return batch, stats_payload, metadata_payload
 
 
@@ -1247,6 +1304,8 @@ def train_pipeline_v1(
     metrics_output: Optional[str] = None,
     optimizer_state_path: Optional[str] = None,
     warmup_steps: int = 100,
+    streaming_load: bool = True,
+    streaming_workers: int = 8,
     infer_devices: Optional[str] = None,
     infer_batch_size: int = 4096,
     infer_warmup_iters: int = 20,
@@ -1425,110 +1484,223 @@ def train_pipeline_v1(
             if train_strategy_norm == "ddp" and _dist_ready():
                 ddp_load_rank = int(dist.get_rank())
                 ddp_load_world = int(dist.get_world_size())
-            payload_load_start = time.perf_counter()
-            samples, sp_stats_payload, _sp_meta = _load_self_play_payload(
-                str(self_play_input),
-                ddp_rank=ddp_load_rank,
-                ddp_world_size=ddp_load_world,
-            )
+
             replay_inputs_str = str(self_play_replay_inputs or "").strip()
             replay_files = [f.strip() for f in replay_inputs_str.split(",") if f.strip()] if replay_inputs_str else []
             replay_files = [f for f in replay_files if os.path.exists(f)]
-            if replay_files:
-                primary_n = int(samples.num_samples)
-                replay_budget = primary_n
-                per_file_budget = max(1, replay_budget // len(replay_files))
-                replay_batches: List[TensorSelfPlayBatch] = [samples]
-                for rf in replay_files:
-                    try:
-                        rb, _rs, _rm = _load_self_play_payload(
-                            rf, ddp_rank=ddp_load_rank, ddp_world_size=ddp_load_world,
-                        )
-                        rn = int(rb.num_samples)
-                        if rn > per_file_budget:
-                            perm_r = torch.randperm(rn)[:per_file_budget]
-                            rb = TensorSelfPlayBatch(
-                                state_tensors=rb.state_tensors.index_select(0, perm_r),
-                                legal_masks=rb.legal_masks.index_select(0, perm_r),
-                                policy_targets=rb.policy_targets.index_select(0, perm_r),
-                                value_targets=rb.value_targets.index_select(0, perm_r),
-                                soft_value_targets=rb.soft_value_targets.index_select(0, perm_r),
-                            )
-                        replay_batches.append(rb)
-                        _print_rank0(
-                            f"[v1.train] replay loaded {rf} "
-                            f"sampled={int(rb.num_samples)}/{rn}"
-                        )
-                    except Exception as exc:
-                        _print_rank0(f"[v1.train] warning: replay load failed for {rf}: {exc}")
-                if len(replay_batches) > 1:
-                    samples = _concat_self_play_batches_cpu(replay_batches)
-                    _print_rank0(
-                        f"[v1.train] replay merged: primary={primary_n} "
-                        f"replay_files={len(replay_files)} total={int(samples.num_samples)}"
-                    )
-            payload_load_sec = float(max(0.0, time.perf_counter() - payload_load_start))
-            global_positions = int(sp_stats_payload.get("num_positions", 0) or 0)
-            if global_positions <= 0:
-                global_positions = int(samples.num_samples)
-            _print_rank0(
-                "[v1.train] timing "
-                f"selfplay_payload_load_sec={payload_load_sec:.3f} "
-                f"input={self_play_input} local_positions={int(samples.num_samples)} "
-                f"global_positions={global_positions}"
-            )
-            value_nonfinite = int(
-                torch.count_nonzero(torch.isfinite(samples.value_targets).logical_not()).item()
-            )
-            soft_nonfinite = int(
-                torch.count_nonzero(torch.isfinite(samples.soft_value_targets).logical_not()).item()
-            )
-            if value_nonfinite > 0 or soft_nonfinite > 0:
-                _print_rank0(
-                    "[v1.train] warning: loaded self-play targets contain non-finite values "
-                    f"value_nonfinite={value_nonfinite} "
-                    f"soft_nonfinite={soft_nonfinite} "
-                    f"local_positions={int(samples.num_samples)}"
-                )
-            train_start = time.perf_counter()
-            model.train()
             parallel_devices = (
                 train_device_list if (train_strategy_norm == "data_parallel" and len(train_device_list) > 1) else None
             )
-            ddp_pre_sharded = bool(
-                train_strategy_norm == "ddp"
-                and isinstance(_sp_meta, dict)
-                and bool(_sp_meta.get("payload_sharded_manifest", False))
-                and not replay_files
-            )
-            model, train_metrics = train_network_from_tensors(
-                model=model,
-                samples=samples,
-                batch_size=batch_size,
-                epochs=epochs,
-                lr=lr,
-                weight_decay=weight_decay,
-                soft_label_alpha=float(soft_label_alpha),
-                anti_draw_penalty=float(anti_draw_penalty),
-                policy_draw_weight=float(policy_draw_weight),
-                device=str(primary_train_device),
-                use_amp=(primary_train_device.type == "cuda"),
-                parallel_devices=parallel_devices,
-                parallel_strategy=train_strategy_norm,
-                ddp_pre_sharded=ddp_pre_sharded,
-                optimizer_state_path=optimizer_state_path,
-                warmup_steps=int(warmup_steps),
-            )
-            train_elapsed = time.perf_counter() - train_start
-            train_bridge_timing = train_metrics.get("timing", {})
-            if isinstance(train_bridge_timing, dict) and train_bridge_timing:
+
+            use_streaming = bool(streaming_load)
+            sp_stats_payload: Dict[str, Any] = {}
+
+            if use_streaming:
+                from v1.python.streaming_dataset import (
+                    build_streaming_dataloader,
+                    resolve_shard_specs,
+                )
+
+                payload_load_start = time.perf_counter()
+
+                primary_manifest = _torch_load_with_retry(str(self_play_input))
+                if isinstance(primary_manifest, dict):
+                    sp_stats_payload = primary_manifest.get("stats", {})
+                    if not isinstance(sp_stats_payload, dict):
+                        sp_stats_payload = {}
+                primary_est = 0
+                if isinstance(primary_manifest, dict):
+                    primary_est = int(primary_manifest.get("num_samples", 0) or 0)
+                    ss = primary_manifest.get("shard_sizes")
+                    if isinstance(ss, list) and ss:
+                        primary_est = sum(int(x) for x in ss)
+                elif isinstance(primary_manifest, TensorSelfPlayBatch):
+                    primary_est = int(primary_manifest.num_samples)
+                del primary_manifest
+
+                replay_budget_per_file = max(1, primary_est // max(1, len(replay_files))) if replay_files else 0
+
+                shard_specs, total_est = resolve_shard_specs(
+                    primary_input=str(self_play_input),
+                    replay_inputs=replay_files,
+                    replay_budget_per_file=replay_budget_per_file,
+                    ddp_rank=int(ddp_load_rank or 0),
+                    ddp_world=int(ddp_load_world or 1),
+                )
+
+                payload_load_sec = float(max(0.0, time.perf_counter() - payload_load_start))
+                global_positions = int(sp_stats_payload.get("num_positions", 0) or 0)
+                if global_positions <= 0:
+                    global_positions = total_est
+
+                _print_rank0(
+                    "[v1.train] streaming mode: "
+                    f"shard_files={len(shard_specs)} est_samples={total_est} "
+                    f"replay_files={len(replay_files)} workers={int(streaming_workers)} "
+                    f"resolve_sec={payload_load_sec:.3f}"
+                )
+
+                stream_dl = build_streaming_dataloader(
+                    shard_specs,
+                    batch_size=batch_size,
+                    num_workers=int(streaming_workers),
+                    epoch_seed=int(time.time_ns() % (2**31)),
+                    pin_memory=(primary_train_device.type == "cuda"),
+                )
+
+                train_start = time.perf_counter()
+                model.train()
+                model, train_metrics = train_network_streaming(
+                    model=model,
+                    dataloader=stream_dl,
+                    total_samples=total_est,
+                    batch_size=batch_size,
+                    epochs=epochs,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    soft_label_alpha=float(soft_label_alpha),
+                    anti_draw_penalty=float(anti_draw_penalty),
+                    policy_draw_weight=float(policy_draw_weight),
+                    device=str(primary_train_device),
+                    use_amp=(primary_train_device.type == "cuda"),
+                    parallel_devices=parallel_devices,
+                    parallel_strategy=train_strategy_norm,
+                    optimizer_state_path=optimizer_state_path,
+                    warmup_steps=int(warmup_steps),
+                    streaming_workers=int(streaming_workers),
+                )
+                train_elapsed = time.perf_counter() - train_start
+                value_nonfinite = 0
+                soft_nonfinite = 0
+                local_positions = total_est
+
+            else:
+                payload_load_start = time.perf_counter()
+                samples, sp_stats_payload, _sp_meta = _load_self_play_payload(
+                    str(self_play_input),
+                    ddp_rank=ddp_load_rank,
+                    ddp_world_size=ddp_load_world,
+                )
+                if replay_files:
+                    primary_n = int(samples.num_samples)
+                    replay_budget = primary_n
+                    per_file_budget = max(1, replay_budget // len(replay_files))
+
+                    def _load_and_sample_replay(rf_path: str, budget: int) -> Optional[TensorSelfPlayBatch]:
+                        try:
+                            rb, _rs, _rm = _load_self_play_payload(
+                                rf_path, ddp_rank=ddp_load_rank, ddp_world_size=ddp_load_world,
+                            )
+                            rn = int(rb.num_samples)
+                            if rn > budget:
+                                perm_r = torch.randperm(rn)[:budget]
+                                rb = TensorSelfPlayBatch(
+                                    state_tensors=rb.state_tensors.index_select(0, perm_r),
+                                    legal_masks=rb.legal_masks.index_select(0, perm_r),
+                                    policy_targets=rb.policy_targets.index_select(0, perm_r),
+                                    value_targets=rb.value_targets.index_select(0, perm_r),
+                                    soft_value_targets=rb.soft_value_targets.index_select(0, perm_r),
+                                )
+                            _print_rank0(
+                                f"[v1.train] replay loaded {rf_path} "
+                                f"sampled={int(rb.num_samples)}/{rn}"
+                            )
+                            return rb
+                        except Exception as exc:
+                            _print_rank0(f"[v1.train] warning: replay load failed for {rf_path}: {exc}")
+                            return None
+
+                    replay_batches: List[TensorSelfPlayBatch] = [samples]
+                    replay_workers_n = min(_PARALLEL_LOAD_WORKERS, len(replay_files))
+                    with ThreadPoolExecutor(max_workers=replay_workers_n, thread_name_prefix="replay-load") as pool:
+                        futures = {
+                            pool.submit(_load_and_sample_replay, rf, per_file_budget): rf
+                            for rf in replay_files
+                        }
+                        for future in as_completed(futures):
+                            result = future.result()
+                            if result is not None:
+                                replay_batches.append(result)
+                    if len(replay_batches) > 1:
+                        samples = _concat_self_play_batches_cpu(replay_batches)
+                        _print_rank0(
+                            f"[v1.train] replay merged: primary={primary_n} "
+                            f"replay_files={len(replay_files)} total={int(samples.num_samples)}"
+                        )
+                import gc
+                gc.collect()
+                payload_load_sec = float(max(0.0, time.perf_counter() - payload_load_start))
+                global_positions = int(sp_stats_payload.get("num_positions", 0) or 0)
+                if global_positions <= 0:
+                    global_positions = int(samples.num_samples)
+                mem_rss_mb = 0.0
+                try:
+                    import resource
+                    mem_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+                except Exception:
+                    pass
                 _print_rank0(
                     "[v1.train] timing "
-                    f"cpu_shard_sec={float(train_bridge_timing.get('cpu_shard_sec', 0.0)):.3f} "
-                    f"h2d_copy_sec={float(train_bridge_timing.get('h2d_copy_sec', 0.0)):.3f} "
-                    f"first_batch_sec={float(train_bridge_timing.get('first_batch_sec', 0.0)):.3f} "
-                    f"ddp_pre_sharded={bool(train_bridge_timing.get('ddp_pre_sharded', False))}"
+                    f"selfplay_payload_load_sec={payload_load_sec:.3f} "
+                    f"input={self_play_input} local_positions={int(samples.num_samples)} "
+                    f"global_positions={global_positions} "
+                    f"rss_mb={mem_rss_mb:.0f}"
                 )
+                value_nonfinite = int(
+                    torch.count_nonzero(torch.isfinite(samples.value_targets).logical_not()).item()
+                )
+                soft_nonfinite = int(
+                    torch.count_nonzero(torch.isfinite(samples.soft_value_targets).logical_not()).item()
+                )
+                if value_nonfinite > 0 or soft_nonfinite > 0:
+                    _print_rank0(
+                        "[v1.train] warning: loaded self-play targets contain non-finite values "
+                        f"value_nonfinite={value_nonfinite} "
+                        f"soft_nonfinite={soft_nonfinite} "
+                        f"local_positions={int(samples.num_samples)}"
+                    )
+                train_start = time.perf_counter()
+                model.train()
+                ddp_pre_sharded = bool(
+                    train_strategy_norm == "ddp"
+                    and isinstance(_sp_meta, dict)
+                    and bool(_sp_meta.get("payload_sharded_manifest", False))
+                    and not replay_files
+                )
+                model, train_metrics = train_network_from_tensors(
+                    model=model,
+                    samples=samples,
+                    batch_size=batch_size,
+                    epochs=epochs,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    soft_label_alpha=float(soft_label_alpha),
+                    anti_draw_penalty=float(anti_draw_penalty),
+                    policy_draw_weight=float(policy_draw_weight),
+                    device=str(primary_train_device),
+                    use_amp=(primary_train_device.type == "cuda"),
+                    parallel_devices=parallel_devices,
+                    parallel_strategy=train_strategy_norm,
+                    ddp_pre_sharded=ddp_pre_sharded,
+                    optimizer_state_path=optimizer_state_path,
+                    warmup_steps=int(warmup_steps),
+                )
+                train_elapsed = time.perf_counter() - train_start
+                local_positions = int(samples.num_samples)
+
+            train_bridge_timing = train_metrics.get("timing", {})
+            if isinstance(train_bridge_timing, dict) and train_bridge_timing:
+                timing_parts = [
+                    f"first_batch_sec={float(train_bridge_timing.get('first_batch_sec', 0.0)):.3f}",
+                ]
+                if not use_streaming:
+                    timing_parts.insert(0, f"cpu_shard_sec={float(train_bridge_timing.get('cpu_shard_sec', 0.0)):.3f}")
+                    timing_parts.insert(1, f"h2d_copy_sec={float(train_bridge_timing.get('h2d_copy_sec', 0.0)):.3f}")
+                    timing_parts.append(f"ddp_pre_sharded={bool(train_bridge_timing.get('ddp_pre_sharded', False))}")
+                if use_streaming:
+                    timing_parts.append(f"streaming_workers={int(streaming_workers)}")
+                _print_rank0("[v1.train] timing " + " ".join(timing_parts))
+
             if _dist_ready():
                 dist.barrier()
             if _is_rank0():
@@ -1551,10 +1723,11 @@ def train_pipeline_v1(
                 last_epoch = (train_metrics.get("epoch_stats") or [{}])[-1]
                 entry: Dict[str, Any] = {
                     "stage": "train",
+                    "streaming": use_streaming,
                     "self_play_input": str(self_play_input),
                     "self_play_games": sp_stats_payload.get("num_games"),
                     "self_play_positions": int(global_positions),
-                    "self_play_positions_local": int(samples.num_samples),
+                    "self_play_positions_local": int(local_positions),
                     "self_play_value_nonfinite_local": int(value_nonfinite),
                     "self_play_soft_value_nonfinite_local": int(soft_nonfinite),
                     "self_play_decisive_games": sp_stats_payload.get("decisive_games"),
@@ -1570,19 +1743,21 @@ def train_pipeline_v1(
                     "train_avg_loss": last_epoch.get("avg_loss"),
                     "train_avg_policy_loss": last_epoch.get("avg_policy_loss"),
                     "train_avg_value_loss": last_epoch.get("avg_value_loss"),
-                    "train_cpu_shard_sec": train_bridge_timing.get("cpu_shard_sec"),
-                    "train_h2d_copy_sec": train_bridge_timing.get("h2d_copy_sec"),
                     "train_first_batch_sec": train_bridge_timing.get("first_batch_sec"),
-                    "ddp_pre_sharded": bool(train_bridge_timing.get("ddp_pre_sharded", False)),
                     "train_soft_label_alpha": float(soft_label_alpha),
                     "checkpoint": ckpt_path,
                 }
+                if not use_streaming:
+                    entry["train_cpu_shard_sec"] = train_bridge_timing.get("cpu_shard_sec")
+                    entry["train_h2d_copy_sec"] = train_bridge_timing.get("h2d_copy_sec")
+                    entry["ddp_pre_sharded"] = bool(train_bridge_timing.get("ddp_pre_sharded", False))
                 metrics_path = str(metrics_output or os.path.join(checkpoint_dir, "training_metrics_v1.json"))
                 _save_json(metrics_path, [entry])
                 _print_rank0(
                     "[v1.train] train complete "
                     f"loss={float(last_epoch.get('avg_loss') or 0.0):.4f} "
                     f"time={train_elapsed:.2f}s checkpoint={ckpt_path}"
+                    + (f" streaming={use_streaming}" if use_streaming else "")
                 )
                 _print_rank0(f"[v1.train] metrics saved: {metrics_path}")
             if _dist_ready():
