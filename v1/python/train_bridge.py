@@ -289,13 +289,14 @@ def train_network_from_tensors(
             batch_states = states.index_select(0, idx)
             batch_masks = legal_masks.index_select(0, idx)
             batch_policy = policy_targets.index_select(0, idx)
-            batch_values = value_targets.index_select(0, idx)
+            raw_batch_values = value_targets.index_select(0, idx)
+            batch_values = raw_batch_values
             batch_soft = soft_targets.index_select(0, idx)
+            hard_draw_mask = raw_batch_values.abs().lt(1e-8)
 
             if abs(anti_draw) > 1e-9:
-                draw_mask_ad = batch_values.abs().lt(1e-8)
                 batch_values = batch_values.clone()
-                batch_values[draw_mask_ad] = anti_draw
+                batch_values[hard_draw_mask] = anti_draw
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -325,7 +326,7 @@ def train_network_from_tensors(
                     log_probs,
                     batch_policy,
                     batch_masks,
-                    batch_values,
+                    raw_batch_values,
                     draw_weight,
                 )
                 loss = policy_loss + value_loss
@@ -338,8 +339,6 @@ def train_network_from_tensors(
             if not loss_is_finite:
                 skipped_non_finite_loss_batches += 1
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                scheduler.step()
                 continue
 
             if loss.requires_grad:
@@ -354,8 +353,6 @@ def train_network_from_tensors(
                     skipped_non_finite_grad_batches += 1
                     optimizer.zero_grad(set_to_none=True)
                     scaler.update()
-                    global_step += 1
-                    scheduler.step()
                     continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
                 scaler.step(optimizer)
@@ -364,9 +361,8 @@ def train_network_from_tensors(
             global_step += 1
             scheduler.step()
 
-            draw_mask = batch_values.abs().squeeze(1) < 1e-8
             policy_weights = torch.where(
-                draw_mask,
+                hard_draw_mask.squeeze(1),
                 batch_values.new_full((), draw_weight),
                 batch_values.new_ones(()),
             )
@@ -621,10 +617,11 @@ def train_network_streaming(
             b_states = b_states.to(device_obj, non_blocking=True).float()
             b_masks = b_masks.to(device_obj, non_blocking=True).bool()
             b_policy = b_policy.to(device_obj, non_blocking=True).float()
-            b_values = b_values.to(device_obj, non_blocking=True).float().view(-1, 1)
+            raw_b_values = b_values.to(device_obj, non_blocking=True).float().view(-1, 1)
+            b_values = raw_b_values
             b_soft = b_soft.to(device_obj, non_blocking=True).float().view(-1, 1)
 
-            finite_mask = torch.isfinite(b_values.squeeze(1))
+            finite_mask = torch.isfinite(raw_b_values.squeeze(1))
             finite_mask &= torch.isfinite(b_soft.squeeze(1))
             finite_mask &= torch.isfinite(b_policy).all(dim=1)
             finite_mask &= torch.isfinite(b_states.view(b_states.size(0), -1)).all(dim=1)
@@ -634,19 +631,18 @@ def train_network_streaming(
                 keep = finite_mask.nonzero(as_tuple=False).view(-1)
                 if keep.numel() == 0:
                     batches_this_epoch += 1
-                    global_step += 1
-                    scheduler.step()
                     continue
                 b_states = b_states.index_select(0, keep)
                 b_masks = b_masks.index_select(0, keep)
                 b_policy = b_policy.index_select(0, keep)
-                b_values = b_values.index_select(0, keep)
+                raw_b_values = raw_b_values.index_select(0, keep)
+                b_values = raw_b_values
                 b_soft = b_soft.index_select(0, keep)
 
+            hard_draw_mask = raw_b_values.abs().lt(1e-8)
             if abs(anti_draw) > 1e-9:
-                draw_mask_ad = b_values.abs().lt(1e-8)
                 b_values = b_values.clone()
-                b_values[draw_mask_ad] = anti_draw
+                b_values[hard_draw_mask] = anti_draw
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -670,7 +666,13 @@ def train_network_streaming(
                     board_size=6,
                 )
                 log_probs = masked_log_softmax(combined_logits, b_masks, dim=1)
-                p_loss = batched_policy_loss(log_probs, b_policy, b_masks, b_values, draw_weight)
+                p_loss = batched_policy_loss(
+                    log_probs,
+                    b_policy,
+                    b_masks,
+                    raw_b_values,
+                    draw_weight,
+                )
                 loss = p_loss + value_loss
 
             loss_ok = _all_ranks_true(
@@ -680,8 +682,6 @@ def train_network_streaming(
             if not loss_ok:
                 skipped_non_finite_loss += 1
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                scheduler.step()
                 batches_this_epoch += 1
                 continue
 
@@ -696,8 +696,6 @@ def train_network_streaming(
                     skipped_non_finite_grad += 1
                     optimizer.zero_grad(set_to_none=True)
                     scaler.update()
-                    global_step += 1
-                    scheduler.step()
                     batches_this_epoch += 1
                     continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
@@ -709,8 +707,11 @@ def train_network_streaming(
             batches_this_epoch += 1
 
             bc = int(b_states.size(0))
-            draw_m = b_values.abs().squeeze(1) < 1e-8
-            pw = torch.where(draw_m, b_values.new_full((), draw_weight), b_values.new_ones(()))
+            pw = torch.where(
+                hard_draw_mask.squeeze(1),
+                b_values.new_full((), draw_weight),
+                b_values.new_ones(()),
+            )
             ws = float(pw.sum().item())
             vp = int((b_policy.sum(dim=1) > 1e-8).sum().item())
 

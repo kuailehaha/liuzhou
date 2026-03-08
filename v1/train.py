@@ -1124,9 +1124,13 @@ def _load_self_play_payload(
         value_targets=payload["value_targets"].to("cpu"),
         soft_value_targets=payload["soft_value_targets"].to("cpu"),
     )
+    stats_payload = payload.get("stats")
+    if not isinstance(stats_payload, dict):
+        stats_payload = {}
+    metadata_payload = payload.get("metadata")
+    if not isinstance(metadata_payload, dict):
+        metadata_payload = {}
     del payload
-    stats_payload: Dict[str, Any] = {}
-    metadata_payload: Dict[str, Any] = {}
     return batch, stats_payload, metadata_payload
 
 
@@ -1509,11 +1513,23 @@ def train_pipeline_v1(
                     if not isinstance(sp_stats_payload, dict):
                         sp_stats_payload = {}
                 primary_est = 0
+                ddp_rank_i = int(ddp_load_rank or 0)
+                ddp_world_i = int(ddp_load_world or 1)
                 if isinstance(primary_manifest, dict):
-                    primary_est = int(primary_manifest.get("num_samples", 0) or 0)
                     ss = primary_manifest.get("shard_sizes")
                     if isinstance(ss, list) and ss:
-                        primary_est = sum(int(x) for x in ss)
+                        if ddp_world_i > 1:
+                            primary_est = sum(
+                                int(ss[idx])
+                                for idx in range(len(ss))
+                                if (idx % ddp_world_i) == ddp_rank_i
+                            )
+                        else:
+                            primary_est = sum(int(x) for x in ss)
+                    if primary_est <= 0:
+                        primary_est = int(primary_manifest.get("num_samples", 0) or 0)
+                        if ddp_world_i > 1:
+                            primary_est = max(1, (primary_est + ddp_world_i - 1) // ddp_world_i)
                 elif isinstance(primary_manifest, TensorSelfPlayBatch):
                     primary_est = int(primary_manifest.num_samples)
                 del primary_manifest

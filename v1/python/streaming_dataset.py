@@ -132,18 +132,20 @@ class StreamingSelfPlayDataset(torch.utils.data.IterableDataset):
     """Streams training samples from shard files without full pre-loading.
 
     Each DataLoader worker is assigned a disjoint subset of shard files.
-    Within each shard, samples are shuffled; across epochs, shard order is
-    re-shuffled.
+    Within each shard, samples are shuffled and emitted in tensor batches;
+    across epochs, shard order is re-shuffled.
     """
 
     def __init__(
         self,
         shard_specs: List[ShardSpec],
         *,
+        batch_size: int,
         epoch_seed: int = 0,
     ) -> None:
         super().__init__()
         self._specs = list(shard_specs)
+        self._batch_size = max(1, int(batch_size))
         self._epoch_seed = int(epoch_seed)
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -183,14 +185,15 @@ class StreamingSelfPlayDataset(torch.utils.data.IterableDataset):
                 n = spec.sample_budget
 
             perm = torch.randperm(n)
-            for i in range(n):
-                j = int(perm[i].item())
+            for start in range(0, n, self._batch_size):
+                end = min(start + self._batch_size, n)
+                batch_idx = perm[start:end]
                 yield (
-                    states[j],
-                    masks[j],
-                    policy[j],
-                    values[j],
-                    soft_values[j],
+                    states.index_select(0, batch_idx),
+                    masks.index_select(0, batch_idx),
+                    policy.index_select(0, batch_idx),
+                    values.index_select(0, batch_idx),
+                    soft_values.index_select(0, batch_idx),
                 )
 
             del tensors, states, masks, policy, values, soft_values, perm
@@ -206,13 +209,16 @@ def build_streaming_dataloader(
     pin_memory: bool = True,
     prefetch_factor: int = 2,
 ) -> torch.utils.data.DataLoader:
-    dataset = StreamingSelfPlayDataset(shard_specs, epoch_seed=epoch_seed)
+    dataset = StreamingSelfPlayDataset(
+        shard_specs,
+        batch_size=batch_size,
+        epoch_seed=epoch_seed,
+    )
     return torch.utils.data.DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=None,
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        drop_last=False,
         persistent_workers=False,
     )
