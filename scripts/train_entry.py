@@ -79,6 +79,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         self_play_opening_random_moves=int(args.self_play_opening_random_moves),
         self_play_backend=args.self_play_backend,
         self_play_shard_dir=args.self_play_shard_dir,
+        self_play_target_samples_per_shard=int(args.self_play_target_samples_per_shard),
         checkpoint_dir=str(args.checkpoint_dir),
         device=str(args.device),
         devices=args.devices,
@@ -149,6 +150,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional v1 process-backend shard directory.",
+    )
+    parser.add_argument(
+        "--self_play_target_samples_per_shard",
+        type=int,
+        default=0,
+        help="Target maximum samples per saved self-play shard; 0 keeps device-count-only sharding.",
     )
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)

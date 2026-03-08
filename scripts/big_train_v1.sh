@@ -41,6 +41,7 @@ REPLAY_WINDOW="${REPLAY_WINDOW:-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
+SELF_PLAY_TARGET_SAMPLES_PER_SHARD="${SELF_PLAY_TARGET_SAMPLES_PER_SHARD:-1000000}"
 STREAMING_LOAD="${STREAMING_LOAD:-1}"       # 1=streaming DataLoader, 0=monolithic load
 STREAMING_WORKERS="${STREAMING_WORKERS:-32}" # DataLoader num_workers
 
@@ -81,8 +82,8 @@ if [[ "$PROFILE" == "stable" ]]; then
 elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${ITERATIONS:=80}"
   : "${SELF_PLAY_GAMES:=522488}"
-  : "${MCTS_SIMULATIONS:=65536}"
-  : "${BATCH_SIZE:=16384}"
+  : "${MCTS_SIMULATIONS:=131072}"
+  : "${BATCH_SIZE:=32768}"
   : "${EPOCHS:=4}"
   : "${LR:=1e-4}"
   : "${WEIGHT_DECAY:=5e-5}"
@@ -332,6 +333,7 @@ echo "[big_train_v1] train_base_model=${TRAIN_BASE_MODEL:-none}"
 echo "[big_train_v1] best_previous_model_init=${BEST_PREVIOUS_MODEL:-none}"
 echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
+echo "[big_train_v1] self_play_target_samples_per_shard=$SELF_PLAY_TARGET_SAMPLES_PER_SHARD"
 echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA anti_draw_penalty=$ANTI_DRAW_PENALTY"
 echo "[big_train_v1] soft_value_k=$SOFT_VALUE_K"
 echo "[big_train_v1] policy_draw_weight=$POLICY_DRAW_WEIGHT->$POLICY_DRAW_WEIGHT_FINAL"
@@ -441,6 +443,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     --self_play_concurrent_games "$SELF_PLAY_CONCURRENT_GAMES"
     --self_play_opening_random_moves "$CUR_OPENING_RANDOM_MOVES"
     --self_play_backend "$SELF_PLAY_BACKEND"
+    --self_play_target_samples_per_shard "$SELF_PLAY_TARGET_SAMPLES_PER_SHARD"
     --checkpoint_dir "$CHECKPOINT_DIR"
     --self_play_output "$SELFPLAY_FILE"
     --self_play_iteration_seed "$it"

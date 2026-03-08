@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import os
 import shutil
@@ -888,11 +889,16 @@ def _save_self_play_payload(
 def _split_self_play_batch_cpu(
     samples: TensorSelfPlayBatch,
     num_shards: int,
+    target_samples_per_shard: int = 0,
 ) -> List[TensorSelfPlayBatch]:
     total = int(samples.num_samples)
     if total <= 0:
         return []
     shard_count = max(1, min(int(num_shards), total))
+    target_n = max(0, int(target_samples_per_shard))
+    if target_n > 0:
+        shard_count = max(shard_count, int(math.ceil(total / float(target_n))))
+        shard_count = min(shard_count, total)
     shard_sizes = _split_games(total, shard_count)
     out: List[TensorSelfPlayBatch] = []
     start = 0
@@ -918,8 +924,13 @@ def _save_self_play_payload_sharded(
     stats: SelfPlayV1Stats,
     metadata: Dict[str, Any],
     num_shards: int,
+    target_samples_per_shard: int = 0,
 ) -> int:
-    shard_batches = _split_self_play_batch_cpu(samples=samples, num_shards=int(num_shards))
+    shard_batches = _split_self_play_batch_cpu(
+        samples=samples,
+        num_shards=int(num_shards),
+        target_samples_per_shard=int(target_samples_per_shard),
+    )
     if not shard_batches:
         _save_self_play_payload(path=path, samples=samples, stats=stats, metadata=metadata)
         return 0
@@ -1290,6 +1301,7 @@ def train_pipeline_v1(
     self_play_opening_random_moves: int = 0,
     self_play_backend: Optional[str] = None,
     self_play_shard_dir: Optional[str] = None,
+    self_play_target_samples_per_shard: int = 0,
     checkpoint_dir: str = "./checkpoints_v1",
     device: str = "cpu",
     devices: Optional[str] = None,
@@ -1366,6 +1378,11 @@ def train_pipeline_v1(
             f"{backend_arg if backend_arg is not None else 'auto'} "
             f"self_play_shard_dir={shard_dir_arg or '<temp>'}"
         )
+        if int(self_play_target_samples_per_shard) > 0:
+            _print_rank0(
+                "[v1.train] "
+                f"self_play_target_samples_per_shard={int(self_play_target_samples_per_shard)}"
+            )
         _print_rank0(
             f"[v1.train] self_play_opening_random_moves={int(self_play_opening_random_moves)}"
         )
@@ -1438,6 +1455,7 @@ def train_pipeline_v1(
                 "self_play_devices": list(self_play_device_list),
                 "self_play_backend": backend_arg if backend_arg is not None else "auto",
                 "self_play_shard_dir": shard_dir_arg,
+                "self_play_target_samples_per_shard": int(self_play_target_samples_per_shard),
                 "mcts_simulations": int(mcts_simulations),
                 "self_play_games": int(self_play_games),
                 "self_play_concurrent_games": int(self_play_concurrent_games),
@@ -1447,13 +1465,14 @@ def train_pipeline_v1(
                 "mixed_value_target_summary": dict(mixed_value_target_summary),
             }
             saved_shards = 0
-            if len(self_play_device_list) > 1:
+            if len(self_play_device_list) > 1 or int(self_play_target_samples_per_shard) > 0:
                 saved_shards = _save_self_play_payload_sharded(
                     path=output_path,
                     samples=samples,
                     stats=sp_stats,
                     metadata=payload_metadata,
                     num_shards=len(self_play_device_list),
+                    target_samples_per_shard=int(self_play_target_samples_per_shard),
                 )
             else:
                 _save_self_play_payload(
@@ -1901,22 +1920,34 @@ def train_pipeline_v1(
 
             if self_play_output:
                 save_path = str(self_play_output).format(iteration=it_idx, iter=it_idx)
-                _save_self_play_payload(
-                    path=save_path,
-                    samples=samples,
-                    stats=sp_stats,
-                    metadata={
-                        "stage": "all",
-                        "iteration": int(it_idx),
-                        "self_play_devices": list(self_play_device_list),
-                        "self_play_backend": backend_arg if backend_arg is not None else "auto",
-                        "self_play_shard_dir": shard_dir_arg,
-                        "self_play_concurrent_games": int(self_play_concurrent_games),
-                        "self_play_opening_random_moves": int(self_play_opening_random_moves),
-                        "value_target_summary": dict(value_target_summary),
-                        "mixed_value_target_summary": dict(mixed_value_target_summary),
-                    },
-                )
+                save_meta = {
+                    "stage": "all",
+                    "iteration": int(it_idx),
+                    "self_play_devices": list(self_play_device_list),
+                    "self_play_backend": backend_arg if backend_arg is not None else "auto",
+                    "self_play_shard_dir": shard_dir_arg,
+                    "self_play_target_samples_per_shard": int(self_play_target_samples_per_shard),
+                    "self_play_concurrent_games": int(self_play_concurrent_games),
+                    "self_play_opening_random_moves": int(self_play_opening_random_moves),
+                    "value_target_summary": dict(value_target_summary),
+                    "mixed_value_target_summary": dict(mixed_value_target_summary),
+                }
+                if len(self_play_device_list) > 1 or int(self_play_target_samples_per_shard) > 0:
+                    _save_self_play_payload_sharded(
+                        path=save_path,
+                        samples=samples,
+                        stats=sp_stats,
+                        metadata=save_meta,
+                        num_shards=len(self_play_device_list),
+                        target_samples_per_shard=int(self_play_target_samples_per_shard),
+                    )
+                else:
+                    _save_self_play_payload(
+                        path=save_path,
+                        samples=samples,
+                        stats=sp_stats,
+                        metadata=save_meta,
+                    )
 
             _print_self_play_summary(
                 stats=sp_stats,
@@ -1976,6 +2007,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional directory for process-backend shard payloads (default uses temp dir).",
+    )
+    parser.add_argument(
+        "--self_play_target_samples_per_shard",
+        type=int,
+        default=0,
+        help="Target maximum samples per saved self-play shard; 0 keeps device-count-only sharding.",
     )
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)
@@ -2096,6 +2133,7 @@ if __name__ == "__main__":
         self_play_opening_random_moves=args.self_play_opening_random_moves,
         self_play_backend=args.self_play_backend,
         self_play_shard_dir=args.self_play_shard_dir,
+        self_play_target_samples_per_shard=args.self_play_target_samples_per_shard,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
         devices=args.devices,
