@@ -82,8 +82,8 @@ if [[ "$PROFILE" == "stable" ]]; then
 elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${ITERATIONS:=80}"
   : "${SELF_PLAY_GAMES:=522488}"
-  : "${MCTS_SIMULATIONS:=131072}"
-  : "${BATCH_SIZE:=32768}"
+  : "${MCTS_SIMULATIONS:=65536}"
+  : "${BATCH_SIZE:=16384}"
   : "${EPOCHS:=4}"
   : "${LR:=1e-4}"
   : "${WEIGHT_DECAY:=5e-5}"
@@ -318,7 +318,7 @@ RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
 mkdir -p "$CHECKPOINT_DIR" "$RUN_DIR" logs
 LOG_FILE="logs/big_train_v1_${RUN_TAG}.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+exec > >(TZ=UTC awk '{ print strftime("[%Y-%m-%d %H:%M:%S UTC]"), $0; fflush(); }' | tee -a "$LOG_FILE") 2>&1
 
 echo "[big_train_v1] run_tag=$RUN_TAG"
 echo "[big_train_v1] profile=$PROFILE train_strategy=$TRAIN_STRATEGY"
