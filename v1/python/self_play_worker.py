@@ -64,6 +64,16 @@ def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
             "positive_count": 0,
             "negative_count": 0,
             "nonzero_ratio": 0.0,
+            "sum_abs": 0.0,
+            "abs_mean": 0.0,
+            "near_zero_count": 0,
+            "near_zero_ratio": 0.0,
+            "ge_abs_0p05_count": 0,
+            "ge_abs_0p05_ratio": 0.0,
+            "ge_abs_0p10_count": 0,
+            "ge_abs_0p10_ratio": 0.0,
+            "ge_abs_0p20_count": 0,
+            "ge_abs_0p20_ratio": 0.0,
         }
     finite_mask = torch.isfinite(values)
     finite_count = int(torch.count_nonzero(finite_mask).item())
@@ -73,6 +83,12 @@ def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
     negative = int(torch.count_nonzero(finite_values < 0).item())
     nonzero = int(positive + negative)
     zero = int(finite_count - nonzero)
+    abs_values = finite_values.abs()
+    sum_abs = float(abs_values.sum().item()) if finite_count > 0 else 0.0
+    near_zero_count = int(torch.count_nonzero(abs_values <= 1e-6).item()) if finite_count > 0 else 0
+    ge_abs_0p05_count = int(torch.count_nonzero(abs_values >= 0.05).item()) if finite_count > 0 else 0
+    ge_abs_0p10_count = int(torch.count_nonzero(abs_values >= 0.10).item()) if finite_count > 0 else 0
+    ge_abs_0p20_count = int(torch.count_nonzero(abs_values >= 0.20).item()) if finite_count > 0 else 0
     return {
         "total": total,
         "finite_count": finite_count,
@@ -82,6 +98,16 @@ def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
         "positive_count": positive,
         "negative_count": negative,
         "nonzero_ratio": float(nonzero / max(1, finite_count)),
+        "sum_abs": sum_abs,
+        "abs_mean": float(sum_abs / max(1, finite_count)),
+        "near_zero_count": near_zero_count,
+        "near_zero_ratio": float(near_zero_count / max(1, finite_count)),
+        "ge_abs_0p05_count": ge_abs_0p05_count,
+        "ge_abs_0p05_ratio": float(ge_abs_0p05_count / max(1, finite_count)),
+        "ge_abs_0p10_count": ge_abs_0p10_count,
+        "ge_abs_0p10_ratio": float(ge_abs_0p10_count / max(1, finite_count)),
+        "ge_abs_0p20_count": ge_abs_0p20_count,
+        "ge_abs_0p20_ratio": float(ge_abs_0p20_count / max(1, finite_count)),
     }
 
 
@@ -95,6 +121,16 @@ def _merge_target_summaries(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
         "positive_count": 0,
         "negative_count": 0,
         "nonzero_ratio": 0.0,
+        "sum_abs": 0.0,
+        "abs_mean": 0.0,
+        "near_zero_count": 0,
+        "near_zero_ratio": 0.0,
+        "ge_abs_0p05_count": 0,
+        "ge_abs_0p05_ratio": 0.0,
+        "ge_abs_0p10_count": 0,
+        "ge_abs_0p10_ratio": 0.0,
+        "ge_abs_0p20_count": 0,
+        "ge_abs_0p20_ratio": 0.0,
     }
     for summary in summaries:
         if not isinstance(summary, dict):
@@ -107,11 +143,21 @@ def _merge_target_summaries(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
             "zero_count",
             "positive_count",
             "negative_count",
+            "near_zero_count",
+            "ge_abs_0p05_count",
+            "ge_abs_0p10_count",
+            "ge_abs_0p20_count",
         ):
             merged[key] = int(merged.get(key, 0) + int(summary.get(key, 0) or 0))
+        merged["sum_abs"] = float(merged.get("sum_abs", 0.0) + float(summary.get("sum_abs", 0.0) or 0.0))
     finite = int(merged.get("finite_count", 0))
     nonzero = int(merged.get("nonzero_count", 0))
     merged["nonzero_ratio"] = float(nonzero / max(1, finite))
+    merged["abs_mean"] = float(float(merged.get("sum_abs", 0.0)) / max(1, finite))
+    merged["near_zero_ratio"] = float(int(merged.get("near_zero_count", 0)) / max(1, finite))
+    merged["ge_abs_0p05_ratio"] = float(int(merged.get("ge_abs_0p05_count", 0)) / max(1, finite))
+    merged["ge_abs_0p10_ratio"] = float(int(merged.get("ge_abs_0p10_count", 0)) / max(1, finite))
+    merged["ge_abs_0p20_ratio"] = float(int(merged.get("ge_abs_0p20_count", 0)) / max(1, finite))
     return merged
 
 
@@ -283,6 +329,7 @@ def run_self_play_worker(
         remaining_games = int(shard_games_i)
         stats_chunks: List[SelfPlayV1Stats] = []
         value_summaries: List[Dict[str, Any]] = []
+        soft_summaries: List[Dict[str, Any]] = []
         mixed_summaries: List[Dict[str, Any]] = []
         saved_chunk_files: List[str] = []
         saved_chunk_sizes: List[int] = []
@@ -305,6 +352,7 @@ def run_self_play_worker(
             chunk_batch_cpu = chunk_batch.to("cpu")
             stats_chunks.append(chunk_stats)
             value_summaries.append(_summarize_scalar_targets(chunk_batch_cpu.value_targets))
+            soft_summaries.append(_summarize_scalar_targets(chunk_batch_cpu.soft_value_targets))
             mixed_values = torch.clamp(
                 (1.0 - alpha) * chunk_batch_cpu.value_targets + alpha * chunk_batch_cpu.soft_value_targets,
                 min=-1.0,
@@ -367,6 +415,7 @@ def run_self_play_worker(
             "avg_bytes_per_sample": int(avg_bps),
             "stats": stats.to_dict(),
             "value_target_summary": _merge_target_summaries(value_summaries),
+            "soft_value_target_summary": _merge_target_summaries(soft_summaries),
             "mixed_value_target_summary": _merge_target_summaries(mixed_summaries),
             "metadata": {
                 "worker_idx": int(worker_idx),

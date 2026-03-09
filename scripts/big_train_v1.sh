@@ -4,6 +4,7 @@ set -euo pipefail
 
 export PYTHONPATH="./:./build/v0/src:./v0/build/src${PYTHONPATH:+:$PYTHONPATH}"
 PYTHON_BIN="${PYTHON_BIN:-/2023533024/users/zhangmq/condaenvs/naivetorch/bin/python}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 PROFILE="${PROFILE:-aggressive}" # stable | aggressive
 TRAIN_STRATEGY="${TRAIN_STRATEGY:-ddp}" # ddp | data_parallel | none
@@ -28,7 +29,7 @@ EXPLORATION_WEIGHT="${EXPLORATION_WEIGHT:-1.0}"
 DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.3}"
 DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
 SOFT_VALUE_K="${SOFT_VALUE_K:-5.0}"
-SOFT_LABEL_ALPHA="${SOFT_LABEL_ALPHA:-0.1}"
+SOFT_LABEL_ALPHA="${SOFT_LABEL_ALPHA:-1.0}"
 SOFT_LABEL_ALPHA_FINAL="${SOFT_LABEL_ALPHA_FINAL:-0.1}"
 ANTI_DRAW_PENALTY="${ANTI_DRAW_PENALTY:--0.05}"
 POLICY_DRAW_WEIGHT="${POLICY_DRAW_WEIGHT:-1.0}"
@@ -89,7 +90,7 @@ elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${LR:=1e-4}"
   : "${WEIGHT_DECAY:=5e-5}"
 else
-  echo "[big_train_v1] unsupported PROFILE=$PROFILE (use stable/aggressive)" >&2
+  printf '[big_train_v1] unsupported PROFILE=%s (use stable/aggressive)\n' "$PROFILE" >&2
   exit 1
 fi
 
@@ -142,7 +143,9 @@ PY
 
 check_train_metrics_finite() {
   local metrics_path="$1"
-  "$PYTHON_BIN" - "$metrics_path" <<'PY'
+  local output=""
+  local rc=0
+  output="$("$PYTHON_BIN" - "$metrics_path" <<'PY'
 import json
 import math
 import sys
@@ -177,11 +180,20 @@ for key in keys:
 
 raise SystemExit(0)
 PY
+  )" || rc=$?
+  if [[ -n "$output" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      log "$line"
+    done <<< "$output"
+  fi
+  return "$rc"
 }
 
 gating_accept_candidate() {
   local eval_path="$1"
-  "$PYTHON_BIN" - "$eval_path" <<'PY'
+  local output=""
+  local rc=0
+  output="$("$PYTHON_BIN" - "$eval_path" <<'PY'
 import json
 import sys
 
@@ -219,6 +231,13 @@ print(
 )
 raise SystemExit(0 if accept else 1)
 PY
+  )" || rc=$?
+  if [[ -n "$output" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      log "$line"
+    done <<< "$output"
+  fi
+  return "$rc"
 }
 
 csv_count() {
@@ -268,6 +287,67 @@ build_local_cuda_list() {
   )
 }
 
+RUN_TAG="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
+mkdir -p "$CHECKPOINT_DIR" "$RUN_DIR" logs
+LOG_FILE="logs/big_train_v1_${RUN_TAG}.log"
+exec 9>>"$LOG_FILE"
+GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+GIT_COMMIT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git status --porcelain 2>/dev/null || true)" ]]; then
+  GIT_DIRTY=1
+else
+  GIT_DIRTY=0
+fi
+
+timestamp_utc() {
+  date -u '+[%Y-%m-%d %H:%M:%S UTC]'
+}
+
+_emit_log_line() {
+  local stream="$1"
+  shift || true
+  local ts
+  ts="$(timestamp_utc)"
+  if [[ "$#" -eq 0 ]]; then
+    if [[ "$stream" == "stderr" ]]; then
+      printf '%s\n' "$ts" >&2
+    else
+      printf '%s\n' "$ts"
+    fi
+    printf '%s\n' "$ts" >&9
+    return 0
+  fi
+  if [[ "$stream" == "stderr" ]]; then
+    printf '%s %s\n' "$ts" "$*" >&2
+  else
+    printf '%s %s\n' "$ts" "$*"
+  fi
+  printf '%s %s\n' "$ts" "$*" >&9
+}
+
+log() {
+  _emit_log_line stdout "$@"
+}
+
+log_err() {
+  _emit_log_line stderr "$@"
+}
+
+run_logged() {
+  "$@" \
+    > >(
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        _emit_log_line stdout "$line"
+      done
+    ) \
+    2> >(
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        _emit_log_line stderr "$line"
+      done
+    )
+}
+
 STAGE_MAX_RETRIES="${STAGE_MAX_RETRIES:-2}"
 
 run_with_retry() {
@@ -279,21 +359,21 @@ run_with_retry() {
   while [[ "$attempt" -le "$max_retries" ]]; do
     attempt=$((attempt + 1))
     rc=0
-    "$@" && return 0 || rc=$?
-    echo "[big_train_v1] $stage_label failed (exit_code=$rc, attempt=$attempt/$((max_retries + 1)))" >&2
-    echo "[big_train_v1] diagnostics for $stage_label failure:" >&2
-    echo "[big_train_v1]   date=$(date '+%Y-%m-%d %H:%M:%S')" >&2
-    free -h 2>/dev/null | head -3 >&2 || true
-    dmesg -T 2>/dev/null | tail -20 >&2 || true
+    run_logged "$@" && return 0 || rc=$?
+    log_err "[big_train_v1] $stage_label failed (exit_code=$rc, attempt=$attempt/$((max_retries + 1)))"
+    log_err "[big_train_v1] diagnostics for $stage_label failure:"
+    log_err "[big_train_v1]   date=$(date '+%Y-%m-%d %H:%M:%S')"
+    run_logged bash -lc 'free -h 2>/dev/null | head -3' || true
+    run_logged bash -lc 'dmesg -T 2>/dev/null | tail -20' || true
     if [[ "$attempt" -le "$max_retries" ]]; then
       local sleep_sec=$((attempt * 5))
-      echo "[big_train_v1] retrying $stage_label in ${sleep_sec}s ..." >&2
+      log_err "[big_train_v1] retrying $stage_label in ${sleep_sec}s ..."
       sleep "$sleep_sec"
       sync 2>/dev/null || true
       echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
     fi
   done
-  echo "[big_train_v1] $stage_label exhausted retries ($((max_retries + 1)) attempts), aborting" >&2
+  log_err "[big_train_v1] $stage_label exhausted retries ($((max_retries + 1)) attempts), aborting"
   return "$rc"
 }
 
@@ -303,7 +383,7 @@ fi
 
 TRAIN_NPROC="$(csv_count "$TRAIN_DEVICES")"
 if [[ "$TRAIN_STRATEGY" == "ddp" && "$TRAIN_NPROC" -le 1 ]]; then
-  echo "[big_train_v1] TRAIN_STRATEGY=ddp needs >1 gpu; fallback to data_parallel"
+  log "[big_train_v1] TRAIN_STRATEGY=ddp needs >1 gpu; fallback to data_parallel"
   TRAIN_STRATEGY="data_parallel"
 fi
 TRAIN_TOTAL_CPU_THREADS="${TRAIN_TOTAL_CPU_THREADS:-200}"
@@ -315,70 +395,65 @@ if [[ "$TRAIN_THREADS_PER_RANK" -lt 1 ]]; then
   TRAIN_THREADS_PER_RANK=1
 fi
 
-RUN_TAG="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
-mkdir -p "$CHECKPOINT_DIR" "$RUN_DIR" logs
-LOG_FILE="logs/big_train_v1_${RUN_TAG}.log"
-exec > >(TZ=UTC awk '{ print strftime("[%Y-%m-%d %H:%M:%S UTC]"), $0; fflush(); }' | tee -a "$LOG_FILE") 2>&1
-
-echo "[big_train_v1] run_tag=$RUN_TAG"
-echo "[big_train_v1] profile=$PROFILE train_strategy=$TRAIN_STRATEGY"
-echo "[big_train_v1] train_total_cpu_threads=$TRAIN_TOTAL_CPU_THREADS train_threads_per_rank=$TRAIN_THREADS_PER_RANK"
-echo "[big_train_v1] python=$PYTHON_BIN"
-echo "[big_train_v1] self_play_devices=$SELF_PLAY_DEVICES"
-echo "[big_train_v1] train_devices=$TRAIN_DEVICES"
-echo "[big_train_v1] infer_devices=$INFER_DEVICES"
-echo "[big_train_v1] checkpoints=$CHECKPOINT_DIR"
-echo "[big_train_v1] run_dir=$RUN_DIR"
-echo "[big_train_v1] train_base_model=${TRAIN_BASE_MODEL:-none}"
-echo "[big_train_v1] best_previous_model_init=${BEST_PREVIOUS_MODEL:-none}"
-echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
-echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
-echo "[big_train_v1] chunk_target_bytes=$CHUNK_TARGET_BYTES (self_play_target_samples_per_shard=$SELF_PLAY_TARGET_SAMPLES_PER_SHARD fallback)"
-echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA anti_draw_penalty=$ANTI_DRAW_PENALTY"
-echo "[big_train_v1] soft_value_k=$SOFT_VALUE_K"
-echo "[big_train_v1] policy_draw_weight=$POLICY_DRAW_WEIGHT->$POLICY_DRAW_WEIGHT_FINAL"
-echo "[big_train_v1] lr=$LR lr_cosine_final_scale=$LR_COSINE_FINAL_SCALE warmup_steps=$WARMUP_STEPS"
-echo "[big_train_v1] streaming_load=$STREAMING_LOAD streaming_workers=$STREAMING_WORKERS"
-echo "[big_train_v1] replay_window=$REPLAY_WINDOW"
-echo "[big_train_v1] opening_random_schedule=$SELF_PLAY_OPENING_RANDOM_MOVES->$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL"
-echo "[big_train_v1] soft_label_alpha_schedule=$SOFT_LABEL_ALPHA->$SOFT_LABEL_ALPHA_FINAL"
-echo "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
+log "[big_train_v1] run_tag=$RUN_TAG"
+log "[big_train_v1] git_branch=$GIT_BRANCH git_commit=$GIT_COMMIT git_dirty=$GIT_DIRTY"
+log "[big_train_v1] profile=$PROFILE train_strategy=$TRAIN_STRATEGY"
+log "[big_train_v1] train_total_cpu_threads=$TRAIN_TOTAL_CPU_THREADS train_threads_per_rank=$TRAIN_THREADS_PER_RANK"
+log "[big_train_v1] python=$PYTHON_BIN"
+log "[big_train_v1] self_play_devices=$SELF_PLAY_DEVICES"
+log "[big_train_v1] train_devices=$TRAIN_DEVICES"
+log "[big_train_v1] infer_devices=$INFER_DEVICES"
+log "[big_train_v1] checkpoints=$CHECKPOINT_DIR"
+log "[big_train_v1] run_dir=$RUN_DIR"
+log "[big_train_v1] train_base_model=${TRAIN_BASE_MODEL:-none}"
+log "[big_train_v1] best_previous_model_init=${BEST_PREVIOUS_MODEL:-none}"
+log "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
+log "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
+log "[big_train_v1] chunk_target_bytes=$CHUNK_TARGET_BYTES (self_play_target_samples_per_shard=$SELF_PLAY_TARGET_SAMPLES_PER_SHARD fallback)"
+log "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA anti_draw_penalty=$ANTI_DRAW_PENALTY"
+log "[big_train_v1] soft_value_k=$SOFT_VALUE_K"
+log "[big_train_v1] policy_draw_weight=$POLICY_DRAW_WEIGHT->$POLICY_DRAW_WEIGHT_FINAL"
+log "[big_train_v1] lr=$LR lr_cosine_final_scale=$LR_COSINE_FINAL_SCALE warmup_steps=$WARMUP_STEPS"
+log "[big_train_v1] streaming_load=$STREAMING_LOAD streaming_workers=$STREAMING_WORKERS"
+log "[big_train_v1] replay_window=$REPLAY_WINDOW"
+log "[big_train_v1] opening_random_schedule=$SELF_PLAY_OPENING_RANDOM_MOVES->$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL"
+log "[big_train_v1] soft_label_alpha_schedule=$SOFT_LABEL_ALPHA->$SOFT_LABEL_ALPHA_FINAL"
+log "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
 if [[ -n "$SELF_PLAY_SHARD_DIR" ]]; then
-  echo "[big_train_v1] self_play_shard_dir=$SELF_PLAY_SHARD_DIR"
+  log "[big_train_v1] self_play_shard_dir=$SELF_PLAY_SHARD_DIR"
 fi
-echo "[big_train_v1] run_eval_stage=$RUN_EVAL_STAGE eval_backend=$EVAL_BACKEND"
-echo "[big_train_v1] eval_games_vs_random=$EVAL_GAMES_VS_RANDOM eval_games_vs_previous=$EVAL_GAMES_VS_PREVIOUS"
-echo "[big_train_v1] eval_devices=$EVAL_DEVICES eval_workers=$EVAL_WORKERS eval_mcts_sims=$EVAL_MCTS_SIMULATIONS"
-echo "[big_train_v1] eval_v1_concurrent_games=$EVAL_V1_CONCURRENT_GAMES"
-echo "[big_train_v1] eval_v1_opening_random_moves=$EVAL_V1_OPENING_RANDOM_MOVES eval_sample_moves=$EVAL_SAMPLE_MOVES"
-echo "[big_train_v1] eval_vs_random temperature=$EVAL_VS_RANDOM_TEMPERATURE opening_random_moves=$EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES"
-echo "[big_train_v1] eval_vs_previous temperature=$EVAL_VS_PREVIOUS_TEMPERATURE sample_moves=$EVAL_VS_PREVIOUS_SAMPLE_MOVES opening_random_moves=$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
-echo "[big_train_v1] selfplay_alloc_conf=$SELF_PLAY_ALLOC_CONF selfplay_memory_anchor_mb=$SELF_PLAY_MEMORY_ANCHOR_MB"
+log "[big_train_v1] run_eval_stage=$RUN_EVAL_STAGE eval_backend=$EVAL_BACKEND"
+log "[big_train_v1] eval_games_vs_random=$EVAL_GAMES_VS_RANDOM eval_games_vs_previous=$EVAL_GAMES_VS_PREVIOUS"
+log "[big_train_v1] eval_devices=$EVAL_DEVICES eval_workers=$EVAL_WORKERS eval_mcts_sims=$EVAL_MCTS_SIMULATIONS"
+log "[big_train_v1] eval_v1_concurrent_games=$EVAL_V1_CONCURRENT_GAMES"
+log "[big_train_v1] eval_v1_opening_random_moves=$EVAL_V1_OPENING_RANDOM_MOVES eval_sample_moves=$EVAL_SAMPLE_MOVES"
+log "[big_train_v1] eval_vs_random temperature=$EVAL_VS_RANDOM_TEMPERATURE opening_random_moves=$EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES"
+log "[big_train_v1] eval_vs_previous temperature=$EVAL_VS_PREVIOUS_TEMPERATURE sample_moves=$EVAL_VS_PREVIOUS_SAMPLE_MOVES opening_random_moves=$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
+log "[big_train_v1] selfplay_alloc_conf=$SELF_PLAY_ALLOC_CONF selfplay_memory_anchor_mb=$SELF_PLAY_MEMORY_ANCHOR_MB"
 
 if [[ -n "$LEGACY_LOAD_CHECKPOINT" && -z "$TRAIN_BASE_MODEL" && -z "${BEST_PREVIOUS_MODEL:-}" ]]; then
-  echo "[big_train_v1] LOAD_CHECKPOINT is no longer auto-wired. Set TRAIN_BASE_MODEL and optionally BEST_PREVIOUS_MODEL explicitly." >&2
+  log_err "[big_train_v1] LOAD_CHECKPOINT is no longer auto-wired. Set TRAIN_BASE_MODEL and optionally BEST_PREVIOUS_MODEL explicitly."
   exit 1
 fi
 
 LATEST_MODEL="$TRAIN_BASE_MODEL"
 if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
-  echo "[big_train_v1] train base checkpoint not found: $LATEST_MODEL" >&2
+  log_err "[big_train_v1] train base checkpoint not found: $LATEST_MODEL"
   exit 1
 fi
 BEST_MODEL="$BEST_PREVIOUS_MODEL"
 if [[ -n "$BEST_MODEL" && ! -f "$BEST_MODEL" ]]; then
-  echo "[big_train_v1] best previous checkpoint not found: $BEST_MODEL" >&2
+  log_err "[big_train_v1] best previous checkpoint not found: $BEST_MODEL"
   exit 1
 fi
 
 GLOBAL_VISIBLE="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-echo "[big_train_v1] global CUDA_VISIBLE_DEVICES=$GLOBAL_VISIBLE"
+log "[big_train_v1] global CUDA_VISIBLE_DEVICES=$GLOBAL_VISIBLE"
 if [[ "${CUDA_LAUNCH_BLOCKING:-0}" == "1" ]]; then
-  echo "[big_train_v1] warning: CUDA_LAUNCH_BLOCKING=1 is debug-only and hurts throughput."
+  log "[big_train_v1] warning: CUDA_LAUNCH_BLOCKING=1 is debug-only and hurts throughput."
   if [[ -z "${V1_FINALIZE_GRAPH:-}" ]]; then
     export V1_FINALIZE_GRAPH=off
-    echo "[big_train_v1] set V1_FINALIZE_GRAPH=off for CUDA_LAUNCH_BLOCKING compatibility."
+    log "[big_train_v1] set V1_FINALIZE_GRAPH=off for CUDA_LAUNCH_BLOCKING compatibility."
   fi
 fi
 
@@ -415,13 +490,13 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     fi
   fi
 
-  echo
-  echo "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
-  echo "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA lr=$CUR_LR policy_draw_weight=$CUR_POLICY_DRAW_WEIGHT"
+  log
+  log "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
+  log "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA lr=$CUR_LR policy_draw_weight=$CUR_POLICY_DRAW_WEIGHT"
   if [[ -n "$REPLAY_INPUTS" ]]; then
-    echo "[big_train_v1] replay_inputs=$REPLAY_INPUTS"
+    log "[big_train_v1] replay_inputs=$REPLAY_INPUTS"
   fi
-  echo "[big_train_v1] stage=selfplay output=$SELFPLAY_FILE"
+  log "[big_train_v1] stage=selfplay output=$SELFPLAY_FILE"
   SP_CMD=(
     "$PYTHON_BIN" scripts/train_entry.py
     --pipeline v1
@@ -463,7 +538,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${SP_CMD[@]}"
 
   if [[ -f "$SELFPLAY_STATS_JSON" ]]; then
-    "$PYTHON_BIN" - "$SELFPLAY_STATS_JSON" <<'PY'
+    run_logged "$PYTHON_BIN" - "$SELFPLAY_STATS_JSON" <<'PY'
 import json
 import sys
 path = str(sys.argv[1])
@@ -529,7 +604,7 @@ if isinstance(piece_delta, dict):
 PY
   fi
 
-  echo "[big_train_v1] stage=train input=$SELFPLAY_FILE strategy=$TRAIN_STRATEGY"
+  log "[big_train_v1] stage=train input=$SELFPLAY_FILE strategy=$TRAIN_STRATEGY"
   if [[ "$TRAIN_STRATEGY" == "ddp" ]]; then
     TRAIN_VISIBLE="$(to_visible_indices "$TRAIN_DEVICES")"
     LOCAL_TRAIN_DEVICES="$(build_local_cuda_list "$TRAIN_NPROC")"
@@ -609,7 +684,7 @@ PY
 
   CANDIDATE_MODEL="$CKPT_PATH"
   if [[ ! -f "$CANDIDATE_MODEL" ]]; then
-    echo "[big_train_v1] expected checkpoint missing: $CANDIDATE_MODEL" >&2
+    log_err "[big_train_v1] expected checkpoint missing: $CANDIDATE_MODEL"
     exit 1
   fi
   CANDIDATE_VALID=1
@@ -618,7 +693,7 @@ PY
       CANDIDATE_VALID=0
     fi
   else
-    echo "[big_train_v1] warning: training metrics not found, reject candidate checkpoint."
+    log "[big_train_v1] warning: training metrics not found, reject candidate checkpoint."
     CANDIDATE_VALID=0
   fi
 
@@ -626,10 +701,11 @@ PY
 
   if [[ "$RUN_EVAL_STAGE" == "1" && "$CANDIDATE_VALID" == "1" ]]; then
     if [[ "$EVAL_GAMES_VS_RANDOM" -gt 0 ]]; then
-      echo "[big_train_v1] stage=eval_vs_random checkpoint=$CANDIDATE_MODEL"
+      log "[big_train_v1] stage=eval_vs_random checkpoint=$CANDIDATE_MODEL"
       EVAL_RANDOM_CMD=(
         "$PYTHON_BIN" scripts/eval_checkpoint.py
         --challenger_checkpoint "$CANDIDATE_MODEL"
+        --match_name vs_random
         --device "$DEVICE"
         --eval_devices "$EVAL_DEVICES"
         --eval_workers "$EVAL_WORKERS"
@@ -645,20 +721,21 @@ PY
         --v1_concurrent_games "$EVAL_V1_CONCURRENT_GAMES"
         --v1_opening_random_moves "$EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES"
       )
-      CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_RANDOM_CMD[@]}"
+      run_logged env CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_RANDOM_CMD[@]}"
     fi
 
     if [[ -n "$GATING_BASE_MODEL" && -f "$GATING_BASE_MODEL" ]]; then
       EVAL_GAMES_VS_PREVIOUS_FOR_ITER="$EVAL_GAMES_VS_PREVIOUS"
       if [[ "$EVAL_GAMES_VS_PREVIOUS_FOR_ITER" -lt 2 ]]; then
         EVAL_GAMES_VS_PREVIOUS_FOR_ITER=2
-        echo "[big_train_v1] gating requires vs_best_previous games; bump eval_games_vs_previous to 2 for this iteration."
+        log "[big_train_v1] gating requires vs_best_previous games; bump eval_games_vs_previous to 2 for this iteration."
       fi
-      echo "[big_train_v1] stage=eval_vs_previous checkpoint=$CANDIDATE_MODEL best_previous=$GATING_BASE_MODEL"
+      log "[big_train_v1] stage=eval_vs_previous checkpoint=$CANDIDATE_MODEL best_previous=$GATING_BASE_MODEL"
       EVAL_PREV_CMD=(
         "$PYTHON_BIN" scripts/eval_checkpoint.py
         --challenger_checkpoint "$CANDIDATE_MODEL"
         --previous_checkpoint "$GATING_BASE_MODEL"
+        --match_name vs_previous
         --device "$DEVICE"
         --eval_devices "$EVAL_DEVICES"
         --eval_workers "$EVAL_WORKERS"
@@ -678,7 +755,7 @@ PY
       if [[ "$EVAL_VS_PREVIOUS_SAMPLE_MOVES" == "1" ]]; then
         EVAL_PREV_CMD+=(--sample_moves)
       fi
-      CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_PREV_CMD[@]}"
+      run_logged env CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_PREV_CMD[@]}"
     fi
 
     # Extra eval: vs fixed baseline (iter_001 or user-specified anchor).
@@ -687,11 +764,12 @@ PY
       BASELINE_CKPT="${CHECKPOINT_DIR}/model_iter_001.pt"
     fi
     if [[ "$EVAL_GAMES_VS_BASELINE" -gt 0 && -f "$BASELINE_CKPT" && "$BASELINE_CKPT" != "$CANDIDATE_MODEL" ]]; then
-      echo "[big_train_v1] stage=eval_vs_baseline checkpoint=$CANDIDATE_MODEL baseline=$BASELINE_CKPT"
+      log "[big_train_v1] stage=eval_vs_baseline checkpoint=$CANDIDATE_MODEL baseline=$BASELINE_CKPT"
       EVAL_BASE_CMD=(
         "$PYTHON_BIN" scripts/eval_checkpoint.py
         --challenger_checkpoint "$CANDIDATE_MODEL"
         --previous_checkpoint "$BASELINE_CKPT"
+        --match_name vs_baseline
         --device "$DEVICE"
         --eval_devices "$EVAL_DEVICES"
         --eval_workers "$EVAL_WORKERS"
@@ -711,16 +789,17 @@ PY
       if [[ "$EVAL_VS_PREVIOUS_SAMPLE_MOVES" == "1" ]]; then
         EVAL_BASE_CMD+=(--sample_moves)
       fi
-      CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_BASE_CMD[@]}"
+      run_logged env CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_BASE_CMD[@]}"
     fi
 
     # Extra eval: vs self (draw rate monitor).
     if [[ "$EVAL_GAMES_VS_SELF" -gt 0 ]]; then
-      echo "[big_train_v1] stage=eval_vs_self checkpoint=$CANDIDATE_MODEL"
+      log "[big_train_v1] stage=eval_vs_self checkpoint=$CANDIDATE_MODEL"
       EVAL_SELF_CMD=(
         "$PYTHON_BIN" scripts/eval_checkpoint.py
         --challenger_checkpoint "$CANDIDATE_MODEL"
         --previous_checkpoint "$CANDIDATE_MODEL"
+        --match_name vs_self
         --device "$DEVICE"
         --eval_devices "$EVAL_DEVICES"
         --eval_workers "$EVAL_WORKERS"
@@ -740,24 +819,24 @@ PY
       if [[ "$EVAL_VS_PREVIOUS_SAMPLE_MOVES" == "1" ]]; then
         EVAL_SELF_CMD+=(--sample_moves)
       fi
-      CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_SELF_CMD[@]}"
+      run_logged env CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "${EVAL_SELF_CMD[@]}"
     fi
   fi
 
   if [[ "$CANDIDATE_VALID" != "1" ]]; then
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
-      echo "[big_train_v1] candidate rejected due non-finite train metrics; keep latest checkpoint: $BASE_MODEL_FOR_ITER"
+      log "[big_train_v1] candidate rejected due non-finite train metrics; keep latest checkpoint: $BASE_MODEL_FOR_ITER"
       CANDIDATE_ACCEPTED=0
     else
-      echo "[big_train_v1] no valid latest checkpoint available after rejecting non-finite candidate." >&2
+      log_err "[big_train_v1] no valid latest checkpoint available after rejecting non-finite candidate."
       exit 1
     fi
   elif [[ -z "$GATING_BASE_MODEL" || ! -f "$GATING_BASE_MODEL" ]]; then
     CANDIDATE_ACCEPTED=1
-    echo "[big_train_v1] bootstrap best_previous checkpoint selected: $CANDIDATE_MODEL"
+    log "[big_train_v1] bootstrap best_previous checkpoint selected: $CANDIDATE_MODEL"
   elif [[ "$RUN_EVAL_STAGE" != "1" ]]; then
     CANDIDATE_ACCEPTED=1
-    echo "[big_train_v1] warning: RUN_EVAL_STAGE=0, gating skipped; promote candidate by default."
+    log "[big_train_v1] warning: RUN_EVAL_STAGE=0, gating skipped; promote candidate by default."
   elif gating_accept_candidate "$EVAL_JSON"; then
     CANDIDATE_ACCEPTED=1
   else
@@ -767,23 +846,23 @@ PY
   if [[ "$CANDIDATE_ACCEPTED" == "1" ]]; then
     BEST_MODEL="$CANDIDATE_MODEL"
   elif [[ "$CANDIDATE_VALID" == "1" ]]; then
-    echo "[big_train_v1] candidate did not beat best_previous; keep training from latest candidate and retain best_previous for gating."
+    log "[big_train_v1] candidate did not beat best_previous; keep training from latest candidate and retain best_previous for gating."
   fi
   if [[ "$CANDIDATE_VALID" == "1" ]]; then
     LATEST_MODEL="$CANDIDATE_MODEL"
   fi
   if [[ -z "$LATEST_MODEL" || ! -f "$LATEST_MODEL" ]]; then
-    echo "[big_train_v1] latest checkpoint missing after iteration: $LATEST_MODEL" >&2
+    log_err "[big_train_v1] latest checkpoint missing after iteration: $LATEST_MODEL"
     exit 1
   fi
   if [[ -n "$BEST_MODEL" && ! -f "$BEST_MODEL" ]]; then
-    echo "[big_train_v1] best checkpoint missing after iteration: $BEST_MODEL" >&2
+    log_err "[big_train_v1] best checkpoint missing after iteration: $BEST_MODEL"
     exit 1
   fi
 
   if [[ "$RUN_INFER_STAGE" == "1" ]]; then
-    echo "[big_train_v1] stage=infer checkpoint=$LATEST_MODEL"
-    CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "$PYTHON_BIN" scripts/train_entry.py \
+    log "[big_train_v1] stage=infer checkpoint=$LATEST_MODEL"
+    run_logged env CUDA_VISIBLE_DEVICES="$GLOBAL_VISIBLE" "$PYTHON_BIN" scripts/train_entry.py \
       --pipeline v1 \
       --stage infer \
       --device "$DEVICE" \
@@ -796,11 +875,11 @@ PY
       --infer_output "$INFER_JSON"
   fi
 
-  echo "[big_train_v1] iteration ${it} done candidate=$CANDIDATE_MODEL latest=$LATEST_MODEL best_previous=$BEST_MODEL"
+  log "[big_train_v1] iteration ${it} done candidate=$CANDIDATE_MODEL latest=$LATEST_MODEL best_previous=$BEST_MODEL"
 done
 
-echo
-echo "[big_train_v1] completed all iterations."
-echo "[big_train_v1] final_checkpoint=$LATEST_MODEL"
-echo "[big_train_v1] final_best_previous_checkpoint=$BEST_MODEL"
-echo "[big_train_v1] log_file=$LOG_FILE"
+log
+log "[big_train_v1] completed all iterations."
+log "[big_train_v1] final_checkpoint=$LATEST_MODEL"
+log "[big_train_v1] final_best_previous_checkpoint=$BEST_MODEL"
+log "[big_train_v1] log_file=$LOG_FILE"

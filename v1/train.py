@@ -251,6 +251,16 @@ def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
             "positive_count": 0,
             "negative_count": 0,
             "nonzero_ratio": 0.0,
+            "sum_abs": 0.0,
+            "abs_mean": 0.0,
+            "near_zero_count": 0,
+            "near_zero_ratio": 0.0,
+            "ge_abs_0p05_count": 0,
+            "ge_abs_0p05_ratio": 0.0,
+            "ge_abs_0p10_count": 0,
+            "ge_abs_0p10_ratio": 0.0,
+            "ge_abs_0p20_count": 0,
+            "ge_abs_0p20_ratio": 0.0,
         }
     finite_mask = torch.isfinite(values)
     finite_count = int(torch.count_nonzero(finite_mask).item())
@@ -260,6 +270,12 @@ def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
     negative = int(torch.count_nonzero(finite_values < 0).item())
     nonzero = int(positive + negative)
     zero = int(finite_count - nonzero)
+    abs_values = finite_values.abs()
+    sum_abs = float(abs_values.sum().item()) if finite_count > 0 else 0.0
+    near_zero_count = int(torch.count_nonzero(abs_values <= 1e-6).item()) if finite_count > 0 else 0
+    ge_abs_0p05_count = int(torch.count_nonzero(abs_values >= 0.05).item()) if finite_count > 0 else 0
+    ge_abs_0p10_count = int(torch.count_nonzero(abs_values >= 0.10).item()) if finite_count > 0 else 0
+    ge_abs_0p20_count = int(torch.count_nonzero(abs_values >= 0.20).item()) if finite_count > 0 else 0
     return {
         "total": total,
         "finite_count": finite_count,
@@ -269,11 +285,25 @@ def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
         "positive_count": positive,
         "negative_count": negative,
         "nonzero_ratio": float(nonzero / max(1, finite_count)),
+        "sum_abs": sum_abs,
+        "abs_mean": float(sum_abs / max(1, finite_count)),
+        "near_zero_count": near_zero_count,
+        "near_zero_ratio": float(near_zero_count / max(1, finite_count)),
+        "ge_abs_0p05_count": ge_abs_0p05_count,
+        "ge_abs_0p05_ratio": float(ge_abs_0p05_count / max(1, finite_count)),
+        "ge_abs_0p10_count": ge_abs_0p10_count,
+        "ge_abs_0p10_ratio": float(ge_abs_0p10_count / max(1, finite_count)),
+        "ge_abs_0p20_count": ge_abs_0p20_count,
+        "ge_abs_0p20_ratio": float(ge_abs_0p20_count / max(1, finite_count)),
     }
 
 
 def _compute_value_target_summary(samples: TensorSelfPlayBatch) -> Dict[str, Any]:
     return _summarize_scalar_targets(samples.value_targets)
+
+
+def _compute_soft_value_target_summary(samples: TensorSelfPlayBatch) -> Dict[str, Any]:
+    return _summarize_scalar_targets(samples.soft_value_targets)
 
 
 def _compute_mixed_value_target_summary(
@@ -293,6 +323,7 @@ def _build_self_play_report(
     *,
     stats: SelfPlayV1Stats,
     value_target_summary: Dict[str, Any],
+    soft_value_target_summary: Optional[Dict[str, Any]] = None,
     mixed_value_target_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload = stats.to_dict()
@@ -308,6 +339,8 @@ def _build_self_play_report(
     payload["piece_delta_bucket_expected"] = int(stats.num_games)
     payload["piece_delta_bucket_coverage"] = float(piece_delta_bucket_total / games)
     payload["value_target_summary"] = dict(value_target_summary)
+    if isinstance(soft_value_target_summary, dict):
+        payload["soft_value_target_summary"] = dict(soft_value_target_summary)
     if isinstance(mixed_value_target_summary, dict):
         payload["mixed_value_target_summary"] = dict(mixed_value_target_summary)
     return payload
@@ -317,6 +350,7 @@ def _print_self_play_summary(
     *,
     stats: SelfPlayV1Stats,
     value_target_summary: Dict[str, Any],
+    soft_value_target_summary: Optional[Dict[str, Any]] = None,
     mixed_value_target_summary: Optional[Dict[str, Any]] = None,
 ) -> None:
     games = max(1, int(stats.num_games))
@@ -346,16 +380,38 @@ def _print_self_play_summary(
         f"total={piece_delta_bucket_total}/{int(stats.num_games)} nonzero={{{bucket_view}}}"
     )
     _print_rank0(
-        "[v1.train] selfplay value targets "
+        "[v1.train] selfplay hard value targets "
         f"nonzero={nonzero}/{finite} ({nonzero_ratio*100.0:.2f}%) "
         f"pos={int(value_target_summary.get('positive_count', 0))} "
-        f"neg={int(value_target_summary.get('negative_count', 0))}"
+        f"neg={int(value_target_summary.get('negative_count', 0))} "
+        f"abs_mean={float(value_target_summary.get('abs_mean', 0.0)):.4f} "
+        f"|v|>=0.05={float(value_target_summary.get('ge_abs_0p05_ratio', 0.0))*100.0:.2f}% "
+        f"|v|>=0.10={float(value_target_summary.get('ge_abs_0p10_ratio', 0.0))*100.0:.2f}%"
     )
     if nonfinite > 0:
         _print_rank0(
             "[v1.train] warning: selfplay value targets contain non-finite values "
             f"nonfinite={nonfinite}/{total}"
         )
+    if isinstance(soft_value_target_summary, dict):
+        soft_total = int(soft_value_target_summary.get("total", 0))
+        soft_finite = int(soft_value_target_summary.get("finite_count", soft_total))
+        soft_nonfinite = int(soft_value_target_summary.get("nonfinite_count", 0))
+        _print_rank0(
+            "[v1.train] selfplay soft value targets "
+            f"pos={int(soft_value_target_summary.get('positive_count', 0))} "
+            f"neg={int(soft_value_target_summary.get('negative_count', 0))} "
+            f"abs_mean={float(soft_value_target_summary.get('abs_mean', 0.0)):.4f} "
+            f"near_zero={float(soft_value_target_summary.get('near_zero_ratio', 0.0))*100.0:.2f}% "
+            f"|v|>=0.05={float(soft_value_target_summary.get('ge_abs_0p05_ratio', 0.0))*100.0:.2f}% "
+            f"|v|>=0.10={float(soft_value_target_summary.get('ge_abs_0p10_ratio', 0.0))*100.0:.2f}% "
+            f"|v|>=0.20={float(soft_value_target_summary.get('ge_abs_0p20_ratio', 0.0))*100.0:.2f}%"
+        )
+        if soft_nonfinite > 0:
+            _print_rank0(
+                "[v1.train] warning: selfplay soft value targets contain non-finite values "
+                f"nonfinite={soft_nonfinite}/{soft_total}"
+            )
     if isinstance(mixed_value_target_summary, dict):
         mixed_nonzero = int(mixed_value_target_summary.get("nonzero_count", 0))
         mixed_total = int(mixed_value_target_summary.get("total", 0))
@@ -366,7 +422,12 @@ def _print_self_play_summary(
             "[v1.train] selfplay mixed value targets "
             f"nonzero={mixed_nonzero}/{mixed_finite} ({mixed_ratio*100.0:.2f}%) "
             f"pos={int(mixed_value_target_summary.get('positive_count', 0))} "
-            f"neg={int(mixed_value_target_summary.get('negative_count', 0))}"
+            f"neg={int(mixed_value_target_summary.get('negative_count', 0))} "
+            f"abs_mean={float(mixed_value_target_summary.get('abs_mean', 0.0)):.4f} "
+            f"near_zero={float(mixed_value_target_summary.get('near_zero_ratio', 0.0))*100.0:.2f}% "
+            f"|v|>=0.05={float(mixed_value_target_summary.get('ge_abs_0p05_ratio', 0.0))*100.0:.2f}% "
+            f"|v|>=0.10={float(mixed_value_target_summary.get('ge_abs_0p10_ratio', 0.0))*100.0:.2f}% "
+            f"|v|>=0.20={float(mixed_value_target_summary.get('ge_abs_0p20_ratio', 0.0))*100.0:.2f}%"
         )
         if mixed_nonfinite > 0:
             _print_rank0(
@@ -753,7 +814,7 @@ def _run_self_play_multi_device_process_saved(
     target_samples_per_shard: int,
     chunk_target_bytes: int,
     metadata_base: Dict[str, Any],
-) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], int]:
+ ) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], Dict[str, Any], int]:
     model_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     shards = _split_games(int(num_games), len(devices))
     active: List[Tuple[int, str, int]] = [
@@ -835,6 +896,7 @@ def _run_self_play_multi_device_process_saved(
         all_shard_sizes: List[int] = []
         stats_list: List[SelfPlayV1Stats] = []
         value_summaries: List[Dict[str, Any]] = []
+        soft_value_summaries: List[Dict[str, Any]] = []
         mixed_value_summaries: List[Dict[str, Any]] = []
         weighted_bps_num = 0
         weighted_bps_den = 0
@@ -884,6 +946,9 @@ def _run_self_play_multi_device_process_saved(
             value_summary_payload = worker_manifest.get("value_target_summary", {})
             if isinstance(value_summary_payload, dict):
                 value_summaries.append(value_summary_payload)
+            soft_summary_payload = worker_manifest.get("soft_value_target_summary", {})
+            if isinstance(soft_summary_payload, dict):
+                soft_value_summaries.append(soft_summary_payload)
             mixed_summary_payload = worker_manifest.get("mixed_value_target_summary", {})
             if isinstance(mixed_summary_payload, dict):
                 mixed_value_summaries.append(mixed_summary_payload)
@@ -902,6 +967,7 @@ def _run_self_play_multi_device_process_saved(
             elapsed_sec=max(1e-9, time.perf_counter() - started),
         )
         value_target_summary = _merge_scalar_target_summaries(value_summaries)
+        soft_value_target_summary = _merge_scalar_target_summaries(soft_value_summaries)
         mixed_value_target_summary = _merge_scalar_target_summaries(mixed_value_summaries)
 
         final_metadata = dict(metadata_base)
@@ -910,6 +976,7 @@ def _run_self_play_multi_device_process_saved(
                 "self_play_target_samples_per_shard": int(target_samples_per_shard),
                 "self_play_chunk_target_bytes": int(chunk_target_bytes),
                 "value_target_summary": dict(value_target_summary),
+                "soft_value_target_summary": dict(soft_value_target_summary),
                 "mixed_value_target_summary": dict(mixed_value_target_summary),
             }
         )
@@ -926,7 +993,13 @@ def _run_self_play_multi_device_process_saved(
             "metadata": final_metadata,
         }
         torch.save(manifest_payload, str(output_path))
-        return merged_stats, value_target_summary, mixed_value_target_summary, int(len(all_shard_files))
+        return (
+            merged_stats,
+            value_target_summary,
+            soft_value_target_summary,
+            mixed_value_target_summary,
+            int(len(all_shard_files)),
+        )
     except Exception:
         failed = True
         raise
@@ -1107,6 +1180,16 @@ def _merge_scalar_target_summaries(summaries: List[Dict[str, Any]]) -> Dict[str,
         "positive_count": 0,
         "negative_count": 0,
         "nonzero_ratio": 0.0,
+        "sum_abs": 0.0,
+        "abs_mean": 0.0,
+        "near_zero_count": 0,
+        "near_zero_ratio": 0.0,
+        "ge_abs_0p05_count": 0,
+        "ge_abs_0p05_ratio": 0.0,
+        "ge_abs_0p10_count": 0,
+        "ge_abs_0p10_ratio": 0.0,
+        "ge_abs_0p20_count": 0,
+        "ge_abs_0p20_ratio": 0.0,
     }
     for summary in summaries:
         if not isinstance(summary, dict):
@@ -1119,11 +1202,21 @@ def _merge_scalar_target_summaries(summaries: List[Dict[str, Any]]) -> Dict[str,
             "zero_count",
             "positive_count",
             "negative_count",
+            "near_zero_count",
+            "ge_abs_0p05_count",
+            "ge_abs_0p10_count",
+            "ge_abs_0p20_count",
         ):
             merged[key] = int(merged.get(key, 0) + int(summary.get(key, 0) or 0))
+        merged["sum_abs"] = float(merged.get("sum_abs", 0.0) + float(summary.get("sum_abs", 0.0) or 0.0))
     finite = int(merged.get("finite_count", 0))
     nonzero = int(merged.get("nonzero_count", 0))
     merged["nonzero_ratio"] = float(nonzero / max(1, finite))
+    merged["abs_mean"] = float(float(merged.get("sum_abs", 0.0)) / max(1, finite))
+    merged["near_zero_ratio"] = float(int(merged.get("near_zero_count", 0)) / max(1, finite))
+    merged["ge_abs_0p05_ratio"] = float(int(merged.get("ge_abs_0p05_count", 0)) / max(1, finite))
+    merged["ge_abs_0p10_ratio"] = float(int(merged.get("ge_abs_0p10_count", 0)) / max(1, finite))
+    merged["ge_abs_0p20_ratio"] = float(int(merged.get("ge_abs_0p20_count", 0)) / max(1, finite))
     return merged
 
 
@@ -1666,7 +1759,13 @@ def train_pipeline_v1(
             saved_shards = 0
             if resolved_backend == "process":
                 _print_rank0(f"[v1.train] self-play backend={resolved_backend} devices={self_play_device_list}")
-                sp_stats, value_target_summary, mixed_value_target_summary, saved_shards = (
+                (
+                    sp_stats,
+                    value_target_summary,
+                    soft_value_target_summary,
+                    mixed_value_target_summary,
+                    saved_shards,
+                ) = (
                     _run_self_play_multi_device_process_saved(
                         model=model,
                         num_games=int(self_play_games),
@@ -1712,6 +1811,7 @@ def train_pipeline_v1(
                     self_play_shard_dir=shard_dir_arg,
                 )
                 value_target_summary = _compute_value_target_summary(samples)
+                soft_value_target_summary = _compute_soft_value_target_summary(samples)
                 mixed_value_target_summary = _compute_mixed_value_target_summary(
                     samples,
                     soft_label_alpha=float(soft_label_alpha),
@@ -1722,6 +1822,7 @@ def train_pipeline_v1(
                         "self_play_target_samples_per_shard": int(self_play_target_samples_per_shard),
                         "self_play_chunk_target_bytes": int(self_play_chunk_target_bytes),
                         "value_target_summary": dict(value_target_summary),
+                        "soft_value_target_summary": dict(soft_value_target_summary),
                         "mixed_value_target_summary": dict(mixed_value_target_summary),
                     }
                 )
@@ -1750,6 +1851,7 @@ def train_pipeline_v1(
             sp_report = _build_self_play_report(
                 stats=sp_stats,
                 value_target_summary=value_target_summary,
+                soft_value_target_summary=soft_value_target_summary,
                 mixed_value_target_summary=mixed_value_target_summary,
             )
             sp_report["self_play_iteration_seed"] = int(stage_selfplay_seed)
@@ -1758,6 +1860,7 @@ def train_pipeline_v1(
             _print_self_play_summary(
                 stats=sp_stats,
                 value_target_summary=value_target_summary,
+                soft_value_target_summary=soft_value_target_summary,
                 mixed_value_target_summary=mixed_value_target_summary,
             )
             _print_rank0(
@@ -2041,6 +2144,7 @@ def train_pipeline_v1(
                     "self_play_decisive_game_ratio": sp_stats_payload.get("decisive_game_ratio"),
                     "self_play_draw_game_ratio": sp_stats_payload.get("draw_game_ratio"),
                     "self_play_value_target_summary": sp_stats_payload.get("value_target_summary"),
+                    "self_play_soft_value_target_summary": sp_stats_payload.get("soft_value_target_summary"),
                     "self_play_mixed_value_target_summary": sp_stats_payload.get("mixed_value_target_summary"),
                     "train_devices": list(train_device_list),
                     "train_strategy": train_strategy_norm,
@@ -2119,6 +2223,7 @@ def train_pipeline_v1(
                 self_play_shard_dir=shard_dir_arg,
             )
             value_target_summary = _compute_value_target_summary(samples)
+            soft_value_target_summary = _compute_soft_value_target_summary(samples)
             mixed_value_target_summary = _compute_mixed_value_target_summary(
                 samples,
                 soft_label_alpha=float(soft_label_alpha),
@@ -2180,6 +2285,7 @@ def train_pipeline_v1(
                 ),
                 "draw_game_ratio": float(int(sp_stats.draws) / max(1, int(sp_stats.num_games))),
                 "value_target_summary": dict(value_target_summary),
+                "soft_value_target_summary": dict(soft_value_target_summary),
                 "mixed_value_target_summary": dict(mixed_value_target_summary),
                 "train_time_sec": train_elapsed,
                 "train_avg_loss": last_epoch.get("avg_loss"),
@@ -2203,6 +2309,7 @@ def train_pipeline_v1(
                     "self_play_concurrent_games": int(self_play_concurrent_games),
                     "self_play_opening_random_moves": int(self_play_opening_random_moves),
                     "value_target_summary": dict(value_target_summary),
+                    "soft_value_target_summary": dict(soft_value_target_summary),
                     "mixed_value_target_summary": dict(mixed_value_target_summary),
                 }
                 _use_sharded_all = (
@@ -2231,6 +2338,7 @@ def train_pipeline_v1(
             _print_self_play_summary(
                 stats=sp_stats,
                 value_target_summary=value_target_summary,
+                soft_value_target_summary=soft_value_target_summary,
                 mixed_value_target_summary=mixed_value_target_summary,
             )
             _print_rank0(

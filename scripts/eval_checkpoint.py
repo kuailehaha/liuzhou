@@ -596,6 +596,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inference_warmup_iters", type=int, default=5)
     parser.add_argument("--v1_concurrent_games", type=int, default=64)
     parser.add_argument("--v1_opening_random_moves", type=int, default=0)
+    parser.add_argument("--match_name", type=str, default=None)
     parser.add_argument("--output_json", type=str, default=None)
     return parser
 
@@ -619,6 +620,7 @@ def main() -> int:
     result_rows: List[Dict[str, Any]] = []
     games_vs_random = max(0, int(args.eval_games_vs_random))
     if games_vs_random > 0:
+        random_name = str(args.match_name or "vs_random").strip() or "vs_random"
         stats = _run_eval_one(
             backend=backend,
             challenger_checkpoint=challenger,
@@ -637,12 +639,13 @@ def main() -> int:
             v1_concurrent_games=int(args.v1_concurrent_games),
             v1_opening_random_moves=int(args.v1_opening_random_moves),
         )
-        payload = _stats_to_payload("vs_random", stats)
+        payload = _stats_to_payload(random_name, stats)
         result_rows.append(payload)
-        _print_stats_line("vs_random", payload)
+        _print_stats_line(random_name, payload)
 
     games_vs_previous = max(0, int(args.eval_games_vs_previous))
     if games_vs_previous > 0 and previous_checkpoint:
+        match_name = str(args.match_name or "vs_previous").strip() or "vs_previous"
         stats = _run_eval_one(
             backend=backend,
             challenger_checkpoint=challenger,
@@ -661,11 +664,12 @@ def main() -> int:
             v1_concurrent_games=int(args.v1_concurrent_games),
             v1_opening_random_moves=int(args.v1_opening_random_moves),
         )
-        payload = _stats_to_payload("vs_previous", stats)
+        payload = _stats_to_payload(match_name, stats)
         result_rows.append(payload)
-        _print_stats_line("vs_previous", payload)
+        _print_stats_line(match_name, payload)
     elif games_vs_previous > 0 and not previous_checkpoint:
-        print("[eval] skip vs_previous: previous checkpoint unavailable.")
+        skipped_name = str(args.match_name or "vs_previous").strip() or "vs_previous"
+        print(f"[eval] skip {skipped_name}: previous checkpoint unavailable.")
 
     elapsed = max(1e-9, time.perf_counter() - started)
     report = {
