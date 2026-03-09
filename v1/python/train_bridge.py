@@ -607,11 +607,25 @@ def train_network_streaming(
         skipped_non_finite_grad = 0
         batches_this_epoch = 0
 
-        for batch_tuple in dataloader:
-            if batches_this_epoch >= est_batches_per_epoch:
-                break
-
+        batch_iter = iter(dataloader)
+        dl_exhausted = False
+        dl_exhausted_steps = 0
+        for step_idx in range(est_batches_per_epoch):
             batch_start = time.perf_counter()
+
+            if dl_exhausted:
+                dl_exhausted_steps += 1
+                _all_ranks_true(False, strategy=strategy, device=device_obj)
+                batches_this_epoch += 1
+                continue
+            try:
+                batch_tuple = next(batch_iter)
+            except StopIteration:
+                dl_exhausted = True
+                dl_exhausted_steps += 1
+                _all_ranks_true(False, strategy=strategy, device=device_obj)
+                batches_this_epoch += 1
+                continue
 
             b_states, b_masks, b_policy, b_values, b_soft = batch_tuple
             b_states = b_states.to(device_obj, non_blocking=True).float()
@@ -630,6 +644,7 @@ def train_network_streaming(
                 total_filtered += n_bad
                 keep = finite_mask.nonzero(as_tuple=False).view(-1)
                 if keep.numel() == 0:
+                    _all_ranks_true(False, strategy=strategy, device=device_obj)
                     batches_this_epoch += 1
                     continue
                 b_states = b_states.index_select(0, keep)
@@ -736,6 +751,7 @@ def train_network_streaming(
                     float(total_seen), total_policy_weight, float(total_valid_policy),
                     soft_abs_sum, mix_abs_sum, float(mix_batches),
                     float(skipped_non_finite_loss), float(skipped_non_finite_grad),
+                    float(dl_exhausted_steps),
                 ],
                 dtype=torch.float64, device=device_obj,
             )
@@ -751,6 +767,7 @@ def train_network_streaming(
             mix_batches = int(round(float(reduced[8].item())))
             skipped_non_finite_loss = int(round(float(reduced[9].item())))
             skipped_non_finite_grad = int(round(float(reduced[10].item())))
+            dl_exhausted_steps = int(round(float(reduced[11].item())))
 
         total_samples_seen_all += total_seen
         avg_loss = total_loss_sum / max(1, total_seen)
@@ -777,6 +794,7 @@ def train_network_streaming(
             "skipped_non_finite_loss_batches": skipped_non_finite_loss,
             "skipped_non_finite_grad_batches": skipped_non_finite_grad,
             "filtered_non_finite_samples": total_filtered,
+            "dl_exhausted_steps": dl_exhausted_steps,
         })
 
     if optimizer_state_path and (strategy != "ddp" or ddp_rank == 0):
