@@ -80,6 +80,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         self_play_backend=args.self_play_backend,
         self_play_shard_dir=args.self_play_shard_dir,
         self_play_target_samples_per_shard=int(args.self_play_target_samples_per_shard),
+        self_play_chunk_target_bytes=int(args.self_play_chunk_target_bytes),
         checkpoint_dir=str(args.checkpoint_dir),
         device=str(args.device),
         devices=args.devices,
@@ -156,6 +157,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Target maximum samples per saved self-play shard; 0 keeps device-count-only sharding.",
+    )
+    parser.add_argument(
+        "--self_play_chunk_target_bytes",
+        type=int,
+        default=0,
+        help=(
+            "Target chunk size in bytes for saved self-play shards (byte-budget mode). "
+            "When > 0, overrides --self_play_target_samples_per_shard. "
+            "8 GiB = 8589934592 gives ~73k samples per chunk at 116 KB/sample."
+        ),
     )
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)

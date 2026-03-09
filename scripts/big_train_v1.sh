@@ -41,9 +41,10 @@ REPLAY_WINDOW="${REPLAY_WINDOW:-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
-SELF_PLAY_TARGET_SAMPLES_PER_SHARD="${SELF_PLAY_TARGET_SAMPLES_PER_SHARD:-1000000}"
+SELF_PLAY_TARGET_SAMPLES_PER_SHARD="${SELF_PLAY_TARGET_SAMPLES_PER_SHARD:-0}"  # kept for fallback; overridden by CHUNK_TARGET_BYTES when set
+CHUNK_TARGET_BYTES="${CHUNK_TARGET_BYTES:-8589934592}"  # 8 GiB per chunk; drives chunk-level streaming
 STREAMING_LOAD="${STREAMING_LOAD:-1}"       # 1=streaming DataLoader, 0=monolithic load
-STREAMING_WORKERS="${STREAMING_WORKERS:-32}" # DataLoader num_workers
+STREAMING_WORKERS="${STREAMING_WORKERS:-1}"  # DataLoader num_workers (1 = one prefetch worker; safe for large shards)
 
 EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-2000}"
 EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-2000}"
@@ -333,7 +334,7 @@ echo "[big_train_v1] train_base_model=${TRAIN_BASE_MODEL:-none}"
 echo "[big_train_v1] best_previous_model_init=${BEST_PREVIOUS_MODEL:-none}"
 echo "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 echo "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
-echo "[big_train_v1] self_play_target_samples_per_shard=$SELF_PLAY_TARGET_SAMPLES_PER_SHARD"
+echo "[big_train_v1] chunk_target_bytes=$CHUNK_TARGET_BYTES (self_play_target_samples_per_shard=$SELF_PLAY_TARGET_SAMPLES_PER_SHARD fallback)"
 echo "[big_train_v1] soft_label_alpha=$SOFT_LABEL_ALPHA anti_draw_penalty=$ANTI_DRAW_PENALTY"
 echo "[big_train_v1] soft_value_k=$SOFT_VALUE_K"
 echo "[big_train_v1] policy_draw_weight=$POLICY_DRAW_WEIGHT->$POLICY_DRAW_WEIGHT_FINAL"
@@ -444,6 +445,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
     --self_play_opening_random_moves "$CUR_OPENING_RANDOM_MOVES"
     --self_play_backend "$SELF_PLAY_BACKEND"
     --self_play_target_samples_per_shard "$SELF_PLAY_TARGET_SAMPLES_PER_SHARD"
+    --self_play_chunk_target_bytes "$CHUNK_TARGET_BYTES"
     --checkpoint_dir "$CHECKPOINT_DIR"
     --self_play_output "$SELFPLAY_FILE"
     --self_play_iteration_seed "$it"

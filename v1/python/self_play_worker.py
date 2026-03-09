@@ -9,11 +9,14 @@ from typing import Any, Dict, List
 
 import torch
 
-from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
-from v0.python.move_encoder import DEFAULT_ACTION_SPEC
 from .self_play_gpu_runner import SelfPlayV1Stats, self_play_v1_gpu
-from .trajectory_buffer import TensorSelfPlayBatch
+from .self_play_storage import (
+    estimate_bytes_per_sample,
+    plan_sample_ranges,
+    save_self_play_payload,
+    slice_batch_cpu,
+)
 
 
 def _is_stream_capture_error(exc: Exception) -> bool:
@@ -48,38 +51,67 @@ def _reserve_memory_anchor(device: torch.device) -> int:
     return anchor_mb
 
 
-def _empty_self_play_batch_cpu() -> TensorSelfPlayBatch:
-    board = int(GameState.BOARD_SIZE)
-    action_dim = int(DEFAULT_ACTION_SPEC.total_dim)
-    empty_state = torch.empty(
-        (0, int(NUM_INPUT_CHANNELS), board, board),
-        dtype=torch.float32,
-        device="cpu",
-    )
-    empty_action = torch.empty((0, action_dim), dtype=torch.float32, device="cpu")
-    empty_mask = torch.empty((0, action_dim), dtype=torch.bool, device="cpu")
-    empty_value = torch.empty((0,), dtype=torch.float32, device="cpu")
-    return TensorSelfPlayBatch(
-        state_tensors=empty_state,
-        legal_masks=empty_mask,
-        policy_targets=empty_action,
-        value_targets=empty_value,
-        soft_value_targets=empty_value.clone(),
-    )
+def _summarize_scalar_targets(values: torch.Tensor) -> Dict[str, Any]:
+    total = int(values.numel())
+    if total <= 0:
+        return {
+            "total": 0,
+            "finite_count": 0,
+            "nonfinite_count": 0,
+            "nonzero_count": 0,
+            "zero_count": 0,
+            "positive_count": 0,
+            "negative_count": 0,
+            "nonzero_ratio": 0.0,
+        }
+    finite_mask = torch.isfinite(values)
+    finite_count = int(torch.count_nonzero(finite_mask).item())
+    nonfinite_count = int(total - finite_count)
+    finite_values = values[finite_mask] if finite_count > 0 else values.new_empty((0,))
+    positive = int(torch.count_nonzero(finite_values > 0).item())
+    negative = int(torch.count_nonzero(finite_values < 0).item())
+    nonzero = int(positive + negative)
+    zero = int(finite_count - nonzero)
+    return {
+        "total": total,
+        "finite_count": finite_count,
+        "nonfinite_count": nonfinite_count,
+        "nonzero_count": nonzero,
+        "zero_count": zero,
+        "positive_count": positive,
+        "negative_count": negative,
+        "nonzero_ratio": float(nonzero / max(1, finite_count)),
+    }
 
 
-def _concat_self_play_batches_cpu(batches: List[TensorSelfPlayBatch]) -> TensorSelfPlayBatch:
-    if not batches:
-        return _empty_self_play_batch_cpu()
-    if len(batches) == 1:
-        return batches[0].to("cpu")
-    return TensorSelfPlayBatch(
-        state_tensors=torch.cat([b.state_tensors.to("cpu") for b in batches], dim=0),
-        legal_masks=torch.cat([b.legal_masks.to("cpu") for b in batches], dim=0),
-        policy_targets=torch.cat([b.policy_targets.to("cpu") for b in batches], dim=0),
-        value_targets=torch.cat([b.value_targets.to("cpu") for b in batches], dim=0),
-        soft_value_targets=torch.cat([b.soft_value_targets.to("cpu") for b in batches], dim=0),
-    )
+def _merge_target_summaries(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = {
+        "total": 0,
+        "finite_count": 0,
+        "nonfinite_count": 0,
+        "nonzero_count": 0,
+        "zero_count": 0,
+        "positive_count": 0,
+        "negative_count": 0,
+        "nonzero_ratio": 0.0,
+    }
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        for key in (
+            "total",
+            "finite_count",
+            "nonfinite_count",
+            "nonzero_count",
+            "zero_count",
+            "positive_count",
+            "negative_count",
+        ):
+            merged[key] = int(merged.get(key, 0) + int(summary.get(key, 0) or 0))
+    finite = int(merged.get("finite_count", 0))
+    nonzero = int(merged.get("nonzero_count", 0))
+    merged["nonzero_ratio"] = float(nonzero / max(1, finite))
+    return merged
 
 
 def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float) -> SelfPlayV1Stats:
@@ -187,6 +219,12 @@ def run_self_play_worker(
     opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
+    soft_label_alpha: float,
+    target_samples_per_shard: int,
+    chunk_target_bytes: int,
+    chunk_output_dir: str,
+    chunk_file_prefix: str,
+    chunk_file_ext: str,
 ) -> Dict[str, Any]:
     """Run one self-play shard inside a dedicated process and persist shard payload."""
 
@@ -242,8 +280,15 @@ def run_self_play_worker(
         graph_env_explicit = "V1_FINALIZE_GRAPH" in os.environ
         graph_retry_off = False
         remaining_games = int(shard_games_i)
-        batch_chunks: List[TensorSelfPlayBatch] = []
         stats_chunks: List[SelfPlayV1Stats] = []
+        value_summaries: List[Dict[str, Any]] = []
+        mixed_summaries: List[Dict[str, Any]] = []
+        saved_chunk_files: List[str] = []
+        saved_chunk_sizes: List[int] = []
+        weighted_bps_num = 0
+        weighted_bps_den = 0
+        saved_chunk_idx = 0
+        alpha = float(max(0.0, min(1.0, soft_label_alpha)))
         started = time.perf_counter()
         while remaining_games > 0:
             chunk_games = min(int(shard_chunk_games), int(remaining_games))
@@ -256,29 +301,79 @@ def run_self_play_worker(
                     chunk_batch, chunk_stats = _run_once(chunk_games)
                 else:
                     raise
-            batch_chunks.append(chunk_batch.to("cpu"))
+            chunk_batch_cpu = chunk_batch.to("cpu")
             stats_chunks.append(chunk_stats)
+            value_summaries.append(_summarize_scalar_targets(chunk_batch_cpu.value_targets))
+            mixed_values = torch.clamp(
+                (1.0 - alpha) * chunk_batch_cpu.value_targets + alpha * chunk_batch_cpu.soft_value_targets,
+                min=-1.0,
+                max=1.0,
+            )
+            mixed_summaries.append(_summarize_scalar_targets(mixed_values))
+
+            bytes_per_sample = estimate_bytes_per_sample(chunk_batch_cpu)
+            weighted_bps_num += int(bytes_per_sample * max(1, int(chunk_batch_cpu.num_samples)))
+            weighted_bps_den += int(max(1, int(chunk_batch_cpu.num_samples)))
+            chunk_ranges = plan_sample_ranges(
+                total_samples=int(chunk_batch_cpu.num_samples),
+                num_shards=1,
+                target_samples_per_shard=int(target_samples_per_shard),
+                chunk_target_bytes=int(chunk_target_bytes),
+                bytes_per_sample=int(bytes_per_sample),
+            )
+            for start_idx, end_idx in chunk_ranges:
+                chunk_name = (
+                    f"{chunk_file_prefix}.chunk{int(saved_chunk_idx):05d}{chunk_file_ext}"
+                )
+                chunk_path = os.path.join(str(chunk_output_dir), chunk_name)
+                chunk_meta = {
+                    "payload_format": "v1_sharded_shard",
+                    "worker_idx": int(worker_idx),
+                    "device": str(dev),
+                    "games": int(shard_games_i),
+                    "games_per_chunk": int(shard_chunk_games),
+                    "num_selfplay_batches": int(len(stats_chunks)),
+                    "saved_chunk_index": int(saved_chunk_idx),
+                    "graph_retry_off": bool(graph_retry_off),
+                    "memory_anchor_mb": int(anchor_mb_effective),
+                    "opening_random_moves": int(opening_random_moves),
+                    "source_worker_manifest": os.path.basename(str(output_path)),
+                }
+                save_self_play_payload(
+                    path=chunk_path,
+                    samples=slice_batch_cpu(chunk_batch_cpu, start=int(start_idx), end=int(end_idx)),
+                    stats_payload={},
+                    metadata=chunk_meta,
+                )
+                saved_chunk_files.append(chunk_name)
+                saved_chunk_sizes.append(int(end_idx - start_idx))
+                saved_chunk_idx += 1
             remaining_games -= int(chunk_games)
 
-        samples = _concat_self_play_batches_cpu(batch_chunks)
         stats = _merge_self_play_stats(
             stats_chunks,
             elapsed_sec=max(1e-9, float(time.perf_counter() - started)),
         )
-
+        avg_bps = int(weighted_bps_num // max(1, weighted_bps_den))
         payload = {
-            "state_tensors": samples.state_tensors.detach().cpu(),
-            "legal_masks": samples.legal_masks.detach().cpu(),
-            "policy_targets": samples.policy_targets.detach().cpu(),
-            "value_targets": samples.value_targets.detach().cpu(),
-            "soft_value_targets": samples.soft_value_targets.detach().cpu(),
+            "payload_format": "v1_worker_chunk_manifest",
+            "version": 1,
+            "num_samples": int(sum(saved_chunk_sizes)),
+            "num_shards": int(len(saved_chunk_files)),
+            "shard_files": list(saved_chunk_files),
+            "shard_sizes": list(saved_chunk_sizes),
+            "chunk_target_bytes": int(chunk_target_bytes),
+            "avg_bytes_per_sample": int(avg_bps),
             "stats": stats.to_dict(),
+            "value_target_summary": _merge_target_summaries(value_summaries),
+            "mixed_value_target_summary": _merge_target_summaries(mixed_summaries),
             "metadata": {
                 "worker_idx": int(worker_idx),
                 "device": str(dev),
                 "games": int(shard_games_i),
                 "games_per_chunk": int(shard_chunk_games),
-                "num_chunks": int(len(batch_chunks)),
+                "num_selfplay_batches": int(len(stats_chunks)),
+                "saved_chunks": int(len(saved_chunk_files)),
                 "graph_retry_off": bool(graph_retry_off),
                 "memory_anchor_mb": int(anchor_mb_effective),
                 "opening_random_moves": int(opening_random_moves),
@@ -292,7 +387,8 @@ def run_self_play_worker(
             "device": str(dev),
             "games": int(shard_games_i),
             "output_path": str(output_path),
-            "num_samples": int(samples.num_samples),
+            "num_samples": int(sum(saved_chunk_sizes)),
+            "saved_chunks": int(len(saved_chunk_files)),
         }
     except Exception as exc:
         detail = traceback.format_exc()

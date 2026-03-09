@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 import random
 import time
@@ -17,6 +18,38 @@ from .trajectory_buffer import TensorSelfPlayBatch
 
 _LOAD_MAX_RETRIES = 3
 _LOAD_RETRY_DELAY = 2.0
+
+
+def _distribute_manifest_budget(sizes: List[int], budget: int) -> List[int]:
+    sizes_i = [max(0, int(sz)) for sz in sizes]
+    if not sizes_i:
+        return []
+    budget_i = max(0, int(budget))
+    manifest_total = int(sum(sizes_i))
+    if budget_i <= 0 or manifest_total <= 0:
+        return [0 for _ in sizes_i]
+    target = min(budget_i, manifest_total)
+    alloc = [0 for _ in sizes_i]
+    fractions: List[Tuple[float, int]] = []
+    assigned = 0
+    for idx, sz in enumerate(sizes_i):
+        if sz <= 0:
+            fractions.append((0.0, idx))
+            continue
+        ideal = float(target) * float(sz) / float(manifest_total)
+        base = min(sz, int(math.floor(ideal)))
+        alloc[idx] = int(base)
+        assigned += int(base)
+        fractions.append((ideal - float(base), idx))
+    remaining = max(0, int(target - assigned))
+    for _frac, idx in sorted(fractions, key=lambda item: (-item[0], item[1])):
+        if remaining <= 0:
+            break
+        if alloc[idx] >= sizes_i[idx]:
+            continue
+        alloc[idx] += 1
+        remaining -= 1
+    return alloc
 
 
 def _torch_load_retry(path: str) -> Any:
@@ -78,10 +111,15 @@ def resolve_shard_specs(
             if ddp_world > 1:
                 resolved = [resolved[i] for i in range(len(resolved)) if (i % ddp_world) == ddp_rank]
 
-            for full, sz in resolved:
-                effective = min(sz, budget) if budget > 0 and sz > 0 else sz
-                specs.append(ShardSpec(path=full, num_samples=sz, sample_budget=budget))
-                total += effective if effective > 0 else sz
+            chunk_budgets = _distribute_manifest_budget(
+                [sz for _, sz in resolved],
+                int(budget),
+            ) if budget > 0 else [0 for _ in resolved]
+            for idx, (full, sz) in enumerate(resolved):
+                chunk_budget = int(chunk_budgets[idx]) if idx < len(chunk_budgets) else 0
+                effective = min(sz, chunk_budget) if chunk_budget > 0 else sz
+                specs.append(ShardSpec(path=full, num_samples=sz, sample_budget=chunk_budget))
+                total += effective
         else:
             n = 0
             if isinstance(manifest, TensorSelfPlayBatch):
@@ -204,11 +242,15 @@ def build_streaming_dataloader(
     shard_specs: List[ShardSpec],
     *,
     batch_size: int,
-    num_workers: int = 8,
+    num_workers: int = 1,
     epoch_seed: int = 0,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
 ) -> torch.utils.data.DataLoader:
+    # Cap workers to number of shards: extra workers get zero specs but still
+    # consume process overhead, and each active worker loads one shard at a
+    # time. Keeping worker count bounded prevents needless RSS growth.
+    effective_workers = min(num_workers, len(shard_specs)) if shard_specs else 0
     dataset = StreamingSelfPlayDataset(
         shard_specs,
         batch_size=batch_size,
@@ -217,8 +259,8 @@ def build_streaming_dataloader(
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=None,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if effective_workers > 0 else None,
         persistent_workers=False,
     )

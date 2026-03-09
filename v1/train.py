@@ -21,6 +21,12 @@ from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 from v1.python.mcts_gpu import TOTAL_ACTION_DIM
 from v1.python.self_play_gpu_runner import SelfPlayV1Stats, self_play_v1_gpu
+from v1.python.self_play_storage import (
+    estimate_bytes_per_sample,
+    plan_sample_ranges,
+    save_self_play_payload as save_self_play_payload_shared,
+    slice_batch_cpu,
+)
 from v1.python.self_play_worker import run_self_play_worker
 from v1.python.train_bridge import train_network_from_tensors, train_network_streaming
 from v1.python.trajectory_buffer import TensorSelfPlayBatch
@@ -724,6 +730,216 @@ def _run_self_play_multi_device_process(
             )
 
 
+def _run_self_play_multi_device_process_saved(
+    *,
+    model: ChessNet,
+    num_games: int,
+    mcts_simulations: int,
+    temperature_init: float,
+    temperature_final: float,
+    temperature_threshold: int,
+    exploration_weight: float,
+    devices: List[str],
+    dirichlet_alpha: float,
+    dirichlet_epsilon: float,
+    soft_value_k: float,
+    soft_label_alpha: float,
+    opening_random_moves: int,
+    max_game_plies: int,
+    concurrent_games_per_device: int,
+    iteration_seed: int,
+    shard_dir: Optional[str],
+    output_path: str,
+    target_samples_per_shard: int,
+    chunk_target_bytes: int,
+    metadata_base: Dict[str, Any],
+) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], int]:
+    model_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    shards = _split_games(int(num_games), len(devices))
+    active: List[Tuple[int, str, int]] = [
+        (idx, dev, g) for idx, (dev, g) in enumerate(zip(devices, shards)) if int(g) > 0
+    ]
+    if not active:
+        raise RuntimeError("No self-play shard assigned after game split.")
+
+    workspace, auto_cleanup = _prepare_self_play_workspace(
+        shard_dir=shard_dir,
+        iteration_seed=int(iteration_seed),
+    )
+    state_path = os.path.join(workspace, "model_state_cpu.pt")
+    torch.save(model_state_cpu, state_path)
+
+    out_dir = os.path.dirname(str(output_path)) or "."
+    base_name = os.path.basename(str(output_path))
+    stem, ext = os.path.splitext(base_name)
+    ext = ext or ".pt"
+    os.makedirs(out_dir, exist_ok=True)
+
+    started = time.perf_counter()
+    failed = False
+    worker_rows: List[Dict[str, Any]] = []
+    try:
+        mp_ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=len(active),
+            mp_context=mp_ctx,
+        ) as pool:
+            future_map = {}
+            for worker_idx, shard_dev, shard_games in active:
+                worker_seed = int(iteration_seed * 10007 + (worker_idx + 1) * 9973)
+                worker_manifest_path = os.path.join(
+                    workspace,
+                    f"worker_manifest_{int(iteration_seed):06d}_{int(worker_idx):02d}.pt",
+                )
+                future = pool.submit(
+                    run_self_play_worker,
+                    worker_idx=int(worker_idx),
+                    shard_device=str(shard_dev),
+                    shard_games=int(shard_games),
+                    seed=int(worker_seed),
+                    model_state_path=str(state_path),
+                    output_path=str(worker_manifest_path),
+                    mcts_simulations=int(mcts_simulations),
+                    temperature_init=float(temperature_init),
+                    temperature_final=float(temperature_final),
+                    temperature_threshold=int(temperature_threshold),
+                    exploration_weight=float(exploration_weight),
+                    dirichlet_alpha=float(dirichlet_alpha),
+                    dirichlet_epsilon=float(dirichlet_epsilon),
+                    soft_value_k=float(soft_value_k),
+                    opening_random_moves=int(opening_random_moves),
+                    max_game_plies=int(max_game_plies),
+                    concurrent_games_per_device=int(concurrent_games_per_device),
+                    soft_label_alpha=float(soft_label_alpha),
+                    target_samples_per_shard=int(target_samples_per_shard),
+                    chunk_target_bytes=int(chunk_target_bytes),
+                    chunk_output_dir=str(out_dir),
+                    chunk_file_prefix=f"{stem}.w{int(worker_idx):02d}",
+                    chunk_file_ext=str(ext),
+                )
+                future_map[future] = (worker_idx, shard_dev, shard_games, worker_manifest_path)
+
+            for future in as_completed(future_map):
+                worker_idx, shard_dev, shard_games, worker_manifest_path = future_map[future]
+                try:
+                    row = future.result()
+                    worker_rows.append(row)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "v1 process self-play direct-save failed "
+                        f"on worker={worker_idx}, device={shard_dev}, games={shard_games}, "
+                        f"worker_manifest={worker_manifest_path}"
+                    ) from exc
+
+        all_shard_files: List[str] = []
+        all_shard_sizes: List[int] = []
+        stats_list: List[SelfPlayV1Stats] = []
+        value_summaries: List[Dict[str, Any]] = []
+        mixed_value_summaries: List[Dict[str, Any]] = []
+        weighted_bps_num = 0
+        weighted_bps_den = 0
+
+        for row in sorted(worker_rows, key=lambda x: int(x.get("worker_idx", 0))):
+            manifest_path = str(row.get("output_path", ""))
+            if not manifest_path:
+                raise RuntimeError(f"Missing worker manifest path in worker row: {row}")
+            worker_manifest = _torch_load_with_retry(manifest_path)
+            if not isinstance(worker_manifest, dict):
+                raise RuntimeError(
+                    f"Invalid worker manifest type in {manifest_path}: {type(worker_manifest)!r}"
+                )
+            if str(worker_manifest.get("payload_format", "")).strip().lower() != "v1_worker_chunk_manifest":
+                raise RuntimeError(
+                    f"Invalid worker manifest payload_format in {manifest_path}: "
+                    f"{worker_manifest.get('payload_format')!r}"
+                )
+            meta_payload = worker_manifest.get("metadata")
+            if not isinstance(meta_payload, dict):
+                meta_payload = {}
+            _print_rank0(
+                "[v1.train] self-play shard merged "
+                f"worker={int(meta_payload.get('worker_idx', row.get('worker_idx', 0)))} "
+                f"device={meta_payload.get('device', row.get('device', ''))} "
+                f"games={int(meta_payload.get('games', row.get('games', 0)))} "
+                f"selfplay_batches={int(meta_payload.get('num_selfplay_batches', 0))} "
+                f"saved_chunks={int(meta_payload.get('saved_chunks', row.get('saved_chunks', 0)))} "
+                f"games_per_chunk={int(meta_payload.get('games_per_chunk', meta_payload.get('games', 0)))}"
+            )
+
+            shard_files_raw = worker_manifest.get("shard_files")
+            shard_sizes_raw = worker_manifest.get("shard_sizes")
+            if not isinstance(shard_files_raw, list) or not isinstance(shard_sizes_raw, list):
+                raise RuntimeError(f"Worker manifest missing shard file lists: {manifest_path}")
+            for idx, entry in enumerate(shard_files_raw):
+                shard_item = str(entry).strip()
+                if not shard_item:
+                    continue
+                all_shard_files.append(shard_item)
+                if idx < len(shard_sizes_raw):
+                    all_shard_sizes.append(int(shard_sizes_raw[idx]))
+                else:
+                    all_shard_sizes.append(0)
+
+            stats_list.append(_self_play_stats_from_payload(worker_manifest.get("stats", {})))
+            value_summary_payload = worker_manifest.get("value_target_summary", {})
+            if isinstance(value_summary_payload, dict):
+                value_summaries.append(value_summary_payload)
+            mixed_summary_payload = worker_manifest.get("mixed_value_target_summary", {})
+            if isinstance(mixed_summary_payload, dict):
+                mixed_value_summaries.append(mixed_summary_payload)
+
+            worker_num_samples = int(worker_manifest.get("num_samples", 0) or 0)
+            worker_avg_bps = int(worker_manifest.get("avg_bytes_per_sample", 0) or 0)
+            if worker_num_samples > 0 and worker_avg_bps > 0:
+                weighted_bps_num += int(worker_num_samples * worker_avg_bps)
+                weighted_bps_den += int(worker_num_samples)
+
+        if not all_shard_files:
+            raise RuntimeError("Process self-play direct-save produced no chunk files.")
+
+        merged_stats = _merge_self_play_stats(
+            stats=stats_list,
+            elapsed_sec=max(1e-9, time.perf_counter() - started),
+        )
+        value_target_summary = _merge_scalar_target_summaries(value_summaries)
+        mixed_value_target_summary = _merge_scalar_target_summaries(mixed_value_summaries)
+
+        final_metadata = dict(metadata_base)
+        final_metadata.update(
+            {
+                "self_play_target_samples_per_shard": int(target_samples_per_shard),
+                "self_play_chunk_target_bytes": int(chunk_target_bytes),
+                "value_target_summary": dict(value_target_summary),
+                "mixed_value_target_summary": dict(mixed_value_target_summary),
+            }
+        )
+        manifest_payload = {
+            "payload_format": "v1_sharded_manifest",
+            "version": 1,
+            "num_samples": int(sum(all_shard_sizes)),
+            "num_shards": int(len(all_shard_files)),
+            "shard_files": list(all_shard_files),
+            "shard_sizes": list(all_shard_sizes),
+            "chunk_target_bytes": int(chunk_target_bytes),
+            "avg_bytes_per_sample": int(weighted_bps_num // max(1, weighted_bps_den)),
+            "stats": merged_stats.to_dict(),
+            "metadata": final_metadata,
+        }
+        torch.save(manifest_payload, str(output_path))
+        return merged_stats, value_target_summary, mixed_value_target_summary, int(len(all_shard_files))
+    except Exception:
+        failed = True
+        raise
+    finally:
+        if auto_cleanup and not failed:
+            shutil.rmtree(workspace, ignore_errors=True)
+        elif auto_cleanup and failed:
+            _print_rank0(
+                "[v1.train] process self-play direct-save failed; keep workspace for debug: "
+                f"{workspace}"
+            )
+
+
 def _run_self_play_multi_device(
     *,
     model: ChessNet,
@@ -873,48 +1089,42 @@ def _save_self_play_payload(
     stats: SelfPlayV1Stats,
     metadata: Dict[str, Any],
 ) -> None:
-    payload = {
-        "state_tensors": samples.state_tensors.detach().cpu(),
-        "legal_masks": samples.legal_masks.detach().cpu(),
-        "policy_targets": samples.policy_targets.detach().cpu(),
-        "value_targets": samples.value_targets.detach().cpu(),
-        "soft_value_targets": samples.soft_value_targets.detach().cpu(),
-        "stats": stats.to_dict(),
-        "metadata": dict(metadata),
+    save_self_play_payload_shared(
+        path=path,
+        samples=samples,
+        stats_payload=stats.to_dict(),
+        metadata=metadata,
+    )
+
+
+def _merge_scalar_target_summaries(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = {
+        "total": 0,
+        "finite_count": 0,
+        "nonfinite_count": 0,
+        "nonzero_count": 0,
+        "zero_count": 0,
+        "positive_count": 0,
+        "negative_count": 0,
+        "nonzero_ratio": 0.0,
     }
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save(payload, path)
-
-
-def _split_self_play_batch_cpu(
-    samples: TensorSelfPlayBatch,
-    num_shards: int,
-    target_samples_per_shard: int = 0,
-) -> List[TensorSelfPlayBatch]:
-    total = int(samples.num_samples)
-    if total <= 0:
-        return []
-    shard_count = max(1, min(int(num_shards), total))
-    target_n = max(0, int(target_samples_per_shard))
-    if target_n > 0:
-        shard_count = max(shard_count, int(math.ceil(total / float(target_n))))
-        shard_count = min(shard_count, total)
-    shard_sizes = _split_games(total, shard_count)
-    out: List[TensorSelfPlayBatch] = []
-    start = 0
-    for size in shard_sizes:
-        end = start + int(size)
-        out.append(
-            TensorSelfPlayBatch(
-                state_tensors=samples.state_tensors[start:end].to("cpu"),
-                legal_masks=samples.legal_masks[start:end].to("cpu"),
-                policy_targets=samples.policy_targets[start:end].to("cpu"),
-                value_targets=samples.value_targets[start:end].to("cpu"),
-                soft_value_targets=samples.soft_value_targets[start:end].to("cpu"),
-            )
-        )
-        start = end
-    return out
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        for key in (
+            "total",
+            "finite_count",
+            "nonfinite_count",
+            "nonzero_count",
+            "zero_count",
+            "positive_count",
+            "negative_count",
+        ):
+            merged[key] = int(merged.get(key, 0) + int(summary.get(key, 0) or 0))
+    finite = int(merged.get("finite_count", 0))
+    nonzero = int(merged.get("nonzero_count", 0))
+    merged["nonzero_ratio"] = float(nonzero / max(1, finite))
+    return merged
 
 
 def _save_self_play_payload_sharded(
@@ -925,13 +1135,17 @@ def _save_self_play_payload_sharded(
     metadata: Dict[str, Any],
     num_shards: int,
     target_samples_per_shard: int = 0,
+    chunk_target_bytes: int = 0,
 ) -> int:
-    shard_batches = _split_self_play_batch_cpu(
-        samples=samples,
+    bytes_per_sample = estimate_bytes_per_sample(samples) if int(samples.num_samples) > 0 else 0
+    shard_ranges = plan_sample_ranges(
+        total_samples=int(samples.num_samples),
         num_shards=int(num_shards),
         target_samples_per_shard=int(target_samples_per_shard),
+        chunk_target_bytes=int(chunk_target_bytes),
+        bytes_per_sample=int(bytes_per_sample),
     )
-    if not shard_batches:
+    if not shard_ranges:
         _save_self_play_payload(path=path, samples=samples, stats=stats, metadata=metadata)
         return 0
 
@@ -941,17 +1155,19 @@ def _save_self_play_payload_sharded(
     ext = ext or ".pt"
     os.makedirs(out_dir, exist_ok=True)
 
+    idx_width = max(2, len(str(len(shard_ranges) - 1)))
     shard_files: List[str] = []
     shard_sizes: List[int] = []
-    for shard_idx, shard_batch in enumerate(shard_batches):
-        shard_name = f"{stem}.shard{int(shard_idx):02d}{ext}"
+    for shard_idx, (start_idx, end_idx) in enumerate(shard_ranges):
+        shard_name = f"{stem}.shard{int(shard_idx):0{idx_width}d}{ext}"
         shard_path = os.path.join(out_dir, shard_name)
+        shard_batch = slice_batch_cpu(samples, start=int(start_idx), end=int(end_idx))
         shard_meta = dict(metadata)
         shard_meta.update(
             {
                 "payload_format": "v1_sharded_shard",
                 "shard_index": int(shard_idx),
-                "shard_count": int(len(shard_batches)),
+                "shard_count": int(len(shard_ranges)),
                 "shard_num_samples": int(shard_batch.num_samples),
                 "source_manifest": str(path),
             }
@@ -972,6 +1188,8 @@ def _save_self_play_payload_sharded(
         "num_shards": int(len(shard_files)),
         "shard_files": list(shard_files),
         "shard_sizes": list(shard_sizes),
+        "chunk_target_bytes": int(chunk_target_bytes),
+        "avg_bytes_per_sample": int(bytes_per_sample),
         "stats": stats.to_dict(),
         "metadata": dict(metadata),
     }
@@ -1302,6 +1520,7 @@ def train_pipeline_v1(
     self_play_backend: Optional[str] = None,
     self_play_shard_dir: Optional[str] = None,
     self_play_target_samples_per_shard: int = 0,
+    self_play_chunk_target_bytes: int = 0,
     checkpoint_dir: str = "./checkpoints_v1",
     device: str = "cpu",
     devices: Optional[str] = None,
@@ -1378,6 +1597,11 @@ def train_pipeline_v1(
             f"{backend_arg if backend_arg is not None else 'auto'} "
             f"self_play_shard_dir={shard_dir_arg or '<temp>'}"
         )
+        if int(self_play_chunk_target_bytes) > 0:
+            _print_rank0(
+                "[v1.train] "
+                f"self_play_chunk_target_bytes={int(self_play_chunk_target_bytes)}"
+            )
         if int(self_play_target_samples_per_shard) > 0:
             _print_rank0(
                 "[v1.train] "
@@ -1419,68 +1643,116 @@ def train_pipeline_v1(
 
         if stage_norm == "selfplay":
             model.eval()
-            samples, sp_stats = _run_self_play_multi_device(
-                model=model,
-                num_games=int(self_play_games),
-                mcts_simulations=int(mcts_simulations),
-                temperature_init=float(temperature_init),
-                temperature_final=float(temperature_final),
-                temperature_threshold=int(temperature_threshold),
-                exploration_weight=float(exploration_weight),
-                devices=self_play_device_list,
-                dirichlet_alpha=float(dirichlet_alpha),
-                dirichlet_epsilon=float(dirichlet_epsilon),
-                soft_value_k=float(soft_value_k),
-                opening_random_moves=int(self_play_opening_random_moves),
-                max_game_plies=int(max_game_plies),
-                concurrent_games_per_device=int(self_play_concurrent_games),
-                iteration_seed=int(stage_selfplay_seed),
-                self_play_backend=backend_arg,
-                self_play_shard_dir=shard_dir_arg,
+            output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
+            payload_metadata_base = {
+                "stage": "selfplay",
+                "self_play_devices": list(self_play_device_list),
+                "self_play_backend": backend_arg if backend_arg is not None else "auto",
+                "self_play_shard_dir": shard_dir_arg,
+                "mcts_simulations": int(mcts_simulations),
+                "self_play_games": int(self_play_games),
+                "self_play_concurrent_games": int(self_play_concurrent_games),
+                "self_play_opening_random_moves": int(self_play_opening_random_moves),
+                "self_play_iteration_seed": int(stage_selfplay_seed),
+            }
+            resolved_backend = (
+                _resolve_self_play_backend(
+                    requested_backend=backend_arg,
+                    devices=self_play_device_list,
+                )
+                if len(self_play_device_list) > 1
+                else "thread"
             )
-            value_target_summary = _compute_value_target_summary(samples)
-            mixed_value_target_summary = _compute_mixed_value_target_summary(
-                samples,
-                soft_label_alpha=float(soft_label_alpha),
-            )
+            saved_shards = 0
+            if resolved_backend == "process":
+                _print_rank0(f"[v1.train] self-play backend={resolved_backend} devices={self_play_device_list}")
+                sp_stats, value_target_summary, mixed_value_target_summary, saved_shards = (
+                    _run_self_play_multi_device_process_saved(
+                        model=model,
+                        num_games=int(self_play_games),
+                        mcts_simulations=int(mcts_simulations),
+                        temperature_init=float(temperature_init),
+                        temperature_final=float(temperature_final),
+                        temperature_threshold=int(temperature_threshold),
+                        exploration_weight=float(exploration_weight),
+                        devices=list(self_play_device_list),
+                        dirichlet_alpha=float(dirichlet_alpha),
+                        dirichlet_epsilon=float(dirichlet_epsilon),
+                        soft_value_k=float(soft_value_k),
+                        soft_label_alpha=float(soft_label_alpha),
+                        opening_random_moves=int(self_play_opening_random_moves),
+                        max_game_plies=int(max_game_plies),
+                        concurrent_games_per_device=int(self_play_concurrent_games),
+                        iteration_seed=int(stage_selfplay_seed),
+                        shard_dir=shard_dir_arg,
+                        output_path=output_path,
+                        target_samples_per_shard=int(self_play_target_samples_per_shard),
+                        chunk_target_bytes=int(self_play_chunk_target_bytes),
+                        metadata_base=payload_metadata_base,
+                    )
+                )
+            else:
+                samples, sp_stats = _run_self_play_multi_device(
+                    model=model,
+                    num_games=int(self_play_games),
+                    mcts_simulations=int(mcts_simulations),
+                    temperature_init=float(temperature_init),
+                    temperature_final=float(temperature_final),
+                    temperature_threshold=int(temperature_threshold),
+                    exploration_weight=float(exploration_weight),
+                    devices=self_play_device_list,
+                    dirichlet_alpha=float(dirichlet_alpha),
+                    dirichlet_epsilon=float(dirichlet_epsilon),
+                    soft_value_k=float(soft_value_k),
+                    opening_random_moves=int(self_play_opening_random_moves),
+                    max_game_plies=int(max_game_plies),
+                    concurrent_games_per_device=int(self_play_concurrent_games),
+                    iteration_seed=int(stage_selfplay_seed),
+                    self_play_backend=backend_arg,
+                    self_play_shard_dir=shard_dir_arg,
+                )
+                value_target_summary = _compute_value_target_summary(samples)
+                mixed_value_target_summary = _compute_mixed_value_target_summary(
+                    samples,
+                    soft_label_alpha=float(soft_label_alpha),
+                )
+                payload_metadata = dict(payload_metadata_base)
+                payload_metadata.update(
+                    {
+                        "self_play_target_samples_per_shard": int(self_play_target_samples_per_shard),
+                        "self_play_chunk_target_bytes": int(self_play_chunk_target_bytes),
+                        "value_target_summary": dict(value_target_summary),
+                        "mixed_value_target_summary": dict(mixed_value_target_summary),
+                    }
+                )
+                _use_sharded = (
+                    len(self_play_device_list) > 1
+                    or int(self_play_target_samples_per_shard) > 0
+                    or int(self_play_chunk_target_bytes) > 0
+                )
+                if _use_sharded:
+                    saved_shards = _save_self_play_payload_sharded(
+                        path=output_path,
+                        samples=samples,
+                        stats=sp_stats,
+                        metadata=payload_metadata,
+                        num_shards=len(self_play_device_list),
+                        target_samples_per_shard=int(self_play_target_samples_per_shard),
+                        chunk_target_bytes=int(self_play_chunk_target_bytes),
+                    )
+                else:
+                    _save_self_play_payload(
+                        path=output_path,
+                        samples=samples,
+                        stats=sp_stats,
+                        metadata=payload_metadata,
+                    )
             sp_report = _build_self_play_report(
                 stats=sp_stats,
                 value_target_summary=value_target_summary,
                 mixed_value_target_summary=mixed_value_target_summary,
             )
             sp_report["self_play_iteration_seed"] = int(stage_selfplay_seed)
-            output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
-            payload_metadata = {
-                "stage": "selfplay",
-                "self_play_devices": list(self_play_device_list),
-                "self_play_backend": backend_arg if backend_arg is not None else "auto",
-                "self_play_shard_dir": shard_dir_arg,
-                "self_play_target_samples_per_shard": int(self_play_target_samples_per_shard),
-                "mcts_simulations": int(mcts_simulations),
-                "self_play_games": int(self_play_games),
-                "self_play_concurrent_games": int(self_play_concurrent_games),
-                "self_play_opening_random_moves": int(self_play_opening_random_moves),
-                "self_play_iteration_seed": int(stage_selfplay_seed),
-                "value_target_summary": dict(value_target_summary),
-                "mixed_value_target_summary": dict(mixed_value_target_summary),
-            }
-            saved_shards = 0
-            if len(self_play_device_list) > 1 or int(self_play_target_samples_per_shard) > 0:
-                saved_shards = _save_self_play_payload_sharded(
-                    path=output_path,
-                    samples=samples,
-                    stats=sp_stats,
-                    metadata=payload_metadata,
-                    num_shards=len(self_play_device_list),
-                    target_samples_per_shard=int(self_play_target_samples_per_shard),
-                )
-            else:
-                _save_self_play_payload(
-                    path=output_path,
-                    samples=samples,
-                    stats=sp_stats,
-                    metadata=payload_metadata,
-                )
             if self_play_stats_json:
                 _save_json(str(self_play_stats_json), sp_report)
             _print_self_play_summary(
@@ -1927,12 +2199,18 @@ def train_pipeline_v1(
                     "self_play_backend": backend_arg if backend_arg is not None else "auto",
                     "self_play_shard_dir": shard_dir_arg,
                     "self_play_target_samples_per_shard": int(self_play_target_samples_per_shard),
+                    "self_play_chunk_target_bytes": int(self_play_chunk_target_bytes),
                     "self_play_concurrent_games": int(self_play_concurrent_games),
                     "self_play_opening_random_moves": int(self_play_opening_random_moves),
                     "value_target_summary": dict(value_target_summary),
                     "mixed_value_target_summary": dict(mixed_value_target_summary),
                 }
-                if len(self_play_device_list) > 1 or int(self_play_target_samples_per_shard) > 0:
+                _use_sharded_all = (
+                    len(self_play_device_list) > 1
+                    or int(self_play_target_samples_per_shard) > 0
+                    or int(self_play_chunk_target_bytes) > 0
+                )
+                if _use_sharded_all:
                     _save_self_play_payload_sharded(
                         path=save_path,
                         samples=samples,
@@ -1940,6 +2218,7 @@ def train_pipeline_v1(
                         metadata=save_meta,
                         num_shards=len(self_play_device_list),
                         target_samples_per_shard=int(self_play_target_samples_per_shard),
+                        chunk_target_bytes=int(self_play_chunk_target_bytes),
                     )
                 else:
                     _save_self_play_payload(
@@ -2013,6 +2292,15 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Target maximum samples per saved self-play shard; 0 keeps device-count-only sharding.",
+    )
+    parser.add_argument(
+        "--self_play_chunk_target_bytes",
+        type=int,
+        default=0,
+        help=(
+            "Target chunk size in bytes for saved self-play shards. "
+            "When > 0, overrides --self_play_target_samples_per_shard."
+        ),
     )
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)
@@ -2134,6 +2422,7 @@ if __name__ == "__main__":
         self_play_backend=args.self_play_backend,
         self_play_shard_dir=args.self_play_shard_dir,
         self_play_target_samples_per_shard=args.self_play_target_samples_per_shard,
+        self_play_chunk_target_bytes=args.self_play_chunk_target_bytes,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
         devices=args.devices,
