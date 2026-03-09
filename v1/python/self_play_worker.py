@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 
 import torch
 
+from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 from .self_play_gpu_runner import SelfPlayV1Stats, self_play_v1_gpu
 from .self_play_storage import (
