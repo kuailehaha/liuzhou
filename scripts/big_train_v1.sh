@@ -45,7 +45,7 @@ SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
 SELF_PLAY_TARGET_SAMPLES_PER_SHARD="${SELF_PLAY_TARGET_SAMPLES_PER_SHARD:-0}"  # kept for fallback; overridden by CHUNK_TARGET_BYTES when set
 CHUNK_TARGET_BYTES="${CHUNK_TARGET_BYTES:-8589934592}"  # 8 GiB per chunk; drives chunk-level streaming
 STREAMING_LOAD="${STREAMING_LOAD:-1}"       # 1=streaming DataLoader, 0=monolithic load
-STREAMING_WORKERS="${STREAMING_WORKERS:-1}"  # DataLoader num_workers (1 = one prefetch worker; safe for large shards)
+STREAMING_WORKERS="${STREAMING_WORKERS:-4}"  # DataLoader num_workers; >1 interleaves shards for cross-shard mixing
 
 EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-2000}"
 EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-2000}"

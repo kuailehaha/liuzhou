@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,7 +21,7 @@ from src.policy_batch import (
 
 from .trajectory_buffer import TensorSelfPlayBatch
 
-_WDL_AUX_LOSS_WEIGHT = 0.25
+_WDL_AUX_LOSS_WEIGHT = 0.0
 _WDL_LOG_EPS = 1e-8
 
 
@@ -268,10 +267,9 @@ def train_network_from_tensors(
     warmup_n = min(max(0, int(warmup_steps)), total_train_steps // 2)
 
     def _lr_lambda(step: int) -> float:
-        if step < warmup_n:
+        if warmup_n > 0 and step < warmup_n:
             return (step + 1) / max(1, warmup_n)
-        progress = (step - warmup_n) / max(1, total_train_steps - warmup_n)
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     global_step = 0
@@ -615,10 +613,9 @@ def train_network_streaming(
     draw_weight = float(max(0.0, policy_draw_weight))
 
     def _lr_lambda(step: int) -> float:
-        if step < warmup_n:
+        if warmup_n > 0 and step < warmup_n:
             return (step + 1) / max(1, warmup_n)
-        progress = (step - warmup_n) / max(1, total_train_steps - warmup_n)
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     global_step = 0
