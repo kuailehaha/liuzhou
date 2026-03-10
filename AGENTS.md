@@ -30,7 +30,7 @@
 ## 项目速览
 
 - 六洲棋 AI 系统：规则引擎 + MCTS + 强化学习训练 + 人机对战前后端
-- 规则权威来源：`README.md`、`rule_description.md`
+- 规则权威来源：`docs/rules.md`（`rule_description.md` 仅保留为兼容入口）
 - 三层实现（当前主线为 V1）：
   - Legacy：纯 Python（`src/`），用于规则功能验证
   - V0：C++/CUDA 核心（`v0/`），作为底层能力与对照实现
@@ -114,14 +114,19 @@
   - `export_torchscript.py`：TorchScript 模型导出
   - `filter_decisive_jsonl.py`：过滤决定性样本（value ≠ 0）
   - `monitor_resources.sh`：资源监控；`kill_top_io.sh`：高 IO 进程清理
-- `docs/`：项目文档
-  - `complexity_estimation.md`：六洲棋复杂度估算
-  - `legacy_tensor_pipeline.md`：Legacy 张量流水线参考
-  - `p1_inference_engine.md`：P1 InferenceEngine + CUDA Graph 验收结论
+- `docs/`：项目文档主树
+  - `index.md`：项目文档首页与阅读导航
+  - `quickstart.md`：构建、训练、评估与人机对战快速开始
+  - `architecture.md`：系统组成、目录职责与三代实现演进
+  - `method.md`：项目方法论、模型输出、训练与评估口径
+  - `gameplay_system.md`：人机对战前后端说明
+  - `rules.md`：正式规则文档
+  - `results.md`：里程碑与阶段成果
+  - `faq.md`：常见问题
 
 ## 规则一致性
 
-- 规则解释以 `README.md`、`rule_description.md` 为准。
+- 规则解释以 `docs/rules.md` 为准；`rule_description.md` 仅作兼容入口。
 - 规则或动作编码变更时，以当前时间同步更新：
   - `src/` 中的规则与动作生成
   - `v0/` 中的参考实现/核心逻辑
@@ -129,32 +134,6 @@
   - 相关测试或对照脚本
   - `TODO.md`
 
-## 工作流
-
-- 规则改动：先更新规则文档与 Python 逻辑，再检查 `v0/` 参考逻辑与对拍脚本。
-- 主训练入口：`scripts/big_train_v1.sh`（大规模）或 `scripts/train_entry.py --pipeline v1`（可控分阶段）。
-- 主评估入口：`scripts/eval_checkpoint.py --backend v1`，并结合 `--v1_concurrent_games`、`--v1_opening_random_moves`。
-- V1 staged 运行：`--stage selfplay/train/infer`；`train_strategy=ddp` 需采用 staged 方式。
-- 性能与回归：`tools/validate_v1_claims.py`、`tools/sweep_v1_gpu_matrix.py`、`tests/v1/test_v1_tensor_pipeline_smoke.py`。
-- 强度评估口径：`vs_random` 以 `win-loss` 视角使用（与锦标赛判胜口径一致），模型选择以锦标赛/Elo 为主。
-- 训练基线约定：每轮训练基于 `latest` 连续推进，`best` 仅用于 gating 与棋力对照保存。
-
-### 评估与选模约定（关键）
-
-- `gating` 判定标准：仅要求候选模型在 `vs_previous(vs_best)` 中 `wins > losses`，和棋不计入通过条件。
-- `vs_random`：默认使用确定性评估（`temperature=0`，`opening_random_moves=0`），用于回归探针和健康度监控。
-- `vs_previous`：默认保持可分辨性（非零温度 + 采样），避免出现 `0-0-1000`/`0-500-500` 这类退化离散分布主导判断。
-- 评估输出约定：`vs_random` 与 `vs_previous` 输出分离；用于 gating 的 `output_json` 只承载 `vs_previous` 结果，避免覆盖/串扰。
-- 若调整以上默认评估行为，必须同步更新 `scripts/big_train_v1.sh` 的启动日志打印项，确保日志可直接追溯参数。
-
-## 当前优先级（2026-02-26）
-
-- 结论：V1 训练加速链路已完成，并具备单节点大规模训练能力。
-- 当前主问题：棋力随数据/算力增长的转化效率不稳定，不再是纯吞吐瓶颈。
-- 下一阶段目标：
-  - 在 v1 训练链路加入 LR scheduler。
-  - 继续优化 draw 倾向控制（不改规则）。
-  - 采用锦标赛/Elo + `vs_random(win-loss)` + 自博弈有效样本的联合 KPI 评估。
 
 ## Vibe Coding 计划内容
 
@@ -165,6 +144,6 @@
 5. 验证方式：具体要跑的测试/脚本或手工验收步骤。
 6. 产出清单：新增或修改的文件列表。
 7. 实现闭环：实现内容和总结结果回归至哪些工作记录/计划文件。
-
+8. 结果回归：可复用的内容和信息写入AGENTS.md
 
 

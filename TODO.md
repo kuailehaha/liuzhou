@@ -145,7 +145,7 @@ TODO以产生时间为准。最近审查：2026.02.26
 - [x] `v0/train.py` 支持 `--data_files` 离线训练模式，或用 `--save_self_play_dir` 将在线自博弈数据自动写入 `v0/data/self_play`。
 - [ ] 后续：给数据生成/训练脚本补详细 README 片段（`v0/v0_pipeline_notes.md` 有基本 JSONL 格式，但缺少字段级文档和典型命令）
 - [x] 排查：动作空间是否相同？ —— `tests/v0/check_v0_policy_index_alignment.py` 已验证 legacy 与 v0 动作索引对齐
-- [x] ~~排查：verify_v0速度优化12倍，benchmark速度为何只优化3倍？~~ （早期调查已过时，README.md 显示端到端 ~4.5x 加速，符合预期）
+- [x] ~~排查：verify_v0速度优化12倍，benchmark速度为何只优化3倍？~~ （早期调查已过时，`docs/results.md` 记录了阶段性性能口径，符合当前文档整理方向）
 
 ### 2025.12.27
 
@@ -207,7 +207,7 @@ TODO以产生时间为准。最近审查：2026.02.26
 - v0 已有：`project_policy_logits_fast`（C++）按 (placement_dim, movement_dim, selection_dim, auxiliary_dim) 从 log_p1/log_p2/log_pmc 构建 combined logits (B, total_dim)，并在 legal_mask 上做 masked softmax；`v0/python/move_encoder.py` 有 `action_to_index(move, board_size, spec)` 将 legacy 的 move 字典映射到 flat 索引，与 v0 动作空间一致。
 
 **不变量**：
-- 规则与阶段语义以 `README.md`、`rule_description.md` 为准。
+- 规则与阶段语义以 `docs/rules.md` 为准。
 - 动作索引与 v0 的 `ActionEncodingSpec`（placement_dim=36, movement_dim=144, selection_dim=36, auxiliary_dim=4, total_dim=220）保持一致，便于日后与 v0 推理/自博弈共用或对拍。
 - 策略损失仍为「仅在合法动作上的 KL」，draw 样本的 policy 权重用 `policy_draw_weight` 控制。Value loss 使用 WDL cross-entropy，和棋样本无需额外降权。
 
@@ -238,4 +238,4 @@ TODO以产生时间为准。最近审查：2026.02.26
 
 </details>
 
-- [ ] 前端展示胜率时没说是黑棋胜率还是白棋胜率
+- [x] 前端展示胜率时没说是黑棋胜率还是白棋胜率

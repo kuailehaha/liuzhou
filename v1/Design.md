@@ -411,7 +411,7 @@ Expose via torch-native dataset/iterator:
 - Validate CPU-worker sensitivity collapse.
 
 ## Invariants (must hold)
-- Rule semantics identical to `README.md` and `rule_description.md`.
+- Rule semantics identical to `docs/rules.md` (`rule_description.md` is compatibility-only).
 - Action index mapping identical to v0 spec.
 - Terminal/winner logic unchanged.
 - Value target sign convention unchanged.
@@ -1744,7 +1744,7 @@ Data-effectiveness standard fields (must be preserved in reports):
   - 在不改规则/编码的前提下，显著降低 draw collapse 发生概率，并提升 `decisive_game_ratio`。
 - 范围:
   - 优先改 v1 训练目标与 self-play 调度策略，最小化新增开关。
-  - 不改 `README.md` / `rule_description.md` 定义的规则语义。
+  - 不改 `docs/rules.md` 定义的规则语义（`rule_description.md` 仅保留兼容入口）。
 
 #### 2. 影响面
 - `v1/train.py`
@@ -1804,4 +1804,3 @@ Data-effectiveness standard fields (must be preserved in reports):
   - 跑本地 3 轮与最小 staged 验证，产出 before/after JSON。
 - Phase D: 记录收敛
   - 将结果回填 `v1/Design.md` 与 `TODO.md`，给出是否达到 gate 的结论。
-

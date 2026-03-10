@@ -166,12 +166,18 @@ def _load_shard_tensors(
     return None
 
 
+_worker_shard_cache: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
 class StreamingSelfPlayDataset(torch.utils.data.IterableDataset):
-    """Streams training samples from shard files without full pre-loading.
+    """Streams training samples from shard files with per-worker caching.
 
     Each DataLoader worker is assigned a disjoint subset of shard files.
     Within each shard, samples are shuffled and emitted in tensor batches;
     across epochs, shard order is re-shuffled.
+
+    Shard tensors are cached in worker-process memory after the first load,
+    so subsequent epochs avoid disk I/O entirely.
     """
 
     def __init__(
@@ -185,6 +191,7 @@ class StreamingSelfPlayDataset(torch.utils.data.IterableDataset):
         self._specs = list(shard_specs)
         self._batch_size = max(1, int(batch_size))
         self._epoch_seed = int(epoch_seed)
+        self._epoch_counter = 0
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         worker_info = torch.utils.data.get_worker_info()
@@ -199,43 +206,54 @@ class StreamingSelfPlayDataset(torch.utils.data.IterableDataset):
         if not my_specs:
             return
 
-        rng = random.Random(self._epoch_seed * 10007 + worker_id)
+        epoch_id = self._epoch_counter
+        self._epoch_counter += 1
+        rng = random.Random(self._epoch_seed * 10007 + worker_id * 31 + epoch_id)
         rng.shuffle(my_specs)
 
         for spec in my_specs:
-            tensors = _load_shard_tensors(spec.path)
-            if tensors is None:
-                continue
+            cached = _worker_shard_cache.get(spec.path)
+            if cached is not None:
+                states, masks, policy, values, soft_values = cached
+            else:
+                tensors = _load_shard_tensors(spec.path)
+                if tensors is None:
+                    continue
+                states, masks, policy, values, soft_values = tensors
+                _worker_shard_cache[spec.path] = (states, masks, policy, values, soft_values)
 
-            states, masks, policy, values, soft_values = tensors
             n = int(states.shape[0])
             if n <= 0:
-                del tensors
                 continue
 
             if spec.sample_budget > 0 and n > spec.sample_budget:
                 idx = torch.randperm(n)[: spec.sample_budget]
-                states = states.index_select(0, idx)
-                masks = masks.index_select(0, idx)
-                policy = policy.index_select(0, idx)
-                values = values.index_select(0, idx)
-                soft_values = soft_values.index_select(0, idx)
+                states_s = states.index_select(0, idx)
+                masks_s = masks.index_select(0, idx)
+                policy_s = policy.index_select(0, idx)
+                values_s = values.index_select(0, idx)
+                soft_values_s = soft_values.index_select(0, idx)
                 n = spec.sample_budget
+            else:
+                states_s = states
+                masks_s = masks
+                policy_s = policy
+                values_s = values
+                soft_values_s = soft_values
 
             perm = torch.randperm(n)
             for start in range(0, n, self._batch_size):
                 end = min(start + self._batch_size, n)
                 batch_idx = perm[start:end]
                 yield (
-                    states.index_select(0, batch_idx),
-                    masks.index_select(0, batch_idx),
-                    policy.index_select(0, batch_idx),
-                    values.index_select(0, batch_idx),
-                    soft_values.index_select(0, batch_idx),
+                    states_s.index_select(0, batch_idx),
+                    masks_s.index_select(0, batch_idx),
+                    policy_s.index_select(0, batch_idx),
+                    values_s.index_select(0, batch_idx),
+                    soft_values_s.index_select(0, batch_idx),
                 )
 
-            del tensors, states, masks, policy, values, soft_values, perm
-            gc.collect()
+            del perm
 
 
 def build_streaming_dataloader(
@@ -247,20 +265,18 @@ def build_streaming_dataloader(
     pin_memory: bool = True,
     prefetch_factor: int = 2,
 ) -> torch.utils.data.DataLoader:
-    # Cap workers to number of shards: extra workers get zero specs but still
-    # consume process overhead, and each active worker loads one shard at a
-    # time. Keeping worker count bounded prevents needless RSS growth.
     effective_workers = min(num_workers, len(shard_specs)) if shard_specs else 0
     dataset = StreamingSelfPlayDataset(
         shard_specs,
         batch_size=batch_size,
         epoch_seed=epoch_seed,
     )
+    use_persistent = effective_workers > 0
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=None,
         num_workers=effective_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor if effective_workers > 0 else None,
-        persistent_workers=False,
+        persistent_workers=use_persistent,
     )
