@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data
 
-from src.neural_network import scalar_to_bucket_twohot
+from src.neural_network import scalar_to_bucket_twohot, scalar_to_wdl
 from src.policy_batch import (
     batched_policy_loss,
     build_combined_logits,
@@ -21,6 +21,23 @@ from src.policy_batch import (
 )
 
 from .trajectory_buffer import TensorSelfPlayBatch
+
+_WDL_AUX_LOSS_WEIGHT = 0.25
+_WDL_LOG_EPS = 1e-8
+
+
+def _bucket_logits_to_wdl_probs(value_logits: torch.Tensor) -> torch.Tensor:
+    probs = torch.softmax(value_logits.to(torch.float32), dim=-1)
+    bins = int(probs.size(1))
+    centers = torch.linspace(-1.0, 1.0, steps=bins, device=probs.device, dtype=probs.dtype)
+    win_mask = centers.gt(1e-8)
+    loss_mask = centers.lt(-1e-8)
+    draw_mask = ~(win_mask.logical_or(loss_mask))
+    p_win = probs[:, win_mask].sum(dim=1)
+    p_draw = probs[:, draw_mask].sum(dim=1)
+    p_loss = probs[:, loss_mask].sum(dim=1)
+    wdl = torch.stack([p_win, p_draw, p_loss], dim=1)
+    return wdl / wdl.sum(dim=1, keepdim=True).clamp_min(_WDL_LOG_EPS)
 
 
 def _train_permutation(num_samples: int, device: torch.device) -> torch.Tensor:
@@ -268,6 +285,8 @@ def train_network_from_tensors(
         total_loss_sum = 0.0
         policy_loss_sum = 0.0
         value_loss_sum = 0.0
+        value_bucket_loss_sum = 0.0
+        wdl_aux_loss_sum = 0.0
         total_seen = 0
         total_policy_weight = 0.0
         total_valid_policy = 0
@@ -313,7 +332,13 @@ def train_network_from_tensors(
                     num_bins=int(value_logits.size(1)),
                 ).to(torch.float32)
                 value_log_probs = torch.log_softmax(value_logits.to(torch.float32), dim=-1)
-                value_loss = -(bucket_target * value_log_probs).sum(dim=-1).mean()
+                bucket_value_loss = -(bucket_target * value_log_probs).sum(dim=-1).mean()
+                wdl_target = scalar_to_wdl(raw_batch_values).to(torch.float32)
+                wdl_probs = _bucket_logits_to_wdl_probs(value_logits)
+                wdl_aux_loss = -(
+                    wdl_target * torch.log(wdl_probs.clamp_min(_WDL_LOG_EPS))
+                ).sum(dim=-1).mean()
+                value_loss = bucket_value_loss + (_WDL_AUX_LOSS_WEIGHT * wdl_aux_loss)
 
                 combined_logits = build_combined_logits(
                     log_p1.view(log_p1.size(0), -1),
@@ -374,6 +399,8 @@ def train_network_from_tensors(
             total_loss_sum += float(loss.item()) * batch_count
             policy_loss_sum += float(policy_loss.item()) * weight_sum
             value_loss_sum += float(value_loss.item()) * batch_count
+            value_bucket_loss_sum += float(bucket_value_loss.item()) * batch_count
+            wdl_aux_loss_sum += float(wdl_aux_loss.item()) * batch_count
             total_policy_weight += weight_sum
             total_valid_policy += valid_policy
 
@@ -390,6 +417,8 @@ def train_network_from_tensors(
                     total_loss_sum,
                     policy_loss_sum,
                     value_loss_sum,
+                    value_bucket_loss_sum,
+                    wdl_aux_loss_sum,
                     float(total_seen),
                     total_policy_weight,
                     float(total_valid_policy),
@@ -406,18 +435,22 @@ def train_network_from_tensors(
             total_loss_sum = float(reduced[0].item())
             policy_loss_sum = float(reduced[1].item())
             value_loss_sum = float(reduced[2].item())
-            total_seen = int(round(float(reduced[3].item())))
-            total_policy_weight = float(reduced[4].item())
-            total_valid_policy = int(round(float(reduced[5].item())))
-            soft_abs_sum = float(reduced[6].item())
-            mix_abs_sum = float(reduced[7].item())
-            mix_batches = int(round(float(reduced[8].item())))
-            skipped_non_finite_loss_batches = int(round(float(reduced[9].item())))
-            skipped_non_finite_grad_batches = int(round(float(reduced[10].item())))
+            value_bucket_loss_sum = float(reduced[3].item())
+            wdl_aux_loss_sum = float(reduced[4].item())
+            total_seen = int(round(float(reduced[5].item())))
+            total_policy_weight = float(reduced[6].item())
+            total_valid_policy = int(round(float(reduced[7].item())))
+            soft_abs_sum = float(reduced[8].item())
+            mix_abs_sum = float(reduced[9].item())
+            mix_batches = int(round(float(reduced[10].item())))
+            skipped_non_finite_loss_batches = int(round(float(reduced[11].item())))
+            skipped_non_finite_grad_batches = int(round(float(reduced[12].item())))
 
         avg_loss = total_loss_sum / max(1, total_seen)
         avg_policy_loss = policy_loss_sum / max(1e-8, total_policy_weight)
         avg_value_loss = value_loss_sum / max(1, total_seen)
+        avg_value_bucket_loss = value_bucket_loss_sum / max(1, total_seen)
+        avg_wdl_aux_loss = wdl_aux_loss_sum / max(1, total_seen)
         avg_soft_abs = soft_abs_sum / max(1, mix_batches)
         avg_mix_abs = mix_abs_sum / max(1, mix_batches)
 
@@ -427,6 +460,8 @@ def train_network_from_tensors(
                 "avg_loss": avg_loss,
                 "avg_policy_loss": avg_policy_loss,
                 "avg_value_loss": avg_value_loss,
+                "avg_value_bucket_loss": avg_value_bucket_loss,
+                "avg_wdl_aux_loss": avg_wdl_aux_loss,
                 "samples": total_seen,
                 "valid_policy_samples": total_valid_policy,
                 "policy_weight_sum": total_policy_weight,
@@ -462,6 +497,7 @@ def train_network_from_tensors(
         "dropped_samples_for_sync": int(dropped_samples_for_sync),
         "optimizer_loaded": bool(optimizer_loaded),
         "anti_draw_penalty": float(anti_draw),
+        "wdl_aux_loss_weight": float(_WDL_AUX_LOSS_WEIGHT),
         "warmup_steps": int(warmup_n),
         "total_train_steps": int(total_train_steps),
         "timing": {
@@ -597,6 +633,8 @@ def train_network_streaming(
         total_loss_sum = 0.0
         policy_loss_sum = 0.0
         value_loss_sum = 0.0
+        value_bucket_loss_sum = 0.0
+        wdl_aux_loss_sum = 0.0
         total_seen = 0
         total_policy_weight = 0.0
         total_valid_policy = 0
@@ -672,7 +710,13 @@ def train_network_streaming(
                     mixed_values, num_bins=int(value_logits.size(1)),
                 ).to(torch.float32)
                 value_log_probs = torch.log_softmax(value_logits.to(torch.float32), dim=-1)
-                value_loss = -(bucket_target * value_log_probs).sum(dim=-1).mean()
+                bucket_value_loss = -(bucket_target * value_log_probs).sum(dim=-1).mean()
+                wdl_target = scalar_to_wdl(raw_b_values).to(torch.float32)
+                wdl_probs = _bucket_logits_to_wdl_probs(value_logits)
+                wdl_aux_loss = -(
+                    wdl_target * torch.log(wdl_probs.clamp_min(_WDL_LOG_EPS))
+                ).sum(dim=-1).mean()
+                value_loss = bucket_value_loss + (_WDL_AUX_LOSS_WEIGHT * wdl_aux_loss)
 
                 combined_logits = build_combined_logits(
                     log_p1.view(log_p1.size(0), -1),
@@ -734,6 +778,8 @@ def train_network_streaming(
             total_loss_sum += float(loss.item()) * bc
             policy_loss_sum += float(p_loss.item()) * ws
             value_loss_sum += float(value_loss.item()) * bc
+            value_bucket_loss_sum += float(bucket_value_loss.item()) * bc
+            wdl_aux_loss_sum += float(wdl_aux_loss.item()) * bc
             total_policy_weight += ws
             total_valid_policy += vp
             soft_abs_sum += float(b_soft.abs().mean().item())
@@ -748,6 +794,7 @@ def train_network_streaming(
             reduced = torch.tensor(
                 [
                     total_loss_sum, policy_loss_sum, value_loss_sum,
+                    value_bucket_loss_sum, wdl_aux_loss_sum,
                     float(total_seen), total_policy_weight, float(total_valid_policy),
                     soft_abs_sum, mix_abs_sum, float(mix_batches),
                     float(skipped_non_finite_loss), float(skipped_non_finite_grad),
@@ -759,20 +806,24 @@ def train_network_streaming(
             total_loss_sum = float(reduced[0].item())
             policy_loss_sum = float(reduced[1].item())
             value_loss_sum = float(reduced[2].item())
-            total_seen = int(round(float(reduced[3].item())))
-            total_policy_weight = float(reduced[4].item())
-            total_valid_policy = int(round(float(reduced[5].item())))
-            soft_abs_sum = float(reduced[6].item())
-            mix_abs_sum = float(reduced[7].item())
-            mix_batches = int(round(float(reduced[8].item())))
-            skipped_non_finite_loss = int(round(float(reduced[9].item())))
-            skipped_non_finite_grad = int(round(float(reduced[10].item())))
-            dl_exhausted_steps = int(round(float(reduced[11].item())))
+            value_bucket_loss_sum = float(reduced[3].item())
+            wdl_aux_loss_sum = float(reduced[4].item())
+            total_seen = int(round(float(reduced[5].item())))
+            total_policy_weight = float(reduced[6].item())
+            total_valid_policy = int(round(float(reduced[7].item())))
+            soft_abs_sum = float(reduced[8].item())
+            mix_abs_sum = float(reduced[9].item())
+            mix_batches = int(round(float(reduced[10].item())))
+            skipped_non_finite_loss = int(round(float(reduced[11].item())))
+            skipped_non_finite_grad = int(round(float(reduced[12].item())))
+            dl_exhausted_steps = int(round(float(reduced[13].item())))
 
         total_samples_seen_all += total_seen
         avg_loss = total_loss_sum / max(1, total_seen)
         avg_policy = policy_loss_sum / max(1e-8, total_policy_weight)
         avg_value = value_loss_sum / max(1, total_seen)
+        avg_value_bucket = value_bucket_loss_sum / max(1, total_seen)
+        avg_wdl_aux = wdl_aux_loss_sum / max(1, total_seen)
         avg_soft_abs = soft_abs_sum / max(1, mix_batches)
         avg_mix_abs = mix_abs_sum / max(1, mix_batches)
 
@@ -781,6 +832,8 @@ def train_network_streaming(
             "avg_loss": avg_loss,
             "avg_policy_loss": avg_policy,
             "avg_value_loss": avg_value,
+            "avg_value_bucket_loss": avg_value_bucket,
+            "avg_wdl_aux_loss": avg_wdl_aux,
             "samples": total_seen,
             "valid_policy_samples": total_valid_policy,
             "policy_weight_sum": total_policy_weight,
@@ -813,6 +866,7 @@ def train_network_streaming(
         "est_batches_per_epoch": est_batches_per_epoch,
         "optimizer_loaded": bool(optimizer_loaded),
         "anti_draw_penalty": float(anti_draw),
+        "wdl_aux_loss_weight": float(_WDL_AUX_LOSS_WEIGHT),
         "warmup_steps": int(warmup_n),
         "total_train_steps": int(total_train_steps),
         "streaming": True,
