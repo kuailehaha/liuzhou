@@ -1739,6 +1739,7 @@ def train_pipeline_v1(
             output_path = str(self_play_output or os.path.join(checkpoint_dir, "selfplay_batch_v1.pt"))
             payload_metadata_base = {
                 "stage": "selfplay",
+                "source_checkpoint": str(load_checkpoint) if load_checkpoint else None,
                 "self_play_devices": list(self_play_device_list),
                 "self_play_backend": backend_arg if backend_arg is not None else "auto",
                 "self_play_shard_dir": shard_dir_arg,

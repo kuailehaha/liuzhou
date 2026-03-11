@@ -457,7 +457,9 @@ if [[ "${CUDA_LAUNCH_BLOCKING:-0}" == "1" ]]; then
   fi
 fi
 
-OPTIMIZER_STATE_PATH="${CHECKPOINT_DIR}/optimizer_state.pt"
+WORK_OPTIMIZER_STATE_PATH="${CHECKPOINT_DIR}/optimizer_state_work.pt"
+BEST_OPTIMIZER_STATE_PATH="${CHECKPOINT_DIR}/optimizer_state_best.pt"
+TRUSTED_SELFPLAY_FILES=()
 
 for ((it = 1; it <= ITERATIONS; it++)); do
   read -r CUR_OPENING_RANDOM_MOVES CUR_SOFT_LABEL_ALPHA CUR_LR CUR_POLICY_DRAW_WEIGHT <<< "$(compute_curriculum_values "$it")"
@@ -471,19 +473,27 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   INFER_JSON="${RUN_DIR}/infer_iter_${ITER_TAG}.json"
   CKPT_NAME="model_iter_${ITER_TAG}.pt"
   CKPT_PATH="${CHECKPOINT_DIR}/${CKPT_NAME}"
-  BASE_MODEL_FOR_ITER="$LATEST_MODEL"
+  if [[ -n "$BEST_MODEL" && -f "$BEST_MODEL" ]]; then
+    BASE_MODEL_FOR_ITER="$BEST_MODEL"
+  else
+    BASE_MODEL_FOR_ITER="$LATEST_MODEL"
+  fi
   GATING_BASE_MODEL="$BEST_MODEL"
 
-  # Build replay input list from previous iterations (sliding window).
+  # Build replay inputs only from trusted self-play history.
   REPLAY_INPUTS=""
-  if [[ "$REPLAY_WINDOW" -gt 1 ]]; then
+  if [[ "$REPLAY_WINDOW" -gt 1 && "${#TRUSTED_SELFPLAY_FILES[@]}" -gt 0 ]]; then
     REPLAY_PARTS=()
-    for ((rw = it - 1; rw >= 1 && rw >= it - REPLAY_WINDOW + 1; rw--)); do
-      RW_TAG="$(printf "%03d" "$rw")"
-      RW_FILE="${RUN_DIR}/selfplay_iter_${RW_TAG}.pt"
-      if [[ -f "$RW_FILE" ]]; then
-        REPLAY_PARTS+=("$RW_FILE")
-      fi
+    TRUSTED_COUNT="${#TRUSTED_SELFPLAY_FILES[@]}"
+    REPLAY_LIMIT=$((REPLAY_WINDOW - 1))
+    REPLAY_START=0
+    if [[ "$TRUSTED_COUNT" -gt "$REPLAY_LIMIT" ]]; then
+      REPLAY_START=$((TRUSTED_COUNT - REPLAY_LIMIT))
+    fi
+    for ((rw = REPLAY_START; rw < TRUSTED_COUNT; rw++)); do
+      RW_FILE="${TRUSTED_SELFPLAY_FILES[rw]}"
+      [[ -f "$RW_FILE" ]] || continue
+      REPLAY_PARTS+=("$RW_FILE")
     done
     if [[ ${#REPLAY_PARTS[@]} -gt 0 ]]; then
       REPLAY_INPUTS="$(IFS=','; echo "${REPLAY_PARTS[*]}")"
@@ -493,6 +503,7 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   log
   log "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
   log "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA lr=$CUR_LR policy_draw_weight=$CUR_POLICY_DRAW_WEIGHT"
+  log "[big_train_v1] base_model_for_iter=${BASE_MODEL_FOR_ITER:-none} gating_base_model=${GATING_BASE_MODEL:-none}"
   if [[ -n "$REPLAY_INPUTS" ]]; then
     log "[big_train_v1] replay_inputs=$REPLAY_INPUTS"
   fi
@@ -604,6 +615,16 @@ if isinstance(piece_delta, dict):
 PY
   fi
 
+  if [[ -f "$SELFPLAY_FILE" ]]; then
+    TRUSTED_SELFPLAY_FILES+=("$SELFPLAY_FILE")
+  fi
+
+  if [[ -n "$BASE_MODEL_FOR_ITER" && -n "$BEST_MODEL" && "$BASE_MODEL_FOR_ITER" == "$BEST_MODEL" && -f "$BEST_OPTIMIZER_STATE_PATH" ]]; then
+    cp -f "$BEST_OPTIMIZER_STATE_PATH" "$WORK_OPTIMIZER_STATE_PATH"
+  else
+    rm -f "$WORK_OPTIMIZER_STATE_PATH"
+  fi
+
   log "[big_train_v1] stage=train input=$SELFPLAY_FILE strategy=$TRAIN_STRATEGY"
   if [[ "$TRAIN_STRATEGY" == "ddp" ]]; then
     TRAIN_VISIBLE="$(to_visible_indices "$TRAIN_DEVICES")"
@@ -628,7 +649,7 @@ PY
       --warmup_steps "$WARMUP_STEPS"
       --streaming_load "$STREAMING_LOAD"
       --streaming_workers "$STREAMING_WORKERS"
-      --optimizer_state_path "$OPTIMIZER_STATE_PATH"
+      --optimizer_state_path "$WORK_OPTIMIZER_STATE_PATH"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --checkpoint_name "$CKPT_NAME"
@@ -666,7 +687,7 @@ PY
       --warmup_steps "$WARMUP_STEPS"
       --streaming_load "$STREAMING_LOAD"
       --streaming_workers "$STREAMING_WORKERS"
-      --optimizer_state_path "$OPTIMIZER_STATE_PATH"
+      --optimizer_state_path "$WORK_OPTIMIZER_STATE_PATH"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --checkpoint_name "$CKPT_NAME"
@@ -845,11 +866,20 @@ PY
 
   if [[ "$CANDIDATE_ACCEPTED" == "1" ]]; then
     BEST_MODEL="$CANDIDATE_MODEL"
-  elif [[ "$CANDIDATE_VALID" == "1" ]]; then
-    log "[big_train_v1] candidate did not beat best_previous; keep training from latest candidate and retain best_previous for gating."
-  fi
-  if [[ "$CANDIDATE_VALID" == "1" ]]; then
     LATEST_MODEL="$CANDIDATE_MODEL"
+    if [[ -f "$WORK_OPTIMIZER_STATE_PATH" ]]; then
+      cp -f "$WORK_OPTIMIZER_STATE_PATH" "$BEST_OPTIMIZER_STATE_PATH"
+    fi
+  else
+    rm -f "$WORK_OPTIMIZER_STATE_PATH"
+    if [[ -n "$BEST_MODEL" && -f "$BEST_MODEL" ]]; then
+      LATEST_MODEL="$BEST_MODEL"
+    elif [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
+      LATEST_MODEL="$BASE_MODEL_FOR_ITER"
+    fi
+    if [[ "$CANDIDATE_VALID" == "1" ]]; then
+      log "[big_train_v1] candidate did not beat best_previous; keep training/selfplay on accepted best and retain rejected candidate only for inspection."
+    fi
   fi
   if [[ -z "$LATEST_MODEL" || ! -f "$LATEST_MODEL" ]]; then
     log_err "[big_train_v1] latest checkpoint missing after iteration: $LATEST_MODEL"
