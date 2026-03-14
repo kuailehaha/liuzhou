@@ -46,6 +46,7 @@ SELF_PLAY_TARGET_SAMPLES_PER_SHARD="${SELF_PLAY_TARGET_SAMPLES_PER_SHARD:-0}"  #
 CHUNK_TARGET_BYTES="${CHUNK_TARGET_BYTES:-8589934592}"  # 8 GiB per chunk; staged process self-play always emits manifest output
 STREAMING_LOAD="${STREAMING_LOAD:-0}"
 STREAMING_WORKERS="${STREAMING_WORKERS:-4}"
+OPTIMIZER_STATE_WORK_PATH="${OPTIMIZER_STATE_WORK_PATH:-$CHECKPOINT_DIR/optimizer_state_work.pt}"
 
 EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-0}"
 EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-0}"
@@ -408,6 +409,7 @@ log "[big_train_v1] policy_draw_weight=$POLICY_DRAW_WEIGHT->$POLICY_DRAW_WEIGHT_
 log "[big_train_v1] lr=$LR lr_cosine_final_scale=$LR_COSINE_FINAL_SCALE warmup_steps=$WARMUP_STEPS"
 log "[big_train_v1] streaming_load=$STREAMING_LOAD streaming_workers=$STREAMING_WORKERS"
 log "[big_train_v1] replay_window=$REPLAY_WINDOW"
+log "[big_train_v1] optimizer_state_work_path=$OPTIMIZER_STATE_WORK_PATH"
 log "[big_train_v1] opening_random_schedule=$SELF_PLAY_OPENING_RANDOM_MOVES->$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL"
 log "[big_train_v1] soft_label_alpha_schedule=$SOFT_LABEL_ALPHA->$SOFT_LABEL_ALPHA_FINAL"
 log "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
@@ -593,10 +595,12 @@ PY
       --lr "$CUR_LR"
       --weight_decay "$WEIGHT_DECAY"
       --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
+      --warmup_steps "$WARMUP_STEPS"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --streaming_load "$STREAMING_LOAD"
       --streaming_workers "$STREAMING_WORKERS"
+      --optimizer_state_path "$OPTIMIZER_STATE_WORK_PATH"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
@@ -624,10 +628,12 @@ PY
       --lr "$CUR_LR"
       --weight_decay "$WEIGHT_DECAY"
       --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
+      --warmup_steps "$WARMUP_STEPS"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
       --streaming_load "$STREAMING_LOAD"
       --streaming_workers "$STREAMING_WORKERS"
+      --optimizer_state_path "$OPTIMIZER_STATE_WORK_PATH"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
@@ -651,6 +657,10 @@ PY
   else
     log "[big_train_v1] warning: training metrics not found, reject candidate checkpoint."
     CANDIDATE_VALID=0
+  fi
+  if [[ "$CANDIDATE_VALID" != "1" && -f "$OPTIMIZER_STATE_WORK_PATH" ]]; then
+    log "[big_train_v1] drop optimizer continuity state after invalid candidate: $OPTIMIZER_STATE_WORK_PATH"
+    rm -f "$OPTIMIZER_STATE_WORK_PATH" || true
   fi
 
   CANDIDATE_ACCEPTED=0
