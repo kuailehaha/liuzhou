@@ -38,13 +38,13 @@ MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
 SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-6}"
 SELF_PLAY_OPENING_RANDOM_MOVES_FINAL="${SELF_PLAY_OPENING_RANDOM_MOVES_FINAL:-0}"
-REPLAY_WINDOW="${REPLAY_WINDOW:-1}"
-WARMUP_STEPS="${WARMUP_STEPS:-0}"
+REPLAY_WINDOW="${REPLAY_WINDOW:-4}"
+WARMUP_STEPS="${WARMUP_STEPS:-100}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
 SELF_PLAY_TARGET_SAMPLES_PER_SHARD="${SELF_PLAY_TARGET_SAMPLES_PER_SHARD:-0}"  # kept for fallback; overridden by CHUNK_TARGET_BYTES when set
 CHUNK_TARGET_BYTES="${CHUNK_TARGET_BYTES:-8589934592}"  # 8 GiB per chunk; staged process self-play always emits manifest output
-STREAMING_LOAD="${STREAMING_LOAD:-0}"
+STREAMING_LOAD="${STREAMING_LOAD:-1}"
 STREAMING_WORKERS="${STREAMING_WORKERS:-4}"
 OPTIMIZER_STATE_WORK_PATH="${OPTIMIZER_STATE_WORK_PATH:-$CHECKPOINT_DIR/optimizer_state_work.pt}"
 
@@ -52,8 +52,8 @@ EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-0}"
 EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-0}"
 EVAL_BASELINE_CHECKPOINT="${EVAL_BASELINE_CHECKPOINT:-}"
 
-EVAL_GAMES_VS_RANDOM="${EVAL_GAMES_VS_RANDOM:-1000}"
-EVAL_GAMES_VS_PREVIOUS="${EVAL_GAMES_VS_PREVIOUS:-1000}"
+EVAL_GAMES_VS_RANDOM="${EVAL_GAMES_VS_RANDOM:-2000}"
+EVAL_GAMES_VS_PREVIOUS="${EVAL_GAMES_VS_PREVIOUS:-2000}"
 EVAL_MCTS_SIMULATIONS="${EVAL_MCTS_SIMULATIONS:-1024}"
 EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.05}"
 EVAL_BACKEND="${EVAL_BACKEND:-v1}" # v0 | legacy | v1
@@ -65,10 +65,10 @@ EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-0}" # 0 | 1
 EVAL_DEVICES="${EVAL_DEVICES:-$INFER_DEVICES}"
 EVAL_V1_CONCURRENT_GAMES="${EVAL_V1_CONCURRENT_GAMES:-8192}"
 EVAL_V1_OPENING_RANDOM_MOVES="${EVAL_V1_OPENING_RANDOM_MOVES:-0}" # strict eval default: no random opening moves
-EVAL_VS_RANDOM_TEMPERATURE="${EVAL_VS_RANDOM_TEMPERATURE:-$EVAL_TEMPERATURE}"
+EVAL_VS_RANDOM_TEMPERATURE="${EVAL_VS_RANDOM_TEMPERATURE:-0.0}"
 EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES="${EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES:-0}"
-EVAL_VS_PREVIOUS_TEMPERATURE="${EVAL_VS_PREVIOUS_TEMPERATURE:-$EVAL_TEMPERATURE}"
-EVAL_VS_PREVIOUS_SAMPLE_MOVES="${EVAL_VS_PREVIOUS_SAMPLE_MOVES:-0}" # 0 | 1
+EVAL_VS_PREVIOUS_TEMPERATURE="${EVAL_VS_PREVIOUS_TEMPERATURE:-1.0}"
+EVAL_VS_PREVIOUS_SAMPLE_MOVES="${EVAL_VS_PREVIOUS_SAMPLE_MOVES:-1}" # 0 | 1
 EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES="${EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES:-0}"
 
 SELF_PLAY_ALLOC_CONF="${SELF_PLAY_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.95,max_split_size_mb:512}"
@@ -88,14 +88,14 @@ elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${MCTS_SIMULATIONS:=65536}"
   : "${BATCH_SIZE:=16384}"
   : "${EPOCHS:=4}"
-  : "${LR:=2e-4}"
+  : "${LR:=1e-4}"
   : "${WEIGHT_DECAY:=1e-4}"
 else
   printf '[big_train_v1] unsupported PROFILE=%s (use stable/aggressive)\n' "$PROFILE" >&2
   exit 1
 fi
 
-: "${LR_COSINE_FINAL_SCALE:=1.0}"
+: "${LR_COSINE_FINAL_SCALE:=0.5}"
 : "${INFER_BATCH_SIZE:=4096}"
 : "${INFER_WARMUP_ITERS:=20}"
 : "${INFER_ITERS:=80}"
@@ -137,6 +137,7 @@ check_train_metrics_finite() {
   output="$("$PYTHON_BIN" - "$metrics_path" <<'PY'
 import json
 import math
+import re
 import sys
 
 path = str(sys.argv[1])
@@ -157,15 +158,53 @@ if not isinstance(row, dict):
     print("[big_train_v1] warning: train metrics payload missing train row.")
     raise SystemExit(1)
 
-keys = ("train_avg_loss", "train_avg_policy_loss", "train_avg_value_loss")
-for key in keys:
+required_keys = ("train_avg_loss", "train_avg_policy_loss", "train_avg_value_loss")
+required_invalid = []
+for key in required_keys:
     value = row.get(key)
     if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-        print(
-            "[big_train_v1] warning: non-finite training metric "
-            f"{key}={value!r}; reject candidate checkpoint."
-        )
-        raise SystemExit(1)
+        required_invalid.append((key, value))
+
+non_finite_numeric = []
+for key, value in row.items():
+    if isinstance(value, bool):
+        continue
+    if isinstance(value, (int, float)) and not math.isfinite(float(value)):
+        non_finite_numeric.append((str(key), value))
+
+if required_invalid or non_finite_numeric:
+    iter_tag = "unknown"
+    match = re.search(r"train_iter_(\d+)\.json$", path)
+    if match:
+        iter_tag = match.group(1)
+    checkpoint = row.get("checkpoint", "<missing>")
+    print("[big_train_v1] warning: non-finite training metrics detected; mark candidate invalid.")
+    print(
+        "[big_train_v1] invalid_metrics_context: "
+        f"metrics_path={path!r} iter_tag={iter_tag} checkpoint={checkpoint!r}"
+    )
+    for key, value in required_invalid:
+        print(f"[big_train_v1] invalid_required_metric {key}={value!r}")
+    for key, value in sorted(non_finite_numeric):
+        print(f"[big_train_v1] non_finite_metric {key}={value!r}")
+    context_keys = (
+        "self_play_value_nonfinite_local",
+        "self_play_soft_value_nonfinite_local",
+        "self_play_positions_local",
+        "self_play_payload_load_sec",
+        "checkpoint_load_sec",
+        "train_first_batch_sec",
+        "train_time_sec",
+        "train_strategy",
+        "streaming",
+    )
+    context_tokens = []
+    for key in context_keys:
+        if key in row:
+            context_tokens.append(f"{key}={row.get(key)!r}")
+    if context_tokens:
+        print("[big_train_v1] invalid_metrics_snapshot: " + ", ".join(context_tokens))
+    raise SystemExit(1)
 
 raise SystemExit(0)
 PY
@@ -655,7 +694,7 @@ PY
       CANDIDATE_VALID=0
     fi
   else
-    log "[big_train_v1] warning: training metrics not found, reject candidate checkpoint."
+    log "[big_train_v1] warning: training metrics not found, mark candidate invalid."
     CANDIDATE_VALID=0
   fi
   if [[ "$CANDIDATE_VALID" != "1" && -f "$OPTIMIZER_STATE_WORK_PATH" ]]; then
@@ -790,13 +829,8 @@ PY
   fi
 
   if [[ "$CANDIDATE_VALID" != "1" ]]; then
-    if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
-      log "[big_train_v1] candidate rejected due non-finite train metrics; keep latest checkpoint: $BASE_MODEL_FOR_ITER"
-      CANDIDATE_ACCEPTED=0
-    else
-      log_err "[big_train_v1] no valid latest checkpoint available after rejecting non-finite candidate."
-      exit 1
-    fi
+    CANDIDATE_ACCEPTED=0
+    log "[big_train_v1] candidate invalid (non-finite metrics); skip eval and keep best_previous frozen."
   elif [[ -z "$GATING_BASE_MODEL" || ! -f "$GATING_BASE_MODEL" ]]; then
     CANDIDATE_ACCEPTED=1
     log "[big_train_v1] bootstrap best_previous checkpoint selected: $CANDIDATE_MODEL"
@@ -811,10 +845,12 @@ PY
 
   if [[ "$CANDIDATE_ACCEPTED" == "1" ]]; then
     BEST_MODEL="$CANDIDATE_MODEL"
+  elif [[ "$CANDIDATE_VALID" == "1" ]]; then
+    log "[big_train_v1] candidate did not beat best_previous; keep training from latest candidate and retain best_previous for gating."
+  else
+    log "[big_train_v1] invalid candidate, best frozen, latest advanced."
   fi
-  if [[ "$CANDIDATE_VALID" == "1" ]]; then
-    LATEST_MODEL="$CANDIDATE_MODEL"
-  fi
+  LATEST_MODEL="$CANDIDATE_MODEL"
   if [[ -z "$LATEST_MODEL" || ! -f "$LATEST_MODEL" ]]; then
     log_err "[big_train_v1] latest checkpoint missing after iteration: $LATEST_MODEL"
     exit 1
