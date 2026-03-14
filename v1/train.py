@@ -688,95 +688,42 @@ def _run_self_play_multi_device_process(
     iteration_seed: int,
     shard_dir: Optional[str],
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
-    model_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    shards = _split_games(int(num_games), len(devices))
-    active: List[Tuple[int, str, int]] = [
-        (idx, dev, g) for idx, (dev, g) in enumerate(zip(devices, shards)) if int(g) > 0
-    ]
-    if not active:
-        raise RuntimeError("No self-play shard assigned after game split.")
-
     workspace, auto_cleanup = _prepare_self_play_workspace(
         shard_dir=shard_dir,
         iteration_seed=int(iteration_seed),
     )
-    state_path = os.path.join(workspace, "model_state_cpu.pt")
-    torch.save(model_state_cpu, state_path)
-
-    started = time.perf_counter()
+    manifest_path = os.path.join(
+        workspace,
+        f"selfplay_manifest_{int(iteration_seed):06d}.pt",
+    )
     failed = False
-    worker_rows: List[Dict[str, Any]] = []
     try:
-        mp_ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(
-            max_workers=len(active),
-            mp_context=mp_ctx,
-        ) as pool:
-            future_map = {}
-            for worker_idx, shard_dev, shard_games in active:
-                worker_seed = int(iteration_seed * 10007 + (worker_idx + 1) * 9973)
-                shard_output = os.path.join(
-                    workspace,
-                    f"selfplay_shard_{int(iteration_seed):06d}_{int(worker_idx):02d}.pt",
-                )
-                future = pool.submit(
-                    run_self_play_worker,
-                    worker_idx=int(worker_idx),
-                    shard_device=str(shard_dev),
-                    shard_games=int(shard_games),
-                    seed=int(worker_seed),
-                    model_state_path=str(state_path),
-                    output_path=str(shard_output),
-                    mcts_simulations=int(mcts_simulations),
-                    temperature_init=float(temperature_init),
-                    temperature_final=float(temperature_final),
-                    temperature_threshold=int(temperature_threshold),
-                    exploration_weight=float(exploration_weight),
-                    dirichlet_alpha=float(dirichlet_alpha),
-                    dirichlet_epsilon=float(dirichlet_epsilon),
-                    soft_value_k=float(soft_value_k),
-                    opening_random_moves=int(opening_random_moves),
-                    max_game_plies=int(max_game_plies),
-                    concurrent_games_per_device=int(concurrent_games_per_device),
-                )
-                future_map[future] = (worker_idx, shard_dev, shard_games, shard_output)
-
-            for future in as_completed(future_map):
-                worker_idx, shard_dev, shard_games, shard_output = future_map[future]
-                try:
-                    row = future.result()
-                    worker_rows.append(row)
-                except Exception as exc:
-                    raise RuntimeError(
-                        "v1 process self-play failed "
-                        f"on worker={worker_idx}, device={shard_dev}, games={shard_games}, "
-                        f"shard_output={shard_output}"
-                    ) from exc
-
-        batches: List[TensorSelfPlayBatch] = []
-        stats_list: List[SelfPlayV1Stats] = []
-        for row in sorted(worker_rows, key=lambda x: int(x.get("worker_idx", 0))):
-            shard_path = str(row.get("output_path", ""))
-            if not shard_path:
-                raise RuntimeError(f"Missing shard output path in worker row: {row}")
-            batch_cpu, stats_payload, meta_payload = _load_self_play_payload(shard_path)
-            if isinstance(meta_payload, dict) and meta_payload:
-                _print_rank0(
-                    "[v1.train] self-play shard merged "
-                    f"worker={int(meta_payload.get('worker_idx', row.get('worker_idx', 0)))} "
-                    f"device={meta_payload.get('device', '')} "
-                    f"games={int(meta_payload.get('games', 0))} "
-                    f"chunks={int(meta_payload.get('num_chunks', 1))} "
-                    f"games_per_chunk={int(meta_payload.get('games_per_chunk', meta_payload.get('games', 0)))}"
-                )
-            batches.append(batch_cpu)
-            stats_list.append(_self_play_stats_from_payload(stats_payload))
-
-        merged_batch = _concat_self_play_batches_cpu(batches)
-        merged_stats = _merge_self_play_stats(
-            stats=stats_list,
-            elapsed_sec=max(1e-9, time.perf_counter() - started),
+        merged_stats, _value_summary, _soft_summary, _mixed_summary, _saved_shards = (
+            _run_self_play_multi_device_process_saved(
+                model=model,
+                num_games=int(num_games),
+                mcts_simulations=int(mcts_simulations),
+                temperature_init=float(temperature_init),
+                temperature_final=float(temperature_final),
+                temperature_threshold=int(temperature_threshold),
+                exploration_weight=float(exploration_weight),
+                devices=list(devices),
+                dirichlet_alpha=float(dirichlet_alpha),
+                dirichlet_epsilon=float(dirichlet_epsilon),
+                soft_value_k=float(soft_value_k),
+                soft_label_alpha=0.0,
+                opening_random_moves=int(opening_random_moves),
+                max_game_plies=int(max_game_plies),
+                concurrent_games_per_device=int(concurrent_games_per_device),
+                iteration_seed=int(iteration_seed),
+                shard_dir=None,
+                output_path=manifest_path,
+                target_samples_per_shard=0,
+                chunk_target_bytes=0,
+                metadata_base={},
+            )
         )
+        merged_batch, _stats_payload, _meta_payload = _load_self_play_payload(str(manifest_path))
         return merged_batch, merged_stats
     except Exception:
         failed = True
@@ -1353,6 +1300,21 @@ def _load_self_play_payload(
     if not os.path.exists(path):
         raise FileNotFoundError(f"Self-play payload not found: {path}")
     payload = _torch_load_with_retry(path)
+    return _load_self_play_payload_from_obj(
+        payload,
+        source_path=path,
+        ddp_rank=ddp_rank,
+        ddp_world_size=ddp_world_size,
+    )
+
+
+def _load_self_play_payload_from_obj(
+    payload: Any,
+    *,
+    source_path: str,
+    ddp_rank: Optional[int] = None,
+    ddp_world_size: Optional[int] = None,
+) -> Tuple[TensorSelfPlayBatch, Dict[str, Any], Dict[str, Any]]:
     if isinstance(payload, TensorSelfPlayBatch):
         return payload.to("cpu"), {}, {}
     if not isinstance(payload, dict):
@@ -1363,11 +1325,11 @@ def _load_self_play_payload(
         shard_files_raw = payload.get("shard_files")
         if not isinstance(shard_files_raw, list) or not shard_files_raw:
             raise RuntimeError(
-                f"Invalid sharded self-play manifest {path}: shard_files missing or empty."
+                f"Invalid sharded self-play manifest {source_path}: shard_files missing or empty."
             )
 
         resolved_shards: List[str] = []
-        base_dir = os.path.dirname(path) or "."
+        base_dir = os.path.dirname(source_path) or "."
         for entry in shard_files_raw:
             shard_item = str(entry).strip()
             if not shard_item:
@@ -1375,7 +1337,7 @@ def _load_self_play_payload(
             shard_path = shard_item if os.path.isabs(shard_item) else os.path.join(base_dir, shard_item)
             resolved_shards.append(shard_path)
         if not resolved_shards:
-            raise RuntimeError(f"No valid shard path resolved from manifest: {path}")
+            raise RuntimeError(f"No valid shard path resolved from manifest: {source_path}")
 
         selected_indices = list(range(len(resolved_shards)))
         selected_paths = list(resolved_shards)
@@ -1388,7 +1350,7 @@ def _load_self_play_payload(
             selected_paths = [resolved_shards[i] for i in selected_indices]
             if not selected_paths:
                 raise RuntimeError(
-                    f"DDP rank={rank_i} got no shard from manifest={path} "
+                    f"DDP rank={rank_i} got no shard from manifest={source_path} "
                     f"(world={world_i}, num_shards={len(resolved_shards)})."
                 )
 
@@ -1419,7 +1381,7 @@ def _load_self_play_payload(
             {
                 "payload_sharded_manifest": True,
                 "payload_format": "v1_sharded_manifest",
-                "manifest_path": str(path),
+                "manifest_path": str(source_path),
                 "manifest_num_shards": int(len(resolved_shards)),
                 "loaded_shard_indices": [int(x) for x in selected_indices],
                 "loaded_shard_count": int(len(selected_indices)),
@@ -1437,7 +1399,7 @@ def _load_self_play_payload(
     ]
     missing = [k for k in required if k not in payload]
     if missing:
-        raise RuntimeError(f"Missing keys in self-play payload {path}: {missing}")
+        raise RuntimeError(f"Missing keys in self-play payload {source_path}: {missing}")
 
     batch = TensorSelfPlayBatch(
         state_tensors=payload["state_tensors"].to("cpu"),
@@ -1631,8 +1593,8 @@ def train_pipeline_v1(
     checkpoint_name: Optional[str] = None,
     metrics_output: Optional[str] = None,
     optimizer_state_path: Optional[str] = None,
-    warmup_steps: int = 100,
-    streaming_load: bool = True,
+    warmup_steps: int = 0,
+    streaming_load: bool = False,
     streaming_workers: int = 8,
     infer_devices: Optional[str] = None,
     infer_batch_size: int = 4096,
@@ -1758,7 +1720,8 @@ def train_pipeline_v1(
                 else "thread"
             )
             saved_shards = 0
-            if resolved_backend == "process":
+            use_saved_process_chunks = bool(resolved_backend == "process")
+            if use_saved_process_chunks:
                 _print_rank0(f"[v1.train] self-play backend={resolved_backend} devices={self_play_device_list}")
                 (
                     sp_stats,
@@ -1891,8 +1854,22 @@ def train_pipeline_v1(
                 train_device_list if (train_strategy_norm == "data_parallel" and len(train_device_list) > 1) else None
             )
 
-            use_streaming = bool(streaming_load)
             sp_stats_payload: Dict[str, Any] = {}
+            payload_load_start = time.perf_counter()
+            primary_input_payload = _torch_load_with_retry(str(self_play_input))
+            primary_payload_format = ""
+            if isinstance(primary_input_payload, dict):
+                primary_payload_format = str(primary_input_payload.get("payload_format", "")).strip().lower()
+                sp_stats_payload = primary_input_payload.get("stats", {})
+                if not isinstance(sp_stats_payload, dict):
+                    sp_stats_payload = {}
+            auto_streaming_input = primary_payload_format == "v1_sharded_manifest"
+            use_streaming = bool(streaming_load) or auto_streaming_input
+            if auto_streaming_input and not bool(streaming_load):
+                _print_rank0(
+                    "[v1.train] auto-enable streaming for sharded manifest "
+                    f"input={self_play_input}"
+                )
 
             if use_streaming:
                 from v1.python.streaming_dataset import (
@@ -1900,13 +1877,9 @@ def train_pipeline_v1(
                     resolve_shard_specs,
                 )
 
-                payload_load_start = time.perf_counter()
-
-                primary_manifest = _torch_load_with_retry(str(self_play_input))
+                primary_manifest = primary_input_payload
                 if isinstance(primary_manifest, dict):
-                    sp_stats_payload = primary_manifest.get("stats", {})
-                    if not isinstance(sp_stats_payload, dict):
-                        sp_stats_payload = {}
+                    sp_stats_payload = dict(sp_stats_payload)
                 primary_est = 0
                 ddp_rank_i = int(ddp_load_rank or 0)
                 ddp_world_i = int(ddp_load_world or 1)
@@ -1928,6 +1901,7 @@ def train_pipeline_v1(
                 elif isinstance(primary_manifest, TensorSelfPlayBatch):
                     primary_est = int(primary_manifest.num_samples)
                 del primary_manifest
+                del primary_input_payload
 
                 replay_budget_per_file = max(1, primary_est // max(1, len(replay_files))) if replay_files else 0
 
@@ -1986,12 +1960,13 @@ def train_pipeline_v1(
                 local_positions = total_est
 
             else:
-                payload_load_start = time.perf_counter()
-                samples, sp_stats_payload, _sp_meta = _load_self_play_payload(
-                    str(self_play_input),
+                samples, sp_stats_payload, _sp_meta = _load_self_play_payload_from_obj(
+                    primary_input_payload,
+                    source_path=str(self_play_input),
                     ddp_rank=ddp_load_rank,
                     ddp_world_size=ddp_load_world,
                 )
+                del primary_input_payload
                 if replay_files:
                     primary_n = int(samples.num_samples)
                     replay_budget = primary_n
@@ -2469,7 +2444,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to save/load optimizer state for training continuity.",
     )
-    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument(
+        "--streaming_load",
+        type=int,
+        default=0,
+        help="1=streaming DataLoader, 0=monolithic load.",
+    )
     parser.add_argument(
         "--self_play_stats_json",
         type=str,

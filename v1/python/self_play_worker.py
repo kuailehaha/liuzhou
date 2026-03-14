@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -266,12 +266,12 @@ def run_self_play_worker(
     opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
-    soft_label_alpha: float,
-    target_samples_per_shard: int,
-    chunk_target_bytes: int,
-    chunk_output_dir: str,
-    chunk_file_prefix: str,
-    chunk_file_ext: str,
+    soft_label_alpha: float = 0.0,
+    target_samples_per_shard: int = 0,
+    chunk_target_bytes: int = 0,
+    chunk_output_dir: Optional[str] = None,
+    chunk_file_prefix: Optional[str] = None,
+    chunk_file_ext: str = ".pt",
 ) -> Dict[str, Any]:
     """Run one self-play shard inside a dedicated process and persist shard payload."""
 
@@ -326,6 +326,13 @@ def run_self_play_worker(
 
         graph_env_explicit = "V1_FINALIZE_GRAPH" in os.environ
         graph_retry_off = False
+        chunk_dir = str(chunk_output_dir or "").strip()
+        chunk_prefix = str(chunk_file_prefix or "").strip()
+        if not chunk_dir or not chunk_prefix:
+            raise ValueError(
+                "run_self_play_worker requires chunk_output_dir and chunk_file_prefix "
+                "to emit worker manifest output."
+            )
         remaining_games = int(shard_games_i)
         stats_chunks: List[SelfPlayV1Stats] = []
         value_summaries: List[Dict[str, Any]] = []
@@ -371,10 +378,8 @@ def run_self_play_worker(
                 bytes_per_sample=int(bytes_per_sample),
             )
             for start_idx, end_idx in chunk_ranges:
-                chunk_name = (
-                    f"{chunk_file_prefix}.chunk{int(saved_chunk_idx):05d}{chunk_file_ext}"
-                )
-                chunk_path = os.path.join(str(chunk_output_dir), chunk_name)
+                chunk_name = f"{chunk_prefix}.chunk{int(saved_chunk_idx):05d}{chunk_file_ext}"
+                chunk_path = os.path.join(chunk_dir, chunk_name)
                 chunk_meta = {
                     "payload_format": "v1_sharded_shard",
                     "worker_idx": int(worker_idx),
@@ -403,6 +408,7 @@ def run_self_play_worker(
             stats_chunks,
             elapsed_sec=max(1e-9, float(time.perf_counter() - started)),
         )
+
         avg_bps = int(weighted_bps_num // max(1, weighted_bps_den))
         payload = {
             "payload_format": "v1_worker_chunk_manifest",

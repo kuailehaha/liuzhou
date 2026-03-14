@@ -223,8 +223,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to save/load optimizer state for training continuity.",
     )
-    parser.add_argument("--warmup_steps", type=int, default=100)
-    parser.add_argument("--streaming_load", type=int, default=1, help="1=streaming DataLoader, 0=monolithic load.")
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--streaming_load", type=int, default=0, help="1=streaming DataLoader, 0=monolithic load.")
     parser.add_argument("--streaming_workers", type=int, default=4, help="DataLoader num_workers for streaming mode.")
     parser.add_argument(
         "--self_play_stats_json",

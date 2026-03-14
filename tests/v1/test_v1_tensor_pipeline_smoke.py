@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -10,8 +11,10 @@ import torch
 from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 from v1.python.mcts_gpu import GpuStateBatch, V1RootMCTS
+from v1.python.self_play_worker import run_self_play_worker
 from v1.python.self_play_gpu_runner import self_play_v1_gpu
 from v1.python.train_bridge import train_network_from_tensors
+from v1.train import _save_self_play_payload_sharded, train_pipeline_v1
 
 
 def test_v1_soft_tan_range_and_sign() -> None:
@@ -28,7 +31,7 @@ def test_v1_soft_tan_range_and_sign() -> None:
 
 def test_v1_terminal_mask_next_state() -> None:
     board = torch.zeros((3, 6, 6), dtype=torch.int8)
-    board[0, 0, 0] = 1  # white pieces are zero but mark-selection is still pre-movement
+    board[0, 0, 0] = 1  # white pieces are zero, but mark-selection is not terminal
     board[1, 0, 0] = 1
     board[1, 0, 1] = -1
     board[2, 0, 0] = 1
@@ -38,7 +41,7 @@ def test_v1_terminal_mask_next_state() -> None:
         board=board,
         marks_black=torch.zeros((3, 6, 6), dtype=torch.bool),
         marks_white=torch.zeros((3, 6, 6), dtype=torch.bool),
-        phase=torch.tensor([2, 2, 1], dtype=torch.int64),
+        phase=torch.tensor([2, 4, 1], dtype=torch.int64),
         current_player=torch.ones((3,), dtype=torch.int64),
         pending_marks_required=zeros.clone(),
         pending_marks_remaining=zeros.clone(),
@@ -123,3 +126,115 @@ def test_v1_tensor_pipeline_smoke() -> None:
     avg_loss = epoch_stats[0].get("avg_loss")
     assert avg_loss is not None
     assert math.isfinite(float(avg_loss))
+
+
+@pytest.mark.parametrize("chunk_target_bytes", [0, 1024])
+def test_process_worker_always_emits_chunk_manifest(tmp_path, chunk_target_bytes: int) -> None:
+    try:
+        import v0_core  # noqa: F401
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"v0_core import failed: {exc}")
+
+    model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
+    model_state_path = tmp_path / "model_state.pt"
+    torch.save(model.state_dict(), model_state_path)
+
+    manifest_path = tmp_path / f"worker_manifest_{chunk_target_bytes}.pt"
+    row = run_self_play_worker(
+        worker_idx=0,
+        shard_device="cpu",
+        shard_games=1,
+        seed=7,
+        model_state_path=str(model_state_path),
+        output_path=str(manifest_path),
+        mcts_simulations=4,
+        temperature_init=1.0,
+        temperature_final=0.1,
+        temperature_threshold=4,
+        exploration_weight=1.0,
+        dirichlet_alpha=0.3,
+        dirichlet_epsilon=0.25,
+        soft_value_k=2.0,
+        opening_random_moves=2,
+        max_game_plies=64,
+        concurrent_games_per_device=1,
+        soft_label_alpha=0.0,
+        target_samples_per_shard=0,
+        chunk_target_bytes=int(chunk_target_bytes),
+        chunk_output_dir=str(tmp_path),
+        chunk_file_prefix=f"worker{chunk_target_bytes}",
+    )
+
+    payload = torch.load(manifest_path, map_location="cpu")
+    assert row["output_path"] == str(manifest_path)
+    assert payload["payload_format"] == "v1_worker_chunk_manifest"
+    assert int(payload["num_shards"]) >= 1
+    assert len(payload["shard_files"]) == int(payload["num_shards"])
+    for shard_name in payload["shard_files"]:
+        assert (tmp_path / str(shard_name)).is_file()
+
+
+def test_stage_train_manifest_input_auto_streams(tmp_path) -> None:
+    try:
+        import v0_core  # noqa: F401
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"v0_core import failed: {exc}")
+
+    model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
+    model.eval()
+    samples, stats = self_play_v1_gpu(
+        model=model,
+        num_games=1,
+        mcts_simulations=4,
+        temperature_init=1.0,
+        temperature_final=0.1,
+        temperature_threshold=4,
+        exploration_weight=1.0,
+        device="cpu",
+        add_dirichlet_noise=True,
+        dirichlet_alpha=0.3,
+        dirichlet_epsilon=0.25,
+        soft_value_k=2.0,
+        opening_random_moves=2,
+        max_game_plies=64,
+        sample_moves=True,
+        concurrent_games=1,
+        verbose=False,
+    )
+
+    manifest_path = tmp_path / "selfplay_manifest.pt"
+    saved = _save_self_play_payload_sharded(
+        path=str(manifest_path),
+        samples=samples.to("cpu"),
+        stats=stats,
+        metadata={"stage": "test"},
+        num_shards=2,
+        chunk_target_bytes=0,
+    )
+    assert saved >= 1
+
+    metrics_path = tmp_path / "train_metrics.json"
+    checkpoint_dir = tmp_path / "ckpt"
+    train_pipeline_v1(
+        stage="train",
+        self_play_input=str(manifest_path),
+        checkpoint_dir=str(checkpoint_dir),
+        metrics_output=str(metrics_path),
+        checkpoint_name="model_iter_001.pt",
+        device="cpu",
+        devices="cpu",
+        train_devices="cpu",
+        infer_devices="cpu",
+        train_strategy="none",
+        batch_size=min(8, max(1, int(samples.num_samples))),
+        epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        soft_label_alpha=0.0,
+        streaming_load=False,
+        streaming_workers=0,
+    )
+
+    with open(metrics_path, "r", encoding="utf-8") as f:
+        metrics = json.load(f)
+    assert metrics[0]["streaming"] is True

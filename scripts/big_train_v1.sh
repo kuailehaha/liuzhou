@@ -20,7 +20,7 @@ RUN_INFER_STAGE="${RUN_INFER_STAGE:-1}"
 RUN_EVAL_STAGE="${RUN_EVAL_STAGE:-1}"
 LEGACY_LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-}"
 TRAIN_BASE_MODEL="${TRAIN_BASE_MODEL:-}"
-BEST_PREVIOUS_MODEL="${BEST_PREVIOUS_MODEL:-$TRAIN_BASE_MODEL}"
+BEST_PREVIOUS_MODEL="${BEST_PREVIOUS_MODEL:-}"
 
 TEMPERATURE_INIT="${TEMPERATURE_INIT:-1.0}"
 TEMPERATURE_FINAL="${TEMPERATURE_FINAL:-0.1}"
@@ -31,28 +31,28 @@ DIRICHLET_EPSILON="${DIRICHLET_EPSILON:-0.25}"
 SOFT_VALUE_K="${SOFT_VALUE_K:-2.0}"
 SOFT_LABEL_ALPHA="${SOFT_LABEL_ALPHA:-1.0}"
 SOFT_LABEL_ALPHA_FINAL="${SOFT_LABEL_ALPHA_FINAL:-1.0}"
-ANTI_DRAW_PENALTY="${ANTI_DRAW_PENALTY:--0.00}"
+ANTI_DRAW_PENALTY="${ANTI_DRAW_PENALTY:-0.0}"
 POLICY_DRAW_WEIGHT="${POLICY_DRAW_WEIGHT:-1.0}"
 POLICY_DRAW_WEIGHT_FINAL="${POLICY_DRAW_WEIGHT_FINAL:-1.0}"
 MAX_GAME_PLIES="${MAX_GAME_PLIES:-512}"
 SELF_PLAY_CONCURRENT_GAMES="${SELF_PLAY_CONCURRENT_GAMES:-8192}"
-SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-4}"
-SELF_PLAY_OPENING_RANDOM_MOVES_FINAL="${SELF_PLAY_OPENING_RANDOM_MOVES_FINAL:-4}"
-REPLAY_WINDOW="${REPLAY_WINDOW:-4}"
-WARMUP_STEPS="${WARMUP_STEPS:-100}"
+SELF_PLAY_OPENING_RANDOM_MOVES="${SELF_PLAY_OPENING_RANDOM_MOVES:-6}"
+SELF_PLAY_OPENING_RANDOM_MOVES_FINAL="${SELF_PLAY_OPENING_RANDOM_MOVES_FINAL:-0}"
+REPLAY_WINDOW="${REPLAY_WINDOW:-1}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
 SELF_PLAY_BACKEND="${SELF_PLAY_BACKEND:-process}" # auto | thread | process
 SELF_PLAY_SHARD_DIR="${SELF_PLAY_SHARD_DIR:-}"
 SELF_PLAY_TARGET_SAMPLES_PER_SHARD="${SELF_PLAY_TARGET_SAMPLES_PER_SHARD:-0}"  # kept for fallback; overridden by CHUNK_TARGET_BYTES when set
-CHUNK_TARGET_BYTES="${CHUNK_TARGET_BYTES:-8589934592}"  # 8 GiB per chunk; drives chunk-level streaming
-STREAMING_LOAD="${STREAMING_LOAD:-1}"       # 1=streaming DataLoader, 0=monolithic load
-STREAMING_WORKERS="${STREAMING_WORKERS:-4}"  # DataLoader num_workers; >1 interleaves shards for cross-shard mixing
+CHUNK_TARGET_BYTES="${CHUNK_TARGET_BYTES:-8589934592}"  # 8 GiB per chunk; staged process self-play always emits manifest output
+STREAMING_LOAD="${STREAMING_LOAD:-0}"
+STREAMING_WORKERS="${STREAMING_WORKERS:-4}"
 
-EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-2000}"
-EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-2000}"
+EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-0}"
+EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-0}"
 EVAL_BASELINE_CHECKPOINT="${EVAL_BASELINE_CHECKPOINT:-}"
 
-EVAL_GAMES_VS_RANDOM="${EVAL_GAMES_VS_RANDOM:-2000}"
-EVAL_GAMES_VS_PREVIOUS="${EVAL_GAMES_VS_PREVIOUS:-2000}"
+EVAL_GAMES_VS_RANDOM="${EVAL_GAMES_VS_RANDOM:-1000}"
+EVAL_GAMES_VS_PREVIOUS="${EVAL_GAMES_VS_PREVIOUS:-1000}"
 EVAL_MCTS_SIMULATIONS="${EVAL_MCTS_SIMULATIONS:-1024}"
 EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.05}"
 EVAL_BACKEND="${EVAL_BACKEND:-v1}" # v0 | legacy | v1
@@ -64,10 +64,10 @@ EVAL_SAMPLE_MOVES="${EVAL_SAMPLE_MOVES:-0}" # 0 | 1
 EVAL_DEVICES="${EVAL_DEVICES:-$INFER_DEVICES}"
 EVAL_V1_CONCURRENT_GAMES="${EVAL_V1_CONCURRENT_GAMES:-8192}"
 EVAL_V1_OPENING_RANDOM_MOVES="${EVAL_V1_OPENING_RANDOM_MOVES:-0}" # strict eval default: no random opening moves
-EVAL_VS_RANDOM_TEMPERATURE="${EVAL_VS_RANDOM_TEMPERATURE:-0.0}"
+EVAL_VS_RANDOM_TEMPERATURE="${EVAL_VS_RANDOM_TEMPERATURE:-$EVAL_TEMPERATURE}"
 EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES="${EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES:-0}"
-EVAL_VS_PREVIOUS_TEMPERATURE="${EVAL_VS_PREVIOUS_TEMPERATURE:-1.0}"
-EVAL_VS_PREVIOUS_SAMPLE_MOVES="${EVAL_VS_PREVIOUS_SAMPLE_MOVES:-1}" # 0 | 1
+EVAL_VS_PREVIOUS_TEMPERATURE="${EVAL_VS_PREVIOUS_TEMPERATURE:-$EVAL_TEMPERATURE}"
+EVAL_VS_PREVIOUS_SAMPLE_MOVES="${EVAL_VS_PREVIOUS_SAMPLE_MOVES:-0}" # 0 | 1
 EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES="${EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES:-0}"
 
 SELF_PLAY_ALLOC_CONF="${SELF_PLAY_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.95,max_split_size_mb:512}"
@@ -84,25 +84,24 @@ if [[ "$PROFILE" == "stable" ]]; then
 elif [[ "$PROFILE" == "aggressive" ]]; then
   : "${ITERATIONS:=80}"
   : "${SELF_PLAY_GAMES:=522488}"
-  : "${MCTS_SIMULATIONS:=131072}"
+  : "${MCTS_SIMULATIONS:=65536}"
   : "${BATCH_SIZE:=16384}"
   : "${EPOCHS:=4}"
-  : "${LR:=1e-4}"
-  : "${WEIGHT_DECAY:=5e-5}"
+  : "${LR:=2e-4}"
+  : "${WEIGHT_DECAY:=1e-4}"
 else
   printf '[big_train_v1] unsupported PROFILE=%s (use stable/aggressive)\n' "$PROFILE" >&2
   exit 1
 fi
 
-: "${LR_COSINE_FINAL_SCALE:=0.5}" # 1.0 keeps fixed LR; e.g. 0.25 anneals to 25% at last iter.
+: "${LR_COSINE_FINAL_SCALE:=1.0}"
 : "${INFER_BATCH_SIZE:=4096}"
 : "${INFER_WARMUP_ITERS:=20}"
 : "${INFER_ITERS:=80}"
 
 compute_curriculum_values() {
   local iter_idx="$1"
-  "$PYTHON_BIN" - "$iter_idx" "$ITERATIONS" "$SELF_PLAY_OPENING_RANDOM_MOVES" "$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL" "$SOFT_LABEL_ALPHA" "$SOFT_LABEL_ALPHA_FINAL" "$LR" "$LR_COSINE_FINAL_SCALE" "$POLICY_DRAW_WEIGHT" "$POLICY_DRAW_WEIGHT_FINAL" <<'PY'
-import math
+  "$PYTHON_BIN" - "$iter_idx" "$ITERATIONS" "$SELF_PLAY_OPENING_RANDOM_MOVES" "$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL" "$SOFT_LABEL_ALPHA" "$SOFT_LABEL_ALPHA_FINAL" "$LR" "$POLICY_DRAW_WEIGHT" <<'PY'
 import sys
 
 it = int(sys.argv[1])
@@ -111,12 +110,8 @@ opening_start = float(sys.argv[3])
 opening_final = float(sys.argv[4])
 alpha_start = float(sys.argv[5])
 alpha_final = float(sys.argv[6])
-lr_start = float(sys.argv[7])
-lr_final_scale = float(sys.argv[8])
-lr_final_scale = max(0.0, min(1.0, lr_final_scale))
-lr_final = lr_start * lr_final_scale
-pdw_start = float(sys.argv[9])
-pdw_final = float(sys.argv[10])
+lr_now = float(sys.argv[7])
+pdw_now = float(sys.argv[8])
 
 if total <= 1:
     progress = 1.0
@@ -129,13 +124,6 @@ opening_now = max(0, opening_now)
 
 alpha_now = alpha_start + (alpha_final - alpha_start) * progress
 alpha_now = max(0.0, min(1.0, alpha_now))
-
-cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-lr_now = lr_final + (lr_start - lr_final) * cosine
-lr_now = max(0.0, lr_now)
-
-pdw_now = pdw_final + (pdw_start - pdw_final) * cosine
-pdw_now = max(0.0, pdw_now)
 
 print(f"{opening_now} {alpha_now:.6f} {lr_now:.12g} {pdw_now:.6f}")
 PY
@@ -395,6 +383,10 @@ if [[ "$TRAIN_THREADS_PER_RANK" -lt 1 ]]; then
   TRAIN_THREADS_PER_RANK=1
 fi
 
+if [[ -n "$LEGACY_LOAD_CHECKPOINT" && -z "$TRAIN_BASE_MODEL" ]]; then
+  TRAIN_BASE_MODEL="$LEGACY_LOAD_CHECKPOINT"
+fi
+
 log "[big_train_v1] run_tag=$RUN_TAG"
 log "[big_train_v1] git_branch=$GIT_BRANCH git_commit=$GIT_COMMIT git_dirty=$GIT_DIRTY"
 log "[big_train_v1] profile=$PROFILE train_strategy=$TRAIN_STRATEGY"
@@ -431,17 +423,15 @@ log "[big_train_v1] eval_vs_random temperature=$EVAL_VS_RANDOM_TEMPERATURE openi
 log "[big_train_v1] eval_vs_previous temperature=$EVAL_VS_PREVIOUS_TEMPERATURE sample_moves=$EVAL_VS_PREVIOUS_SAMPLE_MOVES opening_random_moves=$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
 log "[big_train_v1] selfplay_alloc_conf=$SELF_PLAY_ALLOC_CONF selfplay_memory_anchor_mb=$SELF_PLAY_MEMORY_ANCHOR_MB"
 
-if [[ -n "$LEGACY_LOAD_CHECKPOINT" && -z "$TRAIN_BASE_MODEL" && -z "${BEST_PREVIOUS_MODEL:-}" ]]; then
-  log_err "[big_train_v1] LOAD_CHECKPOINT is no longer auto-wired. Set TRAIN_BASE_MODEL and optionally BEST_PREVIOUS_MODEL explicitly."
-  exit 1
-fi
-
 LATEST_MODEL="$TRAIN_BASE_MODEL"
 if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then
   log_err "[big_train_v1] train base checkpoint not found: $LATEST_MODEL"
   exit 1
 fi
 BEST_MODEL="$BEST_PREVIOUS_MODEL"
+if [[ -z "$BEST_MODEL" ]]; then
+  BEST_MODEL="$LATEST_MODEL"
+fi
 if [[ -n "$BEST_MODEL" && ! -f "$BEST_MODEL" ]]; then
   log_err "[big_train_v1] best previous checkpoint not found: $BEST_MODEL"
   exit 1
@@ -457,10 +447,6 @@ if [[ "${CUDA_LAUNCH_BLOCKING:-0}" == "1" ]]; then
   fi
 fi
 
-WORK_OPTIMIZER_STATE_PATH="${CHECKPOINT_DIR}/optimizer_state_work.pt"
-BEST_OPTIMIZER_STATE_PATH="${CHECKPOINT_DIR}/optimizer_state_best.pt"
-TRUSTED_SELFPLAY_FILES=()
-
 for ((it = 1; it <= ITERATIONS; it++)); do
   read -r CUR_OPENING_RANDOM_MOVES CUR_SOFT_LABEL_ALPHA CUR_LR CUR_POLICY_DRAW_WEIGHT <<< "$(compute_curriculum_values "$it")"
   ITER_TAG="$(printf "%03d" "$it")"
@@ -473,40 +459,13 @@ for ((it = 1; it <= ITERATIONS; it++)); do
   INFER_JSON="${RUN_DIR}/infer_iter_${ITER_TAG}.json"
   CKPT_NAME="model_iter_${ITER_TAG}.pt"
   CKPT_PATH="${CHECKPOINT_DIR}/${CKPT_NAME}"
-  if [[ -n "$BEST_MODEL" && -f "$BEST_MODEL" ]]; then
-    BASE_MODEL_FOR_ITER="$BEST_MODEL"
-  else
-    BASE_MODEL_FOR_ITER="$LATEST_MODEL"
-  fi
+  BASE_MODEL_FOR_ITER="$LATEST_MODEL"
   GATING_BASE_MODEL="$BEST_MODEL"
-
-  # Build replay inputs only from trusted self-play history.
-  REPLAY_INPUTS=""
-  if [[ "$REPLAY_WINDOW" -gt 1 && "${#TRUSTED_SELFPLAY_FILES[@]}" -gt 0 ]]; then
-    REPLAY_PARTS=()
-    TRUSTED_COUNT="${#TRUSTED_SELFPLAY_FILES[@]}"
-    REPLAY_LIMIT=$((REPLAY_WINDOW - 1))
-    REPLAY_START=0
-    if [[ "$TRUSTED_COUNT" -gt "$REPLAY_LIMIT" ]]; then
-      REPLAY_START=$((TRUSTED_COUNT - REPLAY_LIMIT))
-    fi
-    for ((rw = REPLAY_START; rw < TRUSTED_COUNT; rw++)); do
-      RW_FILE="${TRUSTED_SELFPLAY_FILES[rw]}"
-      [[ -f "$RW_FILE" ]] || continue
-      REPLAY_PARTS+=("$RW_FILE")
-    done
-    if [[ ${#REPLAY_PARTS[@]} -gt 0 ]]; then
-      REPLAY_INPUTS="$(IFS=','; echo "${REPLAY_PARTS[*]}")"
-    fi
-  fi
 
   log
   log "[big_train_v1] ===== Iteration ${it}/${ITERATIONS} ====="
   log "[big_train_v1] curriculum opening_random_moves=$CUR_OPENING_RANDOM_MOVES soft_label_alpha=$CUR_SOFT_LABEL_ALPHA lr=$CUR_LR policy_draw_weight=$CUR_POLICY_DRAW_WEIGHT"
   log "[big_train_v1] base_model_for_iter=${BASE_MODEL_FOR_ITER:-none} gating_base_model=${GATING_BASE_MODEL:-none}"
-  if [[ -n "$REPLAY_INPUTS" ]]; then
-    log "[big_train_v1] replay_inputs=$REPLAY_INPUTS"
-  fi
   log "[big_train_v1] stage=selfplay output=$SELFPLAY_FILE"
   SP_CMD=(
     "$PYTHON_BIN" scripts/train_entry.py
@@ -615,16 +574,6 @@ if isinstance(piece_delta, dict):
 PY
   fi
 
-  if [[ -f "$SELFPLAY_FILE" ]]; then
-    TRUSTED_SELFPLAY_FILES+=("$SELFPLAY_FILE")
-  fi
-
-  if [[ -n "$BASE_MODEL_FOR_ITER" && -n "$BEST_MODEL" && "$BASE_MODEL_FOR_ITER" == "$BEST_MODEL" && -f "$BEST_OPTIMIZER_STATE_PATH" ]]; then
-    cp -f "$BEST_OPTIMIZER_STATE_PATH" "$WORK_OPTIMIZER_STATE_PATH"
-  else
-    rm -f "$WORK_OPTIMIZER_STATE_PATH"
-  fi
-
   log "[big_train_v1] stage=train input=$SELFPLAY_FILE strategy=$TRAIN_STRATEGY"
   if [[ "$TRAIN_STRATEGY" == "ddp" ]]; then
     TRAIN_VISIBLE="$(to_visible_indices "$TRAIN_DEVICES")"
@@ -644,20 +593,13 @@ PY
       --lr "$CUR_LR"
       --weight_decay "$WEIGHT_DECAY"
       --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
-      --anti_draw_penalty "$ANTI_DRAW_PENALTY"
-      --policy_draw_weight "$CUR_POLICY_DRAW_WEIGHT"
-      --warmup_steps "$WARMUP_STEPS"
-      --streaming_load "$STREAMING_LOAD"
-      --streaming_workers "$STREAMING_WORKERS"
-      --optimizer_state_path "$WORK_OPTIMIZER_STATE_PATH"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
+      --streaming_load "$STREAMING_LOAD"
+      --streaming_workers "$STREAMING_WORKERS"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
-    if [[ -n "$REPLAY_INPUTS" ]]; then
-      DDP_CMD+=(--self_play_replay_inputs "$REPLAY_INPUTS")
-    fi
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
       DDP_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
@@ -682,20 +624,13 @@ PY
       --lr "$CUR_LR"
       --weight_decay "$WEIGHT_DECAY"
       --soft_label_alpha "$CUR_SOFT_LABEL_ALPHA"
-      --anti_draw_penalty "$ANTI_DRAW_PENALTY"
-      --policy_draw_weight "$CUR_POLICY_DRAW_WEIGHT"
-      --warmup_steps "$WARMUP_STEPS"
-      --streaming_load "$STREAMING_LOAD"
-      --streaming_workers "$STREAMING_WORKERS"
-      --optimizer_state_path "$WORK_OPTIMIZER_STATE_PATH"
       --checkpoint_dir "$CHECKPOINT_DIR"
       --self_play_input "$SELFPLAY_FILE"
+      --streaming_load "$STREAMING_LOAD"
+      --streaming_workers "$STREAMING_WORKERS"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
-    if [[ -n "$REPLAY_INPUTS" ]]; then
-      TRAIN_CMD+=(--self_play_replay_inputs "$REPLAY_INPUTS")
-    fi
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
       TRAIN_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
@@ -866,20 +801,9 @@ PY
 
   if [[ "$CANDIDATE_ACCEPTED" == "1" ]]; then
     BEST_MODEL="$CANDIDATE_MODEL"
+  fi
+  if [[ "$CANDIDATE_VALID" == "1" ]]; then
     LATEST_MODEL="$CANDIDATE_MODEL"
-    if [[ -f "$WORK_OPTIMIZER_STATE_PATH" ]]; then
-      cp -f "$WORK_OPTIMIZER_STATE_PATH" "$BEST_OPTIMIZER_STATE_PATH"
-    fi
-  else
-    rm -f "$WORK_OPTIMIZER_STATE_PATH"
-    if [[ -n "$BEST_MODEL" && -f "$BEST_MODEL" ]]; then
-      LATEST_MODEL="$BEST_MODEL"
-    elif [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
-      LATEST_MODEL="$BASE_MODEL_FOR_ITER"
-    fi
-    if [[ "$CANDIDATE_VALID" == "1" ]]; then
-      log "[big_train_v1] candidate did not beat best_previous; keep training/selfplay on accepted best and retain rejected candidate only for inspection."
-    fi
   fi
   if [[ -z "$LATEST_MODEL" || ! -f "$LATEST_MODEL" ]]; then
     log_err "[big_train_v1] latest checkpoint missing after iteration: $LATEST_MODEL"

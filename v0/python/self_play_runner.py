@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 
-from src.game_state import GameState, Phase, Player
+from src.game_state import GameState, Player
 from src.move_generator import apply_move
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
 

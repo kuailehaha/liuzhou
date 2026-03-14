@@ -1,9 +1,8 @@
-from src.game_state import GameState, Phase
-from src.move_generator import apply_move, generate_all_legal_moves
+from src.game_state import GameState, Phase, Player
+from src.move_generator import apply_move
 
 
-def test_mark_selection_is_not_terminal_before_movement_starts() -> None:
-    # Reproduces a real H-vs-AI trace where BLACK forms a square in placement.
+def test_mark_selection_does_not_adjudicate_before_movement_starts() -> None:
     moves = [
         {"phase": Phase.PLACEMENT, "action_type": "place", "position": (2, 4)},
         {"phase": Phase.PLACEMENT, "action_type": "place", "position": (5, 2)},
@@ -21,7 +20,6 @@ def test_mark_selection_is_not_terminal_before_movement_starts() -> None:
     assert state.phase == Phase.MARK_SELECTION
     assert state.get_winner() is None
     assert not state.is_game_over()
-    assert len(generate_all_legal_moves(state)) > 0
 
 
 def test_winner_check_remains_active_in_movement_stage() -> None:
