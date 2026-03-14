@@ -105,6 +105,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         infer_warmup_iters=int(args.infer_warmup_iters),
         infer_iters=int(args.infer_iters),
         infer_output=args.infer_output,
+        model_init_seed=args.model_init_seed,
     )
     return 0
 
@@ -253,6 +254,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--infer_batch_size", type=int, default=4096)
     parser.add_argument("--infer_warmup_iters", type=int, default=20)
     parser.add_argument("--infer_iters", type=int, default=100)
+    parser.add_argument(
+        "--model_init_seed",
+        type=int,
+        default=None,
+        help="Fixed seed for v1 stable model init when --load_checkpoint is absent.",
+    )
     parser.add_argument(
         "--infer_output",
         type=str,
