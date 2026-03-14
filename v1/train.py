@@ -7,6 +7,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
@@ -137,6 +139,78 @@ def _resolve_staged_selfplay_seed(explicit_seed: Optional[int] = None) -> int:
             f"self_play_iteration_seed must be positive when provided, got {seed_i}"
         )
     return seed_i
+
+
+def _resolve_model_init_seed(explicit_seed: Optional[int] = None) -> int:
+    if explicit_seed is None:
+        raw_env = str(os.environ.get("V1_MODEL_INIT_SEED", "")).strip()
+        if raw_env:
+            explicit_seed = int(raw_env)
+        else:
+            # Stable default for reproducible "no base model" bootstrap.
+            explicit_seed = 20260314
+    seed_i = int(explicit_seed)
+    if seed_i <= 0:
+        raise ValueError(f"model_init_seed must be positive when provided, got {seed_i}")
+    return seed_i
+
+
+def _init_model_stable_resnet(model: nn.Module, *, seed: int) -> None:
+    """Apply a stable ResNet-style initialization under a fixed seed."""
+    seed_i = int(seed)
+    if seed_i <= 0:
+        raise ValueError(f"seed must be positive for model init, got {seed_i}")
+
+    py_rng_state = random.getstate()
+    torch_cpu_state = torch.random.get_rng_state()
+    torch_cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        random.seed(seed_i)
+        torch.manual_seed(seed_i)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed_i)
+
+        for module in model.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                if module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        # Residual last BN gamma=0 keeps each block close to identity at init.
+        for block in getattr(model, "blocks", []):
+            bn2 = getattr(block, "bn2", None)
+            if isinstance(bn2, nn.BatchNorm2d) and bn2.weight is not None:
+                nn.init.zeros_(bn2.weight)
+
+        # Keep policy/value output heads small at startup.
+        policy_head = getattr(model, "policy_head", None)
+        if policy_head is not None:
+            for attr in ("out_pos1", "out_pos2", "out_mark"):
+                out_conv = getattr(policy_head, attr, None)
+                if isinstance(out_conv, nn.Conv2d):
+                    nn.init.normal_(out_conv.weight, mean=0.0, std=1e-3)
+                    if out_conv.bias is not None:
+                        nn.init.zeros_(out_conv.bias)
+        value_head = getattr(model, "value_head", None)
+        out_fc = getattr(value_head, "fc2", None) if value_head is not None else None
+        if isinstance(out_fc, nn.Linear):
+            nn.init.normal_(out_fc.weight, mean=0.0, std=1e-3)
+            if out_fc.bias is not None:
+                nn.init.zeros_(out_fc.bias)
+    finally:
+        random.setstate(py_rng_state)
+        torch.random.set_rng_state(torch_cpu_state)
+        if torch_cuda_states is not None:
+            torch.cuda.set_rng_state_all(torch_cuda_states)
 
 
 def _concat_self_play_batches_cpu(batches: List[TensorSelfPlayBatch]) -> TensorSelfPlayBatch:
@@ -1601,6 +1675,7 @@ def train_pipeline_v1(
     infer_warmup_iters: int = 20,
     infer_iters: int = 100,
     infer_output: Optional[str] = None,
+    model_init_seed: Optional[int] = None,
 ) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     stage_norm = str(stage).strip().lower()
@@ -1668,6 +1743,12 @@ def train_pipeline_v1(
         _print_rank0(f"[v1.train] soft_label_alpha={float(soft_label_alpha):.3f}")
         _print_rank0(f"[v1.train] train_devices={train_device_list}")
         _print_rank0(f"[v1.train] infer_devices={infer_device_list}")
+        resolved_model_init_seed = _resolve_model_init_seed(model_init_seed)
+        _print_rank0(
+            "[v1.train] "
+            f"model_init_seed={int(resolved_model_init_seed)} "
+            "(used only when load_checkpoint is absent)"
+        )
         stage_selfplay_seed = 1
         if stage_norm == "selfplay":
             stage_selfplay_seed = _resolve_staged_selfplay_seed(
@@ -1681,18 +1762,28 @@ def train_pipeline_v1(
             )
 
         model = _build_model()
-        checkpoint_load_start = time.perf_counter()
-        _load_checkpoint_into_model(
-            model=model,
-            load_checkpoint=load_checkpoint,
-            map_location=primary_train_device,
-        )
-        checkpoint_load_sec = float(max(0.0, time.perf_counter() - checkpoint_load_start))
+        checkpoint_load_sec = 0.0
         if load_checkpoint:
+            checkpoint_load_start = time.perf_counter()
+            _load_checkpoint_into_model(
+                model=model,
+                load_checkpoint=load_checkpoint,
+                map_location=primary_train_device,
+            )
+            checkpoint_load_sec = float(max(0.0, time.perf_counter() - checkpoint_load_start))
             _print_rank0(
                 "[v1.train] timing "
                 f"checkpoint_load_sec={checkpoint_load_sec:.3f} "
                 f"checkpoint={load_checkpoint}"
+            )
+        else:
+            _init_model_stable_resnet(
+                model,
+                seed=int(resolved_model_init_seed),
+            )
+            _print_rank0(
+                "[v1.train] initialized new model with stable_resnet init "
+                f"seed={int(resolved_model_init_seed)}"
             )
         model.to(primary_train_device)
 
@@ -2484,6 +2575,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional output path for stage=infer report.",
     )
+    parser.add_argument(
+        "--model_init_seed",
+        type=int,
+        default=None,
+        help=(
+            "Fixed seed for stable ResNet-style model initialization when "
+            "--load_checkpoint is absent."
+        ),
+    )
     return parser
 
 
@@ -2535,4 +2635,5 @@ if __name__ == "__main__":
         infer_warmup_iters=args.infer_warmup_iters,
         infer_iters=args.infer_iters,
         infer_output=args.infer_output,
+        model_init_seed=args.model_init_seed,
     )
