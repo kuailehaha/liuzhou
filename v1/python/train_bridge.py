@@ -244,8 +244,12 @@ def train_network_from_tensors(
             for pg in optimizer.param_groups:
                 pg["lr"] = float(lr)
             optimizer_loaded = True
-        except Exception:
-            pass
+        except Exception as exc:
+            if strategy != "ddp" or ddp_rank == 0:
+                print(
+                    "[v1.train] warning: failed to load optimizer state; "
+                    f"start with fresh Adam. path={optimizer_state_path} err={exc}"
+                )
     use_amp_enabled = bool(use_amp and device_obj.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp_enabled)
 
@@ -480,8 +484,11 @@ def train_network_from_tensors(
     if optimizer_state_path and (strategy != "ddp" or ddp_rank == 0):
         try:
             torch.save(optimizer.state_dict(), optimizer_state_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                "[v1.train] warning: failed to save optimizer state; "
+                f"continuity disabled for next iter. path={optimizer_state_path} err={exc}"
+            )
 
     return model, {
         "epoch_stats": epoch_stats,
@@ -602,8 +609,12 @@ def train_network_streaming(
             for pg in optimizer.param_groups:
                 pg["lr"] = float(lr)
             optimizer_loaded = True
-        except Exception:
-            pass
+        except Exception as exc:
+            if strategy != "ddp" or ddp_rank == 0:
+                print(
+                    "[v1.train] warning: failed to load optimizer state; "
+                    f"start with fresh Adam. path={optimizer_state_path} err={exc}"
+                )
 
     use_amp_enabled = bool(use_amp and device_obj.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp_enabled)
@@ -850,8 +861,11 @@ def train_network_streaming(
     if optimizer_state_path and (strategy != "ddp" or ddp_rank == 0):
         try:
             torch.save(optimizer.state_dict(), optimizer_state_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                "[v1.train] warning: failed to save optimizer state; "
+                f"continuity disabled for next iter. path={optimizer_state_path} err={exc}"
+            )
 
     return model, {
         "epoch_stats": epoch_stats,
