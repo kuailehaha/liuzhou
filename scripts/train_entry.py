@@ -258,7 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--model_init_seed",
         type=int,
         default=None,
-        help="Fixed seed for v1 stable model init when --load_checkpoint is absent.",
+        help=(
+            "Fixed seed for v1 stable model init when --load_checkpoint is absent; "
+            "<=0 disables stable init and uses model default initialization."
+        ),
     )
     parser.add_argument(
         "--infer_output",

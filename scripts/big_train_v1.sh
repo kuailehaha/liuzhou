@@ -47,7 +47,12 @@ SELF_PLAY_TARGET_SAMPLES_PER_SHARD="${SELF_PLAY_TARGET_SAMPLES_PER_SHARD:-0}"  #
 CHUNK_TARGET_BYTES="${CHUNK_TARGET_BYTES:-8589934592}"  # 8 GiB per chunk; staged process self-play always emits manifest output
 STREAMING_LOAD="${STREAMING_LOAD:-1}"
 STREAMING_WORKERS="${STREAMING_WORKERS:-4}"
-OPTIMIZER_STATE_WORK_PATH="${OPTIMIZER_STATE_WORK_PATH:-$CHECKPOINT_DIR/optimizer_state_work.pt}"
+if [[ "${OPTIMIZER_STATE_WORK_PATH+x}" == "x" ]]; then
+  # Keep explicit empty string: disable optimizer continuity for A/B diagnosis.
+  OPTIMIZER_STATE_WORK_PATH="${OPTIMIZER_STATE_WORK_PATH}"
+else
+  OPTIMIZER_STATE_WORK_PATH="$CHECKPOINT_DIR/optimizer_state_work.pt"
+fi
 
 EVAL_GAMES_VS_BASELINE="${EVAL_GAMES_VS_BASELINE:-0}"
 EVAL_GAMES_VS_SELF="${EVAL_GAMES_VS_SELF:-0}"
@@ -192,10 +197,19 @@ if required_invalid or non_finite_numeric:
         "self_play_value_nonfinite_local",
         "self_play_soft_value_nonfinite_local",
         "self_play_positions_local",
+        "self_play_decisive_game_ratio",
+        "self_play_draw_game_ratio",
         "self_play_payload_load_sec",
         "checkpoint_load_sec",
         "train_first_batch_sec",
         "train_time_sec",
+        "optimizer_loaded",
+        "warmup_steps",
+        "total_train_steps",
+        "num_samples_after_filter",
+        "filtered_non_finite_samples",
+        "parallel_strategy",
+        "ddp_world_size",
         "train_strategy",
         "streaming",
     )
@@ -208,6 +222,109 @@ if required_invalid or non_finite_numeric:
     raise SystemExit(1)
 
 raise SystemExit(0)
+PY
+  )" || rc=$?
+  if [[ -n "$output" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      log "$line"
+    done <<< "$output"
+  fi
+  return "$rc"
+}
+
+log_iteration_signature() {
+  local selfplay_stats_path="$1"
+  local train_metrics_path="$2"
+  local base_model_path="$3"
+  local candidate_path="$4"
+  local output=""
+  local rc=0
+  output="$("$PYTHON_BIN" - "$selfplay_stats_path" "$train_metrics_path" "$base_model_path" "$candidate_path" <<'PY'
+import json
+import math
+import sys
+from typing import Any, Dict, Optional
+
+sp_path = str(sys.argv[1])
+tm_path = str(sys.argv[2])
+base_model = str(sys.argv[3]).strip()
+candidate_path = str(sys.argv[4]).strip()
+
+def _load_json(path: str) -> Optional[Any]:
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _as_train_row(payload: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list) and payload and isinstance(payload[-1], dict):
+        return payload[-1]
+    return None
+
+def _fmt_ratio(value: Any) -> str:
+    if isinstance(value, bool):
+        return "n/a"
+    if isinstance(value, (int, float)):
+        fv = float(value)
+        if math.isfinite(fv):
+            return f"{fv * 100.0:.2f}%"
+    return "n/a"
+
+def _fmt_float(value: Any) -> str:
+    if isinstance(value, bool):
+        return "n/a"
+    if isinstance(value, (int, float)):
+        fv = float(value)
+        if math.isfinite(fv):
+            return f"{fv:.6f}"
+    return "n/a"
+
+sp_payload = _load_json(sp_path)
+tm_row = _as_train_row(_load_json(tm_path))
+
+decisive_ratio = None
+hard_ratio = None
+mixed_ratio = None
+if isinstance(sp_payload, dict):
+    decisive_ratio = sp_payload.get("decisive_game_ratio")
+    value_summary = sp_payload.get("value_target_summary")
+    mixed_summary = sp_payload.get("mixed_value_target_summary")
+    if isinstance(value_summary, dict):
+        hard_ratio = value_summary.get("nonzero_ratio")
+    if isinstance(mixed_summary, dict):
+        mixed_ratio = mixed_summary.get("nonzero_ratio")
+
+train_avg_loss = None
+optimizer_loaded = None
+warmup_steps = None
+checkpoint = candidate_path
+if isinstance(tm_row, dict):
+    train_avg_loss = tm_row.get("train_avg_loss")
+    optimizer_loaded = tm_row.get("optimizer_loaded")
+    warmup_steps = tm_row.get("warmup_steps")
+    ckpt = tm_row.get("checkpoint")
+    if isinstance(ckpt, str) and ckpt.strip():
+        checkpoint = ckpt.strip()
+
+base_display = base_model if base_model else "none"
+checkpoint_display = checkpoint if checkpoint else "none"
+
+print(
+    "[big_train_v1] iter_signature: "
+    f"selfplay_decisive_ratio={_fmt_ratio(decisive_ratio)} "
+    f"hard_value_nonzero_ratio={_fmt_ratio(hard_ratio)} "
+    f"mixed_value_nonzero_ratio={_fmt_ratio(mixed_ratio)} "
+    f"train_avg_loss={_fmt_float(train_avg_loss)} "
+    f"optimizer_loaded={optimizer_loaded!r} "
+    f"warmup_steps={warmup_steps!r} "
+    f"base_model={base_display} "
+    f"checkpoint={checkpoint_display}"
+)
 PY
   )" || rc=$?
   if [[ -n "$output" ]]; then
@@ -440,7 +557,7 @@ log "[big_train_v1] checkpoints=$CHECKPOINT_DIR"
 log "[big_train_v1] run_dir=$RUN_DIR"
 log "[big_train_v1] train_base_model=${TRAIN_BASE_MODEL:-none}"
 log "[big_train_v1] best_previous_model_init=${BEST_PREVIOUS_MODEL:-none}"
-log "[big_train_v1] model_init_seed=$MODEL_INIT_SEED (used when train_base_model=none)"
+log "[big_train_v1] model_init_seed=$MODEL_INIT_SEED (used when train_base_model=none; <=0 disables stable_resnet init)"
 log "[big_train_v1] self_play_concurrent_games=$SELF_PLAY_CONCURRENT_GAMES"
 log "[big_train_v1] self_play_opening_random_moves=$SELF_PLAY_OPENING_RANDOM_MOVES"
 log "[big_train_v1] chunk_target_bytes=$CHUNK_TARGET_BYTES (self_play_target_samples_per_shard=$SELF_PLAY_TARGET_SAMPLES_PER_SHARD fallback)"
@@ -450,7 +567,11 @@ log "[big_train_v1] policy_draw_weight=$POLICY_DRAW_WEIGHT->$POLICY_DRAW_WEIGHT_
 log "[big_train_v1] lr=$LR lr_cosine_final_scale=$LR_COSINE_FINAL_SCALE warmup_steps=$WARMUP_STEPS"
 log "[big_train_v1] streaming_load=$STREAMING_LOAD streaming_workers=$STREAMING_WORKERS"
 log "[big_train_v1] replay_window=$REPLAY_WINDOW"
-log "[big_train_v1] optimizer_state_work_path=$OPTIMIZER_STATE_WORK_PATH"
+if [[ -n "$OPTIMIZER_STATE_WORK_PATH" ]]; then
+  log "[big_train_v1] optimizer_continuity=enabled optimizer_state_work_path=$OPTIMIZER_STATE_WORK_PATH"
+else
+  log "[big_train_v1] optimizer_continuity=disabled (optimizer_state_work_path is empty)"
+fi
 log "[big_train_v1] opening_random_schedule=$SELF_PLAY_OPENING_RANDOM_MOVES->$SELF_PLAY_OPENING_RANDOM_MOVES_FINAL"
 log "[big_train_v1] soft_label_alpha_schedule=$SOFT_LABEL_ALPHA->$SOFT_LABEL_ALPHA_FINAL"
 log "[big_train_v1] self_play_backend=$SELF_PLAY_BACKEND"
@@ -642,11 +763,13 @@ PY
       --self_play_input "$SELFPLAY_FILE"
       --streaming_load "$STREAMING_LOAD"
       --streaming_workers "$STREAMING_WORKERS"
-      --optimizer_state_path "$OPTIMIZER_STATE_WORK_PATH"
       --model_init_seed "$MODEL_INIT_SEED"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
+    if [[ -n "$OPTIMIZER_STATE_WORK_PATH" ]]; then
+      DDP_CMD+=(--optimizer_state_path "$OPTIMIZER_STATE_WORK_PATH")
+    fi
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
       DDP_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
@@ -676,11 +799,13 @@ PY
       --self_play_input "$SELFPLAY_FILE"
       --streaming_load "$STREAMING_LOAD"
       --streaming_workers "$STREAMING_WORKERS"
-      --optimizer_state_path "$OPTIMIZER_STATE_WORK_PATH"
       --model_init_seed "$MODEL_INIT_SEED"
       --checkpoint_name "$CKPT_NAME"
       --metrics_output "$TRAIN_METRICS_JSON"
     )
+    if [[ -n "$OPTIMIZER_STATE_WORK_PATH" ]]; then
+      TRAIN_CMD+=(--optimizer_state_path "$OPTIMIZER_STATE_WORK_PATH")
+    fi
     if [[ -n "$BASE_MODEL_FOR_ITER" && -f "$BASE_MODEL_FOR_ITER" ]]; then
       TRAIN_CMD+=(--load_checkpoint "$BASE_MODEL_FOR_ITER")
     fi
@@ -706,6 +831,7 @@ PY
     log "[big_train_v1] drop optimizer continuity state after invalid candidate: $OPTIMIZER_STATE_WORK_PATH"
     rm -f "$OPTIMIZER_STATE_WORK_PATH" || true
   fi
+  log_iteration_signature "$SELFPLAY_STATS_JSON" "$TRAIN_METRICS_JSON" "${BASE_MODEL_FOR_ITER:-}" "$CANDIDATE_MODEL" || true
 
   CANDIDATE_ACCEPTED=0
 

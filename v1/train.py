@@ -149,10 +149,8 @@ def _resolve_model_init_seed(explicit_seed: Optional[int] = None) -> int:
         else:
             # Stable default for reproducible "no base model" bootstrap.
             explicit_seed = 20260314
-    seed_i = int(explicit_seed)
-    if seed_i <= 0:
-        raise ValueError(f"model_init_seed must be positive when provided, got {seed_i}")
-    return seed_i
+    # model_init_seed <= 0 disables stable bootstrap init for A/B diagnosis runs.
+    return int(explicit_seed)
 
 
 def _init_model_stable_resnet(model: nn.Module, *, seed: int) -> None:
@@ -211,6 +209,20 @@ def _init_model_stable_resnet(model: nn.Module, *, seed: int) -> None:
         torch.random.set_rng_state(torch_cpu_state)
         if torch_cuda_states is not None:
             torch.cuda.set_rng_state_all(torch_cuda_states)
+
+
+def _merge_train_bridge_summary(entry: Dict[str, Any], train_metrics: Dict[str, Any]) -> None:
+    for key in (
+        "optimizer_loaded",
+        "warmup_steps",
+        "total_train_steps",
+        "num_samples_after_filter",
+        "filtered_non_finite_samples",
+        "parallel_strategy",
+        "ddp_world_size",
+    ):
+        if key in train_metrics:
+            entry[key] = train_metrics.get(key)
 
 
 def _concat_self_play_batches_cpu(batches: List[TensorSelfPlayBatch]) -> TensorSelfPlayBatch:
@@ -1744,9 +1756,20 @@ def train_pipeline_v1(
         _print_rank0(f"[v1.train] train_devices={train_device_list}")
         _print_rank0(f"[v1.train] infer_devices={infer_device_list}")
         resolved_model_init_seed = _resolve_model_init_seed(model_init_seed)
+        optimizer_state_path_norm: Optional[str] = None
+        if optimizer_state_path is not None:
+            optimizer_state_path_cand = str(optimizer_state_path).strip()
+            if optimizer_state_path_cand:
+                optimizer_state_path_norm = optimizer_state_path_cand
+        init_mode = (
+            "stable_resnet"
+            if int(resolved_model_init_seed) > 0
+            else "default_module_init"
+        )
         _print_rank0(
             "[v1.train] "
             f"model_init_seed={int(resolved_model_init_seed)} "
+            f"mode={init_mode} "
             "(used only when load_checkpoint is absent)"
         )
         stage_selfplay_seed = 1
@@ -1777,14 +1800,20 @@ def train_pipeline_v1(
                 f"checkpoint={load_checkpoint}"
             )
         else:
-            _init_model_stable_resnet(
-                model,
-                seed=int(resolved_model_init_seed),
-            )
-            _print_rank0(
-                "[v1.train] initialized new model with stable_resnet init "
-                f"seed={int(resolved_model_init_seed)}"
-            )
+            if int(resolved_model_init_seed) > 0:
+                _init_model_stable_resnet(
+                    model,
+                    seed=int(resolved_model_init_seed),
+                )
+                _print_rank0(
+                    "[v1.train] initialized new model with stable_resnet init "
+                    f"seed={int(resolved_model_init_seed)}"
+                )
+            else:
+                _print_rank0(
+                    "[v1.train] initialized new model with default module initialization "
+                    "(stable_resnet init disabled by model_init_seed<=0)"
+                )
         model.to(primary_train_device)
 
         if stage_norm == "selfplay":
@@ -2041,7 +2070,7 @@ def train_pipeline_v1(
                     use_amp=(primary_train_device.type == "cuda"),
                     parallel_devices=parallel_devices,
                     parallel_strategy=train_strategy_norm,
-                    optimizer_state_path=optimizer_state_path,
+                    optimizer_state_path=optimizer_state_path_norm,
                     warmup_steps=int(warmup_steps),
                     streaming_workers=int(streaming_workers),
                 )
@@ -2159,7 +2188,7 @@ def train_pipeline_v1(
                     parallel_devices=parallel_devices,
                     parallel_strategy=train_strategy_norm,
                     ddp_pre_sharded=ddp_pre_sharded,
-                    optimizer_state_path=optimizer_state_path,
+                    optimizer_state_path=optimizer_state_path_norm,
                     warmup_steps=int(warmup_steps),
                 )
                 train_elapsed = time.perf_counter() - train_start
@@ -2225,6 +2254,7 @@ def train_pipeline_v1(
                     "train_soft_label_alpha": float(soft_label_alpha),
                     "checkpoint": ckpt_path,
                 }
+                _merge_train_bridge_summary(entry, train_metrics)
                 if not use_streaming:
                     entry["train_cpu_shard_sec"] = train_bridge_timing.get("cpu_shard_sec")
                     entry["train_h2d_copy_sec"] = train_bridge_timing.get("h2d_copy_sec")
@@ -2361,6 +2391,7 @@ def train_pipeline_v1(
                 "train_soft_label_alpha": float(soft_label_alpha),
                 "checkpoint": ckpt_path,
             }
+            _merge_train_bridge_summary(entry, train_metrics)
             metrics.append(entry)
 
             if self_play_output:
@@ -2581,7 +2612,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Fixed seed for stable ResNet-style model initialization when "
-            "--load_checkpoint is absent."
+            "--load_checkpoint is absent; <=0 disables stable init and "
+            "uses model default initialization."
         ),
     )
     return parser
