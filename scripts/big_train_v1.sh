@@ -48,7 +48,7 @@ CHUNK_TARGET_BYTES="${CHUNK_TARGET_BYTES:-8589934592}"  # 8 GiB per chunk; stage
 STREAMING_LOAD="${STREAMING_LOAD:-1}"
 STREAMING_WORKERS="${STREAMING_WORKERS:-4}"
 if [[ "${OPTIMIZER_STATE_WORK_PATH+x}" == "x" ]]; then
-  # Keep explicit empty string: disable optimizer continuity for A/B diagnosis.
+  # Keep explicit empty string: disable optimizer continuity for A/B diagnosis only.
   OPTIMIZER_STATE_WORK_PATH="${OPTIMIZER_STATE_WORK_PATH}"
 else
   OPTIMIZER_STATE_WORK_PATH="$CHECKPOINT_DIR/optimizer_state_work.pt"
@@ -105,6 +105,17 @@ fi
 : "${INFER_BATCH_SIZE:=4096}"
 : "${INFER_WARMUP_ITERS:=20}"
 : "${INFER_ITERS:=80}"
+
+is_close_float() {
+  "$PYTHON_BIN" - "$1" "$2" <<'PY'
+import math
+import sys
+
+a = float(sys.argv[1])
+b = float(sys.argv[2])
+raise SystemExit(0 if math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12) else 1)
+PY
+}
 
 compute_curriculum_values() {
   local iter_idx="$1"
@@ -586,6 +597,25 @@ log "[big_train_v1] eval_v1_opening_random_moves=$EVAL_V1_OPENING_RANDOM_MOVES e
 log "[big_train_v1] eval_vs_random temperature=$EVAL_VS_RANDOM_TEMPERATURE opening_random_moves=$EVAL_VS_RANDOM_V1_OPENING_RANDOM_MOVES"
 log "[big_train_v1] eval_vs_previous temperature=$EVAL_VS_PREVIOUS_TEMPERATURE sample_moves=$EVAL_VS_PREVIOUS_SAMPLE_MOVES opening_random_moves=$EVAL_VS_PREVIOUS_V1_OPENING_RANDOM_MOVES"
 log "[big_train_v1] selfplay_alloc_conf=$SELF_PLAY_ALLOC_CONF selfplay_memory_anchor_mb=$SELF_PLAY_MEMORY_ANCHOR_MB"
+log "[big_train_v1] training_baseline=post_ablation_mainline (stable_resnet init + optimizer continuity + lr=1e-4 warmup=100 cosine_final_scale=0.5 replay_window=4 streaming_load=1)"
+
+if [[ -z "$TRAIN_BASE_MODEL" ]]; then
+  if [[ "$MODEL_INIT_SEED" =~ ^-?[0-9]+$ ]] && (( MODEL_INIT_SEED <= 0 )); then
+    log "[big_train_v1] warning: MODEL_INIT_SEED<=0 selects default_module_init. This is diagnosis-only and is not recommended for main training."
+  fi
+fi
+if [[ -z "$OPTIMIZER_STATE_WORK_PATH" ]]; then
+  log "[big_train_v1] warning: optimizer continuity is disabled. This is diagnosis-only and may increase later-iter collapse risk."
+fi
+
+if [[ "$PROFILE" == "aggressive" ]]; then
+  if ! is_close_float "$LR" "1e-4" || [[ "$WARMUP_STEPS" != "100" ]] || ! is_close_float "$LR_COSINE_FINAL_SCALE" "0.5" || [[ "$REPLAY_WINDOW" != "4" ]] || [[ "$STREAMING_LOAD" != "1" ]]; then
+    log "[big_train_v1] warning: training overrides differ from the recommended aggressive baseline (lr=1e-4 warmup=100 cosine_final_scale=0.5 replay_window=4 streaming_load=1)."
+  fi
+fi
+if [[ "$EVAL_GAMES_VS_RANDOM" != "2000" ]] || [[ "$EVAL_GAMES_VS_PREVIOUS" != "2000" ]] || ! is_close_float "$EVAL_VS_RANDOM_TEMPERATURE" "0.0" || ! is_close_float "$EVAL_VS_PREVIOUS_TEMPERATURE" "1.0" || [[ "$EVAL_VS_PREVIOUS_SAMPLE_MOVES" != "1" ]]; then
+  log "[big_train_v1] warning: eval/gating overrides differ from the recommended mainline baseline (vs_random=2000@0.0, vs_previous=2000@1.0 sample_moves=1)."
+fi
 
 LATEST_MODEL="$TRAIN_BASE_MODEL"
 if [[ -n "$LATEST_MODEL" && ! -f "$LATEST_MODEL" ]]; then

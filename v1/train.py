@@ -149,7 +149,7 @@ def _resolve_model_init_seed(explicit_seed: Optional[int] = None) -> int:
         else:
             # Stable default for reproducible "no base model" bootstrap.
             explicit_seed = 20260314
-    # model_init_seed <= 0 disables stable bootstrap init for A/B diagnosis runs.
+    # model_init_seed <= 0 disables stable bootstrap init for A/B diagnosis runs only.
     return int(explicit_seed)
 
 
@@ -1772,6 +1772,16 @@ def train_pipeline_v1(
             f"mode={init_mode} "
             "(used only when load_checkpoint is absent)"
         )
+        if not load_checkpoint and int(resolved_model_init_seed) <= 0:
+            _print_rank0(
+                "[v1.train] warning: default_module_init selected via model_init_seed<=0. "
+                "This is diagnosis-only and is not recommended for main training."
+            )
+        if stage_norm in {"train", "all"} and optimizer_state_path_norm is None:
+            _print_rank0(
+                "[v1.train] warning: optimizer continuity disabled (optimizer_state_path is empty). "
+                "This is diagnosis-only and may increase later-iter collapse risk."
+            )
         stage_selfplay_seed = 1
         if stage_norm == "selfplay":
             stage_selfplay_seed = _resolve_staged_selfplay_seed(
