@@ -1,0 +1,3 @@
+case	param_overrides	log_file	exit_status	note
+s0_current_baseline	baseline	/2023533024/users/zhangmq/liuzhou/rollback_090640_smoke_subset/logs/s0_current_baseline.log	0	Current main baseline with stable init and optimizer continuity preserved.
+s1_lr_2e4	LR=2e-4	/2023533024/users/zhangmq/liuzhou/rollback_090640_smoke_subset/logs/s1_lr_2e4.log	0	First rollback step: higher training step size.
