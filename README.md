@@ -1,49 +1,100 @@
-# 基于 MCTS 的强化学习六洲棋 AI 系统实现
+# Liuzhou Chess AI
 
-本项目聚焦传统棋类“六洲棋”的智能对弈系统，覆盖规则建模、MCTS 搜索、强化学习训练与人机对战实现。
+An AlphaZero-style reinforcement learning system for **Liuzhou Chess** (六洲棋), a traditional Chinese board game — built end-to-end from rule formalization to self-play training to human-vs-AI gameplay.
 
-当前主线是 `v1/`。如果你第一次打开这个仓库，建议从 `docs/` 文档树开始，而不是直接从历史实现细节倒推。
+## The Game
 
-## 文档导航
+Liuzhou Chess is played on a 6×6 grid. Two players each have 18 pieces (black and white). The game proceeds in two main stages:
 
-- [项目文档首页](./docs/index.md)
-- [快速开始](./docs/quickstart.md)
-- [架构总览](./docs/architecture.md)
-- [方法说明](./docs/method.md)
-- [人机对战系统](./docs/gameplay_system.md)
-- [规则说明](./docs/rules.md)
-- [项目结果](./docs/results.md)
-- [高难问题清单](./docs/faq.md)
+1. **Placement** — Players alternate placing pieces on the board. Forming a *Fang* (方, a 2×2 square of same-color pieces) lets you mark 1 opponent piece; forming a *Zhou* (洲, 6 same-color pieces filling an entire row or column) lets you mark 2. Marked pieces are removed together once the board fills up.
 
-## 核心入口
+2. **Movement** — Players take turns moving one piece to an adjacent empty cell. Forming a Fang or Zhou now *captures* opponent pieces directly. The game ends when one side loses all pieces, or draw conditions are met.
 
-- 构建 / 编译：`scripts/instruct.sh`
-  - 该脚本会调用 `scripts/instruction.sh`
-- 训练：`scripts/big_train_v1.sh`
-- 统一训练入口：`scripts/train_entry.py --pipeline v1`
-- 单点评估：`scripts/eval_checkpoint.py --backend v1`
-- 锦标赛评估：`scripts/tournament_v1_eval.py`
-- 人机对战后端：`backend/main.py`
-- Web UI：`web_ui/`
+The multi-phase structure (placement → marking → removal → movement → capture) makes Liuzhou Chess an interesting RL target: each "logical turn" can span multiple atomic decisions, and the reward signal is extremely sparse — most games end in draws.
 
-## 项目概览
+Full rules: [`docs/rules.md`](./docs/rules.md)
 
-- 六洲棋 AI 系统：规则引擎 + MCTS + 强化学习训练 + 人机对战前后端
-- 三层实现：`src/`（Legacy 参考实现）、`v0/`（C++/CUDA 核心）、`v1/`（当前训练主线）
-- 当前重点：在保持规则一致性的前提下，提高训练主线的强度转化效率，而不只是继续追求吞吐
+## What This Project Does
 
-## 推荐阅读顺序
+This is a solo project that implements the full stack for training a Liuzhou Chess AI:
 
-1. [docs/index.md](./docs/index.md)
-2. [docs/quickstart.md](./docs/quickstart.md)
-3. [docs/method.md](./docs/method.md)
-4. [docs/rules.md](./docs/rules.md)
-5. [docs/results.md](./docs/results.md)
+- **Rule engine** with atomic phase semantics, verified across Python and C++/CUDA implementations
+- **MCTS search** guided by a neural network (policy + bucketed value heads)
+- **AlphaZero-style self-play** training pipeline
+- **Checkpoint evaluation** (vs-random, vs-previous, round-robin tournament)
+- **Web-based human-vs-AI** gameplay (FastAPI backend + browser frontend)
 
-## 说明
+### The Engineering Story
 
-- 正式规则文档以 [docs/rules.md](./docs/rules.md) 为准
-- 根目录 [rule_description.md](./rule_description.md) 保留为兼容入口
-- `v1/Design.md` 作为深设计与阶段记录归档保留，不再作为项目主说明
+The Python prototype worked — but was far too slow for meaningful RL iteration. Profiling revealed bottlenecks in MCTS object copying, fragmented legal-mask computation, and inference overhead. This motivated two major rewrites:
 
-任何建议或帮助，请联系[我](mailto:kuailepapa@gmail.com)。
+| Generation | Focus | Key Change |
+|:---:|---|---|
+| **Legacy** (`src/`) | Get the full loop working | Pure Python rule engine + MCTS + training |
+| **v0** (`v0/`) | Move bottlenecks to native code | C++/CUDA rule engine, move generator, MCTS core via PyBind11 |
+| **v1** (`v1/`) | Scale self-play-to-training | Staged GPU pipeline with wave-batched simulation, fused operators, tensor-native data flow |
+
+The current mainline is **v1**, built on top of `v0_core`'s C++/CUDA capabilities.
+
+## Results
+
+- **~1,157× throughput** vs. the fastest legacy single-GPU baseline (positions/s, same checkpoint)
+- **99.8% win rate** vs. random agent (2,000 games, low-simulation setting)
+- Trained on **4× NVIDIA H20** GPUs with staged self-play → train → eval → infer pipeline
+- Self-play decisive-game ratio improved from **1.23% → 81.72%** over training, addressing the sparse-reward challenge through bucketed value targets and data-distribution strategies
+
+## Quick Start
+
+### Build
+
+```bash
+bash scripts/instruct.sh \
+  --python-bin <your-python> \
+  --cuda-home /usr/local/cuda \
+  --build-v0 1
+```
+
+### Train
+
+```bash
+bash scripts/big_train_v1.sh
+```
+
+This runs the full staged loop: self-play → train → eval → infer, with curriculum scheduling.
+
+### Play Against the AI
+
+```bash
+uvicorn backend.main:app --reload
+```
+
+Then open `http://localhost:8000/ui/index.html` in your browser.
+
+## Project Structure
+
+```
+src/          Legacy Python implementation (rule reference + functional verification)
+v0/           C++/CUDA core (rule engine, move generator, MCTS, PyBind11 bindings)
+v1/           Training pipeline (staged self-play, train bridge, trajectory buffer)
+backend/      FastAPI server for human-vs-AI gameplay
+web_ui/       Browser frontend (board rendering + interaction)
+scripts/      Training scripts, evaluation, model export
+tests/        Unit tests, rule engine regression (1000+ cases), CUDA kernel tests
+docs/         Project documentation
+```
+
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [Quick Start](./docs/quickstart.md) | Build, train, evaluate, play — step by step |
+| [Architecture](./docs/architecture.md) | System decomposition and the three-generation evolution |
+| [Method](./docs/method.md) | Network design, MCTS integration, training objectives |
+| [Rules](./docs/rules.md) | Complete Liuzhou Chess rules (authoritative source) |
+| [Results](./docs/results.md) | Milestones and key metrics |
+| [Human vs AI](./docs/gameplay_system.md) | Web gameplay system overview |
+| [Hard Questions](./docs/faq.md) | Deep technical questions worth revisiting |
+
+## Contact
+
+Questions, suggestions, or want to play? Reach me at [kuailepapa@gmail.com](mailto:kuailepapa@gmail.com).

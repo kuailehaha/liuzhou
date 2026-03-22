@@ -1,38 +1,30 @@
-# 项目文档首页
+# Documentation
 
-本项目是一个基于 MCTS 与强化学习的六洲棋 AI 系统，覆盖规则建模、自博弈训练、模型评估，以及人机对战前后端。
+This is the documentation hub for the Liuzhou Chess AI project. Start wherever fits your goal.
 
-当前主线是 `v1/`。如果你的目标是理解“项目现在如何工作”，应优先阅读 v1 相关文档，而不是从 legacy 或 v0 的历史实现开始。
+## Guides
 
-## 你可以从这里开始
+- **[Quick Start](./quickstart.md)** — Build, train, evaluate, and launch human-vs-AI play
+- **[Architecture](./architecture.md)** — How the system is organized and how the three generations relate
+- **[Method](./method.md)** — Network architecture, MCTS, training objectives, and the v1 pipeline
+- **[Rules](./rules.md)** — Complete game rules (authoritative source for all implementations)
+- **[Results](./results.md)** — Milestones, metrics, and what the project has achieved so far
+- **[Human vs AI](./gameplay_system.md)** — Web-based gameplay system
+- **[Hard Questions](./faq.md)** — Deep technical questions that don't have easy answers
 
-- 想快速上手运行：参见 [快速开始](./quickstart.md)
-- 想了解项目由哪些系统组成：参见 [架构总览](./architecture.md)
-- 想理解训练方法与模型设计：参见 [方法说明](./method.md)
-- 想直接看规则：参见 [规则说明](./rules.md)
-- 想了解阶段成果与对外口径：参见 [项目结果](./results.md)
-- 想沿着难问题反推系统理解：参见 [高难问题清单](./faq.md)
+## Key Entry Points
 
-## 当前主线
+| Task | Entry |
+|---|---|
+| Build / compile | `scripts/instruct.sh` |
+| Train (v1 staged pipeline) | `scripts/big_train_v1.sh` |
+| Single checkpoint evaluation | `scripts/eval_checkpoint.py` |
+| Tournament evaluation | `scripts/tournament_v1_eval.py` |
+| Human-vs-AI backend | `backend/main.py` |
+| Web UI | `web_ui/` |
 
-- 训练主入口：`scripts/big_train_v1.sh`
-- 构建主入口：`scripts/instruct.sh`
-- 单点评估：`scripts/eval_checkpoint.py`
-- 锦标赛评估：`scripts/tournament_v1_eval.py`
-- 人机对战后端：`backend/main.py`
-- Web UI：`web_ui/`
+## Notes
 
-## 推荐阅读顺序
-
-1. [快速开始](./quickstart.md)
-2. [架构总览](./architecture.md)
-3. [方法说明](./method.md)
-4. [规则说明](./rules.md)
-5. [项目结果](./results.md)
-6. [高难问题清单](./faq.md)
-
-## 阅读提示
-
-- `src/`、`v0/`、`v1/` 对应三代实现，但文档主叙事聚焦 `v1/`。
-- `v1/Design.md` 仍保留，作为深设计与阶段记录的归档材料；它不是项目总说明的入口。
-- 根目录 `rule_description.md` 已降级为兼容入口，正式规则文档以 [docs/rules.md](./rules.md) 为准。
+- The current mainline is `v1/`. Legacy (`src/`) and v0 (`v0/`) remain as reference implementations and underlying capabilities.
+- `v1/Design.md` contains detailed design history and stage-by-stage records — useful for archaeology, not as a starting point.
+- `docs/rules.md` is the authoritative rules source. The root-level `rule_description.md` is a legacy compatibility entry.
