@@ -72,6 +72,8 @@ def self_play_v1_gpu(
     sample_moves: bool = True,
     concurrent_games: int = 8,
     child_eval_mode: str = "value_only",
+    sparse_ply: int = 1,
+    sparse_top_k: int = 8,
     inference_engine=None,
     collect_step_timing: bool = False,
     verbose: bool = False,
@@ -95,6 +97,8 @@ def self_play_v1_gpu(
         sample_moves=bool(sample_moves),
         child_eval_mode=str(child_eval_mode),
         soft_value_k=float(soft_value_k),
+        sparse_ply=max(1, int(sparse_ply)),
+        sparse_top_k=max(1, int(sparse_top_k)),
     )
     collect_timing = bool(collect_step_timing)
     mcts = V1RootMCTS(

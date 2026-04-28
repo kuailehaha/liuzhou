@@ -233,6 +233,8 @@ class V1RootMCTSConfig:
     autocast_dtype: str = "float16"
     child_eval_mode: str = "value_only"  # "value_only" or "full"
     soft_value_k: float = 2.0
+    sparse_ply: int = 1  # search depth: 1 = root-only (current), 2-3 = multi-ply
+    sparse_top_k: int = 8  # branching factor per ply when sparse_ply > 1
 
 
 @dataclass
@@ -902,6 +904,355 @@ class V1RootMCTS:
         probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
         return torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
 
+    def _pack_and_evaluate_children(
+        self,
+        states: GpuStateBatch,
+    ):
+        """Pack sparse actions and evaluate all children of a state batch.
+
+        Returns (leaf_mat, valid_indices, valid_mask, action_code_mat, priors_mat,
+                 flat_indices, action_codes_all, parent_indices_all)
+        or None if all states are terminal.
+        """
+        model_input, legal_mask, metadata, probs, _ = self._evaluate_batch(states)
+        legal_mask_bool = legal_mask.to(torch.bool)
+
+        (
+            terminal_mask,
+            valid_indices,
+            counts,
+            valid_mask,
+            legal_index_mat,
+            priors_mat,
+            action_code_mat,
+            flat_indices,
+            action_codes_all,
+            parent_indices_all,
+        ) = v0_core.root_pack_sparse_actions(legal_mask_bool, probs, metadata)
+
+        if int(valid_indices.numel()) == 0:
+            return None
+
+        num_roots = int(valid_indices.numel())
+        max_actions = int(valid_mask.shape[1])
+
+        child_batch = batch_apply_moves_compat(states, action_codes_all, parent_indices_all)
+        child_values = self._evaluate_values_only(child_batch)
+        parent_player = states.current_player.index_select(0, parent_indices_all)
+        child_leaf_values = self._child_values_to_parent_perspective(
+            child_values=child_values,
+            parent_players=parent_player,
+            child_players=child_batch.current_player,
+        )
+
+        terminal_child = self._terminal_mask_from_next_state(child_batch)
+        if bool(terminal_child.any().item()):
+            soft_from_black = self._soft_tan_from_board_black(
+                child_batch.board,
+                soft_value_k=float(self.config.soft_value_k),
+            ).to(torch.float32)
+            parent_player_f = parent_player.to(torch.float32)
+            parent_sign = torch.where(
+                parent_player_f.ge(0.0),
+                torch.ones_like(parent_player_f),
+                -torch.ones_like(parent_player_f),
+            )
+            terminal_leaf_values = soft_from_black * parent_sign
+            child_leaf_values = torch.where(
+                terminal_child, terminal_leaf_values, child_leaf_values
+            )
+            self._terminal_soft_override_count += int(terminal_child.sum().item())
+
+        leaf_mat = torch.zeros(
+            (num_roots, max_actions), dtype=torch.float32, device=states.device
+        )
+        if int(flat_indices.numel()) > 0:
+            leaf_mat.view(-1).index_copy_(0, flat_indices, child_leaf_values)
+
+        return (
+            leaf_mat,
+            valid_indices,
+            valid_mask,
+            action_code_mat,
+            priors_mat,
+            flat_indices,
+            action_codes_all,
+            parent_indices_all,
+        )
+
+    def _refine_via_topk_lookahead(
+        self,
+        state: GpuStateBatch,
+        valid_root_indices: torch.Tensor,
+        leaf_mat: torch.Tensor,
+        valid_mask: torch.Tensor,
+        action_code_mat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Refine leaf_mat by looking ahead one additional ply via top-K expansion.
+
+        For each root, selects top-K children by current leaf_value, expands them
+        to grandchildren, evaluates grandchildren, and max-pools the result back
+        to refine the selected children's values in leaf_mat.
+        """
+        device = leaf_mat.device
+        num_roots = int(valid_root_indices.numel())
+        max_actions = int(valid_mask.shape[1])
+        top_k = min(int(self.config.sparse_top_k), max_actions)
+
+        if top_k <= 0 or num_roots <= 0:
+            return leaf_mat
+
+        # Select top-K per root by current leaf_value, ignoring invalid actions
+        masked_leaf = leaf_mat.masked_fill(~valid_mask, float("-inf"))
+        _, topk_local_indices = torch.topk(masked_leaf, k=top_k, dim=1)  # [R, K]
+
+        # Collect the top-K action codes from the packed action_code_mat [R, M, 4]
+        topk_action_codes = action_code_mat.gather(
+            1, topk_local_indices.unsqueeze(-1).expand(-1, -1, 4)
+        )
+        topk_codes_flat = topk_action_codes.reshape(-1, 4)  # [R*K, 4]
+        batch_size_l2 = int(topk_codes_flat.size(0))
+
+        # Parent indices: each block of K actions belongs to its root
+        topk_parents = (
+            torch.arange(num_roots, device=device)
+            .unsqueeze(1)
+            .expand(-1, top_k)
+            .reshape(-1)
+        )
+
+        # Get root states and apply top-K actions → L2 states
+        root_states_for_l2 = state.select(valid_root_indices)
+        l2_states = batch_apply_moves_compat(
+            root_states_for_l2, topk_codes_flat, topk_parents
+        )
+
+        # L2 children evaluation → L3 values
+        l2_result = self._pack_and_evaluate_children(l2_states)
+        if l2_result is None:
+            return leaf_mat
+
+        l2_leaf_mat, l2_valid_indices, l2_valid_mask, _, _, _, _, _ = l2_result
+        # l2_leaf_mat: [R*K, M2]
+
+        # Max-pool L2 grandchildren values per L2 parent → refined L2 value
+        l2_masked = l2_leaf_mat.masked_fill(~l2_valid_mask, float("-inf"))
+        l2_refined_values = l2_masked.max(dim=1).values  # [R*K]
+        # Replace -inf with 0 for roots with no valid grandchildren
+        l2_refined_values = torch.where(
+            torch.isfinite(l2_refined_values), l2_refined_values, torch.zeros_like(l2_refined_values)
+        )
+        l2_refined = l2_refined_values.view(num_roots, top_k)  # [R, K]
+
+        # Max with original L1 leaf values: refined = max(original, lookahead)
+        original_topk = leaf_mat.gather(1, topk_local_indices)  # [R, K]
+        refined_topk = torch.max(original_topk, l2_refined)
+
+        # Write back to leaf_mat at the top-K positions
+        leaf_mat.scatter_(1, topk_local_indices, refined_topk)
+        return leaf_mat
+
+    def _search_sparse_multi_ply(
+        self,
+        state: GpuStateBatch,
+        *,
+        temp_values: torch.Tensor,
+        add_noise: bool,
+        force_uniform_mask: Optional[torch.Tensor],
+        batch_size: int,
+        legal_mask_bool: torch.Tensor,
+        probs: torch.Tensor,
+        root_values: torch.Tensor,
+        model_input: torch.Tensor,
+        metadata: torch.Tensor,
+    ) -> RootSearchBatchOutput:
+        """Multi-ply search: evaluate root children, iteratively refine via top-K lookahead."""
+        device = state.device
+
+        policy_dense = torch.zeros(
+            (batch_size, TOTAL_ACTION_DIM), dtype=torch.float32, device=device
+        )
+        terminal_mask = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+        chosen_action_indices = torch.full(
+            (batch_size,), -1, dtype=torch.int64, device=device
+        )
+        chosen_action_codes = torch.full(
+            (batch_size, 4), -1, dtype=torch.int32, device=device
+        )
+        chosen_valid_mask = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+
+        with self._nvtx_range("v1.root_pack_sparse_actions"), self._timed("pack_writeback_ms"):
+            (
+                terminal_mask,
+                valid_root_indices,
+                counts,
+                valid_mask,
+                legal_index_mat,
+                priors_mat,
+                action_code_mat,
+                flat_indices,
+                action_codes_all,
+                parent_indices_all,
+            ) = v0_core.root_pack_sparse_actions(legal_mask_bool, probs, metadata)
+
+        if int(valid_root_indices.numel()) == 0:
+            return RootSearchBatchOutput(
+                model_input=model_input.detach(),
+                legal_mask=legal_mask_bool.detach(),
+                policy_dense=policy_dense,
+                root_value=root_values.detach(),
+                terminal_mask=terminal_mask.detach(),
+                chosen_action_indices=chosen_action_indices.detach(),
+                chosen_action_codes=chosen_action_codes.detach(),
+                chosen_valid_mask=chosen_valid_mask.detach(),
+            )
+
+        num_roots = int(valid_root_indices.numel())
+        max_actions = int(valid_mask.shape[1])
+
+        # Dirichlet noise on root priors
+        if add_noise and max_actions > 1:
+            eps = float(self.config.dirichlet_epsilon)
+            alpha = float(self.config.dirichlet_alpha)
+            alpha_t = torch.full_like(priors_mat, alpha, dtype=torch.float32)
+            gamma_dist = torch.distributions.Gamma(alpha_t, torch.ones_like(priors_mat))
+            noise = gamma_dist.sample() * valid_mask.to(torch.float32)
+            noise = noise / noise.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            mixed = (1.0 - eps) * priors_mat + eps * noise
+            apply_mask = counts.gt(1).view(-1, 1)
+            priors_mat = torch.where(apply_mask, mixed, priors_mat)
+
+        # --- Layer 1: evaluate all root children ---
+        child_batch = batch_apply_moves_compat(state, action_codes_all, parent_indices_all)
+        child_values = self._evaluate_values_only(child_batch)
+        parent_player = state.current_player.index_select(0, parent_indices_all)
+        child_leaf_values = self._child_values_to_parent_perspective(
+            child_values=child_values,
+            parent_players=parent_player,
+            child_players=child_batch.current_player,
+        )
+        terminal_child = self._terminal_mask_from_next_state(child_batch)
+        if bool(terminal_child.any().item()):
+            soft_from_black = self._soft_tan_from_board_black(
+                child_batch.board,
+                soft_value_k=float(self.config.soft_value_k),
+            ).to(torch.float32)
+            parent_player_f = parent_player.to(torch.float32)
+            parent_sign = torch.where(
+                parent_player_f.ge(0.0),
+                torch.ones_like(parent_player_f),
+                -torch.ones_like(parent_player_f),
+            )
+            terminal_leaf_values = soft_from_black * parent_sign
+            child_leaf_values = torch.where(
+                terminal_child, terminal_leaf_values, child_leaf_values
+            )
+            self._terminal_soft_override_count += int(terminal_child.sum().item())
+
+        leaf_mat = torch.zeros(
+            (num_roots, max_actions), dtype=torch.float32, device=device
+        )
+        if int(flat_indices.numel()) > 0:
+            leaf_mat.view(-1).index_copy_(0, flat_indices, child_leaf_values)
+
+        # --- Layers 2+: iterative top-K refinement ---
+        n_ply = max(1, int(self.config.sparse_ply))
+        for ply in range(2, n_ply + 1):
+            leaf_mat = self._refine_via_topk_lookahead(
+                state=state,
+                valid_root_indices=valid_root_indices,
+                leaf_mat=leaf_mat,
+                valid_mask=valid_mask,
+                action_code_mat=action_code_mat,
+            )
+
+        # --- PUCT on refined leaf values ---
+        sims = max(1, int(self.config.num_simulations))
+        with self._nvtx_range("v1.root_puct_allocate_visits"), self._timed("root_puct_ms"):
+            visits_cpp, value_sum_cpp, _ = v0_core.root_puct_allocate_visits(
+                priors_mat,
+                leaf_mat,
+                valid_mask,
+                sims,
+                float(self.config.exploration_weight),
+            )
+        visits = visits_cpp.to(dtype=torch.float32, device=device)
+        value_sum = value_sum_cpp.to(dtype=torch.float32, device=device)
+
+        # --- Finalize ---
+        root_temps = temp_values.index_select(0, valid_root_indices)
+        sample_moves = bool(self.config.sample_moves and max_actions > 1)
+        with self._nvtx_range("v1.root_finalize_from_visits"), self._timed("pack_writeback_ms"):
+            (
+                policy_dense,
+                chosen_action_indices,
+                chosen_action_codes,
+                chosen_valid_mask,
+                root_value_vec,
+            ) = self._root_finalize_from_visits(
+                legal_index_mat=legal_index_mat,
+                action_code_mat=action_code_mat,
+                valid_mask=valid_mask,
+                visits=visits,
+                value_sum=value_sum,
+                valid_root_indices=valid_root_indices,
+                batch_size=batch_size,
+                root_temps=root_temps,
+                sample_moves=False,
+            )
+        if sample_moves:
+            with self._nvtx_range("v1.root_sample_outside_graph"), self._timed("pack_writeback_ms"):
+                legal_policy = self._stable_legal_policy_from_visits(
+                    visits=visits,
+                    valid_mask=valid_mask,
+                    root_temps=root_temps,
+                )
+                local_picks = torch.multinomial(legal_policy, num_samples=1).view(-1)
+                sampled_indices_local = legal_index_mat.gather(
+                    1, local_picks.view(-1, 1)
+                ).view(-1)
+                sampled_codes_local = action_code_mat.gather(
+                    1, local_picks.view(-1, 1, 1).expand(-1, 1, 4),
+                ).view(-1, 4)
+                chosen_action_indices.index_copy_(
+                    0, valid_root_indices, sampled_indices_local
+                )
+                chosen_action_codes.index_copy_(
+                    0, valid_root_indices, sampled_codes_local
+                )
+
+        if force_uniform_mask is not None and bool(force_uniform_mask.any().item()):
+            force_local_mask = force_uniform_mask.index_select(0, valid_root_indices)
+            force_local_idx = torch.where(force_local_mask)[0]
+            if int(force_local_idx.numel()) > 0:
+                force_valid = valid_mask.index_select(0, force_local_idx).to(torch.float32)
+                force_policy = force_valid / force_valid.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                force_picks = torch.multinomial(force_policy, num_samples=1).view(-1)
+                force_indices = legal_index_mat.index_select(0, force_local_idx).gather(
+                    1, force_picks.view(-1, 1)
+                ).view(-1)
+                force_codes = action_code_mat.index_select(0, force_local_idx).gather(
+                    1, force_picks.view(-1, 1, 1).expand(-1, 1, 4),
+                ).view(-1, 4)
+                force_global = valid_root_indices.index_select(0, force_local_idx)
+                chosen_action_indices.index_copy_(0, force_global, force_indices)
+                chosen_action_codes.index_copy_(0, force_global, force_codes)
+                chosen_valid_mask.index_fill_(0, force_global, True)
+                self._forced_uniform_pick_count += int(force_local_idx.numel())
+
+        root_values.index_copy_(0, valid_root_indices, root_value_vec)
+
+        return RootSearchBatchOutput(
+            model_input=model_input.detach(),
+            legal_mask=legal_mask_bool.detach(),
+            policy_dense=policy_dense.detach(),
+            root_value=root_values.detach(),
+            terminal_mask=terminal_mask.detach(),
+            chosen_action_indices=chosen_action_indices.detach(),
+            chosen_action_codes=chosen_action_codes.detach(),
+            chosen_valid_mask=chosen_valid_mask.detach(),
+        )
+
     def search_batch(
         self,
         state: GpuStateBatch,
@@ -962,6 +1313,20 @@ class V1RootMCTS:
                 legal_mask_bool,
                 probs,
                 metadata,
+            )
+
+        if int(self.config.sparse_ply) > 1:
+            return self._search_sparse_multi_ply(
+                state=state,
+                temp_values=temp_values,
+                add_noise=add_noise,
+                force_uniform_mask=force_uniform_mask,
+                batch_size=batch_size,
+                legal_mask_bool=legal_mask_bool,
+                probs=probs,
+                root_values=root_values,
+                model_input=model_input,
+                metadata=metadata,
             )
 
         if int(valid_root_indices.numel()) > 0:

@@ -538,6 +538,8 @@ def _run_self_play_shard(
     opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
+    sparse_ply: int = 1,
+    sparse_top_k: int = 8,
     seed: int,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     torch.manual_seed(int(seed))
@@ -569,6 +571,8 @@ def _run_self_play_shard(
         max_game_plies=int(max_game_plies),
         sample_moves=True,
         concurrent_games=shard_concurrent,
+        sparse_ply=int(sparse_ply),
+        sparse_top_k=int(sparse_top_k),
         verbose=False,
     )
     return samples.to("cpu"), stats
@@ -725,6 +729,8 @@ def _run_self_play_multi_device_thread(
                     opening_random_moves=int(opening_random_moves),
                     max_game_plies=int(max_game_plies),
                     concurrent_games_per_device=int(concurrent_games_per_device),
+                    sparse_ply=int(sparse_ply),
+                    sparse_top_k=int(sparse_top_k),
                     seed=int(worker_seed),
                 )
                 future_map[future] = (worker_idx, shard_dev, shard_games)
@@ -773,6 +779,8 @@ def _run_self_play_multi_device_process(
     concurrent_games_per_device: int,
     iteration_seed: int,
     shard_dir: Optional[str],
+    sparse_ply: int = 1,
+    sparse_top_k: int = 8,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     workspace, auto_cleanup = _prepare_self_play_workspace(
         shard_dir=shard_dir,
@@ -807,6 +815,8 @@ def _run_self_play_multi_device_process(
                 target_samples_per_shard=0,
                 chunk_target_bytes=0,
                 metadata_base={},
+                sparse_ply=int(sparse_ply),
+                sparse_top_k=int(sparse_top_k),
             )
         )
         merged_batch, _stats_payload, _meta_payload = _load_self_play_payload(str(manifest_path))
@@ -847,6 +857,8 @@ def _run_self_play_multi_device_process_saved(
     target_samples_per_shard: int,
     chunk_target_bytes: int,
     metadata_base: Dict[str, Any],
+    sparse_ply: int = 1,
+    sparse_top_k: int = 8,
  ) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], Dict[str, Any], int]:
     model_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     shards = _split_games(int(num_games), len(devices))
@@ -905,6 +917,8 @@ def _run_self_play_multi_device_process_saved(
                     max_game_plies=int(max_game_plies),
                     concurrent_games_per_device=int(concurrent_games_per_device),
                     soft_label_alpha=float(soft_label_alpha),
+                    sparse_ply=int(sparse_ply),
+                    sparse_top_k=int(sparse_top_k),
                     target_samples_per_shard=int(target_samples_per_shard),
                     chunk_target_bytes=int(chunk_target_bytes),
                     chunk_output_dir=str(out_dir),
@@ -1065,6 +1079,8 @@ def _run_self_play_multi_device(
     iteration_seed: int,
     self_play_backend: Optional[str],
     self_play_shard_dir: Optional[str],
+    sparse_ply: int = 1,
+    sparse_top_k: int = 8,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     if len(devices) <= 1:
         single_device = devices[0]
@@ -1086,6 +1102,8 @@ def _run_self_play_multi_device(
             max_game_plies=int(max_game_plies),
             sample_moves=True,
             concurrent_games=shard_concurrent,
+            sparse_ply=int(sparse_ply),
+            sparse_top_k=int(sparse_top_k),
             verbose=False,
         )
 
@@ -1112,6 +1130,8 @@ def _run_self_play_multi_device(
             concurrent_games_per_device=int(concurrent_games_per_device),
             iteration_seed=int(iteration_seed),
             shard_dir=self_play_shard_dir,
+            sparse_ply=int(sparse_ply),
+            sparse_top_k=int(sparse_top_k),
         )
     return _run_self_play_multi_device_thread(
         model=model,
@@ -1688,6 +1708,8 @@ def train_pipeline_v1(
     infer_iters: int = 100,
     infer_output: Optional[str] = None,
     model_init_seed: Optional[int] = None,
+    sparse_ply: int = 1,
+    sparse_top_k: int = 8,
 ) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     stage_norm = str(stage).strip().lower()
@@ -1903,6 +1925,8 @@ def train_pipeline_v1(
                     iteration_seed=int(stage_selfplay_seed),
                     self_play_backend=backend_arg,
                     self_play_shard_dir=shard_dir_arg,
+                    sparse_ply=int(sparse_ply),
+                    sparse_top_k=int(sparse_top_k),
                 )
                 value_target_summary = _compute_value_target_summary(samples)
                 soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2328,6 +2352,8 @@ def train_pipeline_v1(
                 iteration_seed=int(it_idx),
                 self_play_backend=backend_arg,
                 self_play_shard_dir=shard_dir_arg,
+                sparse_ply=int(sparse_ply),
+                sparse_top_k=int(sparse_top_k),
             )
             value_target_summary = _compute_value_target_summary(samples)
             soft_value_target_summary = _compute_soft_value_target_summary(samples)

@@ -272,6 +272,8 @@ def run_self_play_worker(
     chunk_output_dir: Optional[str] = None,
     chunk_file_prefix: Optional[str] = None,
     chunk_file_ext: str = ".pt",
+    sparse_ply: int = 1,
+    sparse_top_k: int = 8,
 ) -> Dict[str, Any]:
     """Run one self-play shard inside a dedicated process and persist shard payload."""
 
@@ -321,6 +323,8 @@ def run_self_play_worker(
                 max_game_plies=int(max_game_plies),
                 sample_moves=True,
                 concurrent_games=max(1, min(int(chunk_games), shard_concurrent)),
+                sparse_ply=int(sparse_ply),
+                sparse_top_k=int(sparse_top_k),
                 verbose=False,
             )
 
