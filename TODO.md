@@ -1,6 +1,91 @@
 # TODOS
 
-TODO以产生时间为准。最近审查：2026.02.26
+TODO以产生时间为准。最近审查：2026.07.21
+
+### 2026.07.21 — 正确的 CPU 搜索参考实现与 macOS Apple Silicon MPS 训练
+
+#### 已完成的设计审计
+
+- [x] 确认当前 V1 `SPARSE_PLY=1` 是固定一步子节点价值的 Root-PUCT 分票器，不是完整 MCTS。
+- [x] 区分永久访问统计 `N/W` 与临时并发占位 `virtual loss`；当前 fused Root-PUCT 的同根 simulation 循环顺序执行，不依赖 virtual loss。
+- [x] 确认 Root-PUCT 是为 GPU batching/吞吐建立的迁移基线，不是 GPU 计算必然要求的算法形式。
+- [x] 静态审计当前 `SPARSE_PLY>1` 原型：递归 frontier、行动方视角、minimax/negamax 回传、深层负面证据和终局行映射尚不满足正式训练要求。
+- [x] 确认 aggressive 默认 `MCTS_SIMULATIONS=65536` 与后期 `temperature=0.1` 在固定 `q` 下可能产生极尖锐的教师分布；该结论是训练敏感性的强假设，尚未完成固定模型 A/B 归因。
+
+#### 目标架构与范围
+
+- [ ] 新增 V1 portable reference backend：CPU 负责规则、树节点、选择、扩展 bookkeeping 和回传；PyTorch 负责批量网络前向与训练。
+- [ ] 支持单进程设备 `cpu` 与 `mps`；`auto` 在 `torch.backends.mps.is_available()` 为真时优先选择 `mps`，否则明确回退到 CPU 并记录原因。
+- [ ] portable backend 在 import 和运行时不依赖 `v0_core`、CUDA Graph、CUDA Event/NVTX、NCCL、DDP 或 DataParallel。
+- [ ] 保留现有 CUDA V1 路径和接口，不把 correctness-first portable 实现替换成新的默认高性能后端。
+- [ ] 第一阶段不做正式长训练、不做多进程 MPS、不承诺吞吐超过 CUDA/CPU 现有实现；先交付正确、可测、可在 Mac 上跑通的小规模闭环。
+
+#### P0：冻结契约与 Mac 环境基线
+
+- [ ] 记录 Mac 型号、macOS、Python、PyTorch 版本以及 `torch.backends.mps.is_built()/is_available()`；确认实际支持的 dtype/op，不按记忆假设 MPS API。
+- [ ] 定义统一设备解析和日志：`cpu/mps/cuda` 分支必须显式，任何 MPS→CPU fallback 都要可观察，禁止静默依赖 `PYTORCH_ENABLE_MPS_FALLBACK=1` 制造成功。
+- [ ] 冻结 portable self-play 输出契约：`state_tensors (N,11,6,6)`、`legal_masks (N,220)`、`policy_targets (N,220)`、`value_targets (N,)`、`soft_value_targets (N,)`。
+- [ ] 冻结动作编码、规则阶段、终局判定和价值视角，以 `docs/rules.md`、当前代码与测试为准。
+
+#### P1：实现语义正确的 CPU 完整树搜索参考后端
+
+- [ ] 新增或整理纯 Python/CPU tree node arena，至少保存 `state/parent/children/prior/N/W/current_player/terminal`，不调用 CUDA/C++ 专用 op。
+- [ ] 实现标准循环：selection → expansion → batched neural evaluation → backup；根策略由访问次数和温度生成，非法动作概率严格为零。
+- [ ] 子节点 policy/value 前向可批量送到所选 PyTorch device；在 Mac 上树与规则留在 CPU，模型 batch 放到 MPS。
+- [ ] 回传时逐边比较 parent/child 的 `current_player`：相同玩家不取反，真正换手才取反。
+- [ ] 终局值、网络 value、trajectory target 统一到当前行动方视角；不得每个原子 ply 机械取反。
+- [ ] 如果同一棵树一次收集多个待评估叶子，使用可撤销的 virtual loss 防止重复选择；若每棵树每轮只选一个叶子，则不引入无意义的 virtual loss。
+- [ ] 支持在实际落子后保留可复用子树；可先以正确性为主，复用优化不得阻塞首个参考版本。
+
+#### P2：针对六洲棋阶段语义补齐搜索测试
+
+- [ ] 构造同一玩家连续 `MARK_SELECTION/REMOVAL/CAPTURE_SELECTION/COUNTER_REMOVAL` 的最小状态，验证跨边不翻转。
+- [ ] 构造行动方切换状态，验证只在换手边翻转。
+- [ ] 构造成方、成洲、连续标记和提吃需要 2–4 个原子动作才能看见后果的战术案例，验证深搜索能纠正 root-only 排序。
+- [ ] 验证更深证据既能上调也能下调浅层估值，禁止 optimistic-only `max(shallow,deeper)`。
+- [ ] 验证终局/无合法动作/部分 batch 终局行不会丢失 root/action 映射。
+- [ ] 验证 `sum(π)=1`、非法位置 `π=0`、220 维索引与 `v0/python/move_encoder.py` 一致。
+- [ ] 检查现有 V0 `MCTSCore::Backpropagate()` 的逐边机械取反问题；修正并通过同一测试前，不把 V0 完整搜索当作 ground truth。
+
+#### P3：接入 portable self-play、训练和评估
+
+- [ ] portable self-play 输出与 `TensorSelfPlayBatch`/训练桥接兼容，避免另建不兼容数据格式。
+- [ ] 将 `v0_core` 与 CUDA-only 模块改为按 backend/device 延迟导入，确保纯 CPU/MPS 环境能 import、运行和测试。
+- [ ] `v1/python/train_bridge.py` 支持 MPS 单设备训练：首版使用 float32；CUDA AMP/GradScaler 仅在 CUDA 启用，不能把 `autocast("cuda")` 用到 MPS。
+- [ ] checkpoint 使用可移植 `map_location`，CPU、MPS 和 CUDA 保存的模型权重可以互相加载；optimizer state 不兼容时必须明确报错或记录受控重建。
+- [ ] macOS 首版固定单进程/single-device，避免 fork、NCCL、DDP 和多 MPS 设备假设；如使用 DataLoader worker，验证 `spawn` 行为和关闭流程。
+- [ ] 训练、评估与自博弈必须能够显式选择同一个 portable search backend，避免训练用深搜索、评估误用 root-only。
+- [ ] 新增一个 Mac toy/smoke 入口，使用很小的 games/simulations/epochs 跑通 `selfplay → train → eval → checkpoint reload`。
+
+#### P4：固定模型搜索质量 A/B（先于训练）
+
+- [ ] 选择随机、早期、中期和当前较强 checkpoint；准备覆盖所有主要规则阶段的固定状态集。
+- [ ] 对当前 root-only 运行 `128/512/1536/65536` simulations 消融，记录 `P→π KL`、`π entropy`、有效访问动作数、top-1 稳定性和吞吐。
+- [ ] 对 `q` 做小扰动测试，量化低温度下 `π`/top-1 的敏感性。
+- [ ] 用同一 checkpoint 做 portable full MCTS vs root-only 的交叉执色 head-to-head；固定 seed、温度、开局、最大步数和推理预算。
+- [ ] 只有 portable 搜索在固定模型下稳定提高战术正确率或对战结果，才进入训练效果 A/B。
+
+#### P5：短训练 A/B 与验收
+
+- [ ] 用相同初始 checkpoint、seed、训练参数和样本数比较 root-only 与 portable search，记录 loss、target 分布、draw/decisive ratio 和 previous/best 对战。
+- [ ] 再按相同墙钟时间/设备预算比较，防止搜索更强但数据量锐减后仍误报整体收益。
+- [ ] value 目标必须保留真实 W/D/L 锚点；单独报告 soft material 权重，避免把搜索收益和奖励目标变化混在同一实验。
+- [ ] 棋力结论以 head-to-head/tournament/Elo 或 BT 为主，`vs_random` 只作健康度探针。
+
+#### P6：性能优化（只在语义验收后）
+
+- [ ] profile CPU selection/rules、MPS forward、CPU↔MPS transfer 和 batch padding，先优化实测热点。
+- [ ] 优先使用跨对局并行：每棵树选择一个叶子，再把多棵树的叶子合成 MPS batch；仅在确有需要时做同树多叶并行和 virtual loss。
+- [ ] 评估 phase-complete/bounded search 是否能以更低成本覆盖六洲棋连续原子阶段；不得用错误 max-pooling 替代标准回传。
+- [ ] 任何性能修改都要重新跑 CPU/MPS parity、规则阶段测试和固定 checkpoint 对战，不能只报告 positions/sec。
+
+#### 完成门槛
+
+- [ ] 在不安装/导入 `v0_core`、没有 CUDA 的 Mac 环境中，CPU portable 全部相关测试通过。
+- [ ] 在 `torch.backends.mps.is_available()` 的 Apple Silicon Mac 上，完成至少一次小规模 `selfplay → train → eval → reload`，无静默 CPU fallback、无 NaN/Inf、输出 shape/编码/视角正确。
+- [ ] CPU 与 MPS 在固定输入上的 legal mask 完全一致，policy/value 在约定数值容差内一致。
+- [ ] 搜索测试证明同一玩家连续行动不翻转、换手才翻转、深层负面证据可以降低根动作估值。
+- [ ] 交付固定模型 A/B 报告；若没有棋力收益，如实保留 portable backend 作为正确性参考，不宣称训练已改善。
 
 ### 2026.02.26
 
