@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from scripts.long_train_portable_mps import (
     PortableLongTrainer,
+    _config_signature,
     audit_train_metrics,
     build_parser,
     candidate_beats_incumbent,
@@ -85,6 +87,41 @@ def test_confirm_target_reuses_existing_confirmation_without_eval() -> None:
     trainer.args = SimpleNamespace(target_win_rate=0.99)
     trainer.state = {"target_reached": True}
     assert trainer.confirm_target(12)
+
+
+def test_resume_can_continue_after_confirmed_target_when_stop_flag_is_removed(tmp_path) -> None:
+    args = build_parser().parse_args(["--run-dir", str(tmp_path), "--resume"])
+    trainer = PortableLongTrainer(args)
+    trainer.checkpoint_dir.mkdir(parents=True)
+    trainer.current_checkpoint.write_bytes(b"model")
+    trainer.optimizer_checkpoint.write_bytes(b"optimizer")
+    trainer.state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deadline_epoch": int(time.time()) + 3600,
+                "iteration": 50,
+                "target_reached": True,
+                "stop_reason": "target_confirmed",
+                "ended_utc": "2026-07-22T09:40:01Z",
+                "elapsed_sec": 7502,
+                "config": _config_signature(args),
+                "latest_checkpoint_sha256": sha256_file(trainer.current_checkpoint),
+                "latest_optimizer_sha256": sha256_file(trainer.optimizer_checkpoint),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trainer.initialize()
+
+    assert trainer.state["stop_reason"] is None
+    assert trainer.state["iteration"] == 50
+    assert trainer.state["target_reached"] is True
+    assert trainer.state["resume_count"] == 1
+    assert trainer.state["last_resume_stop_reason"] == "target_confirmed"
+    assert "ended_utc" not in trainer.state
+    assert "elapsed_sec" not in trainer.state
 
 
 def test_interrupted_model_optimizer_commit_restores_previous_pair(tmp_path) -> None:

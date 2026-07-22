@@ -510,11 +510,23 @@ class PortableLongTrainer:
                     "resume configuration differs from state.json; "
                     "resume with the original frozen training/evaluation parameters"
                 )
-            if (
-                state.get("stop_reason") in {"max_iterations", "dry_run"}
+            previous_stop_reason = state.get("stop_reason")
+            resume_after_target = (
+                previous_stop_reason in {"target_confirmed", "target_confirmed_at_start"}
+                and not bool(self.args.stop_on_target)
+            )
+            resume_stopped_run = previous_stop_reason in {"max_iterations", "dry_run"}
+            resumed = bool(
+                (resume_stopped_run or resume_after_target)
                 and int(time.time()) < int(state.get("deadline_epoch", 0))
-            ):
+            )
+            if resumed:
                 state["stop_reason"] = None
+                state.pop("ended_utc", None)
+                state.pop("elapsed_sec", None)
+                state["resume_count"] = int(state.get("resume_count", 0)) + 1
+                state["last_resume_utc"] = utc_now()
+                state["last_resume_stop_reason"] = previous_stop_reason
             self.state = state
             if self._recover_interrupted_commit():
                 self._event(
@@ -524,6 +536,15 @@ class PortableLongTrainer:
                     optimizer_sha256=state.get("latest_optimizer_sha256"),
                 )
                 self._save_state()
+            elif resumed:
+                self._save_state()
+            if resumed:
+                self._event(
+                    "run_resumed",
+                    iteration=int(state.get("iteration", 0)),
+                    previous_stop_reason=previous_stop_reason,
+                    target_reached=bool(state.get("target_reached", False)),
+                )
             if not self.current_checkpoint.exists() and int(state.get("iteration", 0)) > 0:
                 raise RuntimeError(f"resume checkpoint is missing: {self.current_checkpoint}")
             log(

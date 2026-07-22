@@ -7,7 +7,9 @@
 - Current target is an approximately 20-hour portable MPS run on the local MacBook Air, retaining the strongest checkpoint during training and testing whether it can reach at least `99%` raw wins against RandomAgent over 500 games. Draws count as non-wins. This is a `vs_random` health/progress target, not a tournament/Elo strength claim.
 - The run starts from the accepted one-hour checkpoint `tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt` and its matching `optimizer_state.pt`, rather than discarding the already verified 3,744 games / 373,365 positions. The optimizer-state SHA-256 is `845ab53cefc20e1a6456f2845c1d0a6e6011d7db184d6114f5a91946a265db76`.
 - The implementation and smoke evidence are committed as `5f8e0d5e7360eace6d4da47d0aa01cfa0220c0f8`. The full run started at `2026-07-22 15:34:59 UTC+8` (`07:34:59Z`) and has a fixed deadline of `2026-07-23 11:34:59 UTC+8` (`03:34:59Z`). It is active under the one-shot LaunchAgent label `com.liuzhou.portable-mps-20h`, with runtime state in `tmp/v1_portable_long_20h/` and logs in `logs/portable_mps_20h.log` / `.err.log`.
-- The seeded initial 500-game baseline completed in `114.64s`: `433-0-67` (`86.60%` raw wins), Wilson 95% `[83.33%, 89.31%]`; challenger black `217-0-33`, white `216-0-34`. MPS resolved without fallback. The run then entered iteration 1 self-play with 128 games/concurrency 128 and 8 simulations. The `>=495/500` target has not yet been reached.
+- The seeded initial 500-game baseline completed in `114.64s`: `433-0-67` (`86.60%` raw wins), Wilson 95% `[83.33%, 89.31%]`; challenger black `217-0-33`, white `216-0-34`. MPS resolved without fallback.
+- Iteration 50 reached the target with `495-0-5/500` (`99.00%`, seed `21260822`) and passed the required independent confirmation with `497-0-3/500` (`99.40%`, seed `30260772`). The candidate also beat the incumbent `203-106-191/500` under sampled temperature-1 play and was promoted. A separate final probe scored `494-0-6/500`; this independent sample variation does not undo the predeclared two-stage `495/500` + confirmation acceptance.
+- The original `--stop-on-target` ended cleanly at iteration 50. At the user's request, the same current model, optimizer, rolling replay, frozen parameters and original deadline were resumed without the stop flag at `2026-07-22T10:34:05Z`. Iteration 51 then committed successfully with optimizer continuity, replay inputs 47–50, zero device fallback and zero filtered non-finite samples; iteration 52 started afterward.
 
 ### 2) Local Machine and Frozen M5 Parameters
 
@@ -52,7 +54,7 @@
 - The smoke's 4-game evaluation results are only control-flow evidence. In particular, the final `3-0-1` and other 4-game samples provide no evidence that the 500-game `99%` target has been reached.
 - Fresh focused validation:
   - `tests/test_eval_checkpoint_reproducibility.py`: 4 passed;
-  - `tests/test_long_train_portable_mps.py`: 11 passed, including interrupted model/optimizer pair recovery, retry reset and replay-window-zero semantics;
+  - `tests/test_long_train_portable_mps.py`: 12 passed on the continuation update, including resume after a confirmed target, interrupted model/optimizer pair recovery, retry reset and replay-window-zero semantics;
   - `tests/v1/test_portable_mcts.py`: 23 passed;
   - combined focused suite: 38 passed in 1.43 seconds on the latest rerun;
   - Python compilation of both modified Python entry points passed;
@@ -78,7 +80,7 @@ python -m json.tool tmp/v1_portable_long_20h/state.json
 
 - Resume continuity, target-confirmation de-duplication, paired model/optimizer recovery, retry cleanup, replay-window-zero semantics and the portable MCTS focused regressions are now covered by fresh tests and real MPS smoke.
 - Re-run the final exact-path diff audit after documentation settles; local V0/CUDA cross-layer tests remain unavailable on this Mac because `v0_core`/CUDA are absent.
-- The 20-hour task is active but incomplete. Sustained thermal behavior, final independent 500-game result and the `>=99%` outcome remain unverified. Closed-lid behavior is explicitly out of scope for this run.
+- The 20-hour task is active but incomplete. The `>=99%` RandomAgent gate is confirmed, while sustained thermal behavior, the ultimate retained model, final end-of-deadline evaluation and stronger-opponent/tournament strength remain unverified. Closed-lid behavior is explicitly out of scope for this run.
 
 ## Current Conclusions (2026-07-22): Portable MPS One-Hour Smoke Acceptance
 
