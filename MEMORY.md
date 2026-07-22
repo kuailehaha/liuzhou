@@ -1,5 +1,60 @@
 # MEMORY
 
+## Current Conclusions (2026-07-22): Portable MPS One-Hour Smoke Acceptance
+
+### 1) Scope and Verdict
+
+- Evaluated commit `b5eed8ba2a2cff44b0716a10cb379a1e7de52353` (`feature&selfplay: add portable CPU/MPS full-MCTS reference pipeline`) on a MacBook Air with Apple M5, 16 GiB RAM, Python 3.10.20, PyTorch 2.9.1 and MPS. CUDA and `v0_core` were unavailable.
+- Under the frozen portable smoke protocol below, the final one-hour checkpoint beat RandomAgent in `859/1000` games, with `0` losses and `141` draws. Raw win rate was `85.90%`, exceeding the strict `>80%` acceptance threshold by `5.90` percentage points.
+- The Wilson 95% interval for wins over all games was `[83.61%, 87.92%]`; its lower bound also exceeded 80%.
+- This establishes that the new portable pipeline can cross the requested `vs_random` smoke threshold under an appropriate one-hour MPS configuration. It remains a health/training-progress result, not tournament/Elo evidence of general model strength.
+
+### 2) Pilot, Tuning and Frozen Configuration
+
+- The near-untrained pilot checkpoint scored `7-16-77` against RandomAgent over 100 games. A 10-iteration calibration run improved to `63-0-37` over 100 games; iteration 5 had scored `55-0-45`.
+- Early full-game self-play was draw-heavy, so the formal run retained mixed hard/soft value supervision with `soft_label_alpha=0.5` rather than relying on initially sparse hard W/D/L targets alone.
+- The formal run started from scratch after calibration and froze the following configuration before launch; no parameter was changed during the hour and no intermediate checkpoint was selected after seeing the final result:
+  - portable full-MCTS backend on MPS, single process;
+  - 32 self-play games per iteration, concurrency 32 and 6 random opening moves;
+  - 8 MCTS simulations, temperature `1.0 -> 0.1` at ply 10 and maximum 512 plies;
+  - batch size 256, 3 epochs, learning rate `3e-4`, weight decay `1e-4`;
+  - `soft_label_alpha=0.5`, `policy_draw_weight=1.0`;
+  - model initialization seed `20260722`, self-play iteration seeds `1..117`;
+  - explicit staged `selfplay` and `train` calls with checkpoint reload and persistent optimizer state.
+
+### 3) Formal Training Evidence
+
+- Wall-clock window: UTC `2026-07-22T02:49:22Z` to `2026-07-22T03:49:27Z` (Beijing time `10:49:22` to `11:49:27`), `3605` seconds total.
+- Completed 117 full self-play/train iterations, producing 3,744 games and 373,365 positions.
+- Aggregate self-play outcomes were 1,478 black wins, 856 white wins and 1,410 draws; decisive-game ratio was `62.34%`, with `63.13%` over the final 10 iterations.
+- Aggregate measured self-play time was `2383.21s` at `156.66` positions/s; measured training time was `700.54s` over 4,548 optimizer steps.
+- Average loss moved from `4.8333` on iteration 1 to `1.6666` on iteration 117; the final-10 mean was `1.9758`.
+- Optimizer state loaded successfully on all 116 continuation iterations. Device/MCTS fallbacks, non-finite targets, non-finite checkpoint tensors and filtered non-finite samples were all zero.
+- Final checkpoint: `tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt`, SHA-256 `5b4cb05c12f4ccde36653873d124f85646160213130adf0e9a9ffacdde208c18`. Its 156 state tensors (3,040,446 elements) were finite.
+
+### 4) Independent 1000-Game Acceptance
+
+- Evaluated the final checkpoint, not a post-hoc best checkpoint, with portable MPS, 8 simulations, temperature 0, no opening randomization, concurrency 64 and one worker.
+- The challenger played exactly 500 games as black and 500 as white. Aggregate result: `859-0-141` over 1,000 games (`85.90%` win, `0.00%` loss, `14.10%` draw).
+- Evaluation took `240.06s` with zero device fallback. Draws counted as non-wins for the strict win-rate threshold.
+- Evaluation report: `tmp/v1_portable_goal_20260722/formal_1h/eval_final_1000.json`, SHA-256 `7201512b7a256811b8a0452cd71957630cf824cc4dace338909f11ef4c553ad4`.
+
+### 5) Verification and Artifact Anchors
+
+- `tests/v1/test_portable_mcts.py`: 23 tests passed in 1.57 seconds on the same environment.
+- The portable smoke checked CPU/MPS legal-mask and output parity, finite values, checkpoint save/reload and explicit fallback rejection before the formal run.
+- Consolidated local report: `tmp/v1_portable_goal_20260722/formal_1h/formal_summary.json`.
+- Exact staged run protocol: `tmp/v1_portable_goal_20260722/formal_1h/run_formal_1h.txt`.
+- The retained ignored experiment directory is about 1.4 GiB and contains all 117 checkpoints plus paired self-play/train JSON metrics.
+
+### 6) Known Limitations and Follow-Up
+
+- `scripts/eval_checkpoint.py` currently derives its random seed from wall-clock time and does not persist the seed in its report. It balances challenger colors but reports only aggregate W/L/D, not per-color W/L/D.
+- Repeated staged invocations write checkpoint-internal `iteration=1`; the true external iteration is currently recoverable from checkpoint filenames and paired JSON files. Future long staged loops should write explicit external-iteration metadata.
+- Local collection of the V1 tensor-pipeline/V0 action tests was blocked by missing `v0_core`; no CPU/CUDA or portable/CUDA cross-layer parity claim follows from this Mac run.
+- Eight simulations is a constrained portable-Mac smoke budget and is not comparable to the production H20/CUDA search configuration.
+- Continue to use `vs_random` only for health and coarse progress. Any strength claim still requires fixed-opponent head-to-head, tournament/Elo/BT, or the agreed gating protocol under controlled compute.
+
 ## Current Conclusions (2026-07-21): Root-PUCT Audit and Portable CPU/MPS Direction
 
 ### 1) Confirmed Root-PUCT Design Facts

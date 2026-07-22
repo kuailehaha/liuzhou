@@ -213,6 +213,16 @@ Windows 本地机可用 1 张 RTX 3060 和 16 核 CPU，环境启动方式为 `c
 - 大型 checkpoint、JSONL、trace、profile 和临时日志不提交到 Git。交付中引用其路径和关键摘要，并确认不含密钥或敏感环境信息。
 - 修改训练脚本时优先提供 smoke/toy 或 stage 级验证方案；正式 H20 长跑属于独立验收，不因本地代码测试通过而宣称训练效果已验证。
 
+### 冒烟训练与 `vs_random` 验收
+
+- 训练型冒烟按“短 pilot 验证链路和信号 → 小规模调参 → 冻结配置 → 从头正式运行 → 独立评估”的顺序执行。正式计时开始后不再改参数；若因错误重启，保留失败证据并明确重新计时边界。
+- 正式运行前预先指定验收 checkpoint，默认使用到达时间/样本预算后的最后一个完整 checkpoint。若评估多个中间 checkpoint 后再选最优，必须标明为 post-hoc screening，并另用独立样本复验，不能与预注册的 final-checkpoint 结果混报。
+- `vs_random` 阈值必须写清分母和判定式；默认报告 `wins / total_games`，平局属于未胜。固定并记录总局数、双方颜色分配、MCTS simulations、温度、随机开局、并发、设备、fallback 和耗时；条件允许时同时给出逐颜色 W/L/D。
+- 1000 局等有限样本除点估计外应报告二项比例置信区间（默认 Wilson 95%）。只有点估计超过阈值时称“观察值通过”；若要主张有统计余量，置信区间下界也应超过阈值。
+- 评估 seed 必须可设置并写入报告。若当前入口使用时间 seed 或未持久化 seed，交付时必须明确标为复现限制，不能把一次随机结果描述为完全可复现。
+- 外层循环反复调用 staged `selfplay`/`train` 时，显式持久化并审计 checkpoint 与 optimizer state；首轮后每轮都应成功加载。外层迭代号、输入 checkpoint、输出 checkpoint 和配对 metrics 必须有可追踪映射，不能只依赖可能在每次进程启动时重置的 checkpoint 内部 `iteration` 字段。
+- 正式训练健康检查至少汇总：游戏数、位置数、决定性/和棋比例、loss 首尾与近期窗口、optimizer 连续性、非有限值、过滤样本和设备/MCTS fallback。训练内自博弈胜负不能替代独立 `vs_random` 或 tournament 结果。
+
 ## Git、分支收尾与交付
 
 - 修改前后检查 `git status --short`；交付前使用 `git diff -- <exact-paths>` 逐文件阅读本次路径的 diff，确认没有用户改动、临时产物或无关格式化混入。
