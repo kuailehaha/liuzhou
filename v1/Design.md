@@ -22,7 +22,8 @@ Scope: Design for migrating v0 CPU-bottleneck self-play to a GPU-first v1 pipeli
 - Focused suite: 38 tests passed across portable MCTS, evaluation reproducibility/color balance and long-run scheduling/recovery. Real MPS smoke covered three-iteration resume, replay/optimizer continuity, random and incumbent gating, final evaluation, pair SHA persistence and zero fallback/non-finite samples.
 - A 100-game sampled same-checkpoint gate took `61.79s` at concurrency 64 with about 1.26 GB peak footprint, so a 500-game incumbent gate is expected to take about 5.1 minutes. Together with the measured RandomAgent gate, periodic evaluation costs about 7.5 minutes every 10 iterations.
 - No thermal/performance warning or swap was observed in the local tuning and smoke runs. This is not a closed-lid endurance result.
-- The full 20-hour run, 500-game `>=99%` outcome and actual closed-lid endurance remain unverified. The current machine has no external display, so the required `--require-external-display` preflight correctly fails. Apple-supported clamshell operation requires AC, an external display and external keyboard/mouse.
+- The full run started open-lid on AC at `2026-07-22 15:34:59 UTC+8`, with a deadline of `2026-07-23 11:34:59 UTC+8`. It is owned by the one-shot LaunchAgent `com.liuzhou.portable-mps-20h`; `caffeinate -ims` system/idle/disk assertions were observed active. Runtime state is under `tmp/v1_portable_long_20h/`.
+- The initial seeded 500-game gate scored `433-0-67` (`86.60%`, black `217-0-33`, white `216-0-34`) in `114.64s` with zero device fallback, after which iteration 1 entered 128-game self-play. The 20-hour completion, final independent 500-game result and `>=495/500` outcome remain unverified. Closed-lid endurance is out of scope for this user-approved open-lid run.
 
 ### MCTS simulation multiplier decision
 

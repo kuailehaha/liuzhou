@@ -235,6 +235,7 @@ Apple Silicon 本地机为 MacBook Air `Mac17,3`（Apple M5、10 核 CPU、8 核
 - `best_vs_random.pt` 与 `best_model.pt` 语义不同：前者按固定 RandomAgent 口径筛选，后者由候选对 incumbent 的独立 head-to-head gate 更新。不要用随机对手最高点替代 incumbent gating，也不要将训练内胜负当作两者之一。
 - 500 局评估必须使用偶数局、固定并持久化 seed、精确均分 challenger 黑白并报告逐颜色 W/L/D。若目标为 `99%` raw wins，则判定式为 `wins >= 495/500`，平局不计胜；筛选后还要用独立 seed 再跑 500 局确认，并保留 Wilson 95% 区间。
 - macOS `caffeinate -ims` 只在进程存活时抑制 idle/system/disk sleep，不抑制 display sleep，也不能绕过合盖硬件条件。Apple silicon 合盖长跑必须接交流电、外接显示器及外接键盘/鼠标，并用 `--require-external-display` 做启动前检查；缺任一条件时停止，不使用持久化 `sudo pmset disablesleep` 规避。
+- 用户明确选择开盖长跑时，可以不要求外接显示器，但必须接交流电并保持上盖打开；需记录该选择，且不得把结果表述为合盖耐久验证。Codex 执行环境中的直接 `nohup` 可能被进程回收器清理，跨断联运行优先使用 `RunAtLoad=true`、`KeepAlive=false` 的一次性用户 LaunchAgent，并核对任务进程、日志、状态文件和 `caffeinate` 断言后再交付。
 - 长训产物保留在 ignored 的 `tmp/`/`logs/` 路径，不纳入 Git。短 smoke 的 4/20 局结果只验证控制流、seed/颜色统计、best retention、恢复与 fallback 审计，不得作为 500 局目标或模型强度证据。
 
 ## Git、分支收尾与交付

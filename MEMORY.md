@@ -1,12 +1,13 @@
 # MEMORY
 
-## Current Conclusions (2026-07-22): Apple M5 Portable 20-Hour Training Preparation
+## Current Conclusions (2026-07-22): Apple M5 Portable 20-Hour Training Run
 
 ### 1) Goal, Baseline and Current Status
 
 - Current target is an approximately 20-hour portable MPS run on the local MacBook Air, retaining the strongest checkpoint during training and testing whether it can reach at least `99%` raw wins against RandomAgent over 500 games. Draws count as non-wins. This is a `vs_random` health/progress target, not a tournament/Elo strength claim.
 - The run starts from the accepted one-hour checkpoint `tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt` and its matching `optimizer_state.pt`, rather than discarding the already verified 3,744 games / 373,365 positions. The optimizer-state SHA-256 is `845ab53cefc20e1a6456f2845c1d0a6e6011d7db184d6114f5a91946a265db76`.
-- The implementation and smoke evidence below are currently in the worktree based on commit `1c607499cffa1a3ee11e2433388cd698a29b987f`. The full 20-hour run and its 500-game acceptance have **not** run yet.
+- The implementation and smoke evidence are committed as `5f8e0d5e7360eace6d4da47d0aa01cfa0220c0f8`. The full run started at `2026-07-22 15:34:59 UTC+8` (`07:34:59Z`) and has a fixed deadline of `2026-07-23 11:34:59 UTC+8` (`03:34:59Z`). It is active under the one-shot LaunchAgent label `com.liuzhou.portable-mps-20h`, with runtime state in `tmp/v1_portable_long_20h/` and logs in `logs/portable_mps_20h.log` / `.err.log`.
+- The seeded initial 500-game baseline completed in `114.64s`: `433-0-67` (`86.60%` raw wins), Wilson 95% `[83.33%, 89.31%]`; challenger black `217-0-33`, white `216-0-34`. MPS resolved without fallback. The run then entered iteration 1 self-play with 128 games/concurrency 128 and 8 simulations. The `>=495/500` target has not yet been reached.
 
 ### 2) Local Machine and Frozen M5 Parameters
 
@@ -61,27 +62,23 @@
 - A 100-game sampled same-checkpoint incumbent-gate benchmark produced `39-32-29`, with exact 50/50 colors, in `61.79s` at concurrency 64 and about `1.26` GB peak footprint. A 500-game gate therefore projects to roughly 5.1 minutes; together with the measured RandomAgent gate, the every-10-iteration evaluation budget is roughly 7.5 minutes.
 - Simulation-sweep artifacts are under `tmp/v1_portable_goal_20260722/sim_sweep/`; consolidated report: `summary.json`. The 500-game comparison uses independent seed `2026072400` and exact 250/250 challenger colors.
 
-### 5) Closed-Lid Constraint and Intended Launch
+### 5) Open-Lid Launch and Persistence
 
-- Current hardware inspection found AC power and the internal display only; no external display is connected. Apple silicon closed-lid operation requires power, an external display and an external keyboard/mouse ([Apple: Allow accessories to connect](https://support.apple.com/en-mide/102282), [Apple: If your external display is dark](https://support.apple.com/en-ie/102501)). `caffeinate` does not remove that hardware requirement.
-- `--require-external-display` preflight currently fails as intended. Do not launch or claim a reliable closed-lid 20-hour run until the external display and input devices are connected. Avoid persistent or unsupported `sudo pmset disablesleep` workarounds.
-- Once those prerequisites are present, the intended resumable launch is:
+- The user explicitly selected open-lid operation because no external display is connected. The Mac must remain open and on AC power; this run makes no closed-lid endurance claim. Apple silicon closed-lid operation still requires power, an external display and an external keyboard/mouse. `caffeinate` does not remove that hardware requirement.
+- A direct `nohup` launched from the Codex command environment was immediately reaped, so the formal job uses a one-shot per-user LaunchAgent with `RunAtLoad=true` and `KeepAlive=false`. This survives Codex/network disconnection without relaunching after normal completion. The wrapper's `caffeinate -ims` assertions for idle system sleep, system sleep and disk idle were all observed active.
+- Active run identity and monitoring commands:
 
 ```bash
-mkdir -p logs && nohup zsh scripts/run_long_train_mps.sh \
-  --run-dir tmp/v1_portable_long_20h \
-  --hours 20 --resume \
-  --initial-checkpoint tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt \
-  --initial-optimizer-state tmp/v1_portable_goal_20260722/formal_1h/optimizer_state.pt \
-  --require-external-display --stop-on-target \
-  >> logs/portable_mps_20h.log 2>&1 & echo $!
+launchctl print gui/$(id -u)/com.liuzhou.portable-mps-20h
+tail -f logs/portable_mps_20h.log
+python -m json.tool tmp/v1_portable_long_20h/state.json
 ```
 
 ### 6) Remaining Verification
 
 - Resume continuity, target-confirmation de-duplication, paired model/optimizer recovery, retry cleanup, replay-window-zero semantics and the portable MCTS focused regressions are now covered by fresh tests and real MPS smoke.
 - Re-run the final exact-path diff audit after documentation settles; local V0/CUDA cross-layer tests remain unavailable on this Mac because `v0_core`/CUDA are absent.
-- The 20-hour training, actual closed-lid endurance/thermal behavior, final independent 500-game result and the `>=99%` outcome remain unverified.
+- The 20-hour task is active but incomplete. Sustained thermal behavior, final independent 500-game result and the `>=99%` outcome remain unverified. Closed-lid behavior is explicitly out of scope for this run.
 
 ## Current Conclusions (2026-07-22): Portable MPS One-Hour Smoke Acceptance
 
