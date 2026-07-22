@@ -31,5 +31,13 @@ checkpoints_v0_smoke/
 results/
 /tmp/
 
+########################
+# 本地文档 / 会话记录 #
+########################
+/Proj_share.md
+/anal.md
+/cursor_*.md
+/archive/pm/
+
 # 例外规则：跟踪特定的 CMakeLists.txt 文件
 !**/CMakeLists.txt
