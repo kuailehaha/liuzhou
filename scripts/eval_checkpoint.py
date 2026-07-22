@@ -36,6 +36,8 @@ from src.neural_network import ChessNet, NUM_INPUT_CHANNELS  # noqa: E402
 from src.random_agent import RandomAgent  # noqa: E402
 BOARD_SIZE = int(GameState.BOARD_SIZE)
 
+V1WorkerResult = Tuple[int, int, int, int, int, int, int, int, int]
+
 
 def _parse_devices(device: str, eval_devices: Optional[str]) -> List[str]:
     raw = str(eval_devices).strip() if eval_devices is not None else ""
@@ -68,6 +70,60 @@ def _seed_worker(seed: int) -> None:
         torch.cuda.manual_seed(seed)
 
 
+def _aggregate_v1_worker_results(
+    results: Sequence[V1WorkerResult],
+    *,
+    total_games: int,
+    seed: int,
+) -> EvaluationStats:
+    totals = [sum(int(row[idx]) for row in results) for idx in range(9)]
+    wins, losses, draws = totals[:3]
+    black_wins, black_losses, black_draws = totals[3:6]
+    white_wins, white_losses, white_draws = totals[6:9]
+    observed_games = wins + losses + draws
+    if observed_games != int(total_games):
+        raise ValueError(
+            f"Portable evaluation produced {observed_games} outcomes; "
+            f"expected {int(total_games)} games."
+        )
+    if (
+        black_wins + white_wins != wins
+        or black_losses + white_losses != losses
+        or black_draws + white_draws != draws
+    ):
+        raise ValueError("Portable evaluation color totals do not match aggregate outcomes.")
+    black_games = black_wins + black_losses + black_draws
+    white_games = white_wins + white_losses + white_draws
+    if int(total_games) % 2 != 0 or black_games != white_games:
+        raise ValueError(
+            "Portable evaluation requires 250/250-style color balance for an even game count; "
+            f"got challenger_black={black_games} challenger_white={white_games}."
+        )
+
+    stats = EvaluationStats(
+        wins=wins,
+        losses=losses,
+        draws=draws,
+        total_games=int(total_games),
+    )
+    stats.seed = int(seed)
+    stats.color_breakdown = {
+        "challenger_black": {
+            "wins": black_wins,
+            "losses": black_losses,
+            "draws": black_draws,
+            "games": black_games,
+        },
+        "challenger_white": {
+            "wins": white_wins,
+            "losses": white_losses,
+            "draws": white_draws,
+            "games": white_games,
+        },
+    }
+    return stats
+
+
 def _load_model_from_checkpoint(checkpoint_path: str, device: str) -> ChessNet:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
@@ -81,7 +137,7 @@ def _load_model_from_checkpoint(checkpoint_path: str, device: str) -> ChessNet:
 
 
 def _stats_to_payload(name: str, stats: EvaluationStats) -> Dict[str, Any]:
-    return {
+    payload: Dict[str, Any] = {
         "name": str(name),
         "wins": int(stats.wins),
         "losses": int(stats.losses),
@@ -91,6 +147,11 @@ def _stats_to_payload(name: str, stats: EvaluationStats) -> Dict[str, Any]:
         "loss_rate": float(stats.loss_rate),
         "draw_rate": float(stats.draw_rate),
     }
+    if hasattr(stats, "seed"):
+        payload["seed"] = int(stats.seed)
+    if hasattr(stats, "color_breakdown"):
+        payload["color_breakdown"] = dict(stats.color_breakdown)
+    return payload
 
 
 def _print_stats_line(title: str, payload: Dict[str, Any]) -> None:
@@ -309,7 +370,7 @@ def _eval_worker_v1(
     opening_random_moves: int,
     sample_moves: bool,
     search_backend: str,
-) -> Tuple[int, int, int]:
+) -> V1WorkerResult:
     _seed_worker(int(seed) + int(worker_id))
     dev = torch.device(device)
     if dev.type == "cuda":
@@ -345,9 +406,15 @@ def _eval_worker_v1(
             }
         )
 
-    wins = 0
-    losses = 0
-    draws = 0
+    totals = [0, 0, 0]
+    black_totals = [0, 0, 0]
+    white_totals = [0, 0, 0]
+
+    def record_outcome(outcome: int, challenger_is_black: bool) -> None:
+        totals[outcome] += 1
+        color_totals = black_totals if challenger_is_black else white_totals
+        color_totals[outcome] += 1
+
     unfinished = len(contexts)
 
     while unfinished > 0:
@@ -371,15 +438,15 @@ def _eval_worker_v1(
                     or (winner == Player.WHITE and not challenger_is_black)
                 )
                 if challenger_win:
-                    wins += 1
+                    record_outcome(0, challenger_is_black)
                 else:
-                    losses += 1
+                    record_outcome(1, challenger_is_black)
                 ctx["done"] = True
                 unfinished -= 1
                 continue
 
             if state.has_reached_move_limit():
-                draws += 1
+                record_outcome(2, challenger_is_black)
                 ctx["done"] = True
                 unfinished -= 1
                 continue
@@ -388,9 +455,9 @@ def _eval_worker_v1(
             if not legal:
                 challenger_to_move = _is_challenger_to_move(state, challenger_is_black)
                 if challenger_to_move:
-                    losses += 1
+                    record_outcome(1, challenger_is_black)
                 else:
-                    wins += 1
+                    record_outcome(0, challenger_is_black)
                 ctx["done"] = True
                 unfinished -= 1
                 continue
@@ -429,7 +496,7 @@ def _eval_worker_v1(
         if not pending_moves and unfinished > 0:
             for ctx in contexts:
                 if not bool(ctx["done"]):
-                    draws += 1
+                    record_outcome(2, bool(ctx["challenger_is_black"]))
                     ctx["done"] = True
                     unfinished -= 1
             continue
@@ -444,9 +511,9 @@ def _eval_worker_v1(
 
             if move is None:
                 if challenger_to_move:
-                    losses += 1
+                    record_outcome(1, challenger_is_black)
                 else:
-                    wins += 1
+                    record_outcome(0, challenger_is_black)
                 ctx["done"] = True
                 unfinished -= 1
                 continue
@@ -455,9 +522,9 @@ def _eval_worker_v1(
                 next_state = apply_move(state, move, quiet=True)
             except Exception:
                 if challenger_to_move:
-                    losses += 1
+                    record_outcome(1, challenger_is_black)
                 else:
-                    wins += 1
+                    record_outcome(0, challenger_is_black)
                 ctx["done"] = True
                 unfinished -= 1
                 continue
@@ -470,17 +537,27 @@ def _eval_worker_v1(
                     or (winner == Player.WHITE and not challenger_is_black)
                 )
                 if challenger_win:
-                    wins += 1
+                    record_outcome(0, challenger_is_black)
                 else:
-                    losses += 1
+                    record_outcome(1, challenger_is_black)
                 ctx["done"] = True
                 unfinished -= 1
             elif next_state.has_reached_move_limit():
-                draws += 1
+                record_outcome(2, challenger_is_black)
                 ctx["done"] = True
                 unfinished -= 1
 
-    return wins, losses, draws
+    return (
+        totals[0],
+        totals[1],
+        totals[2],
+        black_totals[0],
+        black_totals[1],
+        black_totals[2],
+        white_totals[0],
+        white_totals[1],
+        white_totals[2],
+    )
 
 
 def evaluate_against_agent_parallel_v1(
@@ -497,6 +574,7 @@ def evaluate_against_agent_parallel_v1(
     opening_random_moves: int,
     sample_moves: bool,
     search_backend: str = "cuda_root",
+    seed: Optional[int] = None,
 ) -> EvaluationStats:
     num_games_n = _normalize_eval_games(int(num_games))
     if num_games_n == 0:
@@ -512,9 +590,13 @@ def evaluate_against_agent_parallel_v1(
     if not chunks:
         return EvaluationStats(wins=0, losses=0, draws=0, total_games=num_games_n)
 
-    seed_base = int(time.time() * 1e6) & 0x7FFFFFFF
+    seed_base = (
+        int(seed)
+        if seed is not None
+        else int(time.time() * 1e6) & 0x7FFFFFFF
+    )
     if len(chunks) == 1:
-        wins, losses, draws = _eval_worker_v1(
+        result = _eval_worker_v1(
             0,
             chunks[0],
             num_games_n,
@@ -529,7 +611,9 @@ def evaluate_against_agent_parallel_v1(
             bool(sample_moves),
             str(search_backend),
         )
-        return EvaluationStats(wins=wins, losses=losses, draws=draws, total_games=num_games_n)
+        return _aggregate_v1_worker_results(
+            [result], total_games=num_games_n, seed=seed_base
+        )
 
     ctx = mp.get_context("spawn")
     with ctx.Pool(processes=len(chunks)) as pool:
@@ -555,10 +639,9 @@ def evaluate_against_agent_parallel_v1(
             ],
         )
 
-    wins = sum(int(r[0]) for r in results)
-    losses = sum(int(r[1]) for r in results)
-    draws = sum(int(r[2]) for r in results)
-    return EvaluationStats(wins=wins, losses=losses, draws=draws, total_games=num_games_n)
+    return _aggregate_v1_worker_results(
+        results, total_games=num_games_n, seed=seed_base
+    )
 
 
 def _run_eval_one(
@@ -579,6 +662,7 @@ def _run_eval_one(
     inference_warmup_iters: int,
     v1_concurrent_games: int,
     v1_opening_random_moves: int,
+    seed: Optional[int],
 ) -> EvaluationStats:
     if backend in {"v1", "portable"}:
         return evaluate_against_agent_parallel_v1(
@@ -594,7 +678,11 @@ def _run_eval_one(
             opening_random_moves=int(v1_opening_random_moves),
             sample_moves=bool(sample_moves),
             search_backend=("portable" if backend == "portable" else "cuda_root"),
+            seed=seed,
         )
+
+    if seed is not None:
+        _seed_worker(int(seed))
 
     if backend == "v0":
         try:
@@ -666,6 +754,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inference_warmup_iters", type=int, default=5)
     parser.add_argument("--v1_concurrent_games", type=int, default=64)
     parser.add_argument("--v1_opening_random_moves", type=int, default=0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Explicit evaluation seed. Fully applied and persisted by v1/portable; "
+            "legacy/v0 reproducibility can still depend on their worker implementation."
+        ),
+    )
     parser.add_argument("--match_name", type=str, default=None)
     parser.add_argument("--output_json", type=str, default=None)
     return parser
@@ -733,6 +830,7 @@ def main() -> int:
             inference_warmup_iters=int(args.inference_warmup_iters),
             v1_concurrent_games=int(args.v1_concurrent_games),
             v1_opening_random_moves=int(args.v1_opening_random_moves),
+            seed=args.seed,
         )
         payload = _stats_to_payload(random_name, stats)
         result_rows.append(payload)
@@ -758,6 +856,7 @@ def main() -> int:
             inference_warmup_iters=int(args.inference_warmup_iters),
             v1_concurrent_games=int(args.v1_concurrent_games),
             v1_opening_random_moves=int(args.v1_opening_random_moves),
+            seed=args.seed,
         )
         payload = _stats_to_payload(match_name, stats)
         result_rows.append(payload)
@@ -780,6 +879,7 @@ def main() -> int:
         "sample_moves": bool(args.sample_moves),
         "v1_concurrent_games": int(args.v1_concurrent_games),
         "v1_opening_random_moves": int(args.v1_opening_random_moves),
+        "requested_seed": int(args.seed) if args.seed is not None else None,
         "elapsed_sec": float(elapsed),
         "results": result_rows,
     }

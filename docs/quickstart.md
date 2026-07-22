@@ -41,6 +41,28 @@ python scripts/eval_checkpoint.py \
 
 固定模型 Root-PUCT/full-MCTS 对比入口为 `tools/ab_portable_search.py`。在模型尚未对 random 饱和、高级模型互战平局率过高时，可以把固定条件的 `vs_random win-loss` 作为较长阶段的粗粒度趋势/筛选指标，但应同时报告 draw rate；接近饱和或需要最终棋力结论时，仍以固定 checkpoint 对战或 tournament/Elo 为准。
 
+#### Apple M5 约 20 小时可恢复长训
+
+本机冻结配置由 `scripts/long_train_portable_mps.py` 管理：self-play 为 128 games/concurrency 128，训练为 batch 256、3 epochs、replay window 4，搜索为 8 simulations；每 10 轮分别进行 500 局 RandomAgent 评估和 500 局 candidate-versus-incumbent 自评估，评估 concurrency 为 64。评估 seed、250/250 黑白分配、逐颜色 W/L/D、模型/optimizer SHA 和 replay 输入都会落盘。
+
+8/16/32/64 simulations 的本机同条件测试显示 self-play 墙钟成本约为 `1.00x/2.07x/3.88x/6.93x`。同 seed 500 局 RandomAgent 对照中，64 simulations 相对 8 simulations 仅从 `433/500` 提高到 `449/500`，却耗时 `6.91x`，且高 simulations 自博弈明显更偏和棋。因此 20 小时默认仍为 8 simulations；不要依据 100 局小样本中偶然出现的 `98%` 改成 64。
+
+合盖运行前必须接交流电、外接显示器和外接键盘/鼠标。`caffeinate` 只保证其子进程存活期间抑制 idle/system/disk sleep，不能代替 Apple silicon 的合盖硬件条件；命令中的 `--require-external-display` 会在没有外接显示器时直接失败。
+
+从已验收的一小时 checkpoint 继续训练并在观测、独立复验均达到 `495/500` 后提前停止：
+
+```bash
+mkdir -p logs && nohup zsh scripts/run_long_train_mps.sh \
+  --run-dir tmp/v1_portable_long_20h \
+  --hours 20 --resume \
+  --initial-checkpoint tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt \
+  --initial-optimizer-state tmp/v1_portable_goal_20260722/formal_1h/optimizer_state.pt \
+  --require-external-display --stop-on-target \
+  >> logs/portable_mps_20h.log 2>&1 & echo $!
+```
+
+`--resume` 对新目录和已有目录都可用；已有目录会核对冻结配置、外层 iteration、current checkpoint、optimizer 和 commit SHA 后续跑。运行状态位于 `tmp/v1_portable_long_20h/state.json`，最终摘要位于 `final_summary.json`，`best_model.pt` 和 `best_vs_random.pt` 位于其 `checkpoints/` 子目录。
+
 ## 2. 构建入口
 
 正式构建入口是 `scripts/instruct.sh`。

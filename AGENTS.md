@@ -17,6 +17,8 @@ Linux 训练机可用 4 张 H20（`CUDA_VISIBLE_DEVICES=0,1,2,3`）和 256 核 C
 
 Windows 本地机可用 1 张 RTX 3060 和 16 核 CPU，环境启动方式为 `conda activate torchenv`。
 
+Apple Silicon 本地机为 MacBook Air `Mac17,3`（Apple M5、10 核 CPU、8 核 GPU、16 GiB 统一内存），`torchenv` 当前为 Python 3.10.20、PyTorch 2.9.1，MPS 可用但 CUDA 和 `v0_core` 不可用。该机器使用 `portable` V1 路径做 CPU 搜索/控制和 MPS 推理训练；不得把其 8 simulations 结果与 H20/CUDA 正式配置直接比较。
+
 性能优化通常针对 V1 pipeline；V0 既是 V1 的底层依赖，也是功能/性能对照，Legacy 用作规则和行为参考。在其他机器上不得假定 CUDA、`v0_core`、checkpoint 或上述 Conda 环境可用。
 
 如需测试运行速度，先查看当前系统有无正在运行的任务，选择低占用资源并记录竞争负载。可以通过 `git log` 和 `git status` 判断对话中的修改是否已经提交。所有判断和计划从当前代码实现出发；进行代码优化时先找影响最大的模块或流程，不通过改变实验条件制造收益。
@@ -142,6 +144,8 @@ Windows 本地机可用 1 张 RTX 3060 和 16 核 CPU，环境启动方式为 `c
   - `optimized_train.sh`：大规模优化训练脚本
   - `train_loop.sh`/`train_loop.py`：训练循环调度器
   - `parallel_generate.sh`：多进程并行数据生成
+  - `long_train_portable_mps.py`：Apple Silicon portable MPS 可恢复长训编排（deadline、checkpoint/optimizer、replay、周期评估和 best retention）
+  - `run_long_train_mps.sh`：以项目 `torchenv` 和 `caffeinate -ims` 启动本地 MPS 长训
   - `export_torchscript.py`：TorchScript 模型导出
   - `filter_decisive_jsonl.py`：过滤决定性样本（value ≠ 0）
   - `monitor_resources.sh`：资源监控；`kill_top_io.sh`：高 IO 进程清理
@@ -222,6 +226,16 @@ Windows 本地机可用 1 张 RTX 3060 和 16 核 CPU，环境启动方式为 `c
 - 评估 seed 必须可设置并写入报告。若当前入口使用时间 seed 或未持久化 seed，交付时必须明确标为复现限制，不能把一次随机结果描述为完全可复现。
 - 外层循环反复调用 staged `selfplay`/`train` 时，显式持久化并审计 checkpoint 与 optimizer state；首轮后每轮都应成功加载。外层迭代号、输入 checkpoint、输出 checkpoint 和配对 metrics 必须有可追踪映射，不能只依赖可能在每次进程启动时重置的 checkpoint 内部 `iteration` 字段。
 - 正式训练健康检查至少汇总：游戏数、位置数、决定性/和棋比例、loss 首尾与近期窗口、optimizer 连续性、非有限值、过滤样本和设备/MCTS fallback。训练内自博弈胜负不能替代独立 `vs_random` 或 tournament 结果。
+
+### Apple Silicon portable MPS 长训
+
+- 当前 M5 的测量结果、冻结参数、checkpoint 和命令以 `MEMORY.md` 最新日期段为准；这些参数是该机器的本地基线，不自动推广到其他 Apple Silicon、CUDA 或 H20 环境。正式长训开始后保持 self-play games/concurrency、batch、simulations、replay、LR、温度和开局日程不变。
+- 调整 MCTS simulations 时分别报告 self-play 数据吞吐/和棋率与固定模型评估收益，并用同 checkpoint、seed、局数、并发做倍率对照。100 局 screening 只能决定是否扩大实验；若验收口径为 500 局，参数结论必须由 500 局复核，训练参数还需 equal-wall-clock A/B，不能用更昂贵的评估搜索冒充训练改进。
+- 使用 `scripts/long_train_portable_mps.py` 运行长任务时，保留 `state.json`、`events.jsonl`、`final_summary.json`、逐阶段 metrics、当前/best checkpoint、optimizer state 和滚动 replay。重启用同一 run directory 加 `--resume`，恢复后审计外层 iteration、checkpoint SHA、optimizer 加载和 replay 输入，不能只确认进程重新启动。
+- `best_vs_random.pt` 与 `best_model.pt` 语义不同：前者按固定 RandomAgent 口径筛选，后者由候选对 incumbent 的独立 head-to-head gate 更新。不要用随机对手最高点替代 incumbent gating，也不要将训练内胜负当作两者之一。
+- 500 局评估必须使用偶数局、固定并持久化 seed、精确均分 challenger 黑白并报告逐颜色 W/L/D。若目标为 `99%` raw wins，则判定式为 `wins >= 495/500`，平局不计胜；筛选后还要用独立 seed 再跑 500 局确认，并保留 Wilson 95% 区间。
+- macOS `caffeinate -ims` 只在进程存活时抑制 idle/system/disk sleep，不抑制 display sleep，也不能绕过合盖硬件条件。Apple silicon 合盖长跑必须接交流电、外接显示器及外接键盘/鼠标，并用 `--require-external-display` 做启动前检查；缺任一条件时停止，不使用持久化 `sudo pmset disablesleep` 规避。
+- 长训产物保留在 ignored 的 `tmp/`/`logs/` 路径，不纳入 Git。短 smoke 的 4/20 局结果只验证控制流、seed/颜色统计、best retention、恢复与 fallback 审计，不得作为 500 局目标或模型强度证据。
 
 ## Git、分支收尾与交付
 

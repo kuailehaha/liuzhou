@@ -2,6 +2,34 @@
 Date: 2026-02-16  
 Scope: Design for migrating v0 CPU-bottleneck self-play to a GPU-first v1 pipeline.
 
+## Addendum (2026-07-22): Apple M5 Resumable 20-Hour Portable Run
+
+### Frozen local configuration
+
+- Start from the accepted one-hour checkpoint `tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt` and its matching optimizer state.
+- Use portable MPS, 128 self-play games/concurrency 128, 8 simulations, batch 256, 3 epochs, replay window 4, cosine LR `3e-4 -> 5e-5`, opening-random `6 -> 0`, and evaluation concurrency 64.
+- Concurrency 128 self-play measured `195.201 positions/s`; 256 added only about `1.2%` throughput while increasing peak footprint from about 2.40 GB to 4.22 GB. Evaluation concurrency 64 and 128 produced the identical seeded `163-0-37/200`; 128 was only `1.8%` faster and used about 65% more peak memory.
+
+### Retention and acceptance protocol
+
+- `scripts/long_train_portable_mps.py` owns the wall-clock deadline, lock, checkpoint/optimizer pair commit, replay window, retry cleanup, state/events/summary artifacts and resume validation. `scripts/run_long_train_mps.sh` supplies the project interpreter and `caffeinate -ims`.
+- Every 10 iterations, run 500 seeded games versus RandomAgent and a separate 500-game sampled candidate-versus-incumbent gate. Retain `best_vs_random.pt` by wins then fewer losses; promote `best_model.pt` only when candidate wins exceed losses.
+- The `99%` target means at least 495 raw wins out of 500, with draws counted as non-wins. A screened checkpoint must repeat that threshold on a second independent 500-game seed. A fresh final 500-game report is still written.
+- `scripts/eval_checkpoint.py` now persists explicit seeds and exact challenger-black/challenger-white W/L/D. Even game counts are required to split equally by color.
+
+### Fresh validation and limits
+
+- Focused suite: 38 tests passed across portable MCTS, evaluation reproducibility/color balance and long-run scheduling/recovery. Real MPS smoke covered three-iteration resume, replay/optimizer continuity, random and incumbent gating, final evaluation, pair SHA persistence and zero fallback/non-finite samples.
+- A 100-game sampled same-checkpoint gate took `61.79s` at concurrency 64 with about 1.26 GB peak footprint, so a 500-game incumbent gate is expected to take about 5.1 minutes. Together with the measured RandomAgent gate, periodic evaluation costs about 7.5 minutes every 10 iterations.
+- No thermal/performance warning or swap was observed in the local tuning and smoke runs. This is not a closed-lid endurance result.
+- The full 20-hour run, 500-game `>=99%` outcome and actual closed-lid endurance remain unverified. The current machine has no external display, so the required `--require-external-display` preflight correctly fails. Apple-supported clamshell operation requires AC, an external display and external keyboard/mouse.
+
+### MCTS simulation multiplier decision
+
+- Same-checkpoint 64-game self-play at 8/16/32/64 simulations cost `1.00x/2.07x/3.88x/6.93x`; throughput was `179.58/92.30/48.30/24.31 positions/s`. Draw rate rose from `35.94%` at 8 to `81.25%` at 64, while peak footprint stayed below about 1.82 GB and no thermal warning, swap or fallback occurred.
+- A 100-game screen looked strongly favorable to 64 simulations (`98-0-2`) but was not stable at the required sample size. With the same independent seed over 500 games, 8 simulations scored `433-0-67` in `121.43s`, while 64 scored `449-0-51` in `839.49s`.
+- The robust observed gain was therefore `+3.2` win-rate points for `6.91x` evaluation cost; 64 simulations still missed `495/500` by 46 wins. Keep the 20-hour configuration at 8 simulations. Do not trade away most self-play volume based on the optimistic 100-game point; require an equal-wall-clock training A/B before changing training simulations.
+
 ## Addendum (2026-07-21): Portable CPU/MPS Full-MCTS Reference
 
 ### Implemented scope

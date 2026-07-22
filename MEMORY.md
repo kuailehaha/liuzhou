@@ -1,5 +1,88 @@
 # MEMORY
 
+## Current Conclusions (2026-07-22): Apple M5 Portable 20-Hour Training Preparation
+
+### 1) Goal, Baseline and Current Status
+
+- Current target is an approximately 20-hour portable MPS run on the local MacBook Air, retaining the strongest checkpoint during training and testing whether it can reach at least `99%` raw wins against RandomAgent over 500 games. Draws count as non-wins. This is a `vs_random` health/progress target, not a tournament/Elo strength claim.
+- The run starts from the accepted one-hour checkpoint `tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt` and its matching `optimizer_state.pt`, rather than discarding the already verified 3,744 games / 373,365 positions. The optimizer-state SHA-256 is `845ab53cefc20e1a6456f2845c1d0a6e6011d7db184d6114f5a91946a265db76`.
+- The implementation and smoke evidence below are currently in the worktree based on commit `1c607499cffa1a3ee11e2433388cd698a29b987f`. The full 20-hour run and its 500-game acceptance have **not** run yet.
+
+### 2) Local Machine and Frozen M5 Parameters
+
+- Host: MacBook Air `Mac17,3`, Apple M5, 10 CPU cores (4 performance + 6 efficiency), 8 GPU cores and 16 GiB unified memory. Runtime: macOS 26.5.2 arm64, Python 3.10.20, PyTorch 2.9.1, MPS available; CUDA and `v0_core` unavailable.
+- Benchmarks were run on AC power with no thermal/performance warning and no swap. Self-play used the same accepted checkpoint, portable MPS and 8 simulations:
+  - concurrency 32: `162.805` positions/s, about `0.96` GB maximum RSS;
+  - concurrency 64: `186.119` positions/s, about `1.46` GB maximum RSS;
+  - concurrency 128: `195.201` positions/s, about `2.29` GB maximum RSS and about `2.40` GB peak footprint;
+  - concurrency 256: `197.455` positions/s, about `2.68` GB maximum RSS and about `4.22` GB peak footprint.
+- Freeze self-play at 128 games / concurrency 128. It is about `19.9%` faster than concurrency 32; concurrency 256 adds only about `1.2%` throughput while raising peak footprint by about `76%`, which is poor headroom for a fanless closed-lid run.
+- A fixed 25,457-position, three-epoch training comparison measured `33.40s` at batch 256, `28.26s` at batch 512 and `25.94s` at batch 1024. Freeze batch size 256 because larger batches reduce optimizer-step count and therefore change the learning experiment, rather than being a semantics-neutral throughput adjustment.
+- A same-checkpoint/same-seed 200-game RandomAgent evaluation produced the identical `163-0-37` result at concurrency 64 and 128. Concurrency 64 took `55.83s` with about `1.27` GB peak footprint; concurrency 128 took `54.81s` with about `2.10` GB. Freeze evaluation concurrency at 64 because the `1.8%` speed gain at 128 does not justify roughly `65%` more peak memory.
+- Frozen long-run defaults: portable MPS; 128 self-play games and concurrency 128 per iteration; 8 simulations; temperature `1.0 -> 0.1` at ply 10; opening random moves annealed `6 -> 0`; maximum 512 plies; replay window 4; batch 256; 3 epochs; cosine LR `3e-4 -> 5e-5`; weight decay `1e-4`; `soft_label_alpha=0.5`; `policy_draw_weight=1.0`; evaluation concurrency 64.
+
+#### Simulation multiplier sweep
+
+- A same-checkpoint, same-seed self-play sweep used 64 games, concurrency 64, six random opening moves and changed only MCTS simulations:
+  - 8 sims: `35.05s`, `179.58 positions/s`, `35.94%` draws, about `1.36` GB peak footprint (`1.00x` cost);
+  - 16 sims: `72.39s`, `92.30 positions/s`, `42.19%` draws, about `1.45` GB (`2.07x` cost);
+  - 32 sims: `136.14s`, `48.30 positions/s`, `73.44%` draws, about `1.61` GB (`3.88x` cost);
+  - 64 sims: `243.04s`, `24.31 positions/s`, `81.25%` draws, about `1.81` GB (`6.93x` cost).
+- A fixed-seed 100-game RandomAgent screen was monotonic but too noisy for acceptance: 8/16/32/64 sims produced `87-0-13`, `89-0-11`, `93-0-7` and `98-0-2`, at `1.00x/1.86x/3.21x/6.60x` evaluation time. The apparent `98%` at 64 sims did not generalize to the required sample size.
+- The authoritative same-seed 500-game comparison was:
+  - 8 sims: `433-0-67`, raw win `86.60%`, Wilson 95% `[83.33%, 89.31%]`, `121.43s`; black `223-0-27`, white `210-0-40`;
+  - 64 sims: `449-0-51`, raw win `89.80%`, Wilson 95% `[86.84%, 92.16%]`, `839.49s`; black `230-0-20`, white `219-0-31`.
+- Increasing 8 -> 64 therefore bought 16 additional wins / `+3.2` percentage points for `6.91x` wall time and still missed the `495/500` target by 46 wins. Memory remained safe and no thermal warning, swap or fallback occurred; compute/sample efficiency and increasingly draw-heavy self-play are the limiting factors.
+- Decision: retain 8 simulations for the 20-hour self-play and periodic 500-game gates. Do not select 32/64 from the optimistic 100-game screen. A higher-simulation training schedule would need an equal-wall-clock training A/B showing that improved targets outweigh the large loss of data volume; this sweep does not establish that.
+
+### 3) Long-Run Orchestration and Evaluation Contract
+
+- `scripts/long_train_portable_mps.py` implements a resumable, deadline-based outer loop with a lock file, paired model/optimizer commit hashes and rollback recovery, rolling replay, per-stage retries, finite/fallback audits, `state.json`, append-only `events.jsonl` and `final_summary.json`.
+- `scripts/run_long_train_mps.sh` binds the run to the `torchenv` interpreter and keeps the process awake with `/usr/bin/caffeinate -ims`; display sleep is intentionally not disabled.
+- Every 10 iterations, the candidate is evaluated for exactly 500 games against RandomAgent at temperature 0, with a recorded seed and an exact 250/250 challenger black/white split. `best_vs_random.pt` ranks by raw wins, then fewer losses.
+- A separate sampled 500-game candidate-versus-incumbent evaluation retains `best_model.pt` only when challenger wins exceed losses. RandomAgent screening and incumbent gating are deliberately separate signals.
+- A checkpoint that observes at least 495 wins in 500 RandomAgent games must repeat the result on a second, independent fixed-seed 500-game evaluation before `target_reached=true`. The run also performs a fresh final 500-game evaluation. This avoids treating a post-hoc maximum or a single random sample as confirmed acceptance.
+- `scripts/eval_checkpoint.py` now accepts `--seed`, persists the requested/actual seed and reports aggregate plus per-color W/L/D. These additions remove the seed/color-report limitations recorded for the earlier one-hour run; legacy/v0 worker-level reproducibility remains backend-dependent.
+
+### 4) Fresh Smoke and Test Evidence
+
+- A real MPS smoke started from the one-hour checkpoint and optimizer, ran 4 self-play games per iteration, trained one epoch, evaluated every iteration and retained rolling best checkpoints. It first stopped cleanly at iteration 2, then resumed to iteration 3 from the same state. The resumed train loaded optimizer state, used iteration 2 replay, retained the incumbent after a `1-2-1` candidate result and finished at the wall-clock deadline. Self-play and evaluation reported zero MPS/device fallback. Artifacts: `tmp/v1_portable_goal_20260722/long_smoke/`.
+- A second transaction-focused smoke ran iteration 1, stopped at `max_iterations`, then resumed to iteration 2. Its state persisted matching model/optimizer SHA-256 values, `optimizer_loaded=true`, the exact primary/replay input paths, zero fallback and zero filtered non-finite samples; no rollback file remained after commit. Artifacts: `tmp/v1_portable_goal_20260722/long_transaction_smoke/`.
+- The smoke's 4-game evaluation results are only control-flow evidence. In particular, the final `3-0-1` and other 4-game samples provide no evidence that the 500-game `99%` target has been reached.
+- Fresh focused validation:
+  - `tests/test_eval_checkpoint_reproducibility.py`: 4 passed;
+  - `tests/test_long_train_portable_mps.py`: 11 passed, including interrupted model/optimizer pair recovery, retry reset and replay-window-zero semantics;
+  - `tests/v1/test_portable_mcts.py`: 23 passed;
+  - combined focused suite: 38 passed in 1.43 seconds on the latest rerun;
+  - Python compilation of both modified Python entry points passed;
+  - `zsh -n scripts/run_long_train_mps.sh` passed;
+  - `git diff --check` passed before this documentation update.
+- A 20-game seeded real MPS evaluation produced `17-0-3`, with challenger black `8-0-2` and white `9-0-1`, and persisted seed `4242`. This verifies the new seed/color report path, not model acceptance.
+- A 100-game sampled same-checkpoint incumbent-gate benchmark produced `39-32-29`, with exact 50/50 colors, in `61.79s` at concurrency 64 and about `1.26` GB peak footprint. A 500-game gate therefore projects to roughly 5.1 minutes; together with the measured RandomAgent gate, the every-10-iteration evaluation budget is roughly 7.5 minutes.
+- Simulation-sweep artifacts are under `tmp/v1_portable_goal_20260722/sim_sweep/`; consolidated report: `summary.json`. The 500-game comparison uses independent seed `2026072400` and exact 250/250 challenger colors.
+
+### 5) Closed-Lid Constraint and Intended Launch
+
+- Current hardware inspection found AC power and the internal display only; no external display is connected. Apple silicon closed-lid operation requires power, an external display and an external keyboard/mouse ([Apple: Allow accessories to connect](https://support.apple.com/en-mide/102282), [Apple: If your external display is dark](https://support.apple.com/en-ie/102501)). `caffeinate` does not remove that hardware requirement.
+- `--require-external-display` preflight currently fails as intended. Do not launch or claim a reliable closed-lid 20-hour run until the external display and input devices are connected. Avoid persistent or unsupported `sudo pmset disablesleep` workarounds.
+- Once those prerequisites are present, the intended resumable launch is:
+
+```bash
+mkdir -p logs && nohup zsh scripts/run_long_train_mps.sh \
+  --run-dir tmp/v1_portable_long_20h \
+  --hours 20 --resume \
+  --initial-checkpoint tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt \
+  --initial-optimizer-state tmp/v1_portable_goal_20260722/formal_1h/optimizer_state.pt \
+  --require-external-display --stop-on-target \
+  >> logs/portable_mps_20h.log 2>&1 & echo $!
+```
+
+### 6) Remaining Verification
+
+- Resume continuity, target-confirmation de-duplication, paired model/optimizer recovery, retry cleanup, replay-window-zero semantics and the portable MCTS focused regressions are now covered by fresh tests and real MPS smoke.
+- Re-run the final exact-path diff audit after documentation settles; local V0/CUDA cross-layer tests remain unavailable on this Mac because `v0_core`/CUDA are absent.
+- The 20-hour training, actual closed-lid endurance/thermal behavior, final independent 500-game result and the `>=99%` outcome remain unverified.
+
 ## Current Conclusions (2026-07-22): Portable MPS One-Hour Smoke Acceptance
 
 ### 1) Scope and Verdict
@@ -47,9 +130,9 @@
 - Exact staged run protocol: `tmp/v1_portable_goal_20260722/formal_1h/run_formal_1h.txt`.
 - The retained ignored experiment directory is about 1.4 GiB and contains all 117 checkpoints plus paired self-play/train JSON metrics.
 
-### 6) Known Limitations and Follow-Up
+### 6) Known Limitations at the Time and Follow-Up
 
-- `scripts/eval_checkpoint.py` currently derives its random seed from wall-clock time and does not persist the seed in its report. It balances challenger colors but reports only aggregate W/L/D, not per-color W/L/D.
+- At the time of this one-hour acceptance, `scripts/eval_checkpoint.py` derived its random seed from wall-clock time and did not persist the seed or per-color W/L/D. The later 20-hour preparation work recorded above adds an explicit seed and color breakdown; this does not retroactively make the original 1,000-game sample fully reproducible.
 - Repeated staged invocations write checkpoint-internal `iteration=1`; the true external iteration is currently recoverable from checkpoint filenames and paired JSON files. Future long staged loops should write explicit external-iteration metadata.
 - Local collection of the V1 tensor-pipeline/V0 action tests was blocked by missing `v0_core`; no CPU/CUDA or portable/CUDA cross-layer parity claim follows from this Mac run.
 - Eight simulations is a constrained portable-Mac smoke budget and is not comparable to the production H20/CUDA search configuration.
