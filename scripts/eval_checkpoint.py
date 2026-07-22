@@ -34,11 +34,6 @@ from src.game_state import GameState, Player  # noqa: E402
 from src.move_generator import apply_move, generate_all_legal_moves  # noqa: E402
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS  # noqa: E402
 from src.random_agent import RandomAgent  # noqa: E402
-from v0.python.move_encoder import DEFAULT_ACTION_SPEC, decode_action_indices  # noqa: E402
-from v0.python.state_batch import from_game_states  # noqa: E402
-from v1.python.mcts_gpu import GpuStateBatch, V1RootMCTS, V1RootMCTSConfig  # noqa: E402
-
-
 BOARD_SIZE = int(GameState.BOARD_SIZE)
 
 
@@ -74,7 +69,7 @@ def _seed_worker(seed: int) -> None:
 
 
 def _load_model_from_checkpoint(checkpoint_path: str, device: str) -> ChessNet:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     board_size = checkpoint.get("board_size", GameState.BOARD_SIZE)
     num_inputs = checkpoint.get("num_input_channels", NUM_INPUT_CHANNELS)
@@ -116,7 +111,9 @@ def _print_stats_line(title: str, payload: Dict[str, Any]) -> None:
         )
 
 
-def _build_gpu_state_batch(states: Sequence[GameState], device: torch.device) -> GpuStateBatch:
+def _build_gpu_state_batch(states: Sequence[GameState], device: torch.device):
+    from v1.python.mcts_gpu import GpuStateBatch
+
     batch_size = len(states)
     board = torch.zeros((batch_size, BOARD_SIZE, BOARD_SIZE), dtype=torch.int8, device=device)
     marks_black = torch.zeros((batch_size, BOARD_SIZE, BOARD_SIZE), dtype=torch.bool, device=device)
@@ -166,6 +163,9 @@ def _build_gpu_state_batch(states: Sequence[GameState], device: torch.device) ->
 
 
 def _decode_moves(states: Sequence[GameState], action_indices: torch.Tensor) -> List[Optional[dict]]:
+    from v0.python.move_encoder import DEFAULT_ACTION_SPEC, decode_action_indices
+    from v0.python.state_batch import from_game_states
+
     batch_cpu = from_game_states(states, device=torch.device("cpu"))
     return decode_action_indices(
         action_indices.to(device=torch.device("cpu"), dtype=torch.int64).view(-1),
@@ -190,6 +190,8 @@ class _V1EvalAgent:
         temperature: float,
         sample_moves: bool,
     ) -> None:
+        from v1.python.mcts_gpu import V1RootMCTS, V1RootMCTSConfig
+
         self.device = torch.device(device)
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
@@ -240,6 +242,59 @@ class _V1EvalAgent:
         return out
 
 
+class _PortableEvalAgent:
+    def __init__(
+        self,
+        checkpoint_path: str,
+        *,
+        device: str,
+        mcts_simulations: int,
+        temperature: float,
+        sample_moves: bool,
+    ) -> None:
+        from v1.python.portable_device import resolve_portable_device
+        from v1.python.portable_mcts import PortableMCTS, PortableMCTSConfig
+
+        resolution = resolve_portable_device(device)
+        self.device = resolution.device
+        self.temperature = float(temperature)
+        self.model = _load_model_from_checkpoint(checkpoint_path, str(self.device))
+        self.mcts = PortableMCTS(
+            model=self.model,
+            config=PortableMCTSConfig(
+                num_simulations=max(1, int(mcts_simulations)),
+                exploration_weight=1.0,
+                temperature=float(temperature),
+                add_dirichlet_noise=False,
+                sample_moves=bool(sample_moves),
+            ),
+            device=self.device,
+        )
+
+    def select_moves(self, states: Sequence[GameState], concurrent_games: int) -> List[Optional[dict]]:
+        from v1.python.portable_mcts import PortableTree
+
+        if not states:
+            return []
+        out: List[Optional[dict]] = []
+        chunk = max(1, int(concurrent_games))
+        for start in range(0, len(states), chunk):
+            sub_states = list(states[start : start + chunk])
+            trees = [PortableTree(state) for state in sub_states]
+            search = self.mcts.search_batch(
+                trees,
+                temperatures=float(self.temperature),
+                add_dirichlet_noise=False,
+            )
+            for state, row in zip(sub_states, search):
+                if row.chosen_move is not None:
+                    out.append(row.chosen_move)
+                else:
+                    legal = generate_all_legal_moves(state)
+                    out.append(legal[0] if legal else None)
+        return out
+
+
 def _eval_worker_v1(
     worker_id: int,
     game_indices: List[int],
@@ -253,13 +308,15 @@ def _eval_worker_v1(
     concurrent_games: int,
     opening_random_moves: int,
     sample_moves: bool,
+    search_backend: str,
 ) -> Tuple[int, int, int]:
     _seed_worker(int(seed) + int(worker_id))
     dev = torch.device(device)
     if dev.type == "cuda":
         torch.cuda.set_device(dev)
 
-    challenger_agent = _V1EvalAgent(
+    agent_type = _PortableEvalAgent if str(search_backend) == "portable" else _V1EvalAgent
+    challenger_agent = agent_type(
         challenger_checkpoint,
         device=str(device),
         mcts_simulations=int(mcts_simulations),
@@ -267,7 +324,7 @@ def _eval_worker_v1(
         sample_moves=bool(sample_moves),
     )
     if opponent_checkpoint:
-        opponent_agent: Any = _V1EvalAgent(
+        opponent_agent: Any = agent_type(
             opponent_checkpoint,
             device=str(device),
             mcts_simulations=int(mcts_simulations),
@@ -439,6 +496,7 @@ def evaluate_against_agent_parallel_v1(
     concurrent_games: int,
     opening_random_moves: int,
     sample_moves: bool,
+    search_backend: str = "cuda_root",
 ) -> EvaluationStats:
     num_games_n = _normalize_eval_games(int(num_games))
     if num_games_n == 0:
@@ -446,6 +504,10 @@ def evaluate_against_agent_parallel_v1(
 
     devices_list = _parse_devices(device=str(device), eval_devices=",".join(devices) if isinstance(devices, list) else (devices if isinstance(devices, str) else None))
     workers = max(1, min(int(num_workers), int(num_games_n)))
+    if str(search_backend) == "portable" and workers != 1:
+        raise RuntimeError(
+            "The portable eval backend is single-process in its first version; set --eval_workers 1."
+        )
     chunks = _split_game_indices(num_games_n, workers)
     if not chunks:
         return EvaluationStats(wins=0, losses=0, draws=0, total_games=num_games_n)
@@ -465,6 +527,7 @@ def evaluate_against_agent_parallel_v1(
             int(concurrent_games),
             int(opening_random_moves),
             bool(sample_moves),
+            str(search_backend),
         )
         return EvaluationStats(wins=wins, losses=losses, draws=draws, total_games=num_games_n)
 
@@ -486,6 +549,7 @@ def evaluate_against_agent_parallel_v1(
                     int(concurrent_games),
                     int(opening_random_moves),
                     bool(sample_moves),
+                    str(search_backend),
                 )
                 for worker_id in range(len(chunks))
             ],
@@ -516,7 +580,7 @@ def _run_eval_one(
     v1_concurrent_games: int,
     v1_opening_random_moves: int,
 ) -> EvaluationStats:
-    if backend == "v1":
+    if backend in {"v1", "portable"}:
         return evaluate_against_agent_parallel_v1(
             challenger_checkpoint=challenger_checkpoint,
             opponent_checkpoint=opponent_checkpoint,
@@ -529,6 +593,7 @@ def _run_eval_one(
             concurrent_games=int(v1_concurrent_games),
             opening_random_moves=int(v1_opening_random_moves),
             sample_moves=bool(sample_moves),
+            search_backend=("portable" if backend == "portable" else "cuda_root"),
         )
 
     if backend == "v0":
@@ -584,7 +649,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--eval_devices", type=str, default=None)
     parser.add_argument("--eval_workers", type=int, default=1)
-    parser.add_argument("--backend", type=str, choices=["v0", "legacy", "v1"], default="v0")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["v0", "legacy", "v1", "portable"],
+        default="v0",
+    )
     parser.add_argument("--mcts_simulations", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument("--sample_moves", action="store_true")
@@ -612,9 +682,34 @@ def main() -> int:
     if prev_path and previous_checkpoint is None:
         print(f"[eval] warning: previous checkpoint not found, skip vs_previous: {prev_path}")
 
-    eval_devices = _parse_devices(device=str(args.device), eval_devices=args.eval_devices)
-    workers = max(1, int(args.eval_workers))
     backend = str(args.backend).strip().lower()
+    requested_devices = _parse_devices(device=str(args.device), eval_devices=args.eval_devices)
+    device_resolution_payload: Dict[str, Any] = {
+        "requested": list(requested_devices),
+        "resolved": list(requested_devices),
+        "fallback_count": 0,
+        "fallback_reasons": [],
+    }
+    if backend == "portable":
+        from v1.python.portable_device import resolve_portable_device
+
+        if len(requested_devices) != 1:
+            raise RuntimeError(
+                "The portable eval backend is single-device in its first version; "
+                f"got {requested_devices}."
+            )
+        resolution = resolve_portable_device(requested_devices[0])
+        eval_devices = [str(resolution.device)]
+        device_resolution_payload = {
+            "requested": list(requested_devices),
+            "resolved": list(eval_devices),
+            "fallback_count": int(resolution.fallback_count),
+            "fallback_reasons": list(resolution.fallback_reasons),
+        }
+    else:
+        eval_devices = requested_devices
+    effective_device = eval_devices[0]
+    workers = max(1, int(args.eval_workers))
     started = time.perf_counter()
 
     result_rows: List[Dict[str, Any]] = []
@@ -626,7 +721,7 @@ def main() -> int:
             challenger_checkpoint=challenger,
             opponent_checkpoint=None,
             num_games=games_vs_random,
-            device=str(args.device),
+            device=effective_device,
             devices=eval_devices,
             workers=workers,
             mcts_simulations=int(args.mcts_simulations),
@@ -651,7 +746,7 @@ def main() -> int:
             challenger_checkpoint=challenger,
             opponent_checkpoint=previous_checkpoint,
             num_games=games_vs_previous,
-            device=str(args.device),
+            device=effective_device,
             devices=eval_devices,
             workers=workers,
             mcts_simulations=int(args.mcts_simulations),
@@ -676,8 +771,9 @@ def main() -> int:
         "challenger_checkpoint": challenger,
         "previous_checkpoint": previous_checkpoint,
         "backend": backend,
-        "device": str(args.device),
+        "device": effective_device,
         "eval_devices": eval_devices,
+        "device_resolution": device_resolution_payload,
         "eval_workers": workers,
         "mcts_simulations": int(args.mcts_simulations),
         "temperature": float(args.temperature),

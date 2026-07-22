@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -20,6 +21,7 @@ from src.policy_batch import (
 )
 
 from .trajectory_buffer import TensorSelfPlayBatch
+from .portable_device import resolve_portable_device
 
 _WDL_AUX_LOSS_WEIGHT = 0.0
 _WDL_LOG_EPS = 1e-8
@@ -40,7 +42,7 @@ def _bucket_logits_to_wdl_probs(value_logits: torch.Tensor) -> torch.Tensor:
 
 
 def _train_permutation(num_samples: int, device: torch.device) -> torch.Tensor:
-    if device.type == "cuda":
+    if device.type != "cpu":
         return torch.randperm(num_samples, device=device)
     return torch.randperm(num_samples)
 
@@ -128,7 +130,8 @@ def train_network_from_tensors(
     if samples.num_samples <= 0:
         return model, {"epoch_stats": [], "num_samples": 0}
 
-    device_obj = torch.device(device)
+    device_resolution = resolve_portable_device(device)
+    device_obj = device_resolution.device
     strategy_raw = str(parallel_strategy).strip().lower()
     if strategy_raw in {"dp", "data_parallel"}:
         strategy = "data_parallel"
@@ -237,6 +240,7 @@ def train_network_from_tensors(
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     optimizer_loaded = False
+    optimizer_load_error: Optional[str] = None
     if optimizer_state_path and os.path.exists(optimizer_state_path):
         try:
             opt_state = torch.load(optimizer_state_path, map_location=device_obj)
@@ -245,13 +249,14 @@ def train_network_from_tensors(
                 pg["lr"] = float(lr)
             optimizer_loaded = True
         except Exception as exc:
+            optimizer_load_error = repr(exc)
             if strategy != "ddp" or ddp_rank == 0:
                 print(
                     "[v1.train] warning: failed to load optimizer state; "
                     f"start with fresh Adam. path={optimizer_state_path} err={exc}"
                 )
     use_amp_enabled = bool(use_amp and device_obj.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp_enabled)
+    scaler = torch.amp.GradScaler("cuda", enabled=True) if use_amp_enabled else None
 
     alpha = float(max(0.0, min(1.0, soft_label_alpha)))
     anti_draw = float(anti_draw_penalty)
@@ -321,7 +326,12 @@ def train_network_from_tensors(
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda", enabled=use_amp_enabled):
+            amp_context = (
+                torch.amp.autocast("cuda", enabled=True)
+                if use_amp_enabled
+                else nullcontext()
+            )
+            with amp_context:
                 log_p1, log_p2, log_pmc, value_logits = train_model(batch_states)
 
                 mixed_values = torch.clamp(
@@ -369,8 +379,11 @@ def train_network_from_tensors(
                 continue
 
             if loss.requires_grad:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
                 grads_finite = _all_ranks_true(
                     _grads_are_finite(model),
                     strategy=strategy,
@@ -379,11 +392,15 @@ def train_network_from_tensors(
                 if not grads_finite:
                     skipped_non_finite_grad_batches += 1
                     optimizer.zero_grad(set_to_none=True)
-                    scaler.update()
+                    if scaler is not None:
+                        scaler.update()
                     continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
 
             global_step += 1
             scheduler.step()
@@ -501,6 +518,10 @@ def train_network_from_tensors(
         "synced_batch_count": int(synced_batch_count),
         "dropped_samples_for_sync": int(dropped_samples_for_sync),
         "optimizer_loaded": bool(optimizer_loaded),
+        "optimizer_load_error": optimizer_load_error,
+        "device": str(device_obj),
+        "device_fallback_count": int(device_resolution.fallback_count),
+        "device_fallback_reasons": list(device_resolution.fallback_reasons),
         "anti_draw_penalty": float(anti_draw),
         "wdl_aux_loss_weight": float(_WDL_AUX_LOSS_WEIGHT),
         "warmup_steps": int(warmup_n),
@@ -541,7 +562,8 @@ def train_network_streaming(
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train from a streaming DataLoader — data is loaded on-the-fly per batch."""
 
-    device_obj = torch.device(device)
+    device_resolution = resolve_portable_device(device)
+    device_obj = device_resolution.device
     strategy_raw = str(parallel_strategy).strip().lower()
     if strategy_raw in {"dp", "data_parallel"}:
         strategy = "data_parallel"
@@ -602,6 +624,7 @@ def train_network_streaming(
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     optimizer_loaded = False
+    optimizer_load_error: Optional[str] = None
     if optimizer_state_path and os.path.exists(optimizer_state_path):
         try:
             opt_state = torch.load(optimizer_state_path, map_location=device_obj)
@@ -610,6 +633,7 @@ def train_network_streaming(
                 pg["lr"] = float(lr)
             optimizer_loaded = True
         except Exception as exc:
+            optimizer_load_error = repr(exc)
             if strategy != "ddp" or ddp_rank == 0:
                 print(
                     "[v1.train] warning: failed to load optimizer state; "
@@ -617,7 +641,7 @@ def train_network_streaming(
                 )
 
     use_amp_enabled = bool(use_amp and device_obj.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp_enabled)
+    scaler = torch.amp.GradScaler("cuda", enabled=True) if use_amp_enabled else None
 
     alpha = float(max(0.0, min(1.0, soft_label_alpha)))
     anti_draw = float(anti_draw_penalty)
@@ -707,7 +731,12 @@ def train_network_streaming(
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda", enabled=use_amp_enabled):
+            amp_context = (
+                torch.amp.autocast("cuda", enabled=True)
+                if use_amp_enabled
+                else nullcontext()
+            )
+            with amp_context:
                 log_p1, log_p2, log_pmc, value_logits = train_model(b_states)
 
                 mixed_values = torch.clamp(
@@ -753,8 +782,11 @@ def train_network_streaming(
                 continue
 
             if loss.requires_grad:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
                 grads_ok = _all_ranks_true(
                     _grads_are_finite(model),
                     strategy=strategy, device=device_obj,
@@ -762,12 +794,16 @@ def train_network_streaming(
                 if not grads_ok:
                     skipped_non_finite_grad += 1
                     optimizer.zero_grad(set_to_none=True)
-                    scaler.update()
+                    if scaler is not None:
+                        scaler.update()
                     batches_this_epoch += 1
                     continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
 
             global_step += 1
             scheduler.step()
@@ -876,6 +912,10 @@ def train_network_streaming(
         "ddp_world_size": ddp_world,
         "est_batches_per_epoch": est_batches_per_epoch,
         "optimizer_loaded": bool(optimizer_loaded),
+        "optimizer_load_error": optimizer_load_error,
+        "device": str(device_obj),
+        "device_fallback_count": int(device_resolution.fallback_count),
+        "device_fallback_reasons": list(device_resolution.fallback_reasons),
         "anti_draw_penalty": float(anti_draw),
         "wdl_aux_loss_weight": float(_WDL_AUX_LOSS_WEIGHT),
         "warmup_steps": int(warmup_n),

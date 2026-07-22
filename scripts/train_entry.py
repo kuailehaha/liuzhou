@@ -80,6 +80,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         sparse_ply=int(args.sparse_ply),
         sparse_top_k=int(args.sparse_top_k),
         self_play_backend=args.self_play_backend,
+        search_backend=str(args.search_backend),
         self_play_shard_dir=args.self_play_shard_dir,
         self_play_target_samples_per_shard=int(args.self_play_target_samples_per_shard),
         self_play_chunk_target_bytes=int(args.self_play_chunk_target_bytes),
@@ -150,6 +151,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["auto", "thread", "process"],
         help="Optional v1 self-play backend override.",
+    )
+    parser.add_argument(
+        "--search_backend",
+        type=str,
+        default="cuda_root",
+        choices=["cuda_root", "portable"],
+        help="V1 search implementation; ignored by v0.",
     )
     parser.add_argument(
         "--self_play_shard_dir",

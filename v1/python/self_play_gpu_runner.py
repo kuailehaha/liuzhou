@@ -4,55 +4,19 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
 import v0_core
 
 from .mcts_gpu import GpuStateBatch, TOTAL_ACTION_DIM, V1RootMCTS, V1RootMCTSConfig
+from .self_play_types import SelfPlayV1Stats
 from .trajectory_buffer import TensorSelfPlayBatch, TensorTrajectoryBuffer
 
 _PIECE_DELTA_MIN = -18
 _PIECE_DELTA_MAX = 18
 _PIECE_DELTA_BUCKET_COUNT = (_PIECE_DELTA_MAX - _PIECE_DELTA_MIN) + 1
 
-
-@dataclass
-class SelfPlayV1Stats:
-    num_games: int
-    num_positions: int
-    black_wins: int
-    white_wins: int
-    draws: int
-    avg_game_length: float
-    elapsed_sec: float
-    positions_per_sec: float
-    games_per_sec: float
-    step_timing_ms: Dict[str, float]
-    step_timing_ratio: Dict[str, float]
-    step_timing_calls: Dict[str, int]
-    mcts_counters: Dict[str, int]
-    piece_delta_buckets: Dict[str, int]
-
-    def to_dict(self) -> Dict[str, object]:
-        payload: Dict[str, object] = {
-            "num_games": float(self.num_games),
-            "num_positions": float(self.num_positions),
-            "black_wins": float(self.black_wins),
-            "white_wins": float(self.white_wins),
-            "draws": float(self.draws),
-            "avg_game_length": float(self.avg_game_length),
-            "elapsed_sec": float(self.elapsed_sec),
-            "positions_per_sec": float(self.positions_per_sec),
-            "games_per_sec": float(self.games_per_sec),
-        }
-        payload["step_timing_ms"] = {k: float(v) for k, v in self.step_timing_ms.items()}
-        payload["step_timing_ratio"] = {k: float(v) for k, v in self.step_timing_ratio.items()}
-        payload["step_timing_calls"] = {k: int(v) for k, v in self.step_timing_calls.items()}
-        payload["mcts_counters"] = {k: int(v) for k, v in self.mcts_counters.items()}
-        payload["piece_delta_buckets"] = {k: int(v) for k, v in self.piece_delta_buckets.items()}
-        return payload
 
 def self_play_v1_gpu(
     model,

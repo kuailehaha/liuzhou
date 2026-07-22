@@ -21,15 +21,14 @@ import torch.nn as nn
 
 from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
-from v1.python.mcts_gpu import TOTAL_ACTION_DIM
-from v1.python.self_play_gpu_runner import SelfPlayV1Stats, self_play_v1_gpu
+from src.policy_batch import TOTAL_DIM as TOTAL_ACTION_DIM
 from v1.python.self_play_storage import (
     estimate_bytes_per_sample,
     plan_sample_ranges,
     save_self_play_payload as save_self_play_payload_shared,
     slice_batch_cpu,
 )
-from v1.python.self_play_worker import run_self_play_worker
+from v1.python.self_play_types import SelfPlayV1Stats
 from v1.python.train_bridge import train_network_from_tensors, train_network_streaming
 from v1.python.trajectory_buffer import TensorSelfPlayBatch
 
@@ -96,6 +95,13 @@ def _parse_device_list(primary_device: str, devices: Optional[str]) -> List[str]
     seen = set()
     cuda_count = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
     for item in tokens:
+        if item.lower() == "auto":
+            from v1.python.portable_device import resolve_portable_device
+
+            resolution = resolve_portable_device("auto")
+            item = str(resolution.device)
+            for reason in resolution.fallback_reasons:
+                print(f"[v1.train] device fallback: {reason}")
         dev = torch.device(item)
         if dev.type == "cuda":
             if cuda_count <= 0:
@@ -214,12 +220,16 @@ def _init_model_stable_resnet(model: nn.Module, *, seed: int) -> None:
 def _merge_train_bridge_summary(entry: Dict[str, Any], train_metrics: Dict[str, Any]) -> None:
     for key in (
         "optimizer_loaded",
+        "optimizer_load_error",
         "warmup_steps",
         "total_train_steps",
         "num_samples_after_filter",
         "filtered_non_finite_samples",
         "parallel_strategy",
         "ddp_world_size",
+        "device",
+        "device_fallback_count",
+        "device_fallback_reasons",
     ):
         if key in train_metrics:
             entry[key] = train_metrics.get(key)
@@ -542,6 +552,8 @@ def _run_self_play_shard(
     sparse_top_k: int = 8,
     seed: int,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
+    from v1.python.self_play_gpu_runner import self_play_v1_gpu
+
     torch.manual_seed(int(seed))
     shard_dev_obj = torch.device(shard_device)
     if shard_dev_obj.type == "cuda":
@@ -636,6 +648,17 @@ def _normalize_self_play_backend(backend: str) -> str:
         return "process"
     raise ValueError(
         f"Unsupported self-play backend={backend!r}; expected one of: auto, thread, process."
+    )
+
+
+def _normalize_search_backend(backend: str) -> str:
+    raw = str(backend).strip().lower()
+    if raw in {"cuda_root", "v1", "root", "root_only"}:
+        return "cuda_root"
+    if raw in {"portable", "reference", "full_mcts"}:
+        return "portable"
+    raise ValueError(
+        f"Unsupported search_backend={backend!r}; expected cuda_root or portable."
     )
 
 
@@ -860,6 +883,8 @@ def _run_self_play_multi_device_process_saved(
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
  ) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], Dict[str, Any], int]:
+    from v1.python.self_play_worker import run_self_play_worker
+
     model_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     shards = _split_games(int(num_games), len(devices))
     active: List[Tuple[int, str, int]] = [
@@ -1079,10 +1104,53 @@ def _run_self_play_multi_device(
     iteration_seed: int,
     self_play_backend: Optional[str],
     self_play_shard_dir: Optional[str],
+    search_backend: str = "cuda_root",
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
+    search_backend_norm = _normalize_search_backend(search_backend)
+    if search_backend_norm == "portable":
+        if len(devices) != 1:
+            raise RuntimeError(
+                "The portable backend is single-process/single-device in its first version; "
+                f"got devices={devices}."
+            )
+        requested_runner = _normalize_self_play_backend(self_play_backend or "auto")
+        if requested_runner == "process":
+            raise RuntimeError(
+                "The portable backend does not support process self-play; use auto or thread."
+            )
+        if int(sparse_ply) != 1:
+            raise ValueError(
+                "portable full MCTS does not use the experimental sparse_ply path; set sparse_ply=1."
+            )
+        from v1.python.portable_self_play import self_play_v1_portable
+
+        single_device = devices[0]
+        shard_concurrent = max(1, min(int(num_games), int(concurrent_games_per_device)))
+        return self_play_v1_portable(
+            model=model,
+            num_games=int(num_games),
+            mcts_simulations=int(mcts_simulations),
+            temperature_init=float(temperature_init),
+            temperature_final=float(temperature_final),
+            temperature_threshold=int(temperature_threshold),
+            exploration_weight=float(exploration_weight),
+            device=str(single_device),
+            add_dirichlet_noise=True,
+            dirichlet_alpha=float(dirichlet_alpha),
+            dirichlet_epsilon=float(dirichlet_epsilon),
+            soft_value_k=float(soft_value_k),
+            opening_random_moves=int(opening_random_moves),
+            max_game_plies=int(max_game_plies),
+            sample_moves=True,
+            concurrent_games=shard_concurrent,
+            verbose=False,
+        )
+
     if len(devices) <= 1:
+        from v1.python.self_play_gpu_runner import self_play_v1_gpu
+
         single_device = devices[0]
         shard_concurrent = max(1, min(int(num_games), int(concurrent_games_per_device)))
         return self_play_v1_gpu(
@@ -1166,7 +1234,9 @@ def _load_checkpoint_into_model(
         return
     if not os.path.exists(load_checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {load_checkpoint}")
-    checkpoint = torch.load(load_checkpoint, map_location=map_location)
+    # Deserialize through CPU so checkpoints saved from CPU/MPS/CUDA remain portable.
+    # The caller moves the fully loaded model to its execution device afterwards.
+    checkpoint = torch.load(load_checkpoint, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     try:
         model.load_state_dict(state_dict, strict=True)
@@ -1679,6 +1749,7 @@ def train_pipeline_v1(
     self_play_concurrent_games: int = 8,
     self_play_opening_random_moves: int = 0,
     self_play_backend: Optional[str] = None,
+    search_backend: str = "cuda_root",
     self_play_shard_dir: Optional[str] = None,
     self_play_target_samples_per_shard: int = 0,
     self_play_chunk_target_bytes: int = 0,
@@ -1716,7 +1787,19 @@ def train_pipeline_v1(
     if stage_norm not in {"all", "selfplay", "train", "infer"}:
         raise ValueError(f"Unsupported stage={stage!r}; expected all/selfplay/train/infer.")
 
+    search_backend_norm = _normalize_search_backend(search_backend)
     train_strategy_norm = _normalize_train_strategy(train_strategy)
+    if search_backend_norm == "portable":
+        if train_strategy_norm == "ddp":
+            raise RuntimeError(
+                "The portable backend is single-process/single-device and does not support DDP."
+            )
+        if train_strategy_norm != "none":
+            _print_rank0(
+                "[v1.train] portable backend uses single-device training; "
+                f"train_strategy={train_strategy_norm} normalized to none."
+            )
+            train_strategy_norm = "none"
     if stage_norm == "all" and train_strategy_norm == "ddp":
         raise RuntimeError(
             "stage='all' with train_strategy='ddp' is not supported. "
@@ -1755,6 +1838,7 @@ def train_pipeline_v1(
             self_play_device_list = [str(primary_train_device)]
 
         _print_rank0(f"[v1.train] stage={stage_norm} train_strategy={train_strategy_norm}")
+        _print_rank0(f"[v1.train] search_backend={search_backend_norm}")
         _print_rank0(f"[v1.train] self_play_devices={self_play_device_list}")
         _print_rank0(
             "[v1.train] self_play_backend="
@@ -1856,6 +1940,7 @@ def train_pipeline_v1(
                 "source_checkpoint": str(load_checkpoint) if load_checkpoint else None,
                 "self_play_devices": list(self_play_device_list),
                 "self_play_backend": backend_arg if backend_arg is not None else "auto",
+                "search_backend": search_backend_norm,
                 "self_play_shard_dir": shard_dir_arg,
                 "mcts_simulations": int(mcts_simulations),
                 "self_play_games": int(self_play_games),
@@ -1872,7 +1957,9 @@ def train_pipeline_v1(
                 else "thread"
             )
             saved_shards = 0
-            use_saved_process_chunks = bool(resolved_backend == "process")
+            use_saved_process_chunks = bool(
+                search_backend_norm == "cuda_root" and resolved_backend == "process"
+            )
             if use_saved_process_chunks:
                 _print_rank0(f"[v1.train] self-play backend={resolved_backend} devices={self_play_device_list}")
                 (
@@ -1925,6 +2012,7 @@ def train_pipeline_v1(
                     iteration_seed=int(stage_selfplay_seed),
                     self_play_backend=backend_arg,
                     self_play_shard_dir=shard_dir_arg,
+                    search_backend=search_backend_norm,
                     sparse_ply=int(sparse_ply),
                     sparse_top_k=int(sparse_top_k),
                 )
@@ -2255,6 +2343,7 @@ def train_pipeline_v1(
                         "self_play_devices": list(self_play_device_list),
                         "train_devices": list(train_device_list),
                         "train_strategy": train_strategy_norm,
+                        "search_backend": search_backend_norm,
                         "stage": "train",
                         "self_play_input": str(self_play_input),
                     },
@@ -2278,6 +2367,7 @@ def train_pipeline_v1(
                     "self_play_mixed_value_target_summary": sp_stats_payload.get("mixed_value_target_summary"),
                     "train_devices": list(train_device_list),
                     "train_strategy": train_strategy_norm,
+                    "search_backend": search_backend_norm,
                     "checkpoint_load_sec": float(checkpoint_load_sec),
                     "self_play_payload_load_sec": float(payload_load_sec),
                     "train_time_sec": float(train_elapsed),
@@ -2352,6 +2442,7 @@ def train_pipeline_v1(
                 iteration_seed=int(it_idx),
                 self_play_backend=backend_arg,
                 self_play_shard_dir=shard_dir_arg,
+                search_backend=search_backend_norm,
                 sparse_ply=int(sparse_ply),
                 sparse_top_k=int(sparse_top_k),
             )
@@ -2394,6 +2485,7 @@ def train_pipeline_v1(
                     "self_play_devices": self_play_device_list,
                     "train_devices": train_device_list,
                     "train_strategy": train_strategy_norm,
+                    "search_backend": search_backend_norm,
                 },
                 ckpt_path,
             )
@@ -2412,6 +2504,11 @@ def train_pipeline_v1(
                 "black_wins": sp_stats.black_wins,
                 "white_wins": sp_stats.white_wins,
                 "draws": sp_stats.draws,
+                "search_backend": search_backend_norm,
+                "self_play_device": str(getattr(sp_stats, "device", self_play_device_list[0])),
+                "self_play_fallback_count": int(getattr(sp_stats, "fallback_count", 0)),
+                "self_play_fallback_reasons": list(getattr(sp_stats, "fallback_reasons", ())),
+                "self_play_mcts_counters": dict(getattr(sp_stats, "mcts_counters", {})),
                 "decisive_games": int(sp_stats.black_wins + sp_stats.white_wins),
                 "decisive_game_ratio": float(
                     (sp_stats.black_wins + sp_stats.white_wins) / max(1, int(sp_stats.num_games))
@@ -2437,6 +2534,7 @@ def train_pipeline_v1(
                     "iteration": int(it_idx),
                     "self_play_devices": list(self_play_device_list),
                     "self_play_backend": backend_arg if backend_arg is not None else "auto",
+                    "search_backend": search_backend_norm,
                     "self_play_shard_dir": shard_dir_arg,
                     "self_play_target_samples_per_shard": int(self_play_target_samples_per_shard),
                     "self_play_chunk_target_bytes": int(self_play_chunk_target_bytes),
@@ -2522,6 +2620,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["auto", "thread", "process"],
         help="Optional v1 self-play backend override; default is auto.",
+    )
+    parser.add_argument(
+        "--search_backend",
+        type=str,
+        default="cuda_root",
+        choices=["cuda_root", "portable"],
+        help=(
+            "Search implementation used by self-play. cuda_root preserves the existing "
+            "v0_core/CUDA path; portable uses full CPU-tree MCTS with PyTorch inference."
+        ),
     )
     parser.add_argument(
         "--self_play_shard_dir",
@@ -2678,6 +2786,7 @@ if __name__ == "__main__":
         self_play_concurrent_games=args.self_play_concurrent_games,
         self_play_opening_random_moves=args.self_play_opening_random_moves,
         self_play_backend=args.self_play_backend,
+        search_backend=args.search_backend,
         self_play_shard_dir=args.self_play_shard_dir,
         self_play_target_samples_per_shard=args.self_play_target_samples_per_shard,
         self_play_chunk_target_bytes=args.self_play_chunk_target_bytes,

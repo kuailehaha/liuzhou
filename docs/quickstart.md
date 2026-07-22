@@ -13,6 +13,34 @@
 - Conda 环境：`conda activate torchenv`
 - 常见用途：本地功能验证、小规模回归、人机对战
 
+### macOS Apple Silicon portable 环境
+
+无需构建 `v0_core` 或安装 CUDA。`portable` 后端把规则和完整 MCTS 树留在 CPU，并在可用时使用 MPS 做 PyTorch 批量推理与 float32 训练；现有 CUDA 默认路径不受影响。
+
+一键小规模闭环：
+
+```bash
+python tools/smoke_v1_portable.py \
+  --device auto \
+  --work_dir tmp/v1_portable_smoke
+```
+
+`auto` 在 MPS 可用时选择 `mps`，否则选择 CPU 并在报告中记录原因。不要设置 `PYTORCH_ENABLE_MPS_FALLBACK=1`；portable MPS 会拒绝该静默回退模式。
+
+固定 checkpoint 的 portable 评估：
+
+```bash
+python scripts/eval_checkpoint.py \
+  --challenger_checkpoint tmp/v1_portable_smoke/model_iter_001.pt \
+  --backend portable \
+  --device auto \
+  --eval_workers 1 \
+  --eval_games_vs_random 2 \
+  --mcts_simulations 16
+```
+
+固定模型 Root-PUCT/full-MCTS 对比入口为 `tools/ab_portable_search.py`。在模型尚未对 random 饱和、高级模型互战平局率过高时，可以把固定条件的 `vs_random win-loss` 作为较长阶段的粗粒度趋势/筛选指标，但应同时报告 draw rate；接近饱和或需要最终棋力结论时，仍以固定 checkpoint 对战或 tournament/Elo 为准。
+
 ## 2. 构建入口
 
 正式构建入口是 `scripts/instruct.sh`。

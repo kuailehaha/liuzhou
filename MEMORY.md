@@ -56,6 +56,14 @@
 - Only after the portable search is stronger with the same checkpoint should short training A/B begin.
 - Final comparison must report both equal-sample and equal-wall-clock/GPU-budget results. Tournament/Elo or fixed-opponent head-to-head is the strength criterion; `vs_random` and draw ratio remain health/data-distribution probes.
 
+### 7) Portable Backend Status (implemented 2026-07-21)
+
+- `portable` now provides the CPU rule/tree/full-MCTS reference with batched PyTorch CPU/MPS inference, persistent subtree reuse and current-player-aware backup. Existing `cuda_root` remains the default.
+- Mac CPU and MPS toy workflows pass through self-play, float32 training, evaluation, checkpoint save and CPU/MPS reload with no fallback or non-finite output.
+- The fixed-model search sweep confirms measurable fixed-q sensitivity at 65,536 allocations, but the available random/toy weights and two drawn head-to-head games do not establish stronger play. No training-improvement claim or short training A/B should follow until representative checkpoints or labeled tactical cases are available.
+- During a draw-heavy, pre-saturation phase, fixed-condition `vs_random win-loss` plus draw rate can serve as the primary coarse progress/screening signal. Treat it as an interim proxy, not final strength ground truth; switch back to fixed-checkpoint/tournament evidence as it saturates.
+- Reproducible commands and measured details are recorded in `v1/Design.md`; pending representative-checkpoint and training experiments remain in `TODO.md`.
+
 ## Current Conclusions (2026-02-26)
 
 ### 1) Strength Milestone (Large-Scale V1 Run)

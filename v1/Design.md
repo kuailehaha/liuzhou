@@ -2,6 +2,48 @@
 Date: 2026-02-16  
 Scope: Design for migrating v0 CPU-bottleneck self-play to a GPU-first v1 pipeline.
 
+## Addendum (2026-07-21): Portable CPU/MPS Full-MCTS Reference
+
+### Implemented scope
+
+- Added an additive `portable` search backend. CPU owns `GameState`, rules, the persistent tree arena, PUCT selection, expansion, backup and subtree reuse; PyTorch owns batched policy/value inference on `cpu` or `mps`.
+- The value stored at each node is in that node's `current_player` perspective. Backup flips only across an edge whose player changes; consecutive mark/capture/removal actions keep the sign.
+- Each search round selects one leaf per active tree and batches leaves across games. There is no same-tree in-flight collision, so virtual-loss count is explicitly zero.
+- Portable self-play emits the existing `TensorSelfPlayBatch` shapes and 220-dimensional cell-major action encoding. `v1/train.py` and `scripts/eval_checkpoint.py` select the backend explicitly; CUDA-only imports are lazy.
+- MPS uses float32 training and inference. CUDA autocast/GradScaler remain CUDA-only. `PYTORCH_ENABLE_MPS_FALLBACK=1` is rejected so unsupported MPS operations cannot silently execute on CPU.
+- Existing `cuda_root` remains the default production backend; the portable backend is single-process/single-device and does not use DDP or DataParallel.
+
+Primary entry points:
+
+- `tools/smoke_v1_portable.py`: self-play → train → eval → checkpoint reload.
+- `tools/ab_portable_search.py`: fixed-q root-only semantic reproduction versus full MCTS.
+- `tests/v1/test_portable_mcts.py`: import isolation, phase/value backup, terminal rows, 220-d policy, subtree reuse, CPU/MPS parity and optimizer-load diagnostics.
+
+### Fresh Mac evidence
+
+Environment: MacBook Air (Apple M5, 10 logical CPUs, 16 GB), macOS 26.5.2, Python 3.10.20, PyTorch 2.9.1; MPS built and available. All MPS runs unset `PYTORCH_ENABLE_MPS_FALLBACK`.
+
+- A small real `ChessNet` forward/backward probe produced finite outputs and input gradients on MPS for float32, float16 and bfloat16. The portable backend deliberately remains float32 in its first version.
+- Portable tests: `23 passed` on the Mac; the MPS parity test had no skip.
+- MPS staged smoke (`2 games`, `4 simulations`, `12 max plies`): self-play wrote 24 tensor samples, the train stage reloaded them for three finite steps, then two evaluation games and checkpoint reload ran on both CPU and MPS. Fallback count and non-finite count were 0; CPU/MPS legal masks were identical and max policy/value absolute differences were `3.73e-9` and `2.61e-8`.
+- CPU smoke (`1 game`, `2 simulations`, `6 max plies`): self-play, one training step, two evaluation games and reload passed with fallback count 0 and non-finite count 0.
+- Raw staged-smoke reports are runtime artifacts at `tmp/v1_portable_staged_smoke_20260721/` and `tmp/v1_portable_cpu_staged_smoke_20260721/`; A/B reports are under `tmp/v1_portable_smoke_20260721/`. They are intentionally not source-controlled.
+
+### Fixed-model A/B result and decision
+
+The fixed-q root-only sweep used `128/512/1536/65536` allocations, `temperature=0.1`, `q` perturbation `1e-3`, eight fixed positions spanning PLACEMENT, MARK_SELECTION, REMOVAL, MOVEMENT, CAPTURE_SELECTION and COUNTER_REMOVAL, and random/toy fixed weights. This is a portable semantic reproduction of current Root-PUCT; it is not a CUDA fused-kernel throughput benchmark.
+
+Model fingerprints: random seed-7 initialization `4e11381eecef2714c5f3b8dda13b3ab47bf1345913dae981a80915c59fa1bea2`; toy smoke checkpoint `71350e3027a6716106d4fbdabb4825fbd34a5ad3d58602256a3cc9202412ab6f`.
+
+- At 65,536 allocations, perturbing fixed `q` changed root top-1 on `87.5%` of random-weight positions and `50.0%` of toy-weight positions. Mean policy L1 changes were about `1.145` and `1.138` respectively.
+- Root-only 65,536 throughput was about `0.47–0.48 positions/s`; 128-simulation full MCTS was about `5.8 positions/s`. Budgets differ, so this is a cost observation, not an equal-compute strength result.
+- Equal 128-vs-128 search on the toy checkpoint produced `0-0-2` (full-root-draw) in two cross-color games, at about `62.5 seconds/game`. It does not demonstrate a strength gain.
+- No early/mid/strong project checkpoints or labeled tactical suite were present in this checkout. Consequently tactical accuracy is unmeasured, the fixed-model strength result is inconclusive, and no short training A/B is authorized or justified yet.
+
+Decision: keep portable full MCTS as the correctness reference. Do not claim improved search quality or training effectiveness until labeled tactical cases or representative checkpoints show a repeatable fixed-model advantage.
+
+Operational evaluation note: while advanced-model head-to-head remains draw-heavy and a model has not saturated against random, fixed-condition `vs_random win-loss` plus draw rate may be used as the main coarse trend/screening metric for an extended stage. Once the metric saturates, or for a final strength claim, use fixed-checkpoint head-to-head or tournament/Elo because the repository's historical 80-model correlation with `vs_random` is weak.
+
 ## Addendum (2026-02-26): Strength-Iteration Status
 
 This addendum records the latest strength-oriented outcomes after the acceleration phase and is the current reference for training priorities.
