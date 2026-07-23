@@ -27,6 +27,46 @@ python tools/smoke_v1_portable.py \
 
 `auto` 在 MPS 可用时选择 `mps`，否则选择 CPU 并在报告中记录原因。不要设置 `PYTORCH_ENABLE_MPS_FALLBACK=1`；portable MPS 会拒绝该静默回退模式。
 
+portable C++ 树搜索是显式 opt-in，Python 实现仍是默认参考和回退路径。它只编译 CPU 规则/树搜索代码，MPS 推理由现有 PyTorch 模型执行，不链接 CUDA 或 V0 LibTorch inference engine：
+
+```bash
+python scripts/build_portable_cpp.py --force
+
+python scripts/train_entry.py \
+  --pipeline v1 \
+  --stage selfplay \
+  --search_backend portable \
+  --portable_mcts_backend cpp \
+  --portable_cpp_threads 4 \
+  --device mps \
+  --devices mps \
+  --train_devices mps \
+  --train_strategy none \
+  --self_play_games 8 \
+  --self_play_concurrent_games 8 \
+  --mcts_simulations 8 \
+  --self_play_output tmp/portable_cpp_smoke.pt
+```
+
+产物仍使用 V1 `TensorSelfPlayBatch`/sharded manifest，可直接交给现有 staged train、replay 和长训编排。若扩展未构建或加载失败，显式选择 `cpp` 会报错，不会静默切回 Python。正式启用前须在无竞争负载下完成同 checkpoint 的 1/2/4/8 线程基准：
+
+```bash
+python -m tools.benchmark_portable_cpp \
+  --checkpoint checkpoints/current.pt \
+  --device mps \
+  --games 32 \
+  --concurrency 32 \
+  --simulations 8 \
+  --max-plies 64 \
+  --threads 1,2,4,8 \
+  --repeats 3 \
+  --output tmp/portable_cpp_benchmark.json
+```
+
+基准会拒绝与训练/评测进程并跑，并检查 payload 指纹、非法动作、非有限值和 fallback。只有正确性一致且中位 `positions/s` 达到 Python 基线 `1.5x` 后，才能把 C++ 路径设为该机器的推荐 self-play 实现。
+
+本机 2026-07-23 的固定 checkpoint 验收已通过：Python 中位数为 `163.88 positions/s`，C++ 1/2/4/8 线程分别为 `434.85/409.35/400.02/398.88 positions/s`，即 `2.65x/2.50x/2.44x/2.43x`；15 条测量的完整 tensor payload 指纹一致，fallback、非法动作和非有限值均为 0。当前同条件最优为 1 线程，最佳多线程配置为 2 线程；不要假定增加线程必然提速。原始报告位于 ignored 的 `tmp/portable_cpp_accept_20260723/benchmark_final_rebuild.json`。
+
 固定 checkpoint 的 portable 评估：
 
 ```bash

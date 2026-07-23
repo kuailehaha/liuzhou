@@ -323,10 +323,17 @@ def _preflight(args: argparse.Namespace) -> None:
         )
     if float(args.hours) <= 0.0:
         raise ValueError("--hours must be positive.")
+    if str(args.portable_mcts_backend).strip().lower() not in {"python", "cpp"}:
+        raise ValueError("--portable-mcts-backend must be python or cpp.")
+    if str(args.portable_mcts_backend).strip().lower() == "cpp":
+        from v1.python.portable_cpp_loader import load_portable_cpp
+
+        load_portable_cpp(required=True)
     for name in (
         "self_play_games",
         "self_play_concurrency",
         "portable_self_play_workers",
+        "portable_cpp_threads",
         "eval_concurrency",
     ):
         if int(getattr(args, name)) <= 0:
@@ -354,6 +361,8 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "self_play_games",
         "self_play_concurrency",
         "portable_self_play_workers",
+        "portable_mcts_backend",
+        "portable_cpp_threads",
         "mcts_simulations",
         "temperature_init",
         "temperature_final",
@@ -550,6 +559,8 @@ class PortableLongTrainer:
             additive_defaults = {
                 "incumbent_promotion_score": float(self.args.incumbent_promotion_score),
                 "portable_self_play_workers": int(self.args.portable_self_play_workers),
+                "portable_mcts_backend": str(self.args.portable_mcts_backend),
+                "portable_cpp_threads": int(self.args.portable_cpp_threads),
             }
             if isinstance(previous_signature, dict):
                 previous_signature = dict(previous_signature)
@@ -751,6 +762,10 @@ class PortableLongTrainer:
             str(int(self.args.self_play_concurrency)),
             "--portable_self_play_workers",
             str(int(self.args.portable_self_play_workers)),
+            "--portable_mcts_backend",
+            str(self.args.portable_mcts_backend),
+            "--portable_cpp_threads",
+            str(int(self.args.portable_cpp_threads)),
             "--self_play_opening_random_moves",
             str(opening_moves),
             "--mcts_simulations",
@@ -1245,6 +1260,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--self-play-games", type=int, default=128)
     parser.add_argument("--self-play-concurrency", type=int, default=128)
     parser.add_argument("--portable-self-play-workers", type=int, default=1)
+    parser.add_argument(
+        "--portable-mcts-backend",
+        choices=["python", "cpp"],
+        default="python",
+    )
+    parser.add_argument("--portable-cpp-threads", type=int, default=1)
     parser.add_argument("--mcts-simulations", type=int, default=8)
     parser.add_argument("--temperature-init", type=float, default=1.0)
     parser.add_argument("--temperature-final", type=float, default=0.1)

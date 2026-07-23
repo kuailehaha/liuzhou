@@ -38,6 +38,8 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert args.hours == 20.0
     assert (args.self_play_games, args.self_play_concurrency) == (128, 128)
     assert args.portable_self_play_workers == 1
+    assert args.portable_mcts_backend == "python"
+    assert args.portable_cpp_threads == 1
     assert (args.batch_size, args.epochs, args.replay_window) == (256, 3, 4)
     assert (args.eval_games_random, args.eval_games_best) == (500, 500)
     assert args.final_eval_games == 500
@@ -174,6 +176,8 @@ def test_resume_migrates_legacy_incumbent_gate_to_explicit_default(tmp_path) -> 
     legacy_config = _config_signature(args)
     legacy_config.pop("incumbent_promotion_score")
     legacy_config.pop("portable_self_play_workers")
+    legacy_config.pop("portable_mcts_backend")
+    legacy_config.pop("portable_cpp_threads")
     trainer.state_path.write_text(
         json.dumps(
             {
@@ -193,6 +197,8 @@ def test_resume_migrates_legacy_incumbent_gate_to_explicit_default(tmp_path) -> 
 
     assert trainer.state["config"]["incumbent_promotion_score"] == pytest.approx(0.55)
     assert trainer.state["config"]["portable_self_play_workers"] == 1
+    assert trainer.state["config"]["portable_mcts_backend"] == "python"
+    assert trainer.state["config"]["portable_cpp_threads"] == 1
 
 
 def test_interrupted_model_optimizer_commit_restores_previous_pair(tmp_path) -> None:

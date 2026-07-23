@@ -293,6 +293,8 @@ def run_self_play_worker(
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
     search_backend: str = "cuda_root",
+    portable_mcts_backend: str = "python",
+    portable_cpp_threads: int = 1,
 ) -> Dict[str, Any]:
     """Run one self-play shard inside a dedicated process and persist shard payload."""
 
@@ -326,26 +328,46 @@ def run_self_play_worker(
 
         def _run_once(chunk_games: int) -> tuple[Any, Any]:
             if str(search_backend).strip().lower() == "portable":
-                from .portable_self_play import self_play_v1_portable
+                portable_impl = str(portable_mcts_backend).strip().lower()
+                if portable_impl == "cpp":
+                    from .portable_cpp_self_play import (
+                        self_play_v1_portable_cpp as portable_runner,
+                    )
+                elif portable_impl == "python":
+                    from .portable_self_play import (
+                        self_play_v1_portable as portable_runner,
+                    )
+                else:
+                    raise ValueError(
+                        "portable_mcts_backend must be 'python' or 'cpp', "
+                        f"got {portable_mcts_backend!r}"
+                    )
 
-                return self_play_v1_portable(
-                    model=model,
-                    num_games=int(chunk_games),
-                    mcts_simulations=int(mcts_simulations),
-                    temperature_init=float(temperature_init),
-                    temperature_final=float(temperature_final),
-                    temperature_threshold=int(temperature_threshold),
-                    exploration_weight=float(exploration_weight),
-                    device=str(dev),
-                    add_dirichlet_noise=True,
-                    dirichlet_alpha=float(dirichlet_alpha),
-                    dirichlet_epsilon=float(dirichlet_epsilon),
-                    soft_value_k=float(soft_value_k),
-                    opening_random_moves=int(opening_random_moves),
-                    max_game_plies=int(max_game_plies),
-                    sample_moves=True,
-                    concurrent_games=max(1, min(int(chunk_games), shard_concurrent)),
-                    verbose=False,
+                portable_kwargs = {
+                    "model": model,
+                    "num_games": int(chunk_games),
+                    "mcts_simulations": int(mcts_simulations),
+                    "temperature_init": float(temperature_init),
+                    "temperature_final": float(temperature_final),
+                    "temperature_threshold": int(temperature_threshold),
+                    "exploration_weight": float(exploration_weight),
+                    "device": str(dev),
+                    "add_dirichlet_noise": True,
+                    "dirichlet_alpha": float(dirichlet_alpha),
+                    "dirichlet_epsilon": float(dirichlet_epsilon),
+                    "soft_value_k": float(soft_value_k),
+                    "opening_random_moves": int(opening_random_moves),
+                    "max_game_plies": int(max_game_plies),
+                    "sample_moves": True,
+                    "concurrent_games": max(
+                        1, min(int(chunk_games), shard_concurrent)
+                    ),
+                    "verbose": False,
+                }
+                if portable_impl == "cpp":
+                    portable_kwargs["cpu_threads"] = int(portable_cpp_threads)
+                return portable_runner(
+                    **portable_kwargs,
                 )
             from .self_play_gpu_runner import self_play_v1_gpu
 
@@ -439,6 +461,8 @@ def run_self_play_worker(
                     "memory_anchor_mb": int(anchor_mb_effective),
                     "opening_random_moves": int(opening_random_moves),
                     "search_backend": str(search_backend),
+                    "portable_mcts_backend": str(portable_mcts_backend),
+                    "portable_cpp_threads": int(portable_cpp_threads),
                     "source_worker_manifest": os.path.basename(str(output_path)),
                 }
                 save_self_play_payload(
@@ -482,6 +506,8 @@ def run_self_play_worker(
                 "memory_anchor_mb": int(anchor_mb_effective),
                 "opening_random_moves": int(opening_random_moves),
                 "search_backend": str(search_backend),
+                "portable_mcts_backend": str(portable_mcts_backend),
+                "portable_cpp_threads": int(portable_cpp_threads),
             },
         }
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)

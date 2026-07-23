@@ -414,6 +414,20 @@ GameState ApplyMove(const GameState& state, const MoveRecord& move, bool quiet) 
     }
 
     new_state.move_count = state.move_count + 1;
+    if (
+        state.phase == Phase::kPlacement ||
+        state.phase == Phase::kMarkSelection) {
+        new_state.moves_since_capture = 0;
+    } else {
+        const int old_total =
+            state.CountPlayerPieces(Player::kBlack) +
+            state.CountPlayerPieces(Player::kWhite);
+        const int new_total =
+            new_state.CountPlayerPieces(Player::kBlack) +
+            new_state.CountPlayerPieces(Player::kWhite);
+        new_state.moves_since_capture =
+            new_total < old_total ? 0 : state.moves_since_capture + 1;
+    }
     return new_state;
 }
 

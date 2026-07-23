@@ -1876,3 +1876,43 @@ Data-effectiveness standard fields (must be preserved in reports):
   - 跑本地 3 轮与最小 staged 验证，产出 before/after JSON。
 - Phase D: 记录收敛
   - 将结果回填 `v1/Design.md` 与 `TODO.md`，给出是否达到 gate 的结论。
+
+### Portable MPS Threaded C++ Self-Play (2026-07-23)
+
+#### 目标与边界
+
+- 复用 V1 staged payload、train bridge、replay、checkpoint/optimizer 恢复和既有评测/gating，不新建训练流水线。
+- C++17 仅承担 CPU 规则、220 维合法动作编码、树选择/扩展/回传和子树复用；PyTorch 继续负责 CPU/MPS 模型前向及随机采样。
+- Python full-tree portable MCTS 保持默认参考路径；C++ 必须显式选择，加载失败不允许静默 fallback。
+- 不修改 incumbent `55%` score gate，不把 `vs_random` 当作模型晋级口径。
+
+#### 跨层契约
+
+- C++ 规则直接复用 `v0/src/game/game_state.cpp`、`v0/src/rules/rule_engine.cpp` 和 `v0/src/moves/move_generator.cpp`。
+- 动作空间固定为 36 placement + 144 cell-major movement + 36 selection + 4 auxiliary。
+- 每条回传边比较 parent/child `current_player`；只有行动方改变时才翻转 value。
+- 模型输入保持 `(11, 6, 6)`，输出仍组装为现有 `TensorSelfPlayBatch`。
+- 设备、线程、fallback、非法动作、非有限值和各阶段耗时写入 self-play stats。
+
+#### 实现与验收入口
+
+- 构建：`python scripts/build_portable_cpp.py --force`
+- 正确性：`python -m pytest tests/v1/test_portable_cpp_mcts.py tests/v1/test_portable_mcts.py -q`
+- staged smoke：`scripts/train_entry.py --pipeline v1 --stage selfplay --search_backend portable --portable_mcts_backend cpp --portable_cpp_threads N ...`
+- 同条件基准：`python -m tools.benchmark_portable_cpp --threads 1,2,4,8 --repeats 3 ...`
+
+#### 推荐门槛
+
+- 规则/阶段/终局、合法动作与 220 维索引、policy target、value 回传及 tensor payload 对拍全部通过。
+- 正式短基准零非有限值、零非法动作、零 fallback，且最佳线程配置的中位 `positions/s >= 1.5x` Python portable。
+- 未达到这两个条件前，Python 仍为 portable self-play 的默认和推荐路径。
+
+#### 2026-07-23 验收结果
+
+- Apple M5 / macOS 26.5.2 / Python 3.10.20 / PyTorch 2.9.1 MPS；checkpoint SHA256 为 `2717b63bb9daedb8174075a6247ed8ae957b81479c7123677e9b8b96c409d5f6`。
+- 固定条件：32 games/concurrency 32、8 simulations、64 max plies、temperature 1.0、seed 20260723、无 Dirichlet noise、确定性 argmax；每个配置预热后测 3 次并轮换执行顺序。
+- 中位吞吐：Python `163.88 positions/s`；C++ 1/2/4/8 线程为 `434.85/409.35/400.02/398.88 positions/s`，相对为 `2.65x/2.50x/2.44x/2.43x`。同条件最优为 1 线程，最佳多线程配置为 2 线程。
+- CPU process utilization 中位数：Python `77.46%`；C++ 1/2/4/8 为 `60.36%/59.80%/59.25%/63.64%`。MPS Device Utilization 中位数分别为 `46.5%` 与 `55%/55%/52%/57%`；C++ 让 MPS 等待 CPU/Python 的时间减少，但更多线程在该 workload 下被 MPS 批量推理和线程调度开销抵消。
+- 所有 15 条正式测量的完整 `state/legal/policy/value/soft-value` tensor fingerprint 一致；fallback、非法动作、非有限值均为 0。动态依赖只有系统 `libc++`/`libSystem`，未链接 CUDA、LibTorch 或 V0 inference engine。
+- staged MPS self-play 生成 4 局/160 positions 的标准 payload；现有 train bridge 直接消费成功，随后 replay 合并为 320 samples。第二次训练从隔离 checkpoint 和 optimizer state 恢复时 `optimizer_loaded=True`、load error 为 `None`，过滤非有限样本和设备 fallback 均为 0。
+- 原始报告和 smoke 产物位于 ignored 的 `tmp/portable_cpp_accept_20260723/`。基于正确性与 `>=1.5x` 门槛均通过，C++ 后端现为本机 portable self-play 的推荐实现；Python 路径继续保持默认、正确性参考与无需本地扩展的回退路径。线程数必须按目标并发重新基准，本轮最优 1 线程不代表更高并发或其他 M 系列机器。

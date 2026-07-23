@@ -21,6 +21,11 @@ _EXPORTS = {
     "PortableMCTSConfig": (".portable_mcts", "PortableMCTSConfig"),
     "PortableTree": (".portable_mcts", "PortableTree"),
     "self_play_v1_portable": (".portable_self_play", "self_play_v1_portable"),
+    "PortableCppMCTS": (".portable_cpp_mcts", "PortableCppMCTS"),
+    "self_play_v1_portable_cpp": (
+        ".portable_cpp_self_play",
+        "self_play_v1_portable_cpp",
+    ),
 }
 
 
@@ -45,4 +50,6 @@ __all__ = [
     "PortableMCTSConfig",
     "PortableTree",
     "self_play_v1_portable",
+    "PortableCppMCTS",
+    "self_play_v1_portable_cpp",
 ]

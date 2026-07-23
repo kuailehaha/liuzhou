@@ -684,6 +684,17 @@ def _normalize_search_backend(backend: str) -> str:
     )
 
 
+def _normalize_portable_mcts_backend(backend: str) -> str:
+    raw = str(backend).strip().lower()
+    if raw in {"python", "py", "reference"}:
+        return "python"
+    if raw in {"cpp", "c++", "threaded_cpp"}:
+        return "cpp"
+    raise ValueError(
+        f"Unsupported portable_mcts_backend={backend!r}; expected python or cpp."
+    )
+
+
 def _resolve_self_play_backend(*, requested_backend: Optional[str], devices: List[str]) -> str:
     source = requested_backend
     if source is None:
@@ -827,6 +838,8 @@ def _run_self_play_multi_device_process(
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
     search_backend: str = "cuda_root",
+    portable_mcts_backend: str = "python",
+    portable_cpp_threads: int = 1,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     workspace, auto_cleanup = _prepare_self_play_workspace(
         shard_dir=shard_dir,
@@ -864,6 +877,8 @@ def _run_self_play_multi_device_process(
                 sparse_ply=int(sparse_ply),
                 sparse_top_k=int(sparse_top_k),
                 search_backend=str(search_backend),
+                portable_mcts_backend=str(portable_mcts_backend),
+                portable_cpp_threads=int(portable_cpp_threads),
             )
         )
         merged_batch, _stats_payload, _meta_payload = _load_self_play_payload(str(manifest_path))
@@ -907,6 +922,8 @@ def _run_self_play_multi_device_process_saved(
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
     search_backend: str = "cuda_root",
+    portable_mcts_backend: str = "python",
+    portable_cpp_threads: int = 1,
  ) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], Dict[str, Any], int]:
     from v1.python.self_play_worker import run_self_play_worker
 
@@ -970,6 +987,8 @@ def _run_self_play_multi_device_process_saved(
                     sparse_ply=int(sparse_ply),
                     sparse_top_k=int(sparse_top_k),
                     search_backend=str(search_backend),
+                    portable_mcts_backend=str(portable_mcts_backend),
+                    portable_cpp_threads=int(portable_cpp_threads),
                     target_samples_per_shard=int(target_samples_per_shard),
                     chunk_target_bytes=int(chunk_target_bytes),
                     chunk_output_dir=str(out_dir),
@@ -1134,9 +1153,12 @@ def _run_self_play_multi_device(
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
     portable_self_play_workers: int = 1,
+    portable_mcts_backend: str = "python",
+    portable_cpp_threads: int = 1,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     search_backend_norm = _normalize_search_backend(search_backend)
     if search_backend_norm == "portable":
+        portable_impl = _normalize_portable_mcts_backend(portable_mcts_backend)
         if len(devices) != 1:
             raise RuntimeError(
                 "The portable backend is single-process/single-device in its first version; "
@@ -1172,29 +1194,43 @@ def _run_self_play_multi_device(
                 sparse_ply=1,
                 sparse_top_k=int(sparse_top_k),
                 search_backend="portable",
+                portable_mcts_backend=portable_impl,
+                portable_cpp_threads=int(portable_cpp_threads),
             )
-        from v1.python.portable_self_play import self_play_v1_portable
+        if portable_impl == "cpp":
+            from v1.python.portable_cpp_self_play import (
+                self_play_v1_portable_cpp as portable_runner,
+            )
+        else:
+            from v1.python.portable_self_play import (
+                self_play_v1_portable as portable_runner,
+            )
 
         single_device = devices[0]
         shard_concurrent = max(1, min(int(num_games), int(concurrent_games_per_device)))
-        return self_play_v1_portable(
-            model=model,
-            num_games=int(num_games),
-            mcts_simulations=int(mcts_simulations),
-            temperature_init=float(temperature_init),
-            temperature_final=float(temperature_final),
-            temperature_threshold=int(temperature_threshold),
-            exploration_weight=float(exploration_weight),
-            device=str(single_device),
-            add_dirichlet_noise=True,
-            dirichlet_alpha=float(dirichlet_alpha),
-            dirichlet_epsilon=float(dirichlet_epsilon),
-            soft_value_k=float(soft_value_k),
-            opening_random_moves=int(opening_random_moves),
-            max_game_plies=int(max_game_plies),
-            sample_moves=True,
-            concurrent_games=shard_concurrent,
-            verbose=False,
+        portable_kwargs = {
+            "model": model,
+            "num_games": int(num_games),
+            "mcts_simulations": int(mcts_simulations),
+            "temperature_init": float(temperature_init),
+            "temperature_final": float(temperature_final),
+            "temperature_threshold": int(temperature_threshold),
+            "exploration_weight": float(exploration_weight),
+            "device": str(single_device),
+            "add_dirichlet_noise": True,
+            "dirichlet_alpha": float(dirichlet_alpha),
+            "dirichlet_epsilon": float(dirichlet_epsilon),
+            "soft_value_k": float(soft_value_k),
+            "opening_random_moves": int(opening_random_moves),
+            "max_game_plies": int(max_game_plies),
+            "sample_moves": True,
+            "concurrent_games": shard_concurrent,
+            "verbose": False,
+        }
+        if portable_impl == "cpp":
+            portable_kwargs["cpu_threads"] = int(portable_cpp_threads)
+        return portable_runner(
+            **portable_kwargs,
         )
 
     if len(devices) <= 1:
@@ -1797,6 +1833,8 @@ def train_pipeline_v1(
     dirichlet_epsilon: float = 0.25,
     self_play_concurrent_games: int = 8,
     portable_self_play_workers: int = 1,
+    portable_mcts_backend: str = "python",
+    portable_cpp_threads: int = 1,
     self_play_opening_random_moves: int = 0,
     self_play_backend: Optional[str] = None,
     search_backend: str = "cuda_root",
@@ -1838,6 +1876,9 @@ def train_pipeline_v1(
         raise ValueError(f"Unsupported stage={stage!r}; expected all/selfplay/train/infer.")
 
     search_backend_norm = _normalize_search_backend(search_backend)
+    portable_mcts_backend_norm = _normalize_portable_mcts_backend(
+        portable_mcts_backend
+    )
     train_strategy_norm = _normalize_train_strategy(train_strategy)
     if search_backend_norm == "portable":
         if train_strategy_norm == "ddp":
@@ -1889,6 +1930,12 @@ def train_pipeline_v1(
 
         _print_rank0(f"[v1.train] stage={stage_norm} train_strategy={train_strategy_norm}")
         _print_rank0(f"[v1.train] search_backend={search_backend_norm}")
+        if search_backend_norm == "portable":
+            _print_rank0(
+                "[v1.train] "
+                f"portable_mcts_backend={portable_mcts_backend_norm} "
+                f"portable_cpp_threads={int(portable_cpp_threads)}"
+            )
         _print_rank0(f"[v1.train] self_play_devices={self_play_device_list}")
         _print_rank0(
             "[v1.train] self_play_backend="
@@ -1951,6 +1998,8 @@ def train_pipeline_v1(
             )
         if int(portable_self_play_workers) <= 0:
             raise ValueError("portable_self_play_workers must be positive")
+        if int(portable_cpp_threads) <= 0:
+            raise ValueError("portable_cpp_threads must be positive")
 
         model = _build_model()
         checkpoint_load_sec = 0.0
@@ -1998,6 +2047,8 @@ def train_pipeline_v1(
                 "self_play_games": int(self_play_games),
                 "self_play_concurrent_games": int(self_play_concurrent_games),
                 "portable_self_play_workers": int(portable_self_play_workers),
+                "portable_mcts_backend": portable_mcts_backend_norm,
+                "portable_cpp_threads": int(portable_cpp_threads),
                 "self_play_opening_random_moves": int(self_play_opening_random_moves),
                 "self_play_iteration_seed": int(stage_selfplay_seed),
             }
@@ -2060,6 +2111,8 @@ def train_pipeline_v1(
                         sparse_ply=int(sparse_ply),
                         sparse_top_k=int(sparse_top_k),
                         search_backend=search_backend_norm,
+                        portable_mcts_backend=portable_mcts_backend_norm,
+                        portable_cpp_threads=int(portable_cpp_threads),
                     )
                 )
             else:
@@ -2085,6 +2138,8 @@ def train_pipeline_v1(
                     sparse_ply=int(sparse_ply),
                     sparse_top_k=int(sparse_top_k),
                     portable_self_play_workers=int(portable_self_play_workers),
+                    portable_mcts_backend=portable_mcts_backend_norm,
+                    portable_cpp_threads=int(portable_cpp_threads),
                 )
                 value_target_summary = _compute_value_target_summary(samples)
                 soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2516,6 +2571,8 @@ def train_pipeline_v1(
                 sparse_ply=int(sparse_ply),
                 sparse_top_k=int(sparse_top_k),
                 portable_self_play_workers=int(portable_self_play_workers),
+                portable_mcts_backend=portable_mcts_backend_norm,
+                portable_cpp_threads=int(portable_cpp_threads),
             )
             value_target_summary = _compute_value_target_summary(samples)
             soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2685,6 +2742,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     parser.add_argument("--self_play_concurrent_games", type=int, default=8)
     parser.add_argument("--portable_self_play_workers", type=int, default=1)
+    parser.add_argument(
+        "--portable_mcts_backend",
+        type=str,
+        default="python",
+        choices=["python", "cpp"],
+        help="Portable CPU tree implementation; Python remains the reference/fallback.",
+    )
+    parser.add_argument(
+        "--portable_cpp_threads",
+        type=int,
+        default=1,
+        help="C++ CPU search threads when --portable_mcts_backend=cpp.",
+    )
     parser.add_argument("--self_play_opening_random_moves", type=int, default=0)
     parser.add_argument(
         "--self_play_backend",
@@ -2857,6 +2927,8 @@ if __name__ == "__main__":
         dirichlet_epsilon=args.dirichlet_epsilon,
         self_play_concurrent_games=args.self_play_concurrent_games,
         portable_self_play_workers=args.portable_self_play_workers,
+        portable_mcts_backend=args.portable_mcts_backend,
+        portable_cpp_threads=args.portable_cpp_threads,
         self_play_opening_random_moves=args.self_play_opening_random_moves,
         self_play_backend=args.self_play_backend,
         search_backend=args.search_backend,
