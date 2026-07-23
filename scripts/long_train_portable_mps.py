@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Resumable wall-clock V1 portable training for Apple Silicon.
 
-The orchestrator intentionally keeps only rolling training state plus two best
-checkpoints:
+The orchestrator keeps immutable per-iteration model checkpoints together with
+rolling recovery state and two best-model aliases:
 
+* ``model_iter_XXXXXX.pt`` retains every successfully committed iteration;
 * ``best_model.pt`` is the incumbent selected by a direct 500-game match;
 * ``best_vs_random.pt`` has the strongest observed fixed-seed random score.
 
@@ -401,6 +402,30 @@ class PortableLongTrainer:
         self.state["updated_utc"] = utc_now()
         atomic_write_json(self.state_path, self.state)
 
+    def _iteration_checkpoint_path(self, iteration: int) -> Path:
+        return self.checkpoint_dir / f"model_iter_{int(iteration):06d}.pt"
+
+    def _preserve_iteration_checkpoint(self, iteration: int) -> Path:
+        if not self.current_checkpoint.is_file():
+            raise RuntimeError(
+                f"cannot retain iteration {iteration}: current checkpoint is missing"
+            )
+        destination = self._iteration_checkpoint_path(iteration)
+        current_sha256 = sha256_file(self.current_checkpoint)
+        if destination.exists():
+            retained_sha256 = sha256_file(destination)
+            if retained_sha256 != current_sha256:
+                raise RuntimeError(
+                    "refusing to overwrite retained checkpoint: "
+                    f"iteration={iteration} path={destination} "
+                    f"retained_sha256={retained_sha256} current_sha256={current_sha256}"
+                )
+        else:
+            atomic_copy(self.current_checkpoint, destination)
+        self.state["latest_iteration_checkpoint"] = str(destination)
+        self.state["latest_iteration_checkpoint_sha256"] = current_sha256
+        return destination
+
     def _event(self, event: str, **payload: Any) -> None:
         row = {"utc": utc_now(), "event": str(event), **payload}
         append_jsonl(self.events_path, row)
@@ -528,15 +553,35 @@ class PortableLongTrainer:
                 state["last_resume_utc"] = utc_now()
                 state["last_resume_stop_reason"] = previous_stop_reason
             self.state = state
-            if self._recover_interrupted_commit():
+            reconciled = self._recover_interrupted_commit()
+            retained_checkpoint: Optional[Path] = None
+            retained_checkpoint_created = False
+            if self.current_checkpoint.is_file():
+                retained_checkpoint = self._iteration_checkpoint_path(
+                    int(state.get("iteration", 0))
+                )
+                retained_checkpoint_created = not retained_checkpoint.exists()
+                retained_checkpoint = self._preserve_iteration_checkpoint(
+                    int(state.get("iteration", 0))
+                )
+            if reconciled:
                 self._event(
                     "commit_state_reconciled",
                     iteration=int(state.get("iteration", 0)),
                     checkpoint_sha256=state.get("latest_checkpoint_sha256"),
                     optimizer_sha256=state.get("latest_optimizer_sha256"),
                 )
-                self._save_state()
-            elif resumed:
+            if retained_checkpoint_created and retained_checkpoint is not None:
+                self._event(
+                    "iteration_checkpoint_retained",
+                    iteration=int(state.get("iteration", 0)),
+                    checkpoint=str(retained_checkpoint),
+                    checkpoint_sha256=state.get(
+                        "latest_iteration_checkpoint_sha256"
+                    ),
+                    source="resume",
+                )
+            if reconciled or resumed or retained_checkpoint is not None:
                 self._save_state()
             if resumed:
                 self._event(
@@ -567,6 +612,8 @@ class PortableLongTrainer:
             "target_confirmed_result": None,
             "latest_checkpoint_sha256": None,
             "latest_optimizer_sha256": None,
+            "latest_iteration_checkpoint": None,
+            "latest_iteration_checkpoint_sha256": None,
             "stop_reason": None,
             "config": signature,
             "git": _git_metadata(),
@@ -600,6 +647,17 @@ class PortableLongTrainer:
             self.state["initial_optimizer_state"] = str(optimizer_path)
             self.state["latest_optimizer_sha256"] = sha256_file(
                 self.optimizer_checkpoint
+            )
+        if self.current_checkpoint.is_file():
+            retained_checkpoint = self._preserve_iteration_checkpoint(0)
+            self._event(
+                "iteration_checkpoint_retained",
+                iteration=0,
+                checkpoint=str(retained_checkpoint),
+                checkpoint_sha256=self.state.get(
+                    "latest_iteration_checkpoint_sha256"
+                ),
+                source="initial",
             )
         self._save_state()
         self._event("run_initialized", state=dict(self.state))
@@ -1054,6 +1112,7 @@ class PortableLongTrainer:
             self.state["iteration"] = next_iteration
             self.state["latest_checkpoint_sha256"] = checkpoint_audit["sha256"]
             self.state["latest_optimizer_sha256"] = optimizer_sha256
+            retained_checkpoint = self._preserve_iteration_checkpoint(next_iteration)
             self.state["last_selfplay_stats"] = selfplay_stats
             self.state["last_train_metrics"] = train_row
             self._save_state()
@@ -1065,6 +1124,7 @@ class PortableLongTrainer:
                 selfplay_stats=selfplay_stats,
                 train_metrics=train_row,
                 checkpoint_audit=checkpoint_audit,
+                retained_checkpoint=str(retained_checkpoint),
             )
 
             should_eval = (
@@ -1097,6 +1157,12 @@ class PortableLongTrainer:
                     else None
                 ),
                 "best_random_result": self.state.get("best_random_result"),
+                "latest_iteration_checkpoint": self.state.get(
+                    "latest_iteration_checkpoint"
+                ),
+                "retained_iteration_checkpoints": len(
+                    list(self.checkpoint_dir.glob("model_iter_*.pt"))
+                ),
                 "target_confirmed_result": self.state.get("target_confirmed_result"),
                 "final_eval_result": final_row,
                 "state": str(self.state_path),

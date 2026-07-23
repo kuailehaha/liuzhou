@@ -41,6 +41,7 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert (args.eval_games_random, args.eval_games_best) == (500, 500)
     assert args.final_eval_games == 500
     assert args.eval_concurrency == 64
+    assert args.incumbent_promotion_score == pytest.approx(0.55)
     assert args.target_win_rate == pytest.approx(0.99)
 
 
@@ -63,8 +64,18 @@ def test_random_rank_and_incumbent_gate() -> None:
     assert random_result_rank({"wins": 495, "losses": 0, "draws": 5}) > random_result_rank(
         {"wins": 495, "losses": 1, "draws": 4}
     )
-    assert candidate_beats_incumbent({"wins": 11, "losses": 10, "draws": 479})
-    assert not candidate_beats_incumbent({"wins": 10, "losses": 10, "draws": 480})
+    assert candidate_beats_incumbent(
+        {"wins": 200, "losses": 150, "draws": 150, "total_games": 500},
+        0.55,
+    )
+    assert not candidate_beats_incumbent(
+        {"wins": 199, "losses": 150, "draws": 151, "total_games": 500},
+        0.55,
+    )
+    assert not candidate_beats_incumbent(
+        {"wins": 1, "losses": 0, "draws": 0, "total_games": 0},
+        0.55,
+    )
 
 
 def test_target_confirmation_runs_once_after_observed_threshold() -> None:
@@ -122,6 +133,10 @@ def test_resume_can_continue_after_confirmed_target_when_stop_flag_is_removed(tm
     assert trainer.state["last_resume_stop_reason"] == "target_confirmed"
     assert "ended_utc" not in trainer.state
     assert "elapsed_sec" not in trainer.state
+    retained = trainer.checkpoint_dir / "model_iter_000050.pt"
+    assert retained.read_bytes() == b"model"
+    assert trainer.state["latest_iteration_checkpoint"] == str(retained)
+    assert trainer.state["latest_iteration_checkpoint_sha256"] == sha256_file(retained)
 
 
 def test_interrupted_model_optimizer_commit_restores_previous_pair(tmp_path) -> None:
@@ -147,6 +162,29 @@ def test_interrupted_model_optimizer_commit_restores_previous_pair(tmp_path) -> 
     assert trainer.optimizer_checkpoint.read_bytes() == b"old-optimizer"
     assert not trainer.rollback_current.exists()
     assert not trainer.rollback_optimizer.exists()
+
+
+def test_iteration_checkpoints_are_retained_without_overwrite(tmp_path) -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.checkpoint_dir = tmp_path
+    trainer.current_checkpoint = tmp_path / "current.pt"
+    trainer.state = {}
+
+    trainer.current_checkpoint.write_bytes(b"iteration-1")
+    first = trainer._preserve_iteration_checkpoint(1)
+    trainer.current_checkpoint.write_bytes(b"iteration-2")
+    second = trainer._preserve_iteration_checkpoint(2)
+
+    assert first == tmp_path / "model_iter_000001.pt"
+    assert second == tmp_path / "model_iter_000002.pt"
+    assert first.read_bytes() == b"iteration-1"
+    assert second.read_bytes() == b"iteration-2"
+    assert trainer.state["latest_iteration_checkpoint"] == str(second)
+    assert trainer.state["latest_iteration_checkpoint_sha256"] == sha256_file(second)
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite retained checkpoint"):
+        trainer._preserve_iteration_checkpoint(1)
+    assert first.read_bytes() == b"iteration-1"
 
 
 def test_stage_retry_prepares_every_attempt(monkeypatch) -> None:
