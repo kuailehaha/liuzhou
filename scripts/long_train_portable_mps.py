@@ -313,6 +313,22 @@ def _external_display_connected() -> bool:
     return any(not line.endswith("Internal") for line in connection_lines)
 
 
+def _launchd_spawn_type() -> Optional[str]:
+    service_name = os.environ.get("XPC_SERVICE_NAME", "").strip()
+    if not service_name:
+        return None
+    result = subprocess.run(
+        ["launchctl", "print", f"gui/{os.getuid()}/{service_name}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    match = re.search(r"spawn type\s*=\s*([a-zA-Z_]+)", result.stdout)
+    return match.group(1).lower() if match is not None else None
+
+
 def _preflight(args: argparse.Namespace) -> None:
     if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "").strip() == "1":
         raise RuntimeError("PYTORCH_ENABLE_MPS_FALLBACK=1 is forbidden for verified portable runs.")
@@ -324,6 +340,12 @@ def _preflight(args: argparse.Namespace) -> None:
         raise RuntimeError(
             "Closed-display preflight failed: no external display was detected. "
             "Apple-supported clamshell operation also requires AC power and an external keyboard/mouse."
+        )
+    if platform.system() == "Darwin" and _launchd_spawn_type() == "background":
+        raise RuntimeError(
+            "Refusing to run under launchd ProcessType=Background because macOS "
+            "throttles CPU, I/O, MPS training and evaluation. Remove ProcessType "
+            "or set it to Standard before starting a verified long run."
         )
     if float(args.hours) <= 0.0:
         raise ValueError("--hours must be positive.")
@@ -984,6 +1006,15 @@ class PortableLongTrainer:
             )
         if sample_moves:
             command.append("--sample_moves")
+        if str(self.args.portable_mcts_backend).strip().lower() == "cpp":
+            command.extend(
+                [
+                    "--portable_mcts_backend",
+                    "cpp",
+                    "--portable_cpp_threads",
+                    str(int(self.args.portable_cpp_threads)),
+                ]
+            )
         run_command(
             command,
             label=f"eval({name},games={games},seed={seed})",
@@ -994,6 +1025,26 @@ class PortableLongTrainer:
         if bool(self.args.dry_run):
             return {}
         row = _eval_result(output, name)
+        report = _load_json(output)
+        if str(self.args.portable_mcts_backend).strip().lower() == "cpp":
+            if not isinstance(report, dict):
+                raise RuntimeError(f"invalid C++ evaluation report: {output}")
+            if str(report.get("portable_mcts_backend")) != "cpp":
+                raise RuntimeError(f"C++ evaluation backend audit mismatch in {output}")
+            if int(report.get("portable_cpp_threads", 0) or 0) != int(
+                self.args.portable_cpp_threads
+            ):
+                raise RuntimeError(f"C++ evaluation thread audit mismatch in {output}")
+            audit = report.get("portable_mcts_audit")
+            if not isinstance(audit, dict) or any(
+                int(audit.get(key, -1) or 0) != 0
+                for key in (
+                    "fallback_count",
+                    "illegal_action_count",
+                    "non_finite_count",
+                )
+            ):
+                raise RuntimeError(f"C++ evaluation health audit failed in {output}")
         if int(row.get("total_games", 0) or 0) != int(games):
             raise RuntimeError(f"evaluation game count mismatch in {output}")
         if int(row.get("seed", -1)) != int(seed):

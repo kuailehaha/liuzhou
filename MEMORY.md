@@ -18,10 +18,19 @@
 
 ### 3) First-Iteration Health Evidence
 
-- Iteration 474 completed 128 games and 12,775 positions. Self-play reported `49` black wins, `36` white wins and `43` draws; measured throughput was `171.88 positions/s`. MPS inference accounted for `85.62%` of timed self-play.
+- Iterations 474–480 were later found to be invalid performance evidence because the new LaunchAgent mistakenly set `ProcessType=Background`. This classified the entire process tree as launchd background work (PRI 4): C++ self-play median was only `184.55 positions/s`, training median doubled to `72.69s`, 500-game RandomAgent evaluation took `649.64s` and the incumbent match took `1270.48s`.
+- The job was reloaded without `ProcessType`, preserving the same run directory, deadline, current model, optimizer and replay. It then reported `spawn type=daemon` and PRI 20. Iterations 481–486 produced a real full-game C++ median of `608.81 positions/s` (range `576.90–633.57`), `3.48x` the previous Python run's final-seven median `174.80`; training returned to median `35.61s`.
 - C++ audit counters were all clean: portable fallback `0`, illegal actions `0`, non-finite values `0`; all 12,775 hard/soft targets were finite.
-- Training consumed primary iteration 474 plus exactly four replay files 470–473, loaded the matching optimizer (`optimizer_loaded=true`, load error `None`), filtered `0` non-finite samples and reported device fallback `0`. The committed model/optimizer SHA-256 values became `0ea0ca4fef0f89629d6dca1c08661b143b7c93e0f069e05111d5f64e69ea7da0` and `6d3b1c9066dcce5a05c4da93cebd022610a40a83ebef8429556fa045e7ab4b44`.
+- Training continued to load the matching optimizer (`optimizer_loaded=true`, load error `None`), filtered `0` non-finite samples and reported device fallback `0` after the QoS correction.
 - The LaunchAgent remained `running`, its error log was empty, and `caffeinate -ims` exposed active idle-system, system-sleep and disk-idle assertions.
+
+### 3.1) Efficiency and Retention Corrections
+
+- The long-run preflight now rejects launchd `ProcessType=Background`; omitting the key keeps the job in the normal Standard-equivalent scheduling class.
+- Periodic portable evaluation now inherits `portable_mcts_backend=cpp` and `portable_cpp_threads`, while preserving games, seed, exact color split, temperature and the 55% incumbent score gate. Successful reports explicitly audit zero MCTS fallback, illegal actions and non-finite values.
+- Portable evaluation action decoding now uses the canonical `src.policy_batch.action_to_index` mapping and no longer imports `v0.python`, so the Mac path remains independent of unavailable `v0_core`.
+- The first production C++ evaluation at iteration 490 completed 500 RandomAgent games in `45.39s` (`495-0-5`) and 500 incumbent games in `93.45s` (`183-112-205`), versus roughly `138s/258s` for the old Python portable route. The incumbent score was `0.571`, so the unchanged `0.55` gate promoted it. Both reports used MPS, one C++ thread and exact 250/250 colors, with zero device/MCTS fallback, illegal actions or non-finite values.
+- The initial continuation copied the prior `best_vs_random.pt` file but omitted its rank/result metadata, allowing a new `499-0-1` result to overwrite the prior `500-0-0` alias. The old alias SHA `c143f709190258980b2a2d1f019289e4af59b21569648dfd35bd5e7133e794e3`, rank `[500,0]`, confirmed target result and incumbent audit metadata were restored at a clean committed boundary without changing the current training model, optimizer or replay.
 
 ### 4) Physical Operating Conditions and Remaining Acceptance
 

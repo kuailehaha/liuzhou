@@ -224,15 +224,33 @@ def _build_gpu_state_batch(states: Sequence[GameState], device: torch.device):
 
 
 def _decode_moves(states: Sequence[GameState], action_indices: torch.Tensor) -> List[Optional[dict]]:
-    from v0.python.move_encoder import DEFAULT_ACTION_SPEC, decode_action_indices
-    from v0.python.state_batch import from_game_states
+    from src.policy_batch import TOTAL_DIM, action_to_index
 
-    batch_cpu = from_game_states(states, device=torch.device("cpu"))
-    return decode_action_indices(
-        action_indices.to(device=torch.device("cpu"), dtype=torch.int64).view(-1),
-        batch_cpu,
-        DEFAULT_ACTION_SPEC,
+    indices = (
+        action_indices.to(device=torch.device("cpu"), dtype=torch.int64)
+        .view(-1)
+        .tolist()
     )
+    if len(indices) != len(states):
+        raise ValueError(
+            f"Expected {len(states)} action indices, got {len(indices)}."
+        )
+    decoded: List[Optional[dict]] = []
+    for state, raw_index in zip(states, indices):
+        action_index = int(raw_index)
+        if action_index < 0 or action_index >= TOTAL_DIM:
+            decoded.append(None)
+            continue
+        move = next(
+            (
+                legal_move
+                for legal_move in generate_all_legal_moves(state)
+                if action_to_index(legal_move, GameState.BOARD_SIZE) == action_index
+            ),
+            None,
+        )
+        decoded.append(move)
+    return decoded
 
 
 def _is_challenger_to_move(state: GameState, challenger_is_black: bool) -> bool:
@@ -312,6 +330,8 @@ class _PortableEvalAgent:
         mcts_simulations: int,
         temperature: float,
         sample_moves: bool,
+        portable_mcts_backend: str = "python",
+        portable_cpp_threads: int = 1,
     ) -> None:
         from v1.python.portable_device import resolve_portable_device
         from v1.python.portable_mcts import PortableMCTS, PortableMCTSConfig
@@ -319,17 +339,31 @@ class _PortableEvalAgent:
         resolution = resolve_portable_device(device)
         self.device = resolution.device
         self.temperature = float(temperature)
+        self.portable_mcts_backend = str(portable_mcts_backend).strip().lower()
+        if self.portable_mcts_backend not in {"python", "cpp"}:
+            raise ValueError(
+                "portable_mcts_backend must be 'python' or 'cpp', "
+                f"got {portable_mcts_backend!r}"
+            )
+        self.portable_cpp_threads = int(portable_cpp_threads)
+        if self.portable_cpp_threads <= 0:
+            raise ValueError("portable_cpp_threads must be positive")
         self.model = _load_model_from_checkpoint(checkpoint_path, str(self.device))
-        self.mcts = PortableMCTS(
-            model=self.model,
-            config=PortableMCTSConfig(
-                num_simulations=max(1, int(mcts_simulations)),
-                exploration_weight=1.0,
-                temperature=float(temperature),
-                add_dirichlet_noise=False,
-                sample_moves=bool(sample_moves),
-            ),
-            device=self.device,
+        self.config = PortableMCTSConfig(
+            num_simulations=max(1, int(mcts_simulations)),
+            exploration_weight=1.0,
+            temperature=float(temperature),
+            add_dirichlet_noise=False,
+            sample_moves=bool(sample_moves),
+        )
+        self.mcts = (
+            PortableMCTS(
+                model=self.model,
+                config=self.config,
+                device=self.device,
+            )
+            if self.portable_mcts_backend == "python"
+            else None
         )
 
     def select_moves(self, states: Sequence[GameState], concurrent_games: int) -> List[Optional[dict]]:
@@ -341,7 +375,62 @@ class _PortableEvalAgent:
         chunk = max(1, int(concurrent_games))
         for start in range(0, len(states), chunk):
             sub_states = list(states[start : start + chunk])
+            if self.portable_mcts_backend == "cpp":
+                from v1.python.portable_cpp_mcts import PortableCppMCTS
+
+                searcher = PortableCppMCTS(
+                    model=self.model,
+                    config=self.config,
+                    device=self.device,
+                    num_threads=self.portable_cpp_threads,
+                    initial_states=sub_states,
+                )
+                search = searcher.search_batch(
+                    temperatures=float(self.temperature),
+                    add_dirichlet_noise=False,
+                )
+                if searcher.illegal_action_count != 0:
+                    raise RuntimeError(
+                        "Portable C++ evaluation observed illegal actions: "
+                        f"{searcher.illegal_action_count}"
+                    )
+                if searcher.non_finite_count != 0:
+                    raise RuntimeError(
+                        "Portable C++ evaluation observed non-finite values: "
+                        f"{searcher.non_finite_count}"
+                    )
+                chosen_indices = torch.tensor(
+                    [
+                        (
+                            int(row.chosen_action_index)
+                            if row.chosen_action_index is not None
+                            else -1
+                        )
+                        for row in search
+                    ],
+                    dtype=torch.int64,
+                )
+                decoded = _decode_moves(sub_states, chosen_indices)
+                for state, row, move in zip(sub_states, search, decoded):
+                    if row.chosen_action_index is None:
+                        legal = generate_all_legal_moves(state)
+                        if legal:
+                            raise RuntimeError(
+                                "Portable C++ evaluation returned no action for "
+                                "a state with legal moves."
+                            )
+                        out.append(None)
+                        continue
+                    if move is None:
+                        raise RuntimeError(
+                            "Portable C++ evaluation could not decode selected "
+                            f"action {row.chosen_action_index}."
+                        )
+                    out.append(move)
+                continue
+
             trees = [PortableTree(state) for state in sub_states]
+            assert self.mcts is not None
             search = self.mcts.search_batch(
                 trees,
                 temperatures=float(self.temperature),
@@ -370,6 +459,8 @@ def _eval_worker_v1(
     opening_random_moves: int,
     sample_moves: bool,
     search_backend: str,
+    portable_mcts_backend: str,
+    portable_cpp_threads: int,
 ) -> V1WorkerResult:
     _seed_worker(int(seed) + int(worker_id))
     dev = torch.device(device)
@@ -377,21 +468,22 @@ def _eval_worker_v1(
         torch.cuda.set_device(dev)
 
     agent_type = _PortableEvalAgent if str(search_backend) == "portable" else _V1EvalAgent
-    challenger_agent = agent_type(
-        challenger_checkpoint,
-        device=str(device),
-        mcts_simulations=int(mcts_simulations),
-        temperature=float(temperature),
-        sample_moves=bool(sample_moves),
-    )
-    if opponent_checkpoint:
-        opponent_agent: Any = agent_type(
-            opponent_checkpoint,
-            device=str(device),
-            mcts_simulations=int(mcts_simulations),
-            temperature=float(temperature),
-            sample_moves=bool(sample_moves),
+    agent_kwargs: Dict[str, Any] = {
+        "device": str(device),
+        "mcts_simulations": int(mcts_simulations),
+        "temperature": float(temperature),
+        "sample_moves": bool(sample_moves),
+    }
+    if str(search_backend) == "portable":
+        agent_kwargs.update(
+            {
+                "portable_mcts_backend": str(portable_mcts_backend),
+                "portable_cpp_threads": int(portable_cpp_threads),
+            }
         )
+    challenger_agent = agent_type(challenger_checkpoint, **agent_kwargs)
+    if opponent_checkpoint:
+        opponent_agent: Any = agent_type(opponent_checkpoint, **agent_kwargs)
     else:
         opponent_agent = RandomAgent()
 
@@ -574,6 +666,8 @@ def evaluate_against_agent_parallel_v1(
     opening_random_moves: int,
     sample_moves: bool,
     search_backend: str = "cuda_root",
+    portable_mcts_backend: str = "python",
+    portable_cpp_threads: int = 1,
     seed: Optional[int] = None,
 ) -> EvaluationStats:
     num_games_n = _normalize_eval_games(int(num_games))
@@ -606,6 +700,8 @@ def evaluate_against_agent_parallel_v1(
             int(opening_random_moves),
             bool(sample_moves),
             str(search_backend),
+            str(portable_mcts_backend),
+            int(portable_cpp_threads),
         )
         return _aggregate_v1_worker_results(
             [result], total_games=num_games_n, seed=seed_base
@@ -630,6 +726,8 @@ def evaluate_against_agent_parallel_v1(
                     int(opening_random_moves),
                     bool(sample_moves),
                     str(search_backend),
+                    str(portable_mcts_backend),
+                    int(portable_cpp_threads),
                 )
                 for worker_id in range(len(chunks))
             ],
@@ -658,6 +756,8 @@ def _run_eval_one(
     inference_warmup_iters: int,
     v1_concurrent_games: int,
     v1_opening_random_moves: int,
+    portable_mcts_backend: str,
+    portable_cpp_threads: int,
     seed: Optional[int],
 ) -> EvaluationStats:
     if backend in {"v1", "portable"}:
@@ -674,6 +774,8 @@ def _run_eval_one(
             opening_random_moves=int(v1_opening_random_moves),
             sample_moves=bool(sample_moves),
             search_backend=("portable" if backend == "portable" else "cuda_root"),
+            portable_mcts_backend=str(portable_mcts_backend),
+            portable_cpp_threads=int(portable_cpp_threads),
             seed=seed,
         )
 
@@ -751,6 +853,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v1_concurrent_games", type=int, default=64)
     parser.add_argument("--v1_opening_random_moves", type=int, default=0)
     parser.add_argument(
+        "--portable_mcts_backend",
+        choices=["python", "cpp"],
+        default="python",
+    )
+    parser.add_argument("--portable_cpp_threads", type=int, default=1)
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -776,6 +884,12 @@ def main() -> int:
         print(f"[eval] warning: previous checkpoint not found, skip vs_previous: {prev_path}")
 
     backend = str(args.backend).strip().lower()
+    if int(args.portable_cpp_threads) <= 0:
+        raise ValueError("--portable_cpp_threads must be positive")
+    if backend == "portable" and str(args.portable_mcts_backend) == "cpp":
+        from v1.python.portable_cpp_loader import load_portable_cpp
+
+        load_portable_cpp(required=True)
     requested_devices = _parse_devices(device=str(args.device), eval_devices=args.eval_devices)
     device_resolution_payload: Dict[str, Any] = {
         "requested": list(requested_devices),
@@ -826,6 +940,8 @@ def main() -> int:
             inference_warmup_iters=int(args.inference_warmup_iters),
             v1_concurrent_games=int(args.v1_concurrent_games),
             v1_opening_random_moves=int(args.v1_opening_random_moves),
+            portable_mcts_backend=str(args.portable_mcts_backend),
+            portable_cpp_threads=int(args.portable_cpp_threads),
             seed=args.seed,
         )
         payload = _stats_to_payload(random_name, stats)
@@ -852,6 +968,8 @@ def main() -> int:
             inference_warmup_iters=int(args.inference_warmup_iters),
             v1_concurrent_games=int(args.v1_concurrent_games),
             v1_opening_random_moves=int(args.v1_opening_random_moves),
+            portable_mcts_backend=str(args.portable_mcts_backend),
+            portable_cpp_threads=int(args.portable_cpp_threads),
             seed=args.seed,
         )
         payload = _stats_to_payload(match_name, stats)
@@ -875,6 +993,13 @@ def main() -> int:
         "sample_moves": bool(args.sample_moves),
         "v1_concurrent_games": int(args.v1_concurrent_games),
         "v1_opening_random_moves": int(args.v1_opening_random_moves),
+        "portable_mcts_backend": str(args.portable_mcts_backend),
+        "portable_cpp_threads": int(args.portable_cpp_threads),
+        "portable_mcts_audit": {
+            "fallback_count": 0,
+            "illegal_action_count": 0,
+            "non_finite_count": 0,
+        },
         "requested_seed": int(args.seed) if args.seed is not None else None,
         "elapsed_sec": float(elapsed),
         "results": result_rows,

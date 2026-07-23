@@ -75,6 +75,8 @@ python -m tools.benchmark_portable_cpp \
 python scripts/eval_checkpoint.py \
   --challenger_checkpoint tmp/v1_portable_smoke/model_iter_001.pt \
   --backend portable \
+  --portable_mcts_backend cpp \
+  --portable_cpp_threads 1 \
   --device auto \
   --eval_workers 1 \
   --eval_games_vs_random 2 \
@@ -111,6 +113,8 @@ mkdir -p logs && nohup zsh scripts/run_long_train_mps.sh \
 `--resume` 对新目录和已有目录都可用；已有目录会核对冻结配置、外层 iteration、current checkpoint、optimizer 和 commit SHA 后续跑。运行状态位于 `tmp/v1_portable_long_20h/state.json`，最终摘要位于 `final_summary.json`，`best_model.pt` 和 `best_vs_random.pt` 位于其 `checkpoints/` 子目录。
 
 跨终端或 Codex 断联运行时，优先把同一命令注册为 `RunAtLoad=true`、`KeepAlive=false` 的一次性用户 LaunchAgent，并在交付前核对任务进程、日志、`state.json` 和 `pmset -g assertions` 中的 `caffeinate` 断言；直接 `nohup` 只适合当前 shell 生命周期可靠的环境。
+
+LaunchAgent 不得设置 `ProcessType=Background`。macOS 会把该 job 及其子进程放入受限调度类别，实测会同时拖慢 MPS self-play、训练和评测；长训预检会明确拒绝这种配置。省略 `ProcessType`（Standard 等价行为）后，本机 6 个真实 128/128 full-game iteration 的 C++ self-play 中位数为 `608.81 positions/s`，相对旧 Python 末 7 轮的 `174.80 positions/s` 为 `3.48x`；训练中位耗时恢复为 `35.61s`。设置 Background 时对应数值只有 `184.55 positions/s` 和 `72.69s`，不能作为后端性能结论。相同生产 run 的 500 局 C++ RandomAgent/Incumbent 评测分别用时 `45.39s/93.45s`，相对旧 Python 约 `138s/258s` 为 `3.04x/2.76x`；两份报告的 fallback、非法动作和非有限值均为 0。
 
 ## 2. 构建入口
 

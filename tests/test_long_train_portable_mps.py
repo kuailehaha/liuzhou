@@ -13,6 +13,8 @@ import pytest
 from scripts.long_train_portable_mps import (
     PortableLongTrainer,
     _config_signature,
+    _launchd_spawn_type,
+    _preflight,
     audit_train_metrics,
     build_parser,
     candidate_beats_incumbent,
@@ -66,6 +68,107 @@ def test_direct_script_execution_adds_repository_root_to_sys_path(monkeypatch) -
     runpy.run_path(str(script), run_name="_long_train_import_test")
 
     assert str(root) in sys.path
+
+
+def test_launchd_spawn_type_is_detected_from_active_service(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("XPC_SERVICE_NAME", "com.liuzhou.test")
+    monkeypatch.setattr(
+        "scripts.long_train_portable_mps.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="spawn type = background (5)\n",
+        ),
+    )
+
+    assert _launchd_spawn_type() == "background"
+
+
+def test_preflight_rejects_background_launch_agent(monkeypatch) -> None:
+    args = build_parser().parse_args(["--device", "cpu", "--no-require-ac"])
+    monkeypatch.setattr(
+        "scripts.long_train_portable_mps.platform.system",
+        lambda: "Darwin",
+    )
+    monkeypatch.setattr(
+        "scripts.long_train_portable_mps._launchd_spawn_type",
+        lambda: "background",
+    )
+
+    with pytest.raises(RuntimeError, match="ProcessType=Background"):
+        _preflight(args)
+
+
+def test_long_run_cpp_evaluation_is_explicit_and_audited(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.python = sys.executable
+    trainer.args = SimpleNamespace(
+        device="mps",
+        eval_simulations=8,
+        eval_concurrency=64,
+        portable_mcts_backend="cpp",
+        portable_cpp_threads=4,
+        stage_retries=0,
+        dry_run=False,
+    )
+    output = tmp_path / "eval.json"
+    commands = []
+
+    def fake_run_command(command, **_kwargs) -> None:
+        commands.append(command)
+        output.write_text(
+            json.dumps(
+                {
+                    "portable_mcts_backend": "cpp",
+                    "portable_cpp_threads": 4,
+                    "portable_mcts_audit": {
+                        "fallback_count": 0,
+                        "illegal_action_count": 0,
+                        "non_finite_count": 0,
+                    },
+                    "results": [
+                        {
+                            "name": "vs_random",
+                            "wins": 2,
+                            "losses": 0,
+                            "draws": 0,
+                            "total_games": 2,
+                            "seed": 123,
+                            "color_breakdown": {
+                                "challenger_black": {"games": 1},
+                                "challenger_white": {"games": 1},
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        "scripts.long_train_portable_mps.run_command",
+        fake_run_command,
+    )
+
+    result = trainer._run_eval(
+        challenger=tmp_path / "candidate.pt",
+        opponent=None,
+        games=2,
+        seed=123,
+        name="vs_random",
+        output=output,
+        temperature=0.0,
+        sample_moves=False,
+    )
+
+    assert result["wins"] == 2
+    assert commands
+    assert commands[0][commands[0].index("--portable_mcts_backend") + 1] == "cpp"
+    assert commands[0][commands[0].index("--portable_cpp_threads") + 1] == "4"
 
 
 def test_iteration_checkpoint_retention_is_periodic() -> None:

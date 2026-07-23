@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import torch
+
 from scripts.eval_checkpoint import (
+    _decode_moves,
     _aggregate_v1_worker_results,
     _stats_to_payload,
     build_parser,
 )
+from src.game_state import GameState, Phase
 
 
 def test_eval_parser_accepts_explicit_seed() -> None:
@@ -20,6 +24,35 @@ def test_eval_parser_accepts_multiple_portable_workers() -> None:
     )
     assert args.backend == "portable"
     assert args.eval_workers == 2
+
+
+def test_eval_parser_accepts_explicit_portable_cpp_backend() -> None:
+    args = build_parser().parse_args(
+        [
+            "--challenger_checkpoint",
+            "candidate.pt",
+            "--backend",
+            "portable",
+            "--portable_mcts_backend",
+            "cpp",
+            "--portable_cpp_threads",
+            "4",
+        ]
+    )
+    assert args.portable_mcts_backend == "cpp"
+    assert args.portable_cpp_threads == 4
+
+
+def test_portable_action_decode_does_not_require_v0_core() -> None:
+    moves = _decode_moves([GameState()], torch.tensor([0], dtype=torch.int64))
+
+    assert moves == [
+        {
+            "phase": Phase.PLACEMENT,
+            "action_type": "place",
+            "position": (0, 0),
+        }
+    ]
 
 
 def test_worker_aggregation_preserves_color_breakdown_and_seed() -> None:

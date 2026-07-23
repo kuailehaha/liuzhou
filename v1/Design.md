@@ -1925,3 +1925,20 @@ Data-effectiveness standard fields (must be preserved in reports):
 - 多进程并非普遍无效：当每个 worker 保持 batch 32 且单进程需要顺序跑多波时，2 worker/64 games 和 4 worker/128 games 分别达到约 `1.74x/2.42x`。但正式冻结的 128 games/concurrency 128 本来就是单个 batch 128；1/2/4 worker 的三次中位数为 `1066.61/968.62/1023.16 positions/s`，拆分后推理调用数从 257 增至 514/1028，端到端反而下降 `9.19%/4.07%`。
 - 结论：本机当前 20h portable MPS 长训使用 `portable_mcts_backend=cpp`、`portable_cpp_threads=1`、`portable_self_play_workers=1`。用户提供的 M5 多核仍由 PyTorch、MPS 驱动和系统调度按需使用；不以强制 8 条搜索线程制造较低吞吐。`current.pt`/`optimizer.pt` 每轮原子提交用于恢复，但不可变 `model_iter_*` 只保留初始锚点和每 10 个外层 iteration 的权重快照。若未来将 worker 按批次粗粒度流水化或重写线程池调度，必须重新做同 checkpoint 的 1/2/4/8 线程及生产形状基准。
 - 线程复核原始报告位于 ignored 的 `tmp/portable_cpp_goal_smoke_20260723/thread_sweep.json`；生产形状与 worker 测量命令和原始控制台记录保留在本次验收会话中，未作为版本库 artifact 提交。
+
+#### 生产 LaunchAgent QoS 修正与真实长训吞吐
+
+- 首次 20h C++ run 的 LaunchAgent 误设 `ProcessType=Background`；`launchctl` 显示 `spawn type=background`，orchestrator/子进程优先级为 PRI 4。macOS 本地 `launchd.plist(5)` 明确说明 Background job 会应用资源限制。
+- 该错误污染所有阶段，而不只是 C++：受限时 7 轮 C++ self-play 中位数仅 `184.55 positions/s`，训练中位 `72.69s`；同一阶段的旧 Standard Python 训练中位为 `35.92s`。500 局 RandomAgent 评测从旧 run 的约 `138s` 退化到 `649.64s`，candidate-versus-incumbent 从约 `258s` 退化到 `1270.48s`。机器当时为 AC、low-power mode 关闭、零 swap 且无 thermal/performance warning。
+- 删除 `ProcessType` 并在相同 run directory、相同 deadline、相同 current/optimizer/replay 下重载后，job 变为 `spawn type=daemon`、PRI 20。随后 6 个真实 128 games/concurrency 128、8 simulations、full-game iteration 的 C++ self-play中位为 `608.81 positions/s`（范围 `576.90–633.57`，加权 `609.10`），相对旧 Python 末 7 轮中位 `174.80` 为 `3.48x`；训练中位恢复为 `35.61s`（范围 `34.67–37.20s`）。
+- 修正后的 self-play 中 MPS inference 占中位总墙钟约 `93%`，fallback、非法动作和非有限值累计均为 0。当前 workload 已由 MPS 主导，增加细粒度 C++ search threads 仍没有足够的 Amdahl 空间。
+- 长训预检现在读取当前 launchd service 的 spawn type，并拒绝 Background；portable 评测也显式支持 `portable_mcts_backend=cpp`，报告 backend/thread 和零 fallback/illegal/non-finite 审计。动作解码直接使用 `src.policy_batch` 的 220 维索引，不再通过需要 `v0_core` 的 V0 Python 包。
+- iteration 490 的生产评测验证了新路由：RandomAgent `495-0-5`（黑方 `245-0-5`、白方 `250-0-0`）用时 `45.39s`，相对旧 Python 约 `138s` 为 `3.04x`；incumbent gate `183-112-205`（精确 250/250 换色）用时 `93.45s`，相对旧 Python 约 `258s` 为 `2.76x`。后者按既有 `(wins + 0.5 * draws) / games` 得分 `0.571`，超过 `0.55` 后正常晋级。两份报告均记录 `portable_mcts_backend=cpp`、threads `1`、MPS device fallback `0`，且 MCTS fallback/illegal/non-finite 全为 `0`。
+
+#### 后续效率与质量自查
+
+- 当前普通 iteration 的主要墙钟已是 MPS 前向（self-play 约 `93%`）和 3 epochs 训练（中位 `35.61s`）；checkpoint load 约 `0.01s`、replay payload load 约 `0.04s`、首 batch 约 `0.48s`，因此常驻 trainer、异步 I/O 或继续压缩 Python 编排都不是当前高收益项。
+- 周期评测原是最大的可安全消除开销；切到同一 C++ search backend 后，500+500 局从旧 Python 约 `396s` 降至 `138.84s`，同时完全保留 seed、搜索量、温度、250/250 颜色和 gate 语义。按每 10 iteration 一次计算，评测摊销从约 `39.6s/iteration` 降至 `13.9s/iteration`。
+- 增大训练 batch、减少 epochs/replay、降低 simulations、改变评测局数或并发拆批都会改变优化步数、数据分布、搜索量或实验条件，不能作为等价性能优化直接应用到当前冻结 run。提升 simulations、调整 soft label/draw weight 或开局课程也属于质量实验，需要独立 equal-wall-clock A/B 和固定 checkpoint 复核。
+- 本次 20h 是从旧 checkpoint/optimizer 开始的新墙钟周期，所以 cosine LR 和 opening-random schedule 从新周期起点重新展开；这不是静默 optimizer reset，但也不等价于旧周期的单调延长。当前 loss、非有限值、optimizer continuity 与 55% gate 均健康，故不在正式运行中途改动；未来续训应在启动前明确选择“新周期再热启动”或“延续原 schedule”，并把选择写入 run metadata。
+- `current.pt`/`optimizer.pt` 继续每轮原子更新以保证恢复；不可变 `model_iter_*` 已按用户要求只保留 10 的倍数（当前为 480、490），没有用删除恢复锚点换取表面 I/O 收益。
