@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Tuple
 
 
 @dataclass
@@ -22,6 +22,9 @@ class SelfPlayV1Stats:
     step_timing_calls: Dict[str, int]
     mcts_counters: Dict[str, int]
     piece_delta_buckets: Dict[str, int]
+    device: str = ""
+    fallback_count: int = 0
+    fallback_reasons: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, object]:
         payload: Dict[str, object] = {
@@ -42,4 +45,7 @@ class SelfPlayV1Stats:
         payload["piece_delta_buckets"] = {
             k: int(v) for k, v in self.piece_delta_buckets.items()
         }
+        payload["device"] = str(self.device)
+        payload["fallback_count"] = int(self.fallback_count)
+        payload["fallback_reasons"] = list(self.fallback_reasons)
         return payload

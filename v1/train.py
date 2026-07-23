@@ -299,6 +299,9 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
     step_ratio: Dict[str, float] = {}
     step_calls: Dict[str, int] = {}
     counter_sum: Dict[str, int] = {}
+    fallback_count = 0
+    fallback_reasons: List[str] = []
+    devices: List[str] = []
     for s in stats:
         for k, v in s.step_timing_ms.items():
             step_ms[k] = float(step_ms.get(k, 0.0) + float(v))
@@ -306,14 +309,27 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
             step_calls[k] = int(step_calls.get(k, 0) + int(v))
         for k, v in s.mcts_counters.items():
             counter_sum[k] = int(counter_sum.get(k, 0) + int(v))
+        fallback_count += int(getattr(s, "fallback_count", 0) or 0)
+        fallback_reasons.extend(str(x) for x in getattr(s, "fallback_reasons", ()))
+        device_name = str(getattr(s, "device", ""))
+        if device_name and device_name not in devices:
+            devices.append(device_name)
 
-    tracked_keys = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
-    total_tracked = float(sum(float(step_ms.get(k, 0.0)) for k in tracked_keys))
-    for k in tracked_keys:
-        value = float(step_ms.get(k, 0.0))
-        step_ratio[k] = value / total_tracked if total_tracked > 0.0 else 0.0
+    legacy_keys = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
+    for k in legacy_keys:
         step_calls.setdefault(k, 0)
         step_ms.setdefault(k, 0.0)
+    worker_elapsed_ms = float(
+        sum(max(0.0, float(getattr(s, "elapsed_sec", 0.0))) for s in stats) * 1000.0
+    )
+    step_ratio = {
+        key: (
+            min(1.0, max(0.0, float(value) / worker_elapsed_ms))
+            if worker_elapsed_ms > 0.0
+            else 0.0
+        )
+        for key, value in step_ms.items()
+    }
 
     elapsed = max(1e-9, float(elapsed_sec))
     return SelfPlayV1Stats(
@@ -331,6 +347,9 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
         step_timing_calls=step_calls,
         mcts_counters=counter_sum,
         piece_delta_buckets=piece_delta_buckets,
+        device=",".join(devices),
+        fallback_count=int(fallback_count),
+        fallback_reasons=tuple(fallback_reasons),
     )
 
 
@@ -635,6 +654,9 @@ def _self_play_stats_from_payload(stats_payload: Dict[str, Any]) -> SelfPlayV1St
         step_timing_calls=step_timing_calls,
         mcts_counters=mcts_counters,
         piece_delta_buckets=piece_delta_buckets,
+        device=str(payload.get("device", "")),
+        fallback_count=int(payload.get("fallback_count", 0) or 0),
+        fallback_reasons=tuple(str(x) for x in payload.get("fallback_reasons", []) or []),
     )
 
 
@@ -804,6 +826,7 @@ def _run_self_play_multi_device_process(
     shard_dir: Optional[str],
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
+    search_backend: str = "cuda_root",
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     workspace, auto_cleanup = _prepare_self_play_workspace(
         shard_dir=shard_dir,
@@ -840,6 +863,7 @@ def _run_self_play_multi_device_process(
                 metadata_base={},
                 sparse_ply=int(sparse_ply),
                 sparse_top_k=int(sparse_top_k),
+                search_backend=str(search_backend),
             )
         )
         merged_batch, _stats_payload, _meta_payload = _load_self_play_payload(str(manifest_path))
@@ -882,6 +906,7 @@ def _run_self_play_multi_device_process_saved(
     metadata_base: Dict[str, Any],
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
+    search_backend: str = "cuda_root",
  ) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], Dict[str, Any], int]:
     from v1.python.self_play_worker import run_self_play_worker
 
@@ -944,6 +969,7 @@ def _run_self_play_multi_device_process_saved(
                     soft_label_alpha=float(soft_label_alpha),
                     sparse_ply=int(sparse_ply),
                     sparse_top_k=int(sparse_top_k),
+                    search_backend=str(search_backend),
                     target_samples_per_shard=int(target_samples_per_shard),
                     chunk_target_bytes=int(chunk_target_bytes),
                     chunk_output_dir=str(out_dir),
@@ -1107,6 +1133,7 @@ def _run_self_play_multi_device(
     search_backend: str = "cuda_root",
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
+    portable_self_play_workers: int = 1,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     search_backend_norm = _normalize_search_backend(search_backend)
     if search_backend_norm == "portable":
@@ -1123,6 +1150,28 @@ def _run_self_play_multi_device(
         if int(sparse_ply) != 1:
             raise ValueError(
                 "portable full MCTS does not use the experimental sparse_ply path; set sparse_ply=1."
+            )
+        if int(portable_self_play_workers) > 1:
+            return _run_self_play_multi_device_process(
+                model=model,
+                num_games=int(num_games),
+                mcts_simulations=int(mcts_simulations),
+                temperature_init=float(temperature_init),
+                temperature_final=float(temperature_final),
+                temperature_threshold=int(temperature_threshold),
+                exploration_weight=float(exploration_weight),
+                devices=[str(devices[0])] * int(portable_self_play_workers),
+                dirichlet_alpha=float(dirichlet_alpha),
+                dirichlet_epsilon=float(dirichlet_epsilon),
+                soft_value_k=float(soft_value_k),
+                opening_random_moves=int(opening_random_moves),
+                max_game_plies=int(max_game_plies),
+                concurrent_games_per_device=int(concurrent_games_per_device),
+                iteration_seed=int(iteration_seed),
+                shard_dir=self_play_shard_dir,
+                sparse_ply=1,
+                sparse_top_k=int(sparse_top_k),
+                search_backend="portable",
             )
         from v1.python.portable_self_play import self_play_v1_portable
 
@@ -1747,6 +1796,7 @@ def train_pipeline_v1(
     dirichlet_alpha: float = 0.3,
     dirichlet_epsilon: float = 0.25,
     self_play_concurrent_games: int = 8,
+    portable_self_play_workers: int = 1,
     self_play_opening_random_moves: int = 0,
     self_play_backend: Optional[str] = None,
     search_backend: str = "cuda_root",
@@ -1899,6 +1949,8 @@ def train_pipeline_v1(
                 "[v1.train] warning: self_play_concurrent_games is very high; "
                 "start with 32~128 for stability and throughput."
             )
+        if int(portable_self_play_workers) <= 0:
+            raise ValueError("portable_self_play_workers must be positive")
 
         model = _build_model()
         checkpoint_load_sec = 0.0
@@ -1945,23 +1997,37 @@ def train_pipeline_v1(
                 "mcts_simulations": int(mcts_simulations),
                 "self_play_games": int(self_play_games),
                 "self_play_concurrent_games": int(self_play_concurrent_games),
+                "portable_self_play_workers": int(portable_self_play_workers),
                 "self_play_opening_random_moves": int(self_play_opening_random_moves),
                 "self_play_iteration_seed": int(stage_selfplay_seed),
             }
-            resolved_backend = (
-                _resolve_self_play_backend(
-                    requested_backend=backend_arg,
-                    devices=self_play_device_list,
+            if search_backend_norm == "portable" and int(portable_self_play_workers) > 1:
+                resolved_backend = "process"
+            else:
+                resolved_backend = (
+                    _resolve_self_play_backend(
+                        requested_backend=backend_arg,
+                        devices=self_play_device_list,
+                    )
+                    if len(self_play_device_list) > 1
+                    else "thread"
                 )
-                if len(self_play_device_list) > 1
-                else "thread"
-            )
             saved_shards = 0
             use_saved_process_chunks = bool(
-                search_backend_norm == "cuda_root" and resolved_backend == "process"
+                resolved_backend == "process"
             )
             if use_saved_process_chunks:
-                _print_rank0(f"[v1.train] self-play backend={resolved_backend} devices={self_play_device_list}")
+                process_devices = list(self_play_device_list)
+                if search_backend_norm == "portable":
+                    process_devices = [
+                        str(self_play_device_list[0])
+                        for _ in range(int(portable_self_play_workers))
+                    ]
+                _print_rank0(
+                    f"[v1.train] self-play backend={resolved_backend} "
+                    f"search_backend={search_backend_norm} workers={len(process_devices)} "
+                    f"devices={process_devices}"
+                )
                 (
                     sp_stats,
                     value_target_summary,
@@ -1977,7 +2043,7 @@ def train_pipeline_v1(
                         temperature_final=float(temperature_final),
                         temperature_threshold=int(temperature_threshold),
                         exploration_weight=float(exploration_weight),
-                        devices=list(self_play_device_list),
+                        devices=process_devices,
                         dirichlet_alpha=float(dirichlet_alpha),
                         dirichlet_epsilon=float(dirichlet_epsilon),
                         soft_value_k=float(soft_value_k),
@@ -1991,6 +2057,9 @@ def train_pipeline_v1(
                         target_samples_per_shard=int(self_play_target_samples_per_shard),
                         chunk_target_bytes=int(self_play_chunk_target_bytes),
                         metadata_base=payload_metadata_base,
+                        sparse_ply=int(sparse_ply),
+                        sparse_top_k=int(sparse_top_k),
+                        search_backend=search_backend_norm,
                     )
                 )
             else:
@@ -2015,6 +2084,7 @@ def train_pipeline_v1(
                     search_backend=search_backend_norm,
                     sparse_ply=int(sparse_ply),
                     sparse_top_k=int(sparse_top_k),
+                    portable_self_play_workers=int(portable_self_play_workers),
                 )
                 value_target_summary = _compute_value_target_summary(samples)
                 soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2445,6 +2515,7 @@ def train_pipeline_v1(
                 search_backend=search_backend_norm,
                 sparse_ply=int(sparse_ply),
                 sparse_top_k=int(sparse_top_k),
+                portable_self_play_workers=int(portable_self_play_workers),
             )
             value_target_summary = _compute_value_target_summary(samples)
             soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2613,6 +2684,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     parser.add_argument("--self_play_concurrent_games", type=int, default=8)
+    parser.add_argument("--portable_self_play_workers", type=int, default=1)
     parser.add_argument("--self_play_opening_random_moves", type=int, default=0)
     parser.add_argument(
         "--self_play_backend",
@@ -2784,6 +2856,7 @@ if __name__ == "__main__":
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,
         self_play_concurrent_games=args.self_play_concurrent_games,
+        portable_self_play_workers=args.portable_self_play_workers,
         self_play_opening_random_moves=args.self_play_opening_random_moves,
         self_play_backend=args.self_play_backend,
         search_backend=args.search_backend,

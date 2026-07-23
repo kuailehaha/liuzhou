@@ -487,6 +487,48 @@ def test_portable_self_play_tensor_contract_cpu() -> None:
     assert all(math.isfinite(float(x)) for x in samples.policy_targets.flatten())
 
 
+def test_portable_process_worker_emits_training_manifest(tmp_path) -> None:
+    from v1.python.self_play_worker import run_self_play_worker
+
+    model = ChessNet(
+        board_size=GameState.BOARD_SIZE,
+        num_input_channels=NUM_INPUT_CHANNELS,
+    )
+    model_state_path = tmp_path / "model_state.pt"
+    torch.save(model.state_dict(), model_state_path)
+    manifest_path = tmp_path / "worker_manifest.pt"
+
+    row = run_self_play_worker(
+        worker_idx=0,
+        shard_device="cpu",
+        shard_games=1,
+        seed=17,
+        model_state_path=str(model_state_path),
+        output_path=str(manifest_path),
+        mcts_simulations=1,
+        temperature_init=1.0,
+        temperature_final=0.1,
+        temperature_threshold=4,
+        exploration_weight=1.0,
+        dirichlet_alpha=0.3,
+        dirichlet_epsilon=0.25,
+        soft_value_k=2.0,
+        opening_random_moves=0,
+        max_game_plies=4,
+        concurrent_games_per_device=1,
+        chunk_output_dir=str(tmp_path),
+        chunk_file_prefix="portable_worker",
+        search_backend="portable",
+    )
+
+    payload = torch.load(manifest_path, map_location="cpu")
+    assert row["output_path"] == str(manifest_path)
+    assert payload["payload_format"] == "v1_worker_chunk_manifest"
+    assert payload["metadata"]["search_backend"] == "portable"
+    assert payload["stats"]["fallback_count"] == 0
+    assert payload["num_samples"] > 0
+
+
 def test_mps_fallback_environment_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     from v1.python.portable_device import resolve_portable_device
 

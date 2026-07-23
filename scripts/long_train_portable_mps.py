@@ -21,6 +21,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -322,7 +323,12 @@ def _preflight(args: argparse.Namespace) -> None:
         )
     if float(args.hours) <= 0.0:
         raise ValueError("--hours must be positive.")
-    for name in ("self_play_games", "self_play_concurrency", "eval_concurrency"):
+    for name in (
+        "self_play_games",
+        "self_play_concurrency",
+        "portable_self_play_workers",
+        "eval_concurrency",
+    ):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive.")
     for name in ("eval_games_random", "eval_games_best", "final_eval_games"):
@@ -347,6 +353,7 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "device",
         "self_play_games",
         "self_play_concurrency",
+        "portable_self_play_workers",
         "mcts_simulations",
         "temperature_init",
         "temperature_final",
@@ -539,17 +546,18 @@ class PortableLongTrainer:
             if int(state.get("schema_version", 0)) != STATE_SCHEMA_VERSION:
                 raise RuntimeError(f"unsupported state schema: {state.get('schema_version')}")
             previous_signature = state.get("config")
-            migrated_gate_config = False
-            if (
-                isinstance(previous_signature, dict)
-                and "incumbent_promotion_score" not in previous_signature
-            ):
+            migrated_config: Dict[str, Any] = {}
+            additive_defaults = {
+                "incumbent_promotion_score": float(self.args.incumbent_promotion_score),
+                "portable_self_play_workers": int(self.args.portable_self_play_workers),
+            }
+            if isinstance(previous_signature, dict):
                 previous_signature = dict(previous_signature)
-                previous_signature["incumbent_promotion_score"] = float(
-                    self.args.incumbent_promotion_score
-                )
+                for field_name, default_value in additive_defaults.items():
+                    if field_name not in previous_signature:
+                        previous_signature[field_name] = default_value
+                        migrated_config[field_name] = default_value
                 state["config"] = previous_signature
-                migrated_gate_config = True
             if previous_signature != signature:
                 raise RuntimeError(
                     "resume configuration differs from state.json; "
@@ -573,11 +581,11 @@ class PortableLongTrainer:
                 state["last_resume_utc"] = utc_now()
                 state["last_resume_stop_reason"] = previous_stop_reason
             self.state = state
-            if migrated_gate_config:
+            for field_name, field_value in migrated_config.items():
                 self._event(
                     "config_migrated",
-                    field="incumbent_promotion_score",
-                    value=float(self.args.incumbent_promotion_score),
+                    field=field_name,
+                    value=field_value,
                 )
             reconciled = self._recover_interrupted_commit()
             retained_checkpoint: Optional[Path] = None
@@ -697,13 +705,19 @@ class PortableLongTrainer:
         return _clamp_progress((time.time() - int(self.state["start_epoch"])) / duration)
 
     def _replay_files(self) -> List[Path]:
-        return sorted(self.replay_dir.glob("selfplay_iter_*.pt"))
+        return sorted(
+            path
+            for path in self.replay_dir.glob("selfplay_iter_*.pt")
+            if re.fullmatch(r"selfplay_iter_\d{6}\.pt", path.name)
+        )
 
     def _prune_replay(self) -> None:
         keep = max(0, int(self.args.replay_window)) + 1
         files = self._replay_files()
         for path in files[:-keep] if keep > 0 else files:
             path.unlink(missing_ok=True)
+            for chunk in self.replay_dir.glob(f"{path.stem}.w*.chunk*.pt"):
+                chunk.unlink(missing_ok=True)
 
     def _run_selfplay(self, iteration: int, progress: float) -> Tuple[Path, Dict[str, Any]]:
         tag = f"{iteration:06d}"
@@ -735,6 +749,8 @@ class PortableLongTrainer:
             str(int(self.args.self_play_games)),
             "--self_play_concurrent_games",
             str(int(self.args.self_play_concurrency)),
+            "--portable_self_play_workers",
+            str(int(self.args.portable_self_play_workers)),
             "--self_play_opening_random_moves",
             str(opening_moves),
             "--mcts_simulations",
@@ -1228,6 +1244,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--self-play-games", type=int, default=128)
     parser.add_argument("--self-play-concurrency", type=int, default=128)
+    parser.add_argument("--portable-self-play-workers", type=int, default=1)
     parser.add_argument("--mcts-simulations", type=int, default=8)
     parser.add_argument("--temperature-init", type=float, default=1.0)
     parser.add_argument("--temperature-final", type=float, default=0.1)

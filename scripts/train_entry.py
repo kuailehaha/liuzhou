@@ -76,6 +76,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         dirichlet_alpha=float(args.dirichlet_alpha),
         dirichlet_epsilon=float(args.dirichlet_epsilon),
         self_play_concurrent_games=int(args.self_play_concurrent_games),
+        portable_self_play_workers=int(args.portable_self_play_workers),
         self_play_opening_random_moves=int(args.self_play_opening_random_moves),
         sparse_ply=int(args.sparse_ply),
         sparse_top_k=int(args.sparse_top_k),
@@ -142,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     parser.add_argument("--self_play_concurrent_games", type=int, default=8)
+    parser.add_argument("--portable_self_play_workers", type=int, default=1)
     parser.add_argument("--self_play_opening_random_moves", type=int, default=0)
     parser.add_argument("--sparse_ply", type=int, default=1, help="Multi-ply search depth (1 = root-only, 2-3 = sparse lookahead).")
     parser.add_argument("--sparse_top_k", type=int, default=8, help="Top-K children to expand per additional ply.")

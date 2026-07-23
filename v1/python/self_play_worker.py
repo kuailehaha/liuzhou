@@ -11,7 +11,6 @@ import torch
 
 from src.game_state import GameState
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
-from .self_play_gpu_runner import self_play_v1_gpu
 from .self_play_types import SelfPlayV1Stats
 from .self_play_storage import (
     estimate_bytes_per_sample,
@@ -208,6 +207,9 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
     step_timing_calls: Dict[str, int] = {}
     mcts_counters: Dict[str, int] = {}
     piece_delta_buckets: Dict[str, int] = {str(delta): 0 for delta in range(-18, 19)}
+    fallback_count = 0
+    fallback_reasons: List[str] = []
+    devices: List[str] = []
     for stats in stats_list:
         for k, v in stats.step_timing_ms.items():
             step_timing_ms[str(k)] = float(step_timing_ms.get(str(k), 0.0) + float(v))
@@ -218,16 +220,28 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
         buckets = _normalize_piece_delta_buckets(stats.piece_delta_buckets)
         for key, value in buckets.items():
             piece_delta_buckets[key] = int(piece_delta_buckets.get(key, 0) + int(value))
+        fallback_count += int(getattr(stats, "fallback_count", 0) or 0)
+        fallback_reasons.extend(str(x) for x in getattr(stats, "fallback_reasons", ()))
+        device_name = str(getattr(stats, "device", ""))
+        if device_name and device_name not in devices:
+            devices.append(device_name)
 
-    tracked = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
-    total_tracked = float(sum(float(step_timing_ms.get(k, 0.0)) for k in tracked))
-    step_timing_ratio = {
-        k: (float(step_timing_ms.get(k, 0.0)) / total_tracked if total_tracked > 0.0 else 0.0)
-        for k in tracked
-    }
-    for k in tracked:
+    legacy_keys = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
+    for k in legacy_keys:
         step_timing_ms.setdefault(k, 0.0)
         step_timing_calls.setdefault(k, 0)
+    worker_elapsed_ms = float(
+        sum(max(0.0, float(getattr(stats, "elapsed_sec", 0.0))) for stats in stats_list)
+        * 1000.0
+    )
+    step_timing_ratio = {
+        key: (
+            min(1.0, max(0.0, float(value) / worker_elapsed_ms))
+            if worker_elapsed_ms > 0.0
+            else 0.0
+        )
+        for key, value in step_timing_ms.items()
+    }
 
     elapsed = max(1e-9, float(elapsed_sec))
     return SelfPlayV1Stats(
@@ -245,6 +259,9 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
         step_timing_calls=step_timing_calls,
         mcts_counters=mcts_counters,
         piece_delta_buckets=piece_delta_buckets,
+        device=",".join(devices),
+        fallback_count=int(fallback_count),
+        fallback_reasons=tuple(fallback_reasons),
     )
 
 
@@ -275,6 +292,7 @@ def run_self_play_worker(
     chunk_file_ext: str = ".pt",
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
+    search_backend: str = "cuda_root",
 ) -> Dict[str, Any]:
     """Run one self-play shard inside a dedicated process and persist shard payload."""
 
@@ -307,6 +325,30 @@ def run_self_play_worker(
         model.eval()
 
         def _run_once(chunk_games: int) -> tuple[Any, Any]:
+            if str(search_backend).strip().lower() == "portable":
+                from .portable_self_play import self_play_v1_portable
+
+                return self_play_v1_portable(
+                    model=model,
+                    num_games=int(chunk_games),
+                    mcts_simulations=int(mcts_simulations),
+                    temperature_init=float(temperature_init),
+                    temperature_final=float(temperature_final),
+                    temperature_threshold=int(temperature_threshold),
+                    exploration_weight=float(exploration_weight),
+                    device=str(dev),
+                    add_dirichlet_noise=True,
+                    dirichlet_alpha=float(dirichlet_alpha),
+                    dirichlet_epsilon=float(dirichlet_epsilon),
+                    soft_value_k=float(soft_value_k),
+                    opening_random_moves=int(opening_random_moves),
+                    max_game_plies=int(max_game_plies),
+                    sample_moves=True,
+                    concurrent_games=max(1, min(int(chunk_games), shard_concurrent)),
+                    verbose=False,
+                )
+            from .self_play_gpu_runner import self_play_v1_gpu
+
             return self_play_v1_gpu(
                 model=model,
                 num_games=int(chunk_games),
@@ -396,6 +438,7 @@ def run_self_play_worker(
                     "graph_retry_off": bool(graph_retry_off),
                     "memory_anchor_mb": int(anchor_mb_effective),
                     "opening_random_moves": int(opening_random_moves),
+                    "search_backend": str(search_backend),
                     "source_worker_manifest": os.path.basename(str(output_path)),
                 }
                 save_self_play_payload(
@@ -438,6 +481,7 @@ def run_self_play_worker(
                 "graph_retry_off": bool(graph_retry_off),
                 "memory_anchor_mb": int(anchor_mb_effective),
                 "opening_random_moves": int(opening_random_moves),
+                "search_backend": str(search_backend),
             },
         }
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)

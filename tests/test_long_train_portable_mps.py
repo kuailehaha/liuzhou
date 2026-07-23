@@ -37,6 +37,7 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     args = build_parser().parse_args([])
     assert args.hours == 20.0
     assert (args.self_play_games, args.self_play_concurrency) == (128, 128)
+    assert args.portable_self_play_workers == 1
     assert (args.batch_size, args.epochs, args.replay_window) == (256, 3, 4)
     assert (args.eval_games_random, args.eval_games_best) == (500, 500)
     assert args.final_eval_games == 500
@@ -55,6 +56,31 @@ def test_replay_window_zero_selects_no_history(tmp_path) -> None:
     assert select_replay_inputs(files, primary=primary, window=0) == []
     assert select_replay_inputs(files, primary=primary, window=1) == [files[1]]
     assert select_replay_inputs(files, primary=primary, window=2) == files[:2]
+
+
+def test_replay_discovery_and_pruning_handle_worker_chunks(tmp_path) -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.replay_dir = tmp_path
+    trainer.args = SimpleNamespace(replay_window=1)
+    manifests = [
+        tmp_path / "selfplay_iter_000001.pt",
+        tmp_path / "selfplay_iter_000002.pt",
+        tmp_path / "selfplay_iter_000003.pt",
+    ]
+    chunks = [
+        tmp_path / "selfplay_iter_000001.w00.chunk00000.pt",
+        tmp_path / "selfplay_iter_000002.w00.chunk00000.pt",
+        tmp_path / "selfplay_iter_000003.w00.chunk00000.pt",
+    ]
+    for path in manifests + chunks:
+        path.write_bytes(b"payload")
+
+    assert trainer._replay_files() == manifests
+    trainer._prune_replay()
+
+    assert not manifests[0].exists()
+    assert not chunks[0].exists()
+    assert all(path.exists() for path in manifests[1:] + chunks[1:])
 
 
 def test_random_rank_and_incumbent_gate() -> None:
@@ -147,6 +173,7 @@ def test_resume_migrates_legacy_incumbent_gate_to_explicit_default(tmp_path) -> 
     trainer.optimizer_checkpoint.write_bytes(b"optimizer")
     legacy_config = _config_signature(args)
     legacy_config.pop("incumbent_promotion_score")
+    legacy_config.pop("portable_self_play_workers")
     trainer.state_path.write_text(
         json.dumps(
             {
@@ -165,6 +192,7 @@ def test_resume_migrates_legacy_incumbent_gate_to_explicit_default(tmp_path) -> 
     trainer.initialize()
 
     assert trainer.state["config"]["incumbent_promotion_score"] == pytest.approx(0.55)
+    assert trainer.state["config"]["portable_self_play_workers"] == 1
 
 
 def test_interrupted_model_optimizer_commit_restores_previous_pair(tmp_path) -> None:
