@@ -1916,3 +1916,12 @@ Data-effectiveness standard fields (must be preserved in reports):
 - 所有 15 条正式测量的完整 `state/legal/policy/value/soft-value` tensor fingerprint 一致；fallback、非法动作、非有限值均为 0。动态依赖只有系统 `libc++`/`libSystem`，未链接 CUDA、LibTorch 或 V0 inference engine。
 - staged MPS self-play 生成 4 局/160 positions 的标准 payload；现有 train bridge 直接消费成功，随后 replay 合并为 320 samples。第二次训练从隔离 checkpoint 和 optimizer state 恢复时 `optimizer_loaded=True`、load error 为 `None`，过滤非有限样本和设备 fallback 均为 0。
 - 原始报告和 smoke 产物位于 ignored 的 `tmp/portable_cpp_accept_20260723/`。基于正确性与 `>=1.5x` 门槛均通过，C++ 后端现为本机 portable self-play 的推荐实现；Python 路径继续保持默认、正确性参考与无需本地扩展的回退路径。线程数必须按目标并发重新基准，本轮最优 1 线程不代表更高并发或其他 M 系列机器。
+
+#### 线程与进程扩展复核
+
+- 同 checkpoint、seed、32 games/concurrency 32、8 simulations、32 max plies、无 noise、确定性 argmax 下，三次轮换测量的 Python 中位数为 `185.76 positions/s`；C++ 1/2/4/8 线程为 `416.99/404.81/395.71/394.49 positions/s`，相对为 `2.24x/2.18x/2.13x/2.12x`。所有配置的 payload fingerprint 相同，fallback、非法动作和非有限值均为 0。
+- C++ 1 线程的总墙钟为 `2448.45 ms`，其中 MPS 推理为 `2290.97 ms`（`93.57%`）；计时的 host 工作为 `105.89 ms`，线程池的 prepare/expand/select/advance 合计约 `25.6 ms`（总墙钟约 `1.05%`）。即使完全消除非设备时间，Amdahl 上界也只有约 `1.07x`；只优化当前树阶段的上界约 `1.01x`。
+- 纯 C++ 树 microbenchmark 在 128 trees、32 plies、8 simulations 下的 1/2/4/8 线程中位数为 `82.82/87.10/78.51/104.61 ms`，4 线程仅比 1 线程快 `1.06x`；在 512 trees 下为 `345.63/363.01/392.47/493.21 ms`，多线程全部更慢。当前线程池每阶段使用按 tree 的原子取号和条件变量 barrier，单任务过细，原子竞争、同步和 cache 开销会抵消并行收益。
+- 多进程并非普遍无效：当每个 worker 保持 batch 32 且单进程需要顺序跑多波时，2 worker/64 games 和 4 worker/128 games 分别达到约 `1.74x/2.42x`。但正式冻结的 128 games/concurrency 128 本来就是单个 batch 128；1/2/4 worker 的三次中位数为 `1066.61/968.62/1023.16 positions/s`，拆分后推理调用数从 257 增至 514/1028，端到端反而下降 `9.19%/4.07%`。
+- 结论：本机当前 20h portable MPS 长训使用 `portable_mcts_backend=cpp`、`portable_cpp_threads=1`、`portable_self_play_workers=1`。用户提供的 M5 多核仍由 PyTorch、MPS 驱动和系统调度按需使用；不以强制 8 条搜索线程制造较低吞吐。`current.pt`/`optimizer.pt` 每轮原子提交用于恢复，但不可变 `model_iter_*` 只保留初始锚点和每 10 个外层 iteration 的权重快照。若未来将 worker 按批次粗粒度流水化或重写线程池调度，必须重新做同 checkpoint 的 1/2/4/8 线程及生产形状基准。
+- 线程复核原始报告位于 ignored 的 `tmp/portable_cpp_goal_smoke_20260723/thread_sweep.json`；生产形状与 worker 测量命令和原始控制台记录保留在本次验收会话中，未作为版本库 artifact 提交。

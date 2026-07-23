@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
+import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -40,12 +43,53 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert args.portable_self_play_workers == 1
     assert args.portable_mcts_backend == "python"
     assert args.portable_cpp_threads == 1
+    assert args.checkpoint_retain_every == 10
+    assert args.initial_iteration == 0
     assert (args.batch_size, args.epochs, args.replay_window) == (256, 3, 4)
     assert (args.eval_games_random, args.eval_games_best) == (500, 500)
     assert args.final_eval_games == 500
     assert args.eval_concurrency == 64
     assert args.incumbent_promotion_score == pytest.approx(0.55)
     assert args.target_win_rate == pytest.approx(0.99)
+
+
+def test_direct_script_execution_adds_repository_root_to_sys_path(monkeypatch) -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = root / "scripts" / "long_train_portable_mps.py"
+    filtered = [
+        entry
+        for entry in sys.path
+        if entry and Path(entry).resolve() not in {root, script.parent}
+    ]
+    monkeypatch.setattr(sys, "path", filtered)
+
+    runpy.run_path(str(script), run_name="_long_train_import_test")
+
+    assert str(root) in sys.path
+
+
+def test_iteration_checkpoint_retention_is_periodic() -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.args = SimpleNamespace(checkpoint_retain_every=10)
+
+    assert trainer._should_retain_iteration_checkpoint(0)
+    assert not trainer._should_retain_iteration_checkpoint(1)
+    assert not trainer._should_retain_iteration_checkpoint(9)
+    assert trainer._should_retain_iteration_checkpoint(10)
+    assert trainer._should_retain_iteration_checkpoint(20)
+
+
+def test_nonzero_initial_iteration_requires_initial_checkpoint(tmp_path) -> None:
+    args = build_parser().parse_args(
+        ["--run-dir", str(tmp_path), "--initial-iteration", "473"]
+    )
+    trainer = PortableLongTrainer(args)
+
+    with pytest.raises(
+        ValueError,
+        match="--initial-iteration requires --initial-checkpoint",
+    ):
+        trainer.initialize()
 
 
 def test_replay_window_zero_selects_no_history(tmp_path) -> None:

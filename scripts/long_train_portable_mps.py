@@ -4,7 +4,8 @@
 The orchestrator keeps immutable per-iteration model checkpoints together with
 rolling recovery state and two best-model aliases:
 
-* ``model_iter_XXXXXX.pt`` retains every successfully committed iteration;
+* ``current.pt`` and ``optimizer.pt`` atomically track every committed iteration;
+* ``model_iter_XXXXXX.pt`` retains the initial anchor and periodic snapshots;
 * ``best_model.pt`` is the incumbent selected by a direct 500-game match;
 * ``best_vs_random.pt`` has the strongest observed fixed-seed random score.
 
@@ -31,10 +32,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import torch
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
 STATE_SCHEMA_VERSION = 1
 
 
@@ -346,6 +350,10 @@ def _preflight(args: argparse.Namespace) -> None:
         raise ValueError("--eval-every must be positive.")
     if int(args.batch_size) <= 0 or int(args.epochs) <= 0:
         raise ValueError("--batch-size and --epochs must be positive.")
+    if int(args.initial_iteration) < 0:
+        raise ValueError("--initial-iteration cannot be negative.")
+    if int(args.checkpoint_retain_every) <= 0:
+        raise ValueError("--checkpoint-retain-every must be positive.")
     if int(args.replay_window) < 0:
         raise ValueError("--replay-window cannot be negative.")
     if not 0.0 < float(args.target_win_rate) <= 1.0:
@@ -358,6 +366,7 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
     keys = (
         "hours",
         "device",
+        "initial_iteration",
         "self_play_games",
         "self_play_concurrency",
         "portable_self_play_workers",
@@ -373,6 +382,7 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "soft_label_alpha",
         "policy_draw_weight",
         "replay_window",
+        "checkpoint_retain_every",
         "batch_size",
         "epochs",
         "lr_start",
@@ -429,6 +439,10 @@ class PortableLongTrainer:
 
     def _iteration_checkpoint_path(self, iteration: int) -> Path:
         return self.checkpoint_dir / f"model_iter_{int(iteration):06d}.pt"
+
+    def _should_retain_iteration_checkpoint(self, iteration: int) -> bool:
+        retain_every = int(self.args.checkpoint_retain_every)
+        return int(iteration) == 0 or int(iteration) % retain_every == 0
 
     def _preserve_iteration_checkpoint(self, iteration: int) -> Path:
         if not self.current_checkpoint.is_file():
@@ -561,6 +575,8 @@ class PortableLongTrainer:
                 "portable_self_play_workers": int(self.args.portable_self_play_workers),
                 "portable_mcts_backend": str(self.args.portable_mcts_backend),
                 "portable_cpp_threads": int(self.args.portable_cpp_threads),
+                "checkpoint_retain_every": int(self.args.checkpoint_retain_every),
+                "initial_iteration": int(self.args.initial_iteration),
             }
             if isinstance(previous_signature, dict):
                 previous_signature = dict(previous_signature)
@@ -601,7 +617,9 @@ class PortableLongTrainer:
             reconciled = self._recover_interrupted_commit()
             retained_checkpoint: Optional[Path] = None
             retained_checkpoint_created = False
-            if self.current_checkpoint.is_file():
+            if self.current_checkpoint.is_file() and self._should_retain_iteration_checkpoint(
+                int(state.get("iteration", 0))
+            ):
                 retained_checkpoint = self._iteration_checkpoint_path(
                     int(state.get("iteration", 0))
                 )
@@ -649,7 +667,7 @@ class PortableLongTrainer:
             "created_utc": utc_now(),
             "start_epoch": start_epoch,
             "deadline_epoch": start_epoch + int(round(float(self.args.hours) * 3600.0)),
-            "iteration": 0,
+            "iteration": int(self.args.initial_iteration),
             "last_eval_iteration": None,
             "best_random_rank": None,
             "best_random_result": None,
@@ -671,6 +689,11 @@ class PortableLongTrainer:
         }
         initial = str(self.args.initial_checkpoint or "").strip()
         initial_optimizer = str(self.args.initial_optimizer_state or "").strip()
+        initial_iteration = int(self.args.initial_iteration)
+        if initial_iteration > 0 and not initial:
+            raise ValueError(
+                "--initial-iteration requires --initial-checkpoint"
+            )
         if initial_optimizer and not initial:
             raise ValueError(
                 "--initial-optimizer-state requires its matching --initial-checkpoint"
@@ -694,16 +717,19 @@ class PortableLongTrainer:
                 self.optimizer_checkpoint
             )
         if self.current_checkpoint.is_file():
-            retained_checkpoint = self._preserve_iteration_checkpoint(0)
-            self._event(
-                "iteration_checkpoint_retained",
-                iteration=0,
-                checkpoint=str(retained_checkpoint),
-                checkpoint_sha256=self.state.get(
-                    "latest_iteration_checkpoint_sha256"
-                ),
-                source="initial",
-            )
+            if self._should_retain_iteration_checkpoint(initial_iteration):
+                retained_checkpoint = self._preserve_iteration_checkpoint(
+                    initial_iteration
+                )
+                self._event(
+                    "iteration_checkpoint_retained",
+                    iteration=initial_iteration,
+                    checkpoint=str(retained_checkpoint),
+                    checkpoint_sha256=self.state.get(
+                        "latest_iteration_checkpoint_sha256"
+                    ),
+                    source="initial",
+                )
         self._save_state()
         self._event("run_initialized", state=dict(self.state))
         log(
@@ -1144,8 +1170,9 @@ class PortableLongTrainer:
             and self.current_checkpoint.is_file()
             and self.state.get("last_eval_iteration") is None
         ):
-            self.evaluate_current(0, label="initial")
-            if self.confirm_target(0) and bool(self.args.stop_on_target):
+            initial_eval_iteration = int(self.state.get("iteration", 0))
+            self.evaluate_current(initial_eval_iteration, label="initial")
+            if self.confirm_target(initial_eval_iteration) and bool(self.args.stop_on_target):
                 self._set_stop_reason("target_confirmed_at_start")
 
         while not self.state.get("stop_reason"):
@@ -1175,7 +1202,9 @@ class PortableLongTrainer:
             self.state["iteration"] = next_iteration
             self.state["latest_checkpoint_sha256"] = checkpoint_audit["sha256"]
             self.state["latest_optimizer_sha256"] = optimizer_sha256
-            retained_checkpoint = self._preserve_iteration_checkpoint(next_iteration)
+            retained_checkpoint: Optional[Path] = None
+            if self._should_retain_iteration_checkpoint(next_iteration):
+                retained_checkpoint = self._preserve_iteration_checkpoint(next_iteration)
             self.state["last_selfplay_stats"] = selfplay_stats
             self.state["last_train_metrics"] = train_row
             self._save_state()
@@ -1187,7 +1216,9 @@ class PortableLongTrainer:
                 selfplay_stats=selfplay_stats,
                 train_metrics=train_row,
                 checkpoint_audit=checkpoint_audit,
-                retained_checkpoint=str(retained_checkpoint),
+                retained_checkpoint=(
+                    str(retained_checkpoint) if retained_checkpoint is not None else None
+                ),
             )
 
             should_eval = (
@@ -1249,6 +1280,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--initial-checkpoint", default=None)
     parser.add_argument("--initial-optimizer-state", default=None)
+    parser.add_argument("--initial-iteration", type=int, default=0)
     parser.add_argument("--device", choices=["mps", "cpu"], default="mps")
     parser.add_argument("--require-ac", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-external-display", action="store_true")
@@ -1276,6 +1308,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--soft-label-alpha", type=float, default=0.5)
     parser.add_argument("--policy-draw-weight", type=float, default=1.0)
     parser.add_argument("--replay-window", type=int, default=4)
+    parser.add_argument("--checkpoint-retain-every", type=int, default=10)
 
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=3)

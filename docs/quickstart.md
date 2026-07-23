@@ -67,6 +67,8 @@ python -m tools.benchmark_portable_cpp \
 
 本机 2026-07-23 的固定 checkpoint 验收已通过：Python 中位数为 `163.88 positions/s`，C++ 1/2/4/8 线程分别为 `434.85/409.35/400.02/398.88 positions/s`，即 `2.65x/2.50x/2.44x/2.43x`；15 条测量的完整 tensor payload 指纹一致，fallback、非法动作和非有限值均为 0。当前同条件最优为 1 线程，最佳多线程配置为 2 线程；不要假定增加线程必然提速。原始报告位于 ignored 的 `tmp/portable_cpp_accept_20260723/benchmark_final_rebuild.json`。
 
+同日扩展复核进一步确认了正式长训配置：在固定 32 games/concurrency 32、8 simulations、32 max plies 的三次轮换基准中，Python 为 `185.76 positions/s`，C++ 1/2/4/8 线程为 `416.99/404.81/395.71/394.49 positions/s`，即 `2.24x/2.18x/2.13x/2.12x`；payload 指纹仍完全一致，三类审计计数仍全部为 0。C++ 单线程时设备推理已占总墙钟 `93.57%`，线程池树阶段约占 `1.05%`，所以增加细粒度搜索线程没有足够的可并行热点。在与长训一致的 128 games/concurrency 128 条件下，1/2/4 个 self-play worker 的三次中位数为 `1066.61/968.62/1023.16 positions/s`；多 worker 会把单次 MPS batch 从 128 拆成 64/32 并增加推理调用，因此本机当前推荐 `--portable-self-play-workers 1 --portable-cpp-threads 1`。这不表示其余 CPU 核心被禁用：PyTorch、MPS 驱动和系统调度仍可使用它们；只是不要为了“用满 8 核”而降低端到端吞吐。复核报告位于 ignored 的 `tmp/portable_cpp_goal_smoke_20260723/thread_sweep.json`。
+
 固定 checkpoint 的 portable 评估：
 
 ```bash
@@ -83,7 +85,7 @@ python scripts/eval_checkpoint.py \
 
 #### Apple M5 约 20 小时可恢复长训
 
-本机冻结配置由 `scripts/long_train_portable_mps.py` 管理：self-play 为 128 games/concurrency 128，训练为 batch 256、3 epochs、replay window 4，搜索为 8 simulations；每 10 轮分别进行 500 局 RandomAgent 评估和 500 局 candidate-versus-incumbent 自评估，评估 concurrency 为 64。评估 seed、250/250 黑白分配、逐颜色 W/L/D、模型/optimizer SHA 和 replay 输入都会落盘。
+本机冻结配置由 `scripts/long_train_portable_mps.py` 管理：self-play 为 128 games/concurrency 128，训练为 batch 256、3 epochs、replay window 4，搜索为 8 simulations；每 10 个外层 iteration 分别进行 500 局 RandomAgent 评估和 500 局 candidate-versus-incumbent 自评估，评估 concurrency 为 64。`current.pt` 和 `optimizer.pt` 每轮原子更新以支持精确恢复，不可变 `model_iter_*` 权重只保留初始锚点和每 10 个外层 iteration 的快照；评估 seed、250/250 黑白分配、逐颜色 W/L/D、模型/optimizer SHA 和 replay 输入都会落盘。
 
 8/16/32/64 simulations 的本机同条件测试显示 self-play 墙钟成本约为 `1.00x/2.07x/3.88x/6.93x`。同 seed 500 局 RandomAgent 对照中，64 simulations 相对 8 simulations 仅从 `433/500` 提高到 `449/500`，却耗时 `6.91x`，且高 simulations 自博弈明显更偏和棋。因此 20 小时默认仍为 8 simulations；不要依据 100 局小样本中偶然出现的 `98%` 改成 64。
 
@@ -97,11 +99,18 @@ mkdir -p logs && nohup zsh scripts/run_long_train_mps.sh \
   --hours 20 --resume \
   --initial-checkpoint tmp/v1_portable_goal_20260722/formal_1h/model_iter_117.pt \
   --initial-optimizer-state tmp/v1_portable_goal_20260722/formal_1h/optimizer_state.pt \
+  --initial-iteration 117 \
+  --portable-mcts-backend cpp \
+  --portable-cpp-threads 1 \
+  --portable-self-play-workers 1 \
+  --checkpoint-retain-every 10 \
   --require-external-display --stop-on-target \
   >> logs/portable_mps_20h.log 2>&1 & echo $!
 ```
 
 `--resume` 对新目录和已有目录都可用；已有目录会核对冻结配置、外层 iteration、current checkpoint、optimizer 和 commit SHA 后续跑。运行状态位于 `tmp/v1_portable_long_20h/state.json`，最终摘要位于 `final_summary.json`，`best_model.pt` 和 `best_vs_random.pt` 位于其 `checkpoints/` 子目录。
+
+跨终端或 Codex 断联运行时，优先把同一命令注册为 `RunAtLoad=true`、`KeepAlive=false` 的一次性用户 LaunchAgent，并在交付前核对任务进程、日志、`state.json` 和 `pmset -g assertions` 中的 `caffeinate` 断言；直接 `nohup` 只适合当前 shell 生命周期可靠的环境。
 
 ## 2. 构建入口
 

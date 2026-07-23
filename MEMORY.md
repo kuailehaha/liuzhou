@@ -1,5 +1,41 @@
 # MEMORY
 
+## Current Conclusions (2026-07-23): Threaded C++ Portable MPS 20-Hour Continuation
+
+### 1) Active Run and Recovery Anchors
+
+- A new 20-hour continuation is active under one-shot LaunchAgent `com.liuzhou.portable-cpp-mps-20h`. It started at `2026-07-23T05:43:57Z` (`2026-07-23 13:43:57 UTC+8`) and has a fixed deadline of `2026-07-24T01:43:57Z` (`2026-07-24 09:43:57 UTC+8`). Runtime state is `tmp/v1_portable_cpp_long_20h_20260723/`; logs are `logs/portable_cpp_mps_20h.log` and `.err.log`.
+- The continuation starts at outer iteration 473 from `tmp/v1_portable_long_20h/checkpoints/current.pt`, SHA-256 `2717b63bb9daedb8174075a6247ed8ae957b81479c7123677e9b8b96c409d5f6`, and its matching optimizer, SHA-256 `92f09fbf7472bc8780b017c8b6fd4059aead0f85997e84f6998dbdf762c59c2b`. The next self-play seed is therefore derived for iteration 474 rather than resetting the outer iteration namespace.
+- Rolling replay 469–473 was cloned byte-for-byte into the new run. The first continued train used replay 470–473 together with primary iteration 474; after commit the rolling window was 470–474. The prior direct-match incumbent and RandomAgent-best aliases were also cloned with SHA-256 `80c27a7a802946ad3d09054cc062585ac2ca3b13b06755808fe874a50a4c1d30` and `c143f709190258980b2a2d1f019289e4af59b21569648dfd35bd5e7133e794e3`.
+- The run was launched from repository commit `e0614c67234d2d1b6aa2d9cc771f75c32b280f54`; `state.json` records `dirty=true` because the retention/continuation fix and this documentation were intentionally validated before starting but not committed automatically.
+
+### 2) Frozen C++/MPS Configuration and Retention
+
+- Self-play uses the production-compatible V1 staged path with `portable_mcts_backend=cpp`, one self-play worker, one C++ search thread, MPS inference, 128 games/concurrency 128, 8 simulations, maximum 512 plies, temperature `1.0 -> 0.1` at ply 10 and opening random moves `6 -> 0`.
+- Training remains batch 256, 3 epochs, replay window 4, cosine LR `3e-4 -> 5e-5`, weight decay `1e-4`, `soft_label_alpha=0.5` and `policy_draw_weight=1.0`. Every 10 outer iterations it retains an immutable model snapshot and runs the existing 500-game RandomAgent plus 500-game candidate-versus-incumbent gates at concurrency 64 and promotion score 55%.
+- `current.pt` and `optimizer.pt` still commit atomically every outer iteration for exact crash recovery. `model_iter_*` is no longer duplicated every iteration: only the initial/default anchor and multiples of 10 are retained. For this continuation, iteration 473 remains anchored in the source run and the first new immutable snapshot will be iteration 480; iteration 474 correctly produced no `model_iter_000474.pt`.
+- The available M5 cores are not artificially disabled. The verified choice of one C++ search thread applies only to the fine-grained tree pool; PyTorch, the MPS driver and the OS may use the remaining cores. Under the frozen 128/128 workload, 1/2/4 workers measured `1066.61/968.62/1023.16 positions/s`, so forcing more worker processes would fragment the MPS batch and reduce median throughput.
+
+### 3) First-Iteration Health Evidence
+
+- Iteration 474 completed 128 games and 12,775 positions. Self-play reported `49` black wins, `36` white wins and `43` draws; measured throughput was `171.88 positions/s`. MPS inference accounted for `85.62%` of timed self-play.
+- C++ audit counters were all clean: portable fallback `0`, illegal actions `0`, non-finite values `0`; all 12,775 hard/soft targets were finite.
+- Training consumed primary iteration 474 plus exactly four replay files 470–473, loaded the matching optimizer (`optimizer_loaded=true`, load error `None`), filtered `0` non-finite samples and reported device fallback `0`. The committed model/optimizer SHA-256 values became `0ea0ca4fef0f89629d6dca1c08661b143b7c93e0f069e05111d5f64e69ea7da0` and `6d3b1c9066dcce5a05c4da93cebd022610a40a83ebef8429556fa045e7ab4b44`.
+- The LaunchAgent remained `running`, its error log was empty, and `caffeinate -ims` exposed active idle-system, system-sleep and disk-idle assertions.
+
+### 4) Physical Operating Conditions and Remaining Acceptance
+
+- The machine was on AC power at 100% charge with `AppleClamshellState=No`; only the internal display was connected. This continues the user's previously selected open-lid mode. The lid must remain open and AC connected; this run is not a closed-lid endurance test.
+- The first committed iteration proves launch, C++ selection, optimizer/replay continuity, audit counters and periodic-retention behavior. The 20-hour deadline, periodic/final evaluations, sustained thermal behavior and final retained checkpoint are still in progress and must not be reported as complete before `final_summary.json` exists.
+
+Monitoring:
+
+```bash
+launchctl print gui/$(id -u)/com.liuzhou.portable-cpp-mps-20h
+tail -f logs/portable_cpp_mps_20h.log
+python -m json.tool tmp/v1_portable_cpp_long_20h_20260723/state.json
+```
+
 ## Current Conclusions (2026-07-22): Apple M5 Portable 20-Hour Training Run
 
 ### 1) Goal, Baseline and Current Status
