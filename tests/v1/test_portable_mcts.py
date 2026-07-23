@@ -468,6 +468,22 @@ def test_portable_self_play_tensor_contract_cpu() -> None:
     assert stats.num_games == 1
     assert stats.device == "cpu"
     assert stats.fallback_count == 0
+    assert set(stats.step_timing_ms) == {
+        "state_encode",
+        "legal_encode",
+        "device_inference",
+        "eval_validate",
+        "tree_select",
+        "tree_expand_backup",
+        "policy_select",
+        "trajectory_commit",
+        "payload_finalize",
+    }
+    assert set(stats.step_timing_ratio) == set(stats.step_timing_ms)
+    assert set(stats.step_timing_calls) == set(stats.step_timing_ms)
+    assert all(value >= 0.0 for value in stats.step_timing_ms.values())
+    assert all(0.0 <= value <= 1.0 for value in stats.step_timing_ratio.values())
+    assert all(value > 0 for value in stats.step_timing_calls.values())
     assert all(math.isfinite(float(x)) for x in samples.policy_targets.flatten())
 
 

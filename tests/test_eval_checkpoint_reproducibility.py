@@ -14,6 +14,14 @@ def test_eval_parser_accepts_explicit_seed() -> None:
     assert args.seed == 20260722
 
 
+def test_eval_parser_accepts_multiple_portable_workers() -> None:
+    args = build_parser().parse_args(
+        ["--challenger_checkpoint", "candidate.pt", "--backend", "portable", "--eval_workers", "2"]
+    )
+    assert args.backend == "portable"
+    assert args.eval_workers == 2
+
+
 def test_worker_aggregation_preserves_color_breakdown_and_seed() -> None:
     stats = _aggregate_v1_worker_results(
         [

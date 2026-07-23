@@ -8,6 +8,7 @@ importing ``v0_core`` or any CUDA-only helper.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -156,6 +157,28 @@ class PortableMCTS:
         self.model = model.to(device=self.device, dtype=torch.float32)
         self.model.eval()
         self.inference_batches = 0
+        self.timing_seconds: Dict[str, float] = {}
+        self.timing_calls: Dict[str, int] = {}
+
+    def record_timing(self, name: str, elapsed_sec: float) -> None:
+        key = str(name)
+        self.timing_seconds[key] = self.timing_seconds.get(key, 0.0) + max(
+            0.0, float(elapsed_sec)
+        )
+        self.timing_calls[key] = self.timing_calls.get(key, 0) + 1
+
+    def timing_snapshot(
+        self, total_elapsed_sec: float
+    ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, int]]:
+        denominator = max(1e-9, float(total_elapsed_sec))
+        timing_ms = {
+            key: float(value * 1000.0) for key, value in self.timing_seconds.items()
+        }
+        timing_ratio = {
+            key: min(1.0, max(0.0, float(value / denominator)))
+            for key, value in self.timing_seconds.items()
+        }
+        return timing_ms, timing_ratio, dict(self.timing_calls)
 
     def _add_root_noise(self, node: PortableNode) -> None:
         if len(node.children) <= 1:
@@ -188,12 +211,15 @@ class PortableMCTS:
                 fallback_reasons=self.device_resolution.fallback_reasons,
             )
 
+        started = time.perf_counter()
         model_inputs = torch.cat(
             [state_to_tensor(state, state.current_player) for state in states], dim=0
         ).to(torch.float32)
+        self.record_timing("state_encode", time.perf_counter() - started)
         if tuple(model_inputs.shape[1:]) != (11, 6, 6):
             raise ValueError(f"Unexpected model input shape: {tuple(model_inputs.shape)}")
 
+        started = time.perf_counter()
         legal_masks = torch.zeros((len(states), TOTAL_DIM), dtype=torch.bool)
         moves_by_row: List[Tuple[MoveType, ...]] = []
         for row, state in enumerate(states):
@@ -208,7 +234,9 @@ class PortableMCTS:
                         f"Two legal moves map to action index {action_index} in state row {row}."
                     )
                 legal_masks[row, int(action_index)] = True
+        self.record_timing("legal_encode", time.perf_counter() - started)
 
+        started = time.perf_counter()
         device_inputs = model_inputs.to(self.device, dtype=torch.float32)
         device_masks = legal_masks.to(self.device)
         try:
@@ -239,6 +267,8 @@ class PortableMCTS:
         self.inference_batches += 1
         priors = priors_device.to("cpu")
         values = values_device.view(-1).to("cpu")
+        self.record_timing("device_inference", time.perf_counter() - started)
+        started = time.perf_counter()
         if tuple(priors.shape) != (len(states), TOTAL_DIM):
             raise ValueError(f"Unexpected prior shape: {tuple(priors.shape)}")
         if not bool(torch.isfinite(priors).all().item()):
@@ -254,6 +284,7 @@ class PortableMCTS:
             rtol=0.0,
         ):
             raise ValueError("Portable policy is not normalized over legal actions.")
+        self.record_timing("eval_validate", time.perf_counter() - started)
 
         return PortableEvaluationBatch(
             model_inputs=model_inputs.detach().cpu(),
@@ -436,6 +467,7 @@ class PortableMCTS:
                 roots_to_expand.append((row, tree, root))
         if roots_to_expand:
             root_eval = self.evaluate_states([item[2].state for item in roots_to_expand])
+            started = time.perf_counter()
             for eval_row, (_output_row, tree, node) in enumerate(roots_to_expand):
                 self._expand_evaluated_node(
                     tree,
@@ -445,6 +477,7 @@ class PortableMCTS:
                     is_root=True,
                     add_noise=add_noise,
                 )
+            self.record_timing("tree_expand_backup", time.perf_counter() - started)
         if add_noise:
             newly_expanded = {id(item[2]) for item in roots_to_expand}
             for tree in trees:
@@ -453,6 +486,7 @@ class PortableMCTS:
 
         simulations = max(1, int(self.config.num_simulations))
         for _simulation in range(simulations):
+            started = time.perf_counter()
             pending: List[Tuple[PortableTree, List[PortableNode]]] = []
             for tree in trees:
                 root = tree.root
@@ -469,8 +503,10 @@ class PortableMCTS:
                     backup_path(path, -1.0)
                 else:
                     pending.append((tree, path))
+            self.record_timing("tree_select", time.perf_counter() - started)
             if pending:
                 evaluation = self.evaluate_states([path[-1].state for _tree, path in pending])
+                started = time.perf_counter()
                 for row, (tree, path) in enumerate(pending):
                     leaf = path[-1]
                     value = self._expand_evaluated_node(
@@ -482,7 +518,9 @@ class PortableMCTS:
                         add_noise=False,
                     )
                     backup_path(path, value)
+                self.record_timing("tree_expand_backup", time.perf_counter() - started)
 
+        started = time.perf_counter()
         outputs: List[PortableSearchOutput] = []
         for row, tree in enumerate(trees):
             root = tree.root
@@ -539,6 +577,7 @@ class PortableMCTS:
                     visit_counts=visit_counts,
                 )
             )
+        self.record_timing("policy_select", time.perf_counter() - started)
         return outputs
 
     def search(

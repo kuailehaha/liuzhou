@@ -582,10 +582,6 @@ def evaluate_against_agent_parallel_v1(
 
     devices_list = _parse_devices(device=str(device), eval_devices=",".join(devices) if isinstance(devices, list) else (devices if isinstance(devices, str) else None))
     workers = max(1, min(int(num_workers), int(num_games_n)))
-    if str(search_backend) == "portable" and workers != 1:
-        raise RuntimeError(
-            "The portable eval backend is single-process in its first version; set --eval_workers 1."
-        )
     chunks = _split_game_indices(num_games_n, workers)
     if not chunks:
         return EvaluationStats(wins=0, losses=0, draws=0, total_games=num_games_n)

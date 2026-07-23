@@ -155,6 +155,7 @@ def self_play_v1_portable(
                 add_dirichlet_noise=add_dirichlet_noise,
                 force_uniform_random=force_uniform,
             )
+            trajectory_started = time.perf_counter()
             for ctx, output in zip(active, outputs):
                 tree: PortableTree = ctx["tree"]
                 state = tree.root.state
@@ -196,6 +197,9 @@ def self_play_v1_portable(
                         policy_rows.append(policy)
                         value_rows.append(float(result_black * sign))
                         soft_rows.append(float(soft_black * sign))
+            search.record_timing(
+                "trajectory_commit", time.perf_counter() - trajectory_started
+            )
             if verbose:
                 completed = sum(bool(ctx["done"]) for ctx in contexts)
                 print(
@@ -203,6 +207,7 @@ def self_play_v1_portable(
                     f"completed={completed}/{wave_games}"
                 )
 
+    finalize_started = time.perf_counter()
     if state_rows:
         samples = TensorSelfPlayBatch(
             state_tensors=torch.stack(state_rows).to(torch.float32),
@@ -227,8 +232,12 @@ def self_play_v1_portable(
     ):
         if not bool(torch.isfinite(tensor).all().item()):
             raise ValueError(f"Portable self-play produced NaN/Inf in {name}.")
+    search.record_timing("payload_finalize", time.perf_counter() - finalize_started)
 
     elapsed = max(1e-9, time.perf_counter() - started)
+    step_timing_ms, step_timing_ratio, step_timing_calls = search.timing_snapshot(
+        elapsed
+    )
     stats = PortableSelfPlayStats(
         num_games=int(num_games),
         num_positions=samples.num_samples,
@@ -243,9 +252,9 @@ def self_play_v1_portable(
         fallback_count=int(search.device_resolution.fallback_count),
         fallback_reasons=search.device_resolution.fallback_reasons,
         inference_batches=int(search.inference_batches),
-        step_timing_ms={},
-        step_timing_ratio={},
-        step_timing_calls={},
+        step_timing_ms=step_timing_ms,
+        step_timing_ratio=step_timing_ratio,
+        step_timing_calls=step_timing_calls,
         mcts_counters={
             "portable_inference_batches": int(search.inference_batches),
             "portable_virtual_loss_count": 0,

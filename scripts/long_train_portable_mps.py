@@ -79,8 +79,14 @@ def random_result_rank(row: Dict[str, Any]) -> Tuple[int, int]:
     return int(row.get("wins", 0) or 0), -int(row.get("losses", 0) or 0)
 
 
-def candidate_beats_incumbent(row: Dict[str, Any]) -> bool:
-    return int(row.get("wins", 0) or 0) > int(row.get("losses", 0) or 0)
+def candidate_beats_incumbent(row: Dict[str, Any], promotion_score: float) -> bool:
+    total_games = int(row.get("total_games", 0) or 0)
+    if total_games <= 0:
+        return False
+    wins = int(row.get("wins", 0) or 0)
+    draws = int(row.get("draws", 0) or 0)
+    score = (wins + (0.5 * draws)) / float(total_games)
+    return score >= float(promotion_score)
 
 
 def target_requires_confirmation(state: Dict[str, Any], target_win_rate: float) -> bool:
@@ -331,6 +337,8 @@ def _preflight(args: argparse.Namespace) -> None:
         raise ValueError("--replay-window cannot be negative.")
     if not 0.0 < float(args.target_win_rate) <= 1.0:
         raise ValueError("--target-win-rate must be in (0, 1].")
+    if not 0.5 < float(args.incumbent_promotion_score) <= 1.0:
+        raise ValueError("--incumbent-promotion-score must be in (0.5, 1].")
 
 
 def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
@@ -359,6 +367,7 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "eval_games_best",
         "eval_simulations",
         "eval_concurrency",
+        "incumbent_promotion_score",
         "target_win_rate",
         "seed",
     )
@@ -530,6 +539,17 @@ class PortableLongTrainer:
             if int(state.get("schema_version", 0)) != STATE_SCHEMA_VERSION:
                 raise RuntimeError(f"unsupported state schema: {state.get('schema_version')}")
             previous_signature = state.get("config")
+            migrated_gate_config = False
+            if (
+                isinstance(previous_signature, dict)
+                and "incumbent_promotion_score" not in previous_signature
+            ):
+                previous_signature = dict(previous_signature)
+                previous_signature["incumbent_promotion_score"] = float(
+                    self.args.incumbent_promotion_score
+                )
+                state["config"] = previous_signature
+                migrated_gate_config = True
             if previous_signature != signature:
                 raise RuntimeError(
                     "resume configuration differs from state.json; "
@@ -553,6 +573,12 @@ class PortableLongTrainer:
                 state["last_resume_utc"] = utc_now()
                 state["last_resume_stop_reason"] = previous_stop_reason
             self.state = state
+            if migrated_gate_config:
+                self._event(
+                    "config_migrated",
+                    field="incumbent_promotion_score",
+                    value=float(self.args.incumbent_promotion_score),
+                )
             reconciled = self._recover_interrupted_commit()
             retained_checkpoint: Optional[Path] = None
             retained_checkpoint_created = False
@@ -986,7 +1012,9 @@ class PortableLongTrainer:
                 temperature=1.0,
                 sample_moves=True,
             )
-            if candidate_beats_incumbent(best_row):
+            if candidate_beats_incumbent(
+                best_row, float(self.args.incumbent_promotion_score)
+            ):
                 atomic_copy(self.current_checkpoint, self.best_checkpoint)
                 self.state["best_iteration"] = iteration
                 self.state["best_sha256"] = sha256_file(self.best_checkpoint)
@@ -994,13 +1022,17 @@ class PortableLongTrainer:
                 self._event("best_model_promoted", iteration=iteration, result=best_row)
                 log(
                     f"best_model promoted iter={iteration} "
-                    f"W-L-D={best_row['wins']}-{best_row['losses']}-{best_row['draws']}"
+                    f"W-L-D={best_row['wins']}-{best_row['losses']}-{best_row['draws']} "
+                    f"score={(int(best_row['wins']) + 0.5 * int(best_row['draws'])) / int(best_row['total_games']):.4f} "
+                    f"threshold={float(self.args.incumbent_promotion_score):.4f}"
                 )
             else:
                 self._event("best_model_retained", iteration=iteration, result=best_row)
                 log(
                     f"best_model retained iter={iteration} "
-                    f"candidate_W-L-D={best_row['wins']}-{best_row['losses']}-{best_row['draws']}"
+                    f"candidate_W-L-D={best_row['wins']}-{best_row['losses']}-{best_row['draws']} "
+                    f"score={(int(best_row['wins']) + 0.5 * int(best_row['draws'])) / int(best_row['total_games']):.4f} "
+                    f"threshold={float(self.args.incumbent_promotion_score):.4f}"
                 )
 
         self.state["last_eval_iteration"] = iteration
@@ -1219,6 +1251,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-simulations", type=int, default=8)
     parser.add_argument("--eval-concurrency", type=int, default=64)
     parser.add_argument("--eval-at-start", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--incumbent-promotion-score", type=float, default=0.55)
     parser.add_argument("--target-win-rate", type=float, default=0.99)
     parser.add_argument("--stop-on-target", action="store_true")
     parser.add_argument("--final-eval", action=argparse.BooleanOptionalAction, default=True)
