@@ -16,11 +16,11 @@ from fastapi.responses import RedirectResponse
 from src.game_state import GameState, Player
 from src.move_generator import apply_move, generate_all_legal_moves
 from src.neural_network import state_to_tensor
-from src.random_agent import RandomAgent
 from src.evaluate import MCTSAgent
+from v1.python.portable_gameplay_agent import PortableGameplayAgent
 
 from .game_manager import GameManager, GameSession
-from .model_loader import ModelLoadError, get_model
+from .model_loader import ModelLoadError, get_model_with_metadata
 from .schemas import MoveRequest, NewGameRequest
 from .utils import build_game_payload, deserialize_move, move_to_key
 from .static_files import NoCacheStaticFiles
@@ -34,11 +34,22 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_UI_DIR = BASE_DIR / "web_ui"
 
 DEFAULT_MODEL_PATH = os.getenv(
-    "MODEL_PATH", str((BASE_DIR / "models" / "model_iter_3.pt").resolve())
+    "MODEL_PATH",
+    str(
+        (
+            BASE_DIR
+            / "tmp"
+            / "v1_portable_cpp_long_20h_20260723"
+            / "checkpoints"
+            / "best_model.pt"
+        ).resolve()
+    ),
 )
 DEFAULT_DEVICE = os.getenv("MODEL_DEVICE", "cpu")
-DEFAULT_SIMULATIONS = int(os.getenv("MCTS_SIMULATIONS", "160"))
-DEFAULT_TEMPERATURE = float(os.getenv("MCTS_TEMPERATURE", "0.05"))
+DEFAULT_SIMULATIONS = int(os.getenv("MCTS_SIMULATIONS", "1024"))
+DEFAULT_TEMPERATURE = float(os.getenv("MCTS_TEMPERATURE", "0"))
+DEFAULT_SEARCH_BACKEND = os.getenv("GAMEPLAY_SEARCH_BACKEND", "portable_cpp")
+DEFAULT_CPP_THREADS = int(os.getenv("PORTABLE_CPP_THREADS", "1"))
 
 app = FastAPI(title="Liuzhou Web API", version="0.1.0")
 
@@ -56,8 +67,10 @@ if WEB_UI_DIR.exists():
     app.mount("/ui", NoCacheStaticFiles(directory=WEB_UI_DIR, html=True), name="web_ui")
 
 
-def _reset_agent(agent: Any) -> None:
-    if hasattr(agent, "mcts"):
+def _sync_agent(agent: Any, state: GameState) -> None:
+    if hasattr(agent, "sync_state"):
+        agent.sync_state(state)
+    elif hasattr(agent, "mcts"):
         agent.mcts.root = None  # type: ignore[attr-defined]
 
 
@@ -70,27 +83,62 @@ def _create_ai_agent(
     simulations: int,
     temperature: float,
     device: str,
-) -> tuple[Any, bool]:
+    search_backend: str,
+) -> tuple[Any, bool, Dict[str, Any]]:
     """
     Build the agent that will control the AI player.
 
     Returns (agent, using_random_agent).
     """
     try:
-        model = get_model(model_path, device)
+        model, model_metadata = get_model_with_metadata(model_path, device)
     except ModelLoadError as exc:
-        if model_path:
-            raise HTTPException(status_code=500, detail=str(exc))
-        return RandomAgent(), True
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    agent = MCTSAgent(
-        model=model,
-        mcts_simulations=simulations,
-        temperature=temperature,
-        device=device,
-        add_dirichlet_noise=False,
-    )
-    return agent, False
+    backend = str(search_backend).strip().lower()
+    if backend in {"portable_cpp", "portable_python"}:
+        implementation = "cpp" if backend == "portable_cpp" else "python"
+        try:
+            agent = PortableGameplayAgent(
+                model=model,
+                mcts_simulations=simulations,
+                temperature=temperature,
+                device=device,
+                portable_mcts_backend=implementation,
+                portable_cpp_threads=DEFAULT_CPP_THREADS,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Requested gameplay backend {backend} is unavailable; "
+                    "no fallback was attempted. "
+                    f"{exc}"
+                ),
+            ) from exc
+    elif backend == "legacy":
+        agent = MCTSAgent(
+            model=model,
+            mcts_simulations=simulations,
+            temperature=temperature,
+            device=device,
+            add_dirichlet_noise=False,
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported search backend: {search_backend}",
+        )
+    metadata = {
+        **model_metadata,
+        "searchBackend": backend,
+        "simulations": int(simulations),
+        "temperature": float(temperature),
+        "portableCppThreads": (
+            DEFAULT_CPP_THREADS if backend == "portable_cpp" else 0
+        ),
+    }
+    return agent, False, metadata
 
 
 def _maybe_run_ai_turn(session: GameSession) -> List[Mapping[str, Any]]:
@@ -106,7 +154,6 @@ def _maybe_run_ai_turn(session: GameSession) -> List[Mapping[str, Any]]:
         not session.state.is_game_over()
         and session.state.current_player == session.ai_player
     ):
-        _reset_agent(session.ai_agent)
         candidate_moves = generate_all_legal_moves(session.state)
         if not candidate_moves:
             break
@@ -128,7 +175,6 @@ def _maybe_run_ai_turn(session: GameSession) -> List[Mapping[str, Any]]:
         session.state = apply_move(session.state, move_to_apply, quiet=True)
         ai_moves.append(move_to_apply)
 
-    _reset_agent(session.ai_agent)
     return ai_moves
 
 
@@ -214,9 +260,10 @@ def _prepare_payload(session: GameSession, ai_moves: List[Mapping[str, Any]] | N
         "humanPlayer": session.human_player.name,
         "aiPlayer": session.ai_player.name,
         "usingRandomAgent": session.using_random_agent,
+        **session.ai_metadata,
     }
-    if session.using_random_agent:
-        payload["meta"]["note"] = "Falling back to RandomAgent because no model checkpoint was configured."
+    if hasattr(session.ai_agent, "audit_metadata"):
+        payload["meta"].update(session.ai_agent.audit_metadata())
     evaluation = _evaluate_position(session)
     if evaluation is not None:
         payload["evaluation"] = evaluation
@@ -226,22 +273,32 @@ def _prepare_payload(session: GameSession, ai_moves: List[Mapping[str, Any]] | N
 @app.post("/api/new-game")
 def create_new_game(request: NewGameRequest):
     human_player = Player[request.human_player]
-    simulations = request.mcts_simulations or DEFAULT_SIMULATIONS
-    temperature = request.temperature or DEFAULT_TEMPERATURE
+    simulations = (
+        DEFAULT_SIMULATIONS
+        if request.mcts_simulations is None
+        else request.mcts_simulations
+    )
+    temperature = (
+        DEFAULT_TEMPERATURE if request.temperature is None else request.temperature
+    )
     model_path = request.model_path or DEFAULT_MODEL_PATH
+    search_backend = request.search_backend or DEFAULT_SEARCH_BACKEND
 
-    ai_agent, using_random_agent = _create_ai_agent(
+    ai_agent, using_random_agent, ai_metadata = _create_ai_agent(
         model_path=model_path,
         simulations=simulations,
         temperature=temperature,
         device=DEFAULT_DEVICE,
+        search_backend=search_backend,
     )
 
     session = game_manager.create_session(
         human_player=human_player,
         ai_agent=ai_agent,
         using_random_agent=using_random_agent,
+        ai_metadata=ai_metadata,
     )
+    _sync_agent(session.ai_agent, session.state)
 
     ai_moves = _maybe_run_ai_turn(session)
     return _prepare_payload(session, ai_moves=ai_moves or None)
@@ -282,7 +339,7 @@ def submit_human_move(game_id: str, request: MoveRequest):
 
     canonical_move = legal_map[key]
     session.state = apply_move(session.state, canonical_move, quiet=True)
-    _reset_agent(session.ai_agent)
+    _sync_agent(session.ai_agent, session.state)
 
     return _prepare_payload(session)
 

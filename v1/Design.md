@@ -2,6 +2,80 @@
 Date: 2026-02-16  
 Scope: Design for migrating v0 CPU-bottleneck self-play to a GPU-first v1 pipeline.
 
+## Addendum (2026-07-24): Portable MPS Policy-Quality Phase
+
+### Problem and invariants
+
+The 8-simulation portable run exposed a supervision bottleneck rather than an action-space incompatibility. A typical state had about 12.5 legal actions, but visit-only targets gave positive probability to only about 4.2 and late temperature 0.1 made roughly 36–40% of all targets one-hot. This does not mean MCTS must visit all 220 global action slots: only legal actions for the current atomic phase belong in a target. It does mean an unvisited legal action should not automatically be trained as an exact negative when the search budget is only 8 or 16.
+
+The change is additive and keeps all cross-layer contracts:
+
+- the payload remains a dense 220-dimensional policy plus the existing state/legal/value tensors;
+- illegal actions remain zero and legal masks/action indices are unchanged;
+- rules, atomic phases, terminal outcomes and replay/checkpoint formats are unchanged;
+- values are backed up in node side-to-move perspective and flip only when the player changes;
+- existing staged self-play, train bridge, replay window and 55% incumbent gate remain the only production pipeline.
+
+### Selection policy versus training target
+
+`PortableMCTSConfig` now has two opt-in fields:
+
+- `policy_target_temperature: Optional[float] = None`;
+- `policy_target_prior_pseudocount: float = 0.0`.
+
+The actual move continues to use the ordinary selection temperature. The training target uses its own temperature when configured and is proportional to:
+
+`target(a) = temperature_transform(N(a) + beta * P(a))`
+
+over legal root actions. `P` is the normalized legal root prior after the configured root Dirichlet noise. With `beta=1`, even legal actions not visited by a 16-simulation search retain a small model-prior probability. With `beta=0` and no target temperature, the old visit-only target is preserved. Python and C++ both call the same target-construction helper after producing the same root visits/priors; the actual sampled/argmax move is always taken from the separate selection policy.
+
+Portable self-play now persists a target audit containing legal count, positive support, visit support, entropy, `exp(entropy)` effective support, unvisited prior mass, one-hot count and ply buckets `0–9`, `10–29`, `30+`. These fields are additive metadata and do not change readers of existing payload tensors.
+
+### Run fork and optimizer continuity
+
+`scripts/long_train_portable_mps.py --fork-from-run <parent>` accepts only a stopped, locked-free parent whose committed iteration is a positive multiple of 10 and whose periodic evaluation completed at that same iteration. It verifies the current model and optimizer against `state.json`, copies the last configured replay window plus chunk files, copies incumbent/best metadata, saves a phase-start model anchor and emits `run_forked` with the configuration delta.
+
+The fork derives its initial LR from the saved optimizer and its opening-random start from the latest replay metadata. It retains the parent deadline. An elapsed parent deadline is a hard error; extending wall-clock budget requires new authorization rather than an implicit `--hours` reset. Phase-2 opening randomization uses:
+
+`curriculum_progress = min(1, elapsed_fraction / opening_random_anneal_fraction)`
+
+so `--opening-random-anneal-fraction 0.25` reaches zero after the first quarter of the remaining phase time without a discontinuity at the fork.
+
+Optimizer resume had a separate correctness bug: loaded param groups retained an old `initial_lr`, and `LambdaLR` reset the requested continued LR to the old `3e-4` base. Most phase-1 iterations therefore did not use the lower LR printed in orchestration commands; this is a plausible plateau contributor and those printed labels must not be treated as effective-LR evidence. Both tensor and streaming bridges now set `lr` and `initial_lr` before scheduler construction. Train metrics expose `optimizer_lr_start/final`; the orchestrator requires both and checks the LR saved in `optimizer.pt`. The corrected path was used for the clean 857–860 completion, whose optimizer ends at the audited `0.000196904486436`.
+
+New incumbent promotions copy the candidate model and its paired optimizer to `best_model.pt` and `best_optimizer.pt`. Historical incumbents that predate optimizer retention are explicitly marked unavailable rather than paired with the wrong optimizer.
+
+### Gameplay search
+
+`v1.python.portable_gameplay_agent.PortableGameplayAgent` supplies persistent Python or C++ portable search for FastAPI/Web play. Production defaults are C++, no Dirichlet noise, temperature 0 and 1024 simulations. The backend synchronizes the tree after a human move, then preserves the subtree across consecutive AI-owned atomic phases. It reports resolved checkpoint path/SHA, device, backend, threads, simulations, temperature, search elapsed time and root top-10 `P/N/Q`. A requested portable extension or checkpoint failure is an HTTP error; no Legacy/Random fallback occurs.
+
+Legacy `src/mcts.py` is retained for diagnostics, but its backup and PUCT Q conversion now use the same player-change rule. This fixes the prior unconditional per-edge sign flip without making Legacy the production gameplay recommendation.
+
+### Fresh acceptance evidence
+
+- Focused regression suite: 64 passed across portable Python/C++ target parity, move-selection independence, current-player backup, long-run fork/retention and backend cache/tree behavior.
+- Real MPS staged smoke: 4 games/378 positions and 20 games/1,777 positions at 16 simulations, target temperature 1 and beta 1; both had every legal action positive, no invalid action/fallback/non-finite value, and the 20-game payload trained through the existing bridge with replay and optimizer restore.
+- Production-shape comparison, same checkpoint SHA `4cbab2cd...dec9d`, seed, 128 games/concurrency 128, opening 3, full 512 plies, one C++ thread, three repeats:
+  - old 8-sim: median `523.24 positions/s`, `23.27s`, support `4.13/12.47`, entropy `0.135`, one-hot `37.18%`;
+  - new 16-sim: median `290.82 positions/s`, `41.08s`, support `12.34/12.34`, entropy `0.671`, one-hot `4.06%`;
+  - self-play elapsed ratio `1.765x`; with unchanged recent training median `36.22s`, complete-iteration ratio `1.299x`, below the `1.5x` ceiling;
+  - all six measurements: fallback 0, illegal actions 0, non-finite values 0.
+- Deterministic 16-sim 32x32/32-ply thread and backend sweep:
+  - Python `88.62 positions/s`;
+  - C++ 1/2/4/8 threads `210.05/196.27/209.92/216.79 positions/s` (`2.37x/2.21x/2.37x/2.45x`);
+  - all 15 measured payload fingerprints matched; every audit counter was zero.
+- A real retained-incumbent MPS gameplay probe completed one 1024-simulation portable C++ move in `8.626s`, returned root `P/N/Q`, and reported zero fallback/illegal/non-finite values. A real Uvicorn `POST /api/new-game` using MPS/portable C++ also returned HTTP 200 with the expected incumbent SHA and search audit.
+
+The small diagnostic favors eight threads by about 3%, but the production 128x128 measurements still favor one worker/one C++ thread because MPS inference dominates. Phase 2 therefore keeps one thread. Artifacts are under ignored `tmp/v1_portable_cpp_quality_validation/`.
+
+### Boundary result and remaining strength acceptance
+
+Phase 1 stopped cleanly at iteration 860 after training and both 500-game evaluations. The candidate scored `139-145-216` (`0.494`) and was not promoted. The boundary current/optimizer hashes are `4cbab2cd...dec9d` and `95adc9c6...c3b4`; saved optimizer LR is `0.000196904486436`. The source deadline `2026-07-24 09:43:57 UTC+8` elapsed before the phase-2 fork could start, so no new run was launched and no deadline was extended.
+
+During development, one staged child loaded the updated Python wrapper before the C++ extension rebuild and failed on the new root-output fields. A later recovery attempt correctly refused to commit because the new optimizer-LR metrics were not yet present in the merged stage report. In both cases the orchestrator retained/restored the last committed iteration-856 model/optimizer pair; after rebuilding and fixing metric propagation, iterations 857–860 completed normally. The stderr history is intentionally retained in `logs/portable_cpp_mps_20h.err.log`; it is not part of the clean final-boundary health claim.
+
+After a newly authorized deadline, phase 2 is intended to use 16 simulations, policy-target temperature 1, beta 1 and opening anneal fraction 0.25 while retaining 128 games/concurrency, one worker/thread, replay 4, batch 256, 3 epochs, 10-iteration retention/evaluation and the 8-simulation incumbent gate. Network improvement may be claimed only after an actual promotion. Final strength requires a preregistered 500-game 64-simulation match against the phase-start anchor at temperature 0 and an independent 500-game confirmation if score is at least 55%. A 64-game 1024-simulation screen and human play remain diagnostics, not substitutes.
+
 ## Addendum (2026-07-22): Apple M5 Resumable 20-Hour Portable Run
 
 ### Frozen local configuration

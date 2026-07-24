@@ -19,6 +19,7 @@ from scripts.long_train_portable_mps import (
     build_parser,
     candidate_beats_incumbent,
     cosine_schedule,
+    curriculum_progress,
     linear_int_schedule,
     random_result_rank,
     run_command,
@@ -36,6 +37,10 @@ def test_curriculum_schedules_are_bounded() -> None:
     assert linear_int_schedule(6, 0, 0.0) == 6
     assert linear_int_schedule(6, 0, 0.5) == 3
     assert linear_int_schedule(6, 0, 1.0) == 0
+    assert curriculum_progress(0.0, 0.25) == 0.0
+    assert curriculum_progress(0.125, 0.25) == pytest.approx(0.5)
+    assert curriculum_progress(0.25, 0.25) == 1.0
+    assert curriculum_progress(1.0, 0.25) == 1.0
 
 
 def test_m5_long_run_defaults_are_frozen() -> None:
@@ -46,6 +51,9 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert args.portable_mcts_backend == "python"
     assert args.portable_cpp_threads == 1
     assert args.checkpoint_retain_every == 10
+    assert args.policy_target_temperature is None
+    assert args.policy_target_prior_pseudocount == 0.0
+    assert args.opening_random_anneal_fraction == 1.0
     assert args.initial_iteration == 0
     assert (args.batch_size, args.epochs, args.replay_window) == (256, 3, 4)
     assert (args.eval_games_random, args.eval_games_best) == (500, 500)
@@ -180,6 +188,153 @@ def test_iteration_checkpoint_retention_is_periodic() -> None:
     assert not trainer._should_retain_iteration_checkpoint(9)
     assert trainer._should_retain_iteration_checkpoint(10)
     assert trainer._should_retain_iteration_checkpoint(20)
+
+
+def test_fork_run_preserves_deadline_optimizer_replay_and_incumbent(tmp_path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "phase2"
+    (source / "checkpoints").mkdir(parents=True)
+    (source / "replay").mkdir()
+    current = source / "checkpoints" / "current.pt"
+    optimizer = source / "checkpoints" / "optimizer.pt"
+    best = source / "checkpoints" / "best_model.pt"
+    best_random = source / "checkpoints" / "best_vs_random.pt"
+    current.write_bytes(b"current-model")
+    best.write_bytes(b"incumbent-model")
+    best_random.write_bytes(b"random-model")
+    torch_optimizer = {
+        "state": {},
+        "param_groups": [{"params": [], "lr": 1.8e-4, "initial_lr": 1.8e-4}],
+    }
+    import torch
+
+    torch.save(torch_optimizer, optimizer)
+    for iteration in range(847, 851):
+        replay = source / "replay" / f"selfplay_iter_{iteration:06d}.pt"
+        torch.save(
+            {
+                "metadata": {
+                    "self_play_opening_random_moves": 3,
+                }
+            },
+            replay,
+        )
+        (source / "replay" / f"selfplay_iter_{iteration:06d}.w00.chunk00000.pt").write_bytes(
+            f"chunk-{iteration}".encode()
+        )
+    deadline = int(time.time()) + 3600
+    source_state = {
+        "schema_version": 1,
+        "start_epoch": int(time.time()) - 3600,
+        "deadline_epoch": deadline,
+        "iteration": 850,
+        "last_eval_iteration": 850,
+        "stop_reason": "max_iterations",
+        "latest_checkpoint_sha256": sha256_file(current),
+        "latest_optimizer_sha256": sha256_file(optimizer),
+        "best_iteration": 600,
+        "best_sha256": sha256_file(best),
+        "best_random_iteration": 840,
+        "best_random_sha256": sha256_file(best_random),
+        "best_random_rank": [450, 0],
+        "best_random_result": {"wins": 450, "losses": 0, "draws": 50},
+        "target_reached": False,
+        "config": _config_signature(build_parser().parse_args([])),
+    }
+    (source / "state.json").write_text(
+        json.dumps(source_state),
+        encoding="utf-8",
+    )
+    (source / "run.lock").touch()
+
+    args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(destination),
+            "--fork-from-run",
+            str(source),
+            "--device",
+            "cpu",
+            "--no-require-ac",
+            "--mcts-simulations",
+            "16",
+            "--policy-target-temperature",
+            "1.0",
+            "--policy-target-prior-pseudocount",
+            "1.0",
+            "--opening-random-anneal-fraction",
+            "0.25",
+        ]
+    )
+    trainer = PortableLongTrainer(args)
+    trainer.initialize()
+
+    assert args.initial_iteration == 850
+    assert args.lr_start == pytest.approx(1.8e-4)
+    assert args.opening_random_start == 3
+    assert trainer.state["deadline_epoch"] == deadline
+    assert trainer.state["iteration"] == 850
+    assert trainer.state["fork"]["parent_iteration"] == 850
+    assert trainer.state["fork"]["parent_checkpoint_sha256"] == sha256_file(current)
+    assert trainer.state["best_iteration"] == 600
+    assert trainer.current_checkpoint.read_bytes() == b"current-model"
+    assert trainer.best_checkpoint.read_bytes() == b"incumbent-model"
+    assert (trainer.checkpoint_dir / "phase_start_model.pt").read_bytes() == b"current-model"
+    assert len(trainer._replay_files()) == 4
+    assert len(list(trainer.replay_dir.glob("*.chunk*.pt"))) == 4
+
+
+def test_fork_refuses_elapsed_parent_deadline(tmp_path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "phase2"
+    source.mkdir()
+    (source / "run.lock").touch()
+    (source / "state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "iteration": 850,
+                "last_eval_iteration": 850,
+                "deadline_epoch": int(time.time()) - 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(destination),
+            "--fork-from-run",
+            str(source),
+            "--device",
+            "cpu",
+            "--no-require-ac",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="deadline has already elapsed"):
+        PortableLongTrainer(args).initialize()
+
+
+def test_best_promotion_saves_matching_optimizer(tmp_path) -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.current_checkpoint = tmp_path / "current.pt"
+    trainer.optimizer_checkpoint = tmp_path / "optimizer.pt"
+    trainer.best_checkpoint = tmp_path / "best_model.pt"
+    trainer.best_optimizer_checkpoint = tmp_path / "best_optimizer.pt"
+    trainer.current_checkpoint.write_bytes(b"candidate")
+    trainer.optimizer_checkpoint.write_bytes(b"candidate-optimizer")
+    trainer.state = {}
+
+    trainer._promote_best_pair(iteration=12)
+
+    assert trainer.best_checkpoint.read_bytes() == b"candidate"
+    assert trainer.best_optimizer_checkpoint.read_bytes() == b"candidate-optimizer"
+    assert trainer.state["best_iteration"] == 12
+    assert trainer.state["best_sha256"] == sha256_file(trainer.best_checkpoint)
+    assert trainer.state["best_optimizer_sha256"] == sha256_file(
+        trainer.best_optimizer_checkpoint
+    )
 
 
 def test_nonzero_initial_iteration_requires_initial_checkpoint(tmp_path) -> None:

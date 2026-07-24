@@ -1,5 +1,34 @@
 # MEMORY
 
+## Current Conclusions (2026-07-24): Portable MPS Quality Phase 2
+
+### 1) Phase-1 boundary and current blocker
+
+- The C++/MPS continuation stopped cleanly at outer iteration 860, the next requested multiple-of-10 boundary. Self-play, training and both 500-game periodic evaluations completed before the commit. The candidate scored `139-145-216` against the incumbent (`0.494` score), so the unchanged `0.55` gate correctly retained the incumbent. The retained RandomAgent-best then scored `500-0-0` in the final probe.
+- Boundary artifacts are `tmp/v1_portable_cpp_long_20h_20260723/checkpoints/current.pt` (SHA-256 `4cbab2cd3148e7d3c1a11cd3617e55a9f9e9e85b03b49ac3e768b1e751ddec9d`) and its paired optimizer (SHA-256 `95adc9c69eb3f3f971ce4934feeb3700c3f71f29e5f0f4608aac44e3284ec3b4`). The optimizer's saved `lr` and `initial_lr` both equal the orchestrated boundary LR `0.000196904486436`.
+- The source run's fixed deadline was `2026-07-24 09:43:57 UTC+8`. It elapsed before the phase-2 fork could be started. The fork implementation deliberately refuses an elapsed parent deadline, so `tmp/v1_portable_cpp_quality_phase2_20260723` was not started and the deadline was not silently extended. A new deadline requires explicit user authorization.
+- The source run did promote at iterations 490, 600 and 830. Therefore the final current diagnosis is three consecutive 10-iteration gates without promotion after iteration 830, not the earlier planning-time estimate of about 20 gates.
+
+### 2) Target-quality change
+
+- Portable MCTS now separates move selection from training supervision. Move selection remains temperature `1.0 -> 0.1` after ply 10. Phase 2 opts into a fixed policy-target temperature of `1.0` and target weights proportional to `N + beta*P` with `beta=1.0`, where `P` is the legal root prior after root noise. Omitting the target temperature and leaving `beta=0` preserves the old visit-only behavior.
+- No payload dimensions or consumers changed: policy remains dense 220-dimensional, illegal actions stay exactly zero, and the existing staged train bridge, replay, checkpoint and evaluation paths consume it unchanged.
+- Per-run audit now records legal support, positive target support, visit support, entropy, effective support, unvisited prior mass, one-hot ratio and ply buckets. In the controlled 128-game MPS comparison, old 8-sim medians were positive support `4.13/12.47`, entropy `0.135`, effective support `1.55` and one-hot `37.18%`; new 16-sim targets were `12.34/12.34`, `0.671`, `3.05` and `4.06%`. Remaining one-hot cases are forced positions with one legal action.
+
+### 3) Performance and recommended local configuration
+
+- Same checkpoint, seed, 128 games/concurrency 128, opening 3, full 512-ply limit and three repeats: old 8-sim C++ self-play median was `523.24 positions/s` in `23.27s`; new 16-sim was `290.82 positions/s` in `41.08s`. Self-play cost was `1.765x`, but with the unchanged last-four training median of `36.22s`, estimated complete-iteration cost was `1.299x`, below the predeclared `1.5x` ceiling. All six runs had zero fallback, illegal actions and non-finite values.
+- A separate deterministic 16-sim, 32-game/concurrency-32, 32-ply thread sweep produced Python `88.62 positions/s` and C++ 1/2/4/8-thread medians `210.05/196.27/209.92/216.79`, or `2.37x/2.21x/2.37x/2.45x`. Tensor fingerprints matched across every case and all audits were zero. GPU-utilization medians were `46%` for Python and `56/53/57/56%` for C++; process CPU medians were `78.2%` and `59.2/57.0/61.7/67.9%`.
+- Eight threads win only the small 32x32 diagnostic by about 3%. The production 128x128 evidence still favors one C++ thread because MPS inference dominates and extra fine-grained threads add overhead. Phase 2 therefore keeps one worker and one C++ thread.
+- Validation artifacts are ignored under `tmp/v1_portable_cpp_quality_validation/`, especially `benchmark/quality_8_vs_16_summary.json`, `thread_sweep_16sim.json`, and the real-MPS 4/20-game smoke directories.
+
+### 4) Recovery, gameplay and strength protocol
+
+- The long-run orchestrator can fork only a stopped, fully evaluated, positive multiple-of-10 boundary. It verifies paired model/optimizer SHA values, copies the latest replay window and incumbent metadata, derives LR from the saved optimizer, continues opening randomization from replay metadata, preserves the parent deadline and emits `run_forked`. New promotions save `best_model.pt` and the matching `best_optimizer.pt`; a missing historical incumbent optimizer remains explicitly marked unavailable.
+- A discovered resume bug was fixed in both train-bridge modes: after loading optimizer state, both `lr` and `initial_lr` are set before constructing `LambdaLR`. Otherwise PyTorch restored `initial_lr=3e-4` and reset the intended continued LR. Most of phase 1 therefore trained at the old base LR despite lower LR values printed by the orchestrator; this is a plausible contributor to the plateau and means those log labels were not evidence of effective LR. The corrected path was live for the clean 857–860 completion, and the boundary optimizer now carries the audited `0.000196904486436`. Metrics and the orchestrator now audit requested, effective and saved optimizer LR.
+- Web gameplay defaults to the retained `best_model.pt`, portable C++ search, no root noise, temperature 0 and 1024 simulations. The portable agent preserves the subtree across same-player atomic phases, reports checkpoint SHA/device/backend/search time/root P-N-Q, and refuses extension/device/model failures instead of silently falling back. Legacy MCTS now also flips value only when the side to move changes and converts child Q to the parent perspective.
+- Network-quality promotion remains the existing 8-sim, 500-game, sampled 55% incumbent gate. After an authorized phase-2 run ends, the final current checkpoint must play the phase-start anchor for 500 games at 64 simulations/temperature 0 with exact color balance; an observed score of at least 55% requires an independent 500-game seed confirmation. A 64-game 1024-sim screen and Web play are diagnostic only.
+
 ## Current Conclusions (2026-07-23): Threaded C++ Portable MPS 20-Hour Continuation
 
 ### 1) Active Run and Recovery Anchors

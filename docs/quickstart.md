@@ -87,9 +87,24 @@ python scripts/eval_checkpoint.py \
 
 #### Apple M5 约 20 小时可恢复长训
 
-本机冻结配置由 `scripts/long_train_portable_mps.py` 管理：self-play 为 128 games/concurrency 128，训练为 batch 256、3 epochs、replay window 4，搜索为 8 simulations；每 10 个外层 iteration 分别进行 500 局 RandomAgent 评估和 500 局 candidate-versus-incumbent 自评估，评估 concurrency 为 64。`current.pt` 和 `optimizer.pt` 每轮原子更新以支持精确恢复，不可变 `model_iter_*` 权重只保留初始锚点和每 10 个外层 iteration 的快照；评估 seed、250/250 黑白分配、逐颜色 W/L/D、模型/optimizer SHA 和 replay 输入都会落盘。
+本机第一阶段冻结配置由 `scripts/long_train_portable_mps.py` 管理：self-play 为 128 games/concurrency 128，训练为 batch 256、3 epochs、replay window 4，搜索为 8 simulations；每 10 个外层 iteration 分别进行 500 局 RandomAgent 评估和 500 局 candidate-versus-incumbent 自评估，评估 concurrency 为 64。`current.pt` 和 `optimizer.pt` 每轮原子更新以支持精确恢复，不可变 `model_iter_*` 权重只保留初始锚点和每 10 个外层 iteration 的快照；评估 seed、250/250 黑白分配、逐颜色 W/L/D、模型/optimizer SHA 和 replay 输入都会落盘。晋级时还会配对保存 `best_model.pt` 和 `best_optimizer.pt`；旧 run 没有 incumbent optimizer 时会明确记录 unavailable。
 
-8/16/32/64 simulations 的本机同条件测试显示 self-play 墙钟成本约为 `1.00x/2.07x/3.88x/6.93x`。同 seed 500 局 RandomAgent 对照中，64 simulations 相对 8 simulations 仅从 `433/500` 提高到 `449/500`，却耗时 `6.91x`，且高 simulations 自博弈明显更偏和棋。因此 20 小时默认仍为 8 simulations；不要依据 100 局小样本中偶然出现的 `98%` 改成 64。
+8/16/32/64 simulations 的早期同条件测试显示 self-play 墙钟成本约为 `1.00x/2.07x/3.88x/6.93x`。同 seed 500 局 RandomAgent 对照中，64 simulations 相对 8 simulations 仅从 `433/500` 提高到 `449/500`，却耗时 `6.91x`，且高 simulations 自博弈明显更偏和棋。因此第一阶段保留 8 simulations，不依据 100 局小样本中偶然出现的 `98%` 改成 64。
+
+低模拟量的 policy target 可以单独改善，不必改变选步温度。portable 路径支持：
+
+```bash
+--mcts-simulations 16 \
+--temperature-init 1.0 \
+--temperature-final 0.1 \
+--temperature-threshold 10 \
+--policy-target-temperature 1.0 \
+--policy-target-prior-pseudocount 1.0
+```
+
+实际选步仍按 `1.0 -> 0.1`；训练 target 固定温度 1，并按合法根动作的 `N + beta*P` 构造。省略 `--policy-target-temperature` 且保留默认 `beta=0` 时与旧 visit target 兼容。self-play JSON 会额外审计合法/正 target/访问支持数、熵、有效支持度、未访问先验质量、one-hot 比例及分 ply 数据。
+
+2026-07-24 的生产形状复测固定同 checkpoint、seed、128 games/concurrency 128、opening 3、完整 512 plies 和一个 C++ 线程，三次中位数为：旧 8-sim `523.24 positions/s`、`23.27s`；新 16-sim `290.82 positions/s`、`41.08s`。结合近期不变的 `36.22s` 训练中位数，完整 iteration 预计为旧配置的 `1.299x`。target 正支持从 `4.13/12.47` 提升到 `12.34/12.34`，熵从 `0.135` 提升到 `0.671`，one-hot 从 `37.18%` 降到 `4.06%`；所有六次运行的 fallback、非法动作和非有限值均为 0。
 
 合盖运行前必须接交流电、外接显示器和外接键盘/鼠标。`caffeinate` 只保证其子进程存活期间抑制 idle/system/disk sleep，不能代替 Apple silicon 的合盖硬件条件；命令中的 `--require-external-display` 会在没有外接显示器时直接失败。
 
@@ -111,6 +126,34 @@ mkdir -p logs && nohup zsh scripts/run_long_train_mps.sh \
 ```
 
 `--resume` 对新目录和已有目录都可用；已有目录会核对冻结配置、外层 iteration、current checkpoint、optimizer 和 commit SHA 后续跑。运行状态位于 `tmp/v1_portable_long_20h/state.json`，最终摘要位于 `final_summary.json`，`best_model.pt` 和 `best_vs_random.pt` 位于其 `checkpoints/` 子目录。
+
+质量阶段可从已停止且完成周期评测的 10-iteration 边界分叉：
+
+```bash
+zsh scripts/run_long_train_mps.sh \
+  --run-dir tmp/v1_portable_cpp_quality_phase2_20260723 \
+  --fork-from-run tmp/v1_portable_cpp_long_20h_20260723 \
+  --hours 20 \
+  --device mps \
+  --self-play-games 128 --self-play-concurrency 128 \
+  --portable-self-play-workers 1 \
+  --portable-mcts-backend cpp --portable-cpp-threads 1 \
+  --mcts-simulations 16 \
+  --policy-target-temperature 1.0 \
+  --policy-target-prior-pseudocount 1.0 \
+  --opening-random-final 0 \
+  --opening-random-anneal-fraction 0.25 \
+  --replay-window 4 --batch-size 256 --epochs 3 \
+  --lr-final 0.00005 \
+  --checkpoint-retain-every 10 \
+  --eval-every 10 --eval-games-random 500 --eval-games-best 500 \
+  --eval-simulations 8 --incumbent-promotion-score 0.55 \
+  --quality-strength-eval
+```
+
+fork 会从保存的 optimizer 推导起始 LR，从最新 replay 推导 opening-random 起点，复制最近 replay window 和 incumbent metadata，并继承父 run 的 deadline；`--hours` 不会重置该 deadline。父 deadline 已过时会直接报错。当前 iteration-860 父 run 的 deadline `2026-07-24 09:43:57 UTC+8` 已过，因此上述 phase2 尚未启动；不得为了启动而擅自延长。
+
+恢复 optimizer 后必须同时覆盖 param group 的 `lr` 和 `initial_lr`，再构造 `LambdaLR`。旧实现只覆盖 `lr`，会被保存的 `initial_lr=3e-4` 重置；现在 train metrics 会写 `optimizer_lr_start/final`，长训编排还会读取保存后的 optimizer 再核对一次。phase-1 的大部分历史 LR 日志仅表示请求值，不表示实际生效值；iteration 857–860 和其后的新 run 才具有这项完整审计。
 
 跨终端或 Codex 断联运行时，优先把同一命令注册为 `RunAtLoad=true`、`KeepAlive=false` 的一次性用户 LaunchAgent，并在交付前核对任务进程、日志、`state.json` 和 `pmset -g assertions` 中的 `caffeinate` 断言；直接 `nohup` 只适合当前 shell 生命周期可靠的环境。
 
