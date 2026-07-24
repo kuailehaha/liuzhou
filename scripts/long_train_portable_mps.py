@@ -65,6 +65,13 @@ def linear_int_schedule(start: int, final: int, progress: float) -> int:
     return max(0, int(round(float(start) + (float(final) - float(start)) * p)))
 
 
+def curriculum_progress(progress: float, anneal_fraction: float) -> float:
+    fraction = float(anneal_fraction)
+    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+        raise ValueError("anneal_fraction must be finite and in (0, 1].")
+    return _clamp_progress(float(progress) / fraction)
+
+
 def wilson_interval(wins: int, total: int, z: float = 1.959963984540054) -> Tuple[float, float]:
     n = int(total)
     if n <= 0:
@@ -158,6 +165,34 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def optimizer_learning_rate(path: Path) -> float:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"optimizer state is not a mapping: {path}")
+    groups = payload.get("param_groups")
+    if not isinstance(groups, list) or not groups or not isinstance(groups[0], dict):
+        raise RuntimeError(f"optimizer state has no param_groups: {path}")
+    value = groups[0].get("lr")
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise RuntimeError(f"optimizer state has invalid learning rate {value!r}: {path}")
+    return float(value)
+
+
+def replay_opening_random_moves(path: Path) -> int:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"self-play payload is not a mapping: {path}")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"self-play payload has no metadata: {path}")
+    value = metadata.get("self_play_opening_random_moves")
+    if not isinstance(value, (int, float)):
+        raise RuntimeError(
+            f"self-play payload has no opening-random audit: {path}"
+        )
+    return max(0, int(value))
+
+
 def audit_train_metrics(path: Path, *, require_optimizer_loaded: bool) -> Dict[str, Any]:
     payload = _load_json(path)
     if isinstance(payload, list) and payload:
@@ -210,6 +245,22 @@ def audit_selfplay_stats(path: Path, *, expected_games: int) -> Dict[str, Any]:
         summary = row.get(summary_key)
         if isinstance(summary, dict) and int(summary.get("nonfinite_count", 0) or 0) != 0:
             raise RuntimeError(f"non-finite {summary_key} in {path}")
+    policy_audit = row.get("policy_target_audit")
+    if isinstance(policy_audit, dict):
+        for key in (
+            "mean_legal_actions",
+            "mean_positive_support",
+            "mean_visit_support",
+            "mean_entropy",
+            "mean_effective_support",
+            "mean_unvisited_prior_mass",
+            "one_hot_ratio",
+        ):
+            value = policy_audit.get(key, 0.0)
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise RuntimeError(
+                    f"non-finite policy target audit {key}={value!r}: {path}"
+                )
     return row
 
 
@@ -368,6 +419,10 @@ def _preflight(args: argparse.Namespace) -> None:
         value = int(getattr(args, name))
         if value <= 0 or value % 2 != 0:
             raise ValueError(f"--{name.replace('_', '-')} must be a positive even number.")
+    for name in ("strength_eval_games", "strength_screen_games"):
+        value = int(getattr(args, name))
+        if value <= 0 or value % 2 != 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be a positive even number.")
     if int(args.eval_every) <= 0:
         raise ValueError("--eval-every must be positive.")
     if int(args.batch_size) <= 0 or int(args.epochs) <= 0:
@@ -378,6 +433,24 @@ def _preflight(args: argparse.Namespace) -> None:
         raise ValueError("--checkpoint-retain-every must be positive.")
     if int(args.replay_window) < 0:
         raise ValueError("--replay-window cannot be negative.")
+    curriculum_progress(0.0, float(args.opening_random_anneal_fraction))
+    if (
+        args.policy_target_temperature is not None
+        and (
+            not math.isfinite(float(args.policy_target_temperature))
+            or float(args.policy_target_temperature) < 0.0
+        )
+    ):
+        raise ValueError(
+            "--policy-target-temperature must be finite and non-negative."
+        )
+    if (
+        not math.isfinite(float(args.policy_target_prior_pseudocount))
+        or float(args.policy_target_prior_pseudocount) < 0.0
+    ):
+        raise ValueError(
+            "--policy-target-prior-pseudocount must be finite and non-negative."
+        )
     if not 0.0 < float(args.target_win_rate) <= 1.0:
         raise ValueError("--target-win-rate must be in (0, 1].")
     if not 0.5 < float(args.incumbent_promotion_score) <= 1.0:
@@ -398,8 +471,11 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "temperature_init",
         "temperature_final",
         "temperature_threshold",
+        "policy_target_temperature",
+        "policy_target_prior_pseudocount",
         "opening_random_start",
         "opening_random_final",
+        "opening_random_anneal_fraction",
         "max_game_plies",
         "soft_label_alpha",
         "policy_draw_weight",
@@ -417,6 +493,11 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "eval_concurrency",
         "incumbent_promotion_score",
         "target_win_rate",
+        "quality_strength_eval",
+        "strength_eval_games",
+        "strength_eval_simulations",
+        "strength_screen_games",
+        "strength_screen_simulations",
         "seed",
     )
     return {key: getattr(args, key) for key in keys}
@@ -447,13 +528,465 @@ class PortableLongTrainer:
         self.summary_path = self.run_dir / "final_summary.json"
         self.current_checkpoint = self.checkpoint_dir / "current.pt"
         self.best_checkpoint = self.checkpoint_dir / "best_model.pt"
+        self.best_optimizer_checkpoint = self.checkpoint_dir / "best_optimizer.pt"
         self.best_random_checkpoint = self.checkpoint_dir / "best_vs_random.pt"
+        self.phase_start_checkpoint = self.checkpoint_dir / "phase_start_model.pt"
         self.optimizer_checkpoint = self.checkpoint_dir / "optimizer.pt"
         self.optimizer_work = self.checkpoint_dir / "optimizer_work.pt"
         self.candidate_checkpoint = self.checkpoint_dir / "candidate.pt"
         self.rollback_current = self.checkpoint_dir / ".rollback_current.pt"
         self.rollback_optimizer = self.checkpoint_dir / ".rollback_optimizer.pt"
+        self.best_pair_transaction = (
+            self.checkpoint_dir / ".best_pair_transaction.json"
+        )
+        self.best_model_next = self.checkpoint_dir / ".best_model.next.pt"
+        self.best_optimizer_next = (
+            self.checkpoint_dir / ".best_optimizer.next.pt"
+        )
+        self.rollback_best_model = (
+            self.checkpoint_dir / ".rollback_best_model.pt"
+        )
+        self.rollback_best_optimizer = (
+            self.checkpoint_dir / ".rollback_best_optimizer.pt"
+        )
         self.state: Dict[str, Any] = {}
+
+    @staticmethod
+    def _assert_run_unlocked(run_dir: Path) -> None:
+        lock_path = run_dir / "run.lock"
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(
+                    f"cannot fork an active source run: {run_dir}"
+                ) from exc
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _prepare_fork(self) -> Optional[Dict[str, Any]]:
+        raw_source = str(self.args.fork_from_run or "").strip()
+        if not raw_source:
+            return None
+        if bool(self.args.resume):
+            raise ValueError("--fork-from-run cannot be combined with --resume")
+        if self.state_path.exists():
+            raise RuntimeError(
+                f"fork destination already has state: {self.state_path}"
+            )
+        if self.args.initial_checkpoint or self.args.initial_optimizer_state:
+            raise ValueError(
+                "--fork-from-run cannot be combined with explicit initial artifacts"
+            )
+
+        source_dir = _absolute_path(raw_source)
+        if source_dir == self.run_dir:
+            raise ValueError("fork source and destination must differ")
+        self._assert_run_unlocked(source_dir)
+        source_state_path = source_dir / "state.json"
+        source_state = _load_json(source_state_path)
+        if not isinstance(source_state, dict):
+            raise RuntimeError(f"invalid fork source state: {source_state_path}")
+        if int(source_state.get("schema_version", 0)) != STATE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported fork source schema: {source_state.get('schema_version')}"
+            )
+        parent_iteration = int(source_state.get("iteration", 0) or 0)
+        if parent_iteration <= 0 or parent_iteration % 10 != 0:
+            raise RuntimeError(
+                "fork source must be committed at a positive 10-iteration boundary: "
+                f"iteration={parent_iteration}"
+            )
+        if int(source_state.get("last_eval_iteration", -1) or -1) != parent_iteration:
+            raise RuntimeError(
+                "fork source boundary evaluation is incomplete: "
+                f"iteration={parent_iteration} "
+                f"last_eval_iteration={source_state.get('last_eval_iteration')}"
+            )
+        if int(time.time()) >= int(source_state.get("deadline_epoch", 0) or 0):
+            raise RuntimeError("fork source deadline has already elapsed")
+
+        source_checkpoint_dir = source_dir / "checkpoints"
+        source_current = source_checkpoint_dir / "current.pt"
+        source_optimizer = source_checkpoint_dir / "optimizer.pt"
+        for path in (source_current, source_optimizer):
+            if not path.is_file():
+                raise RuntimeError(f"fork source artifact is missing: {path}")
+        current_sha = sha256_file(source_current)
+        optimizer_sha = sha256_file(source_optimizer)
+        if current_sha != str(source_state.get("latest_checkpoint_sha256")):
+            raise RuntimeError("fork source current checkpoint SHA does not match state")
+        if optimizer_sha != str(source_state.get("latest_optimizer_sha256")):
+            raise RuntimeError("fork source optimizer SHA does not match state")
+
+        replay_dir = source_dir / "replay"
+        replay_files = sorted(
+            path
+            for path in replay_dir.glob("selfplay_iter_*.pt")
+            if re.fullmatch(r"selfplay_iter_\d{6}\.pt", path.name)
+        )
+        replay_count = max(0, int(self.args.replay_window))
+        selected_replay = replay_files[-replay_count:] if replay_count > 0 else []
+        if replay_count > 0 and len(selected_replay) != replay_count:
+            raise RuntimeError(
+                f"fork source has {len(selected_replay)} replay files; "
+                f"expected {replay_count}"
+            )
+
+        self.args.initial_iteration = parent_iteration
+        self.args.lr_start = optimizer_learning_rate(source_optimizer)
+        if selected_replay:
+            self.args.opening_random_start = replay_opening_random_moves(
+                selected_replay[-1]
+            )
+        return {
+            "source_dir": source_dir,
+            "source_state": source_state,
+            "source_current": source_current,
+            "source_optimizer": source_optimizer,
+            "selected_replay": selected_replay,
+            "parent_iteration": parent_iteration,
+            "parent_checkpoint_sha256": current_sha,
+            "parent_optimizer_sha256": optimizer_sha,
+        }
+
+    def _initialize_fork(
+        self,
+        *,
+        signature: Dict[str, Any],
+        fork: Dict[str, Any],
+    ) -> None:
+        source_dir: Path = fork["source_dir"]
+        source_state: Dict[str, Any] = fork["source_state"]
+        start_epoch = int(time.time())
+        deadline_epoch = int(source_state["deadline_epoch"])
+        parent_iteration = int(fork["parent_iteration"])
+
+        atomic_copy(fork["source_current"], self.current_checkpoint)
+        atomic_copy(fork["source_optimizer"], self.optimizer_checkpoint)
+        atomic_copy(fork["source_current"], self.phase_start_checkpoint)
+
+        copied_replay: List[str] = []
+        for source_manifest in fork["selected_replay"]:
+            destination_manifest = self.replay_dir / source_manifest.name
+            atomic_copy(source_manifest, destination_manifest)
+            copied_replay.append(str(destination_manifest))
+            for source_chunk in source_manifest.parent.glob(
+                f"{source_manifest.stem}.w*.chunk*.pt"
+            ):
+                atomic_copy(source_chunk, self.replay_dir / source_chunk.name)
+
+        source_checkpoint_dir = source_dir / "checkpoints"
+        alias_pairs = (
+            ("best_model.pt", self.best_checkpoint),
+            ("best_vs_random.pt", self.best_random_checkpoint),
+            ("best_optimizer.pt", self.best_optimizer_checkpoint),
+        )
+        copied_aliases: Dict[str, Optional[str]] = {}
+        for name, destination in alias_pairs:
+            source = source_checkpoint_dir / name
+            if source.is_file():
+                atomic_copy(source, destination)
+                copied_aliases[name] = sha256_file(destination)
+            else:
+                copied_aliases[name] = None
+
+        inherited_keys = (
+            "last_eval_iteration",
+            "best_random_rank",
+            "best_random_result",
+            "best_random_iteration",
+            "best_random_sha256",
+            "best_iteration",
+            "best_sha256",
+            "best_gate_result",
+            "last_random_result",
+            "last_best_result",
+            "target_reached",
+            "target_confirmed_result",
+            "target_confirmed_iteration",
+        )
+        inherited = {
+            key: source_state[key]
+            for key in inherited_keys
+            if key in source_state
+        }
+        source_config = source_state.get("config")
+        config_diff = {
+            key: {
+                "parent": (
+                    source_config.get(key)
+                    if isinstance(source_config, dict)
+                    else None
+                ),
+                "phase": value,
+            }
+            for key, value in signature.items()
+            if not isinstance(source_config, dict)
+            or source_config.get(key) != value
+        }
+        self.state = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "created_utc": utc_now(),
+            "start_epoch": start_epoch,
+            "deadline_epoch": deadline_epoch,
+            "iteration": parent_iteration,
+            "latest_checkpoint_sha256": sha256_file(self.current_checkpoint),
+            "latest_optimizer_sha256": sha256_file(self.optimizer_checkpoint),
+            "latest_iteration_checkpoint": None,
+            "latest_iteration_checkpoint_sha256": None,
+            "stop_reason": None,
+            "config": signature,
+            "git": _git_metadata(),
+            "environment": {
+                "python": sys.version.split()[0],
+                "torch": torch.__version__,
+                "platform": platform.platform(),
+                "device": str(self.args.device),
+            },
+            "fork": {
+                "parent_run": str(source_dir),
+                "parent_iteration": parent_iteration,
+                "parent_checkpoint_sha256": fork["parent_checkpoint_sha256"],
+                "parent_optimizer_sha256": fork["parent_optimizer_sha256"],
+                "parent_stop_reason": source_state.get("stop_reason"),
+                "original_deadline_epoch": deadline_epoch,
+                "phase_start_checkpoint": str(self.phase_start_checkpoint),
+                "phase_start_checkpoint_sha256": sha256_file(
+                    self.phase_start_checkpoint
+                ),
+                "copied_replay": copied_replay,
+                "copied_aliases": copied_aliases,
+                "config_diff": config_diff,
+            },
+            **inherited,
+        }
+        if not self.best_optimizer_checkpoint.is_file():
+            self.state["best_optimizer_available"] = False
+            self.state["best_optimizer_unavailable_reason"] = (
+                "parent incumbent predates paired best-optimizer retention"
+            )
+        else:
+            self.state["best_optimizer_available"] = True
+            self.state["best_optimizer_sha256"] = sha256_file(
+                self.best_optimizer_checkpoint
+            )
+        retained = self._preserve_iteration_checkpoint(parent_iteration)
+        self._save_state()
+        self._event(
+            "run_forked",
+            parent_run=str(source_dir),
+            parent_iteration=parent_iteration,
+            parent_checkpoint_sha256=fork["parent_checkpoint_sha256"],
+            parent_optimizer_sha256=fork["parent_optimizer_sha256"],
+            deadline_epoch=deadline_epoch,
+            retained_checkpoint=str(retained),
+            config_diff=config_diff,
+        )
+        log(
+            f"forked run_dir={self.run_dir} parent={source_dir} "
+            f"iteration={parent_iteration} deadline_epoch={deadline_epoch} "
+            f"lr_start={float(self.args.lr_start):.12g} "
+            f"opening_start={int(self.args.opening_random_start)}"
+        )
+
+    @staticmethod
+    def _link_or_copy(source: Path, destination: Path) -> None:
+        destination.unlink(missing_ok=True)
+        try:
+            os.link(source, destination)
+        except OSError:
+            atomic_copy(source, destination)
+
+    def _clear_best_pair_transaction(self) -> None:
+        for path in (
+            self.best_pair_transaction,
+            self.best_model_next,
+            self.best_optimizer_next,
+            self.rollback_best_model,
+            self.rollback_best_optimizer,
+        ):
+            path.unlink(missing_ok=True)
+
+    def _prepare_best_pair_transaction(
+        self,
+        *,
+        iteration: int,
+        gate_result: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not self.current_checkpoint.is_file():
+            raise RuntimeError("cannot promote best pair without current.pt")
+        if not self.optimizer_checkpoint.is_file():
+            raise RuntimeError("cannot promote best pair without optimizer.pt")
+        if self.best_pair_transaction.exists():
+            raise RuntimeError(
+                "best-pair transaction already exists; resume recovery first"
+            )
+
+        self._clear_best_pair_transaction()
+        atomic_copy(self.current_checkpoint, self.best_model_next)
+        atomic_copy(self.optimizer_checkpoint, self.best_optimizer_next)
+        old_model_sha = (
+            sha256_file(self.best_checkpoint)
+            if self.best_checkpoint.is_file()
+            else None
+        )
+        old_optimizer_sha = (
+            sha256_file(self.best_optimizer_checkpoint)
+            if self.best_optimizer_checkpoint.is_file()
+            else None
+        )
+        if self.best_checkpoint.is_file():
+            self._link_or_copy(
+                self.best_checkpoint,
+                self.rollback_best_model,
+            )
+        if self.best_optimizer_checkpoint.is_file():
+            self._link_or_copy(
+                self.best_optimizer_checkpoint,
+                self.rollback_best_optimizer,
+            )
+        transaction = {
+            "schema_version": 1,
+            "iteration": int(iteration),
+            "old_model_sha256": old_model_sha,
+            "old_optimizer_sha256": old_optimizer_sha,
+            "new_model_sha256": sha256_file(self.best_model_next),
+            "new_optimizer_sha256": sha256_file(self.best_optimizer_next),
+            "gate_result": gate_result,
+            "created_utc": utc_now(),
+        }
+        atomic_write_json(self.best_pair_transaction, transaction)
+        return transaction
+
+    def _apply_best_pair_state(self, transaction: Dict[str, Any]) -> None:
+        self.state["best_iteration"] = int(transaction["iteration"])
+        self.state["best_sha256"] = str(transaction["new_model_sha256"])
+        self.state["best_optimizer_available"] = True
+        self.state["best_optimizer_sha256"] = str(
+            transaction["new_optimizer_sha256"]
+        )
+        self.state.pop("best_optimizer_unavailable_reason", None)
+        gate_result = transaction.get("gate_result")
+        if isinstance(gate_result, dict):
+            self.state["best_gate_result"] = gate_result
+
+    def _recover_best_pair_transaction(self) -> bool:
+        if not self.best_pair_transaction.is_file():
+            return False
+        transaction = _load_json(self.best_pair_transaction)
+        if not isinstance(transaction, dict):
+            raise RuntimeError(
+                f"invalid best-pair transaction: {self.best_pair_transaction}"
+            )
+        new_model_sha = str(transaction.get("new_model_sha256") or "")
+        new_optimizer_sha = str(transaction.get("new_optimizer_sha256") or "")
+        if (
+            self._artifact_matches(self.best_checkpoint, new_model_sha)
+            and self._artifact_matches(
+                self.best_optimizer_checkpoint,
+                new_optimizer_sha,
+            )
+        ):
+            self._apply_best_pair_state(transaction)
+            self._save_state()
+            self._clear_best_pair_transaction()
+            self._event(
+                "best_pair_commit_recovered",
+                iteration=int(transaction["iteration"]),
+                model_sha256=new_model_sha,
+                optimizer_sha256=new_optimizer_sha,
+            )
+            return True
+
+        for target, rollback, old_sha in (
+            (
+                self.best_checkpoint,
+                self.rollback_best_model,
+                transaction.get("old_model_sha256"),
+            ),
+            (
+                self.best_optimizer_checkpoint,
+                self.rollback_best_optimizer,
+                transaction.get("old_optimizer_sha256"),
+            ),
+        ):
+            if old_sha is None:
+                target.unlink(missing_ok=True)
+                continue
+            if (
+                not rollback.is_file()
+                or sha256_file(rollback) != str(old_sha)
+            ):
+                raise RuntimeError(
+                    "interrupted best model/optimizer commit cannot be "
+                    f"recovered: artifact={target} expected_sha256={old_sha} "
+                    f"rollback={rollback}"
+                )
+            atomic_copy(rollback, target)
+        if not self._artifact_matches(
+            self.best_checkpoint,
+            transaction.get("old_model_sha256"),
+        ) or not self._artifact_matches(
+            self.best_optimizer_checkpoint,
+            transaction.get("old_optimizer_sha256"),
+        ):
+            raise RuntimeError(
+                "best model/optimizer rollback did not restore the old pair"
+            )
+        self._clear_best_pair_transaction()
+        self._event(
+            "best_pair_rollback_recovered",
+            iteration=int(transaction["iteration"]),
+        )
+        return True
+
+    def _promote_best_pair(
+        self,
+        *,
+        iteration: int,
+        gate_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self.optimizer_checkpoint.is_file():
+            atomic_copy(self.current_checkpoint, self.best_checkpoint)
+            self.state["best_iteration"] = int(iteration)
+            self.state["best_sha256"] = sha256_file(self.best_checkpoint)
+            self.state["best_optimizer_available"] = False
+            self.state["best_optimizer_unavailable_reason"] = (
+                "optimizer.pt was unavailable at promotion"
+            )
+            self.state.pop("best_optimizer_sha256", None)
+            if isinstance(gate_result, dict):
+                self.state["best_gate_result"] = gate_result
+            self._save_state()
+            return
+
+        transaction = self._prepare_best_pair_transaction(
+            iteration=iteration,
+            gate_result=gate_result,
+        )
+        try:
+            os.replace(self.best_model_next, self.best_checkpoint)
+            os.replace(
+                self.best_optimizer_next,
+                self.best_optimizer_checkpoint,
+            )
+            if not self._artifact_matches(
+                self.best_checkpoint,
+                str(transaction["new_model_sha256"]),
+            ) or not self._artifact_matches(
+                self.best_optimizer_checkpoint,
+                str(transaction["new_optimizer_sha256"]),
+            ):
+                raise RuntimeError(
+                    "best model/optimizer transaction produced mismatched files"
+                )
+            self._apply_best_pair_state(transaction)
+            self._save_state()
+        except Exception:
+            self._recover_best_pair_transaction()
+            raise
+        self._clear_best_pair_transaction()
 
     def _save_state(self) -> None:
         self.state["updated_utc"] = utc_now()
@@ -579,7 +1112,11 @@ class PortableLongTrainer:
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
+        fork = self._prepare_fork() if not self.state_path.exists() else None
         signature = _config_signature(self.args)
+        if fork is not None:
+            self._initialize_fork(signature=signature, fork=fork)
+            return
         if self.state_path.exists():
             if not bool(self.args.resume):
                 raise RuntimeError(
@@ -599,6 +1136,22 @@ class PortableLongTrainer:
                 "portable_cpp_threads": int(self.args.portable_cpp_threads),
                 "checkpoint_retain_every": int(self.args.checkpoint_retain_every),
                 "initial_iteration": int(self.args.initial_iteration),
+                "policy_target_temperature": self.args.policy_target_temperature,
+                "policy_target_prior_pseudocount": float(
+                    self.args.policy_target_prior_pseudocount
+                ),
+                "opening_random_anneal_fraction": float(
+                    self.args.opening_random_anneal_fraction
+                ),
+                "quality_strength_eval": bool(self.args.quality_strength_eval),
+                "strength_eval_games": int(self.args.strength_eval_games),
+                "strength_eval_simulations": int(
+                    self.args.strength_eval_simulations
+                ),
+                "strength_screen_games": int(self.args.strength_screen_games),
+                "strength_screen_simulations": int(
+                    self.args.strength_screen_simulations
+                ),
             }
             if isinstance(previous_signature, dict):
                 previous_signature = dict(previous_signature)
@@ -636,6 +1189,7 @@ class PortableLongTrainer:
                     field=field_name,
                     value=field_value,
                 )
+            best_pair_reconciled = self._recover_best_pair_transaction()
             reconciled = self._recover_interrupted_commit()
             retained_checkpoint: Optional[Path] = None
             retained_checkpoint_created = False
@@ -649,12 +1203,13 @@ class PortableLongTrainer:
                 retained_checkpoint = self._preserve_iteration_checkpoint(
                     int(state.get("iteration", 0))
                 )
-            if reconciled:
+            if reconciled or best_pair_reconciled:
                 self._event(
                     "commit_state_reconciled",
                     iteration=int(state.get("iteration", 0)),
                     checkpoint_sha256=state.get("latest_checkpoint_sha256"),
                     optimizer_sha256=state.get("latest_optimizer_sha256"),
+                    best_pair=bool(best_pair_reconciled),
                 )
             if retained_checkpoint_created and retained_checkpoint is not None:
                 self._event(
@@ -666,7 +1221,12 @@ class PortableLongTrainer:
                     ),
                     source="resume",
                 )
-            if reconciled or resumed or retained_checkpoint is not None:
+            if (
+                reconciled
+                or best_pair_reconciled
+                or resumed
+                or retained_checkpoint is not None
+            ):
                 self._save_state()
             if resumed:
                 self._event(
@@ -785,7 +1345,10 @@ class PortableLongTrainer:
         opening_moves = linear_int_schedule(
             int(self.args.opening_random_start),
             int(self.args.opening_random_final),
-            progress,
+            curriculum_progress(
+                progress,
+                float(self.args.opening_random_anneal_fraction),
+            ),
         )
         command = [
             self.python,
@@ -839,6 +1402,20 @@ class PortableLongTrainer:
             "--self_play_stats_json",
             str(stats_path),
         ]
+        if self.args.policy_target_temperature is not None:
+            command.extend(
+                [
+                    "--policy_target_temperature",
+                    str(float(self.args.policy_target_temperature)),
+                ]
+            )
+        if float(self.args.policy_target_prior_pseudocount) != 0.0:
+            command.extend(
+                [
+                    "--policy_target_prior_pseudocount",
+                    str(float(self.args.policy_target_prior_pseudocount)),
+                ]
+            )
         if self.current_checkpoint.exists():
             command.extend(["--load_checkpoint", str(self.current_checkpoint)])
 
@@ -944,7 +1521,32 @@ class PortableLongTrainer:
         row["orchestrator_primary_input"] = str(primary)
         row["orchestrator_replay_inputs"] = [str(path) for path in replay_inputs]
         row["orchestrator_optimizer_continuity_required"] = bool(had_optimizer)
+        row["orchestrator_learning_rate"] = float(learning_rate)
+        for key in ("optimizer_lr_start", "optimizer_lr_final"):
+            observed_lr = row.get(key)
+            if not isinstance(observed_lr, (int, float)) or not math.isclose(
+                float(observed_lr),
+                float(learning_rate),
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(
+                    "optimizer learning-rate schedule was not applied after restore: "
+                    f"expected={learning_rate:.12g} {key}={observed_lr!r}"
+                )
         checkpoint_audit = audit_checkpoint(self.candidate_checkpoint)
+        saved_optimizer_lr = optimizer_learning_rate(self.optimizer_work)
+        if not math.isclose(
+            saved_optimizer_lr,
+            float(learning_rate),
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                "saved optimizer learning rate differs from scheduled value: "
+                f"expected={learning_rate:.12g} saved={saved_optimizer_lr:.12g}"
+            )
+        row["orchestrator_saved_optimizer_learning_rate"] = saved_optimizer_lr
         optimizer_sha256 = sha256_file(self.optimizer_work)
         self._prepare_commit_rollback()
         try:
@@ -966,6 +1568,8 @@ class PortableLongTrainer:
         output: Path,
         temperature: float,
         sample_moves: bool,
+        simulations: Optional[int] = None,
+        concurrency: Optional[int] = None,
     ) -> Dict[str, Any]:
         command = [
             self.python,
@@ -979,11 +1583,23 @@ class PortableLongTrainer:
             "--eval_workers",
             "1",
             "--mcts_simulations",
-            str(int(self.args.eval_simulations)),
+            str(
+                int(
+                    self.args.eval_simulations
+                    if simulations is None
+                    else simulations
+                )
+            ),
             "--temperature",
             str(float(temperature)),
             "--v1_concurrent_games",
-            str(int(self.args.eval_concurrency)),
+            str(
+                int(
+                    self.args.eval_concurrency
+                    if concurrency is None
+                    else concurrency
+                )
+            ),
             "--v1_opening_random_moves",
             "0",
             "--seed",
@@ -1102,9 +1718,7 @@ class PortableLongTrainer:
 
         best_row: Optional[Dict[str, Any]] = None
         if not self.best_checkpoint.is_file():
-            atomic_copy(self.current_checkpoint, self.best_checkpoint)
-            self.state["best_iteration"] = iteration
-            self.state["best_sha256"] = sha256_file(self.best_checkpoint)
+            self._promote_best_pair(iteration=iteration)
             self._event("best_model_bootstrapped", iteration=iteration)
             log(f"best_model bootstrapped iter={iteration}")
         else:
@@ -1123,10 +1737,10 @@ class PortableLongTrainer:
             if candidate_beats_incumbent(
                 best_row, float(self.args.incumbent_promotion_score)
             ):
-                atomic_copy(self.current_checkpoint, self.best_checkpoint)
-                self.state["best_iteration"] = iteration
-                self.state["best_sha256"] = sha256_file(self.best_checkpoint)
-                self.state["best_gate_result"] = best_row
+                self._promote_best_pair(
+                    iteration=iteration,
+                    gate_result=best_row,
+                )
                 self._event("best_model_promoted", iteration=iteration, result=best_row)
                 log(
                     f"best_model promoted iter={iteration} "
@@ -1210,6 +1824,101 @@ class PortableLongTrainer:
         self._save_state()
         return row
 
+    def _final_strength_evaluation(self) -> Optional[Dict[str, Any]]:
+        if not bool(self.args.quality_strength_eval):
+            return None
+        if not self.phase_start_checkpoint.is_file():
+            raise RuntimeError(
+                "quality strength evaluation requires phase_start_model.pt"
+            )
+        if not self.current_checkpoint.is_file():
+            raise RuntimeError(
+                "quality strength evaluation requires current.pt"
+            )
+        iteration = int(self.state.get("iteration", 0))
+        seed = int(self.args.seed) + 30_000_000 + iteration
+        primary_output = self.eval_dir / (
+            f"strength_vs_phase_start_iter_{iteration:06d}.json"
+        )
+        primary = self._run_eval(
+            challenger=self.current_checkpoint,
+            opponent=self.phase_start_checkpoint,
+            games=int(self.args.strength_eval_games),
+            seed=seed,
+            name="strength_vs_phase_start",
+            output=primary_output,
+            temperature=0.0,
+            sample_moves=False,
+            simulations=int(self.args.strength_eval_simulations),
+            concurrency=min(
+                int(self.args.eval_concurrency),
+                int(self.args.strength_eval_games),
+            ),
+        )
+        if bool(self.args.dry_run):
+            return None
+        primary_score = (
+            int(primary.get("wins", 0))
+            + 0.5 * int(primary.get("draws", 0))
+        ) / max(1, int(primary.get("total_games", 0)))
+        confirmation: Optional[Dict[str, Any]] = None
+        if primary_score >= float(self.args.incumbent_promotion_score):
+            confirmation_output = self.eval_dir / (
+                f"strength_confirm_vs_phase_start_iter_{iteration:06d}.json"
+            )
+            confirmation = self._run_eval(
+                challenger=self.current_checkpoint,
+                opponent=self.phase_start_checkpoint,
+                games=int(self.args.strength_eval_games),
+                seed=seed + 1,
+                name="strength_confirm_vs_phase_start",
+                output=confirmation_output,
+                temperature=0.0,
+                sample_moves=False,
+                simulations=int(self.args.strength_eval_simulations),
+                concurrency=min(
+                    int(self.args.eval_concurrency),
+                    int(self.args.strength_eval_games),
+                ),
+            )
+
+        screen_output = self.eval_dir / (
+            f"strength_screen_1024_iter_{iteration:06d}.json"
+        )
+        screen = self._run_eval(
+            challenger=self.current_checkpoint,
+            opponent=self.phase_start_checkpoint,
+            games=int(self.args.strength_screen_games),
+            seed=seed + 2,
+            name="strength_screen_vs_phase_start",
+            output=screen_output,
+            temperature=0.0,
+            sample_moves=False,
+            simulations=int(self.args.strength_screen_simulations),
+            concurrency=min(
+                int(self.args.eval_concurrency),
+                int(self.args.strength_screen_games),
+            ),
+        )
+        result = {
+            "phase_start_checkpoint": str(self.phase_start_checkpoint),
+            "phase_start_sha256": sha256_file(self.phase_start_checkpoint),
+            "final_checkpoint": str(self.current_checkpoint),
+            "final_checkpoint_sha256": sha256_file(self.current_checkpoint),
+            "primary": primary,
+            "primary_score": primary_score,
+            "confirmation": confirmation,
+            "screen_1024": screen,
+        }
+        self.state["final_strength_evaluation"] = result
+        self._event(
+            "final_strength_evaluation",
+            iteration=iteration,
+            result=result,
+        )
+        self._save_state()
+        return result
+
     def run(self) -> int:
         if bool(self.args.preflight_only):
             log("preflight-only complete")
@@ -1284,6 +1993,7 @@ class PortableLongTrainer:
 
         if not bool(self.args.dry_run):
             final_row = self._final_evaluation()
+            final_strength = self._final_strength_evaluation()
             self.state["ended_utc"] = utc_now()
             self.state["elapsed_sec"] = int(time.time()) - int(self.state["start_epoch"])
             self.state["final_eval_result"] = final_row
@@ -1310,6 +2020,7 @@ class PortableLongTrainer:
                 ),
                 "target_confirmed_result": self.state.get("target_confirmed_result"),
                 "final_eval_result": final_row,
+                "final_strength_evaluation": final_strength,
                 "state": str(self.state_path),
                 "events": str(self.events_path),
             }
@@ -1329,6 +2040,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", default="tmp/v1_portable_long_20h")
     parser.add_argument("--hours", type=float, default=20.0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--fork-from-run",
+        default=None,
+        help=(
+            "Create a new phase from a stopped, evaluated 10-iteration boundary "
+            "while preserving its deadline, optimizer and replay."
+        ),
+    )
     parser.add_argument("--initial-checkpoint", default=None)
     parser.add_argument("--initial-optimizer-state", default=None)
     parser.add_argument("--initial-iteration", type=int, default=0)
@@ -1353,8 +2072,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature-init", type=float, default=1.0)
     parser.add_argument("--temperature-final", type=float, default=0.1)
     parser.add_argument("--temperature-threshold", type=int, default=10)
+    parser.add_argument("--policy-target-temperature", type=float, default=None)
+    parser.add_argument(
+        "--policy-target-prior-pseudocount",
+        type=float,
+        default=0.0,
+    )
     parser.add_argument("--opening-random-start", type=int, default=6)
     parser.add_argument("--opening-random-final", type=int, default=0)
+    parser.add_argument(
+        "--opening-random-anneal-fraction",
+        type=float,
+        default=1.0,
+    )
     parser.add_argument("--max-game-plies", type=int, default=512)
     parser.add_argument("--soft-label-alpha", type=float, default=0.5)
     parser.add_argument("--policy-draw-weight", type=float, default=1.0)
@@ -1378,6 +2108,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-on-target", action="store_true")
     parser.add_argument("--final-eval", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--final-eval-games", type=int, default=500)
+    parser.add_argument("--quality-strength-eval", action="store_true")
+    parser.add_argument("--strength-eval-games", type=int, default=500)
+    parser.add_argument("--strength-eval-simulations", type=int, default=64)
+    parser.add_argument("--strength-screen-games", type=int, default=64)
+    parser.add_argument("--strength-screen-simulations", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=20260722)
     return parser
 

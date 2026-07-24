@@ -18,6 +18,7 @@ from .self_play_storage import (
     save_self_play_payload,
     slice_batch_cpu,
 )
+from .policy_target_audit import merge_policy_target_audits
 
 
 def _is_stream_capture_error(exc: Exception) -> bool:
@@ -210,6 +211,7 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
     fallback_count = 0
     fallback_reasons: List[str] = []
     devices: List[str] = []
+    policy_target_audits: List[Dict[str, Any]] = []
     for stats in stats_list:
         for k, v in stats.step_timing_ms.items():
             step_timing_ms[str(k)] = float(step_timing_ms.get(str(k), 0.0) + float(v))
@@ -225,6 +227,9 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
         device_name = str(getattr(stats, "device", ""))
         if device_name and device_name not in devices:
             devices.append(device_name)
+        audit = getattr(stats, "policy_target_audit", {})
+        if isinstance(audit, dict):
+            policy_target_audits.append(audit)
 
     legacy_keys = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
     for k in legacy_keys:
@@ -259,6 +264,9 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
         step_timing_calls=step_timing_calls,
         mcts_counters=mcts_counters,
         piece_delta_buckets=piece_delta_buckets,
+        policy_target_audit=merge_policy_target_audits(
+            policy_target_audits
+        ),
         device=",".join(devices),
         fallback_count=int(fallback_count),
         fallback_reasons=tuple(fallback_reasons),
@@ -295,6 +303,8 @@ def run_self_play_worker(
     search_backend: str = "cuda_root",
     portable_mcts_backend: str = "python",
     portable_cpp_threads: int = 1,
+    policy_target_temperature: Optional[float] = None,
+    policy_target_prior_pseudocount: float = 0.0,
 ) -> Dict[str, Any]:
     """Run one self-play shard inside a dedicated process and persist shard payload."""
 
@@ -363,6 +373,10 @@ def run_self_play_worker(
                         1, min(int(chunk_games), shard_concurrent)
                     ),
                     "verbose": False,
+                    "policy_target_temperature": policy_target_temperature,
+                    "policy_target_prior_pseudocount": float(
+                        policy_target_prior_pseudocount
+                    ),
                 }
                 if portable_impl == "cpp":
                     portable_kwargs["cpu_threads"] = int(portable_cpp_threads)
@@ -463,6 +477,10 @@ def run_self_play_worker(
                     "search_backend": str(search_backend),
                     "portable_mcts_backend": str(portable_mcts_backend),
                     "portable_cpp_threads": int(portable_cpp_threads),
+                    "policy_target_temperature": policy_target_temperature,
+                    "policy_target_prior_pseudocount": float(
+                        policy_target_prior_pseudocount
+                    ),
                     "source_worker_manifest": os.path.basename(str(output_path)),
                 }
                 save_self_play_payload(
@@ -508,6 +526,10 @@ def run_self_play_worker(
                 "search_backend": str(search_backend),
                 "portable_mcts_backend": str(portable_mcts_backend),
                 "portable_cpp_threads": int(portable_cpp_threads),
+                "policy_target_temperature": policy_target_temperature,
+                "policy_target_prior_pseudocount": float(
+                    policy_target_prior_pseudocount
+                ),
             },
         }
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)

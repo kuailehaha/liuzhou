@@ -40,7 +40,7 @@ The API surface:
 - `POST /api/game/{gameId}/ai-move`: ask the backend to resolve the AI turn (including chained follow-up phases owned by AI).
 - `DELETE /api/game/{gameId}`: remove a session.
 
-The portable gameplay agent uses the same 220-dimensional action mapping and player-change-aware value backup as portable training. It disables root noise, preserves the subtree across consecutive atomic phases owned by the same player, and synchronises only after an external human move. Response metadata includes the resolved checkpoint SHA, device, backend, simulations, temperature, threads, elapsed search time and root top-10 `P/N/Q`.
+The portable gameplay agent uses the same 220-dimensional action mapping and player-change-aware value backup as portable training. It disables root noise, preserves the subtree across consecutive atomic phases owned by the same player, and synchronises only after an external human move. Response metadata includes the resolved checkpoint SHA, device, backend, simulations, temperature, threads, elapsed search time and root top-10 `P/N/Q`. The additive `gameRecord` field accumulates every human/AI atomic action, its before/after state and the complete AI root audit, so a high-budget game can be replayed without relying on only the final board.
 
 ## Front-end
 

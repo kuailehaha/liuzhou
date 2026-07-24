@@ -13,6 +13,7 @@ from src.policy_batch import TOTAL_DIM
 
 from .portable_cpp_mcts import PortableCppMCTS
 from .portable_mcts import PortableMCTSConfig
+from .policy_target_audit import PolicyTargetAudit
 from .portable_self_play import PortableSelfPlayStats
 from .trajectory_buffer import TensorSelfPlayBatch
 
@@ -45,6 +46,8 @@ def self_play_v1_portable_cpp(
     concurrent_games: int = 8,
     cpu_threads: int = 1,
     verbose: bool = False,
+    policy_target_temperature: float | None = None,
+    policy_target_prior_pseudocount: float = 0.0,
 ) -> Tuple[TensorSelfPlayBatch, PortableSelfPlayStats]:
     """Produce the existing V1 tensor payload with an opt-in C++ search core."""
 
@@ -58,6 +61,14 @@ def self_play_v1_portable_cpp(
         num_simulations=max(1, int(mcts_simulations)),
         exploration_weight=float(exploration_weight),
         temperature=float(temperature_init),
+        policy_target_temperature=(
+            None
+            if policy_target_temperature is None
+            else float(policy_target_temperature)
+        ),
+        policy_target_prior_pseudocount=float(
+            policy_target_prior_pseudocount
+        ),
         add_dirichlet_noise=bool(add_dirichlet_noise),
         dirichlet_alpha=float(dirichlet_alpha),
         dirichlet_epsilon=float(dirichlet_epsilon),
@@ -76,6 +87,7 @@ def self_play_v1_portable_cpp(
     draws = 0
     lengths: List[int] = []
     piece_delta_buckets = {str(delta): 0 for delta in range(-18, 19)}
+    policy_target_audit = PolicyTargetAudit()
     timing_seconds: Dict[str, float] = {}
     timing_calls: Dict[str, int] = {}
     inference_batches = 0
@@ -145,6 +157,10 @@ def self_play_v1_portable_cpp(
                     raise RuntimeError(
                         f"Portable C++ selected illegal action {action_index}."
                     )
+                policy_target_audit.observe(
+                    output,
+                    ply=int(ctx["plies"]),
+                )
                 ctx["steps"].append(
                     (
                         output.model_input.clone(),
@@ -287,5 +303,6 @@ def self_play_v1_portable_cpp(
             "portable_cpp_non_finite": int(non_finite),
         },
         piece_delta_buckets=piece_delta_buckets,
+        policy_target_audit=policy_target_audit.to_dict(),
     )
     return samples, stats

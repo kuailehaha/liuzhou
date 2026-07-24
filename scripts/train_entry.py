@@ -72,6 +72,10 @@ def _run_v1(args: argparse.Namespace) -> int:
         temperature_init=float(args.temperature_init),
         temperature_final=float(args.temperature_final),
         temperature_threshold=int(args.temperature_threshold),
+        policy_target_temperature=args.policy_target_temperature,
+        policy_target_prior_pseudocount=float(
+            args.policy_target_prior_pseudocount
+        ),
         exploration_weight=float(args.exploration_weight),
         dirichlet_alpha=float(args.dirichlet_alpha),
         dirichlet_epsilon=float(args.dirichlet_epsilon),
@@ -141,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature_init", type=float, default=1.0)
     parser.add_argument("--temperature_final", type=float, default=0.1)
     parser.add_argument("--temperature_threshold", type=int, default=10)
+    parser.add_argument("--policy_target_temperature", type=float, default=None)
+    parser.add_argument(
+        "--policy_target_prior_pseudocount",
+        type=float,
+        default=0.0,
+    )
     parser.add_argument("--exploration_weight", type=float, default=1.0)
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)

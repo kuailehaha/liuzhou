@@ -247,6 +247,7 @@ def train_network_from_tensors(
             optimizer.load_state_dict(opt_state)
             for pg in optimizer.param_groups:
                 pg["lr"] = float(lr)
+                pg["initial_lr"] = float(lr)
             optimizer_loaded = True
         except Exception as exc:
             optimizer_load_error = repr(exc)
@@ -281,6 +282,7 @@ def train_network_from_tensors(
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    optimizer_lr_start = float(optimizer.param_groups[0]["lr"])
     global_step = 0
 
     epoch_stats: List[Dict[str, Any]] = []
@@ -498,6 +500,7 @@ def train_network_from_tensors(
             }
         )
 
+    optimizer_lr_final = float(optimizer.param_groups[0]["lr"])
     if optimizer_state_path and (strategy != "ddp" or ddp_rank == 0):
         try:
             torch.save(optimizer.state_dict(), optimizer_state_path)
@@ -519,6 +522,8 @@ def train_network_from_tensors(
         "dropped_samples_for_sync": int(dropped_samples_for_sync),
         "optimizer_loaded": bool(optimizer_loaded),
         "optimizer_load_error": optimizer_load_error,
+        "optimizer_lr_start": optimizer_lr_start,
+        "optimizer_lr_final": optimizer_lr_final,
         "device": str(device_obj),
         "device_fallback_count": int(device_resolution.fallback_count),
         "device_fallback_reasons": list(device_resolution.fallback_reasons),
@@ -631,6 +636,7 @@ def train_network_streaming(
             optimizer.load_state_dict(opt_state)
             for pg in optimizer.param_groups:
                 pg["lr"] = float(lr)
+                pg["initial_lr"] = float(lr)
             optimizer_loaded = True
         except Exception as exc:
             optimizer_load_error = repr(exc)
@@ -653,6 +659,7 @@ def train_network_streaming(
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    optimizer_lr_start = float(optimizer.param_groups[0]["lr"])
     global_step = 0
 
     epoch_stats: List[Dict[str, Any]] = []
@@ -894,6 +901,7 @@ def train_network_streaming(
             "dl_exhausted_steps": dl_exhausted_steps,
         })
 
+    optimizer_lr_final = float(optimizer.param_groups[0]["lr"])
     if optimizer_state_path and (strategy != "ddp" or ddp_rank == 0):
         try:
             torch.save(optimizer.state_dict(), optimizer_state_path)
@@ -913,6 +921,8 @@ def train_network_streaming(
         "est_batches_per_epoch": est_batches_per_epoch,
         "optimizer_loaded": bool(optimizer_loaded),
         "optimizer_load_error": optimizer_load_error,
+        "optimizer_lr_start": optimizer_lr_start,
+        "optimizer_lr_final": optimizer_lr_final,
         "device": str(device_obj),
         "device_fallback_count": int(device_resolution.fallback_count),
         "device_fallback_reasons": list(device_resolution.fallback_reasons),

@@ -317,24 +317,120 @@ def test_fork_refuses_elapsed_parent_deadline(tmp_path) -> None:
 
 
 def test_best_promotion_saves_matching_optimizer(tmp_path) -> None:
-    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
-    trainer.current_checkpoint = tmp_path / "current.pt"
-    trainer.optimizer_checkpoint = tmp_path / "optimizer.pt"
-    trainer.best_checkpoint = tmp_path / "best_model.pt"
-    trainer.best_optimizer_checkpoint = tmp_path / "best_optimizer.pt"
+    args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--device",
+            "cpu",
+            "--no-require-ac",
+        ]
+    )
+    trainer = PortableLongTrainer(args)
+    trainer.checkpoint_dir.mkdir(parents=True)
     trainer.current_checkpoint.write_bytes(b"candidate")
     trainer.optimizer_checkpoint.write_bytes(b"candidate-optimizer")
-    trainer.state = {}
+    trainer.state = {"schema_version": 1}
 
-    trainer._promote_best_pair(iteration=12)
+    gate = {"wins": 3, "losses": 1, "draws": 0}
+    trainer._promote_best_pair(iteration=12, gate_result=gate)
 
     assert trainer.best_checkpoint.read_bytes() == b"candidate"
     assert trainer.best_optimizer_checkpoint.read_bytes() == b"candidate-optimizer"
     assert trainer.state["best_iteration"] == 12
+    assert trainer.state["best_gate_result"] == gate
     assert trainer.state["best_sha256"] == sha256_file(trainer.best_checkpoint)
     assert trainer.state["best_optimizer_sha256"] == sha256_file(
         trainer.best_optimizer_checkpoint
     )
+    assert not trainer.best_pair_transaction.exists()
+    assert not trainer.rollback_best_model.exists()
+    assert not trainer.rollback_best_optimizer.exists()
+
+
+def test_partial_best_pair_commit_rolls_back_both_artifacts(tmp_path) -> None:
+    args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--device",
+            "cpu",
+            "--no-require-ac",
+        ]
+    )
+    trainer = PortableLongTrainer(args)
+    trainer.checkpoint_dir.mkdir(parents=True)
+    trainer.current_checkpoint.write_bytes(b"new-model")
+    trainer.optimizer_checkpoint.write_bytes(b"new-optimizer")
+    trainer.best_checkpoint.write_bytes(b"old-model")
+    trainer.best_optimizer_checkpoint.write_bytes(b"old-optimizer")
+    trainer.state = {
+        "schema_version": 1,
+        "best_iteration": 10,
+        "best_sha256": sha256_file(trainer.best_checkpoint),
+        "best_optimizer_sha256": sha256_file(
+            trainer.best_optimizer_checkpoint
+        ),
+    }
+    trainer._prepare_best_pair_transaction(
+        iteration=20,
+        gate_result={"wins": 3, "losses": 1, "draws": 0},
+    )
+    os.replace(trainer.best_model_next, trainer.best_checkpoint)
+
+    assert trainer._recover_best_pair_transaction()
+    assert trainer.best_checkpoint.read_bytes() == b"old-model"
+    assert trainer.best_optimizer_checkpoint.read_bytes() == b"old-optimizer"
+    assert trainer.state["best_iteration"] == 10
+    assert not trainer.best_pair_transaction.exists()
+
+
+def test_complete_best_pair_commit_reconciles_state_after_crash(tmp_path) -> None:
+    args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--device",
+            "cpu",
+            "--no-require-ac",
+        ]
+    )
+    trainer = PortableLongTrainer(args)
+    trainer.checkpoint_dir.mkdir(parents=True)
+    trainer.current_checkpoint.write_bytes(b"new-model")
+    trainer.optimizer_checkpoint.write_bytes(b"new-optimizer")
+    trainer.best_checkpoint.write_bytes(b"old-model")
+    trainer.best_optimizer_checkpoint.write_bytes(b"old-optimizer")
+    trainer.state = {
+        "schema_version": 1,
+        "best_iteration": 10,
+        "best_sha256": sha256_file(trainer.best_checkpoint),
+        "best_optimizer_sha256": sha256_file(
+            trainer.best_optimizer_checkpoint
+        ),
+    }
+    gate = {"wins": 3, "losses": 1, "draws": 0}
+    transaction = trainer._prepare_best_pair_transaction(
+        iteration=20,
+        gate_result=gate,
+    )
+    os.replace(trainer.best_model_next, trainer.best_checkpoint)
+    os.replace(
+        trainer.best_optimizer_next,
+        trainer.best_optimizer_checkpoint,
+    )
+
+    assert trainer._recover_best_pair_transaction()
+    assert trainer.best_checkpoint.read_bytes() == b"new-model"
+    assert trainer.best_optimizer_checkpoint.read_bytes() == b"new-optimizer"
+    assert trainer.state["best_iteration"] == 20
+    assert trainer.state["best_gate_result"] == gate
+    assert trainer.state["best_sha256"] == transaction["new_model_sha256"]
+    assert (
+        trainer.state["best_optimizer_sha256"]
+        == transaction["new_optimizer_sha256"]
+    )
+    assert not trainer.best_pair_transaction.exists()
 
 
 def test_nonzero_initial_iteration_requires_initial_checkpoint(tmp_path) -> None:

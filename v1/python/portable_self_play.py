@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -13,6 +13,7 @@ from src.game_state import GameState, Player
 from src.policy_batch import TOTAL_DIM
 
 from .portable_mcts import PortableMCTS, PortableMCTSConfig, PortableTree
+from .policy_target_audit import PolicyTargetAudit
 from .trajectory_buffer import TensorSelfPlayBatch
 
 
@@ -36,6 +37,7 @@ class PortableSelfPlayStats:
     step_timing_calls: Dict[str, int]
     mcts_counters: Dict[str, int]
     piece_delta_buckets: Dict[str, int]
+    policy_target_audit: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -57,6 +59,7 @@ class PortableSelfPlayStats:
             "step_timing_calls": dict(self.step_timing_calls),
             "mcts_counters": dict(self.mcts_counters),
             "piece_delta_buckets": dict(self.piece_delta_buckets),
+            "policy_target_audit": dict(self.policy_target_audit),
         }
 
 
@@ -94,6 +97,8 @@ def self_play_v1_portable(
     sample_moves: bool = True,
     concurrent_games: int = 8,
     verbose: bool = False,
+    policy_target_temperature: float | None = None,
+    policy_target_prior_pseudocount: float = 0.0,
 ) -> Tuple[TensorSelfPlayBatch, PortableSelfPlayStats]:
     """Produce the existing tensor payload contract without ``v0_core``."""
 
@@ -105,6 +110,14 @@ def self_play_v1_portable(
         num_simulations=max(1, int(mcts_simulations)),
         exploration_weight=float(exploration_weight),
         temperature=float(temperature_init),
+        policy_target_temperature=(
+            None
+            if policy_target_temperature is None
+            else float(policy_target_temperature)
+        ),
+        policy_target_prior_pseudocount=float(
+            policy_target_prior_pseudocount
+        ),
         add_dirichlet_noise=bool(add_dirichlet_noise),
         dirichlet_alpha=float(dirichlet_alpha),
         dirichlet_epsilon=float(dirichlet_epsilon),
@@ -124,6 +137,7 @@ def self_play_v1_portable(
     draws = 0
     lengths: List[int] = []
     piece_delta_buckets = {str(delta): 0 for delta in range(-18, 19)}
+    policy_target_audit = PolicyTargetAudit()
     started = time.perf_counter()
 
     for wave_base in range(0, int(num_games), wave_size):
@@ -162,6 +176,10 @@ def self_play_v1_portable(
                 if output.terminal or output.chosen_action_index is None or output.chosen_move is None:
                     ctx["done"] = True
                 else:
+                    policy_target_audit.observe(
+                        output,
+                        ply=int(ctx["plies"]),
+                    )
                     ctx["steps"].append(
                         (
                             output.model_input.clone(),
@@ -261,5 +279,6 @@ def self_play_v1_portable(
             "portable_fallback_count": int(search.device_resolution.fallback_count),
         },
         piece_delta_buckets=piece_delta_buckets,
+        policy_target_audit=policy_target_audit.to_dict(),
     )
     return samples, stats

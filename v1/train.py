@@ -221,6 +221,8 @@ def _merge_train_bridge_summary(entry: Dict[str, Any], train_metrics: Dict[str, 
     for key in (
         "optimizer_loaded",
         "optimizer_load_error",
+        "optimizer_lr_start",
+        "optimizer_lr_final",
         "warmup_steps",
         "total_train_steps",
         "num_samples_after_filter",
@@ -494,6 +496,21 @@ def _print_self_play_summary(
         "[v1.train] selfplay piece_delta buckets "
         f"total={piece_delta_bucket_total}/{int(stats.num_games)} nonzero={{{bucket_view}}}"
     )
+    policy_audit = getattr(stats, "policy_target_audit", {})
+    if isinstance(policy_audit, dict) and int(policy_audit.get("positions", 0) or 0) > 0:
+        _print_rank0(
+            "[v1.train] selfplay policy targets "
+            f"positions={int(policy_audit.get('positions', 0))} "
+            f"legal_mean={float(policy_audit.get('mean_legal_actions', 0.0)):.2f} "
+            f"positive_support_mean={float(policy_audit.get('mean_positive_support', 0.0)):.2f} "
+            f"visit_support_mean={float(policy_audit.get('mean_visit_support', 0.0)):.2f} "
+            f"entropy_mean={float(policy_audit.get('mean_entropy', 0.0)):.4f} "
+            f"effective_support_mean={float(policy_audit.get('mean_effective_support', 0.0)):.2f} "
+            f"unvisited_prior_mass_mean={float(policy_audit.get('mean_unvisited_prior_mass', 0.0)):.4f} "
+            f"one_hot={int(policy_audit.get('one_hot_count', 0))}/"
+            f"{int(policy_audit.get('positions', 0))} "
+            f"({float(policy_audit.get('one_hot_ratio', 0.0))*100.0:.2f}%)"
+        )
     _print_rank0(
         "[v1.train] selfplay hard value targets "
         f"nonzero={nonzero}/{finite} ({nonzero_ratio*100.0:.2f}%) "
@@ -654,6 +671,11 @@ def _self_play_stats_from_payload(stats_payload: Dict[str, Any]) -> SelfPlayV1St
         step_timing_calls=step_timing_calls,
         mcts_counters=mcts_counters,
         piece_delta_buckets=piece_delta_buckets,
+        policy_target_audit=(
+            dict(payload.get("policy_target_audit"))
+            if isinstance(payload.get("policy_target_audit"), dict)
+            else {}
+        ),
         device=str(payload.get("device", "")),
         fallback_count=int(payload.get("fallback_count", 0) or 0),
         fallback_reasons=tuple(str(x) for x in payload.get("fallback_reasons", []) or []),
@@ -840,6 +862,8 @@ def _run_self_play_multi_device_process(
     search_backend: str = "cuda_root",
     portable_mcts_backend: str = "python",
     portable_cpp_threads: int = 1,
+    policy_target_temperature: Optional[float] = None,
+    policy_target_prior_pseudocount: float = 0.0,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     workspace, auto_cleanup = _prepare_self_play_workspace(
         shard_dir=shard_dir,
@@ -879,6 +903,10 @@ def _run_self_play_multi_device_process(
                 search_backend=str(search_backend),
                 portable_mcts_backend=str(portable_mcts_backend),
                 portable_cpp_threads=int(portable_cpp_threads),
+                policy_target_temperature=policy_target_temperature,
+                policy_target_prior_pseudocount=float(
+                    policy_target_prior_pseudocount
+                ),
             )
         )
         merged_batch, _stats_payload, _meta_payload = _load_self_play_payload(str(manifest_path))
@@ -924,6 +952,8 @@ def _run_self_play_multi_device_process_saved(
     search_backend: str = "cuda_root",
     portable_mcts_backend: str = "python",
     portable_cpp_threads: int = 1,
+    policy_target_temperature: Optional[float] = None,
+    policy_target_prior_pseudocount: float = 0.0,
  ) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], Dict[str, Any], int]:
     from v1.python.self_play_worker import run_self_play_worker
 
@@ -989,6 +1019,10 @@ def _run_self_play_multi_device_process_saved(
                     search_backend=str(search_backend),
                     portable_mcts_backend=str(portable_mcts_backend),
                     portable_cpp_threads=int(portable_cpp_threads),
+                    policy_target_temperature=policy_target_temperature,
+                    policy_target_prior_pseudocount=float(
+                        policy_target_prior_pseudocount
+                    ),
                     target_samples_per_shard=int(target_samples_per_shard),
                     chunk_target_bytes=int(chunk_target_bytes),
                     chunk_output_dir=str(out_dir),
@@ -1155,6 +1189,8 @@ def _run_self_play_multi_device(
     portable_self_play_workers: int = 1,
     portable_mcts_backend: str = "python",
     portable_cpp_threads: int = 1,
+    policy_target_temperature: Optional[float] = None,
+    policy_target_prior_pseudocount: float = 0.0,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     search_backend_norm = _normalize_search_backend(search_backend)
     if search_backend_norm == "portable":
@@ -1196,6 +1232,10 @@ def _run_self_play_multi_device(
                 search_backend="portable",
                 portable_mcts_backend=portable_impl,
                 portable_cpp_threads=int(portable_cpp_threads),
+                policy_target_temperature=policy_target_temperature,
+                policy_target_prior_pseudocount=float(
+                    policy_target_prior_pseudocount
+                ),
             )
         if portable_impl == "cpp":
             from v1.python.portable_cpp_self_play import (
@@ -1226,6 +1266,10 @@ def _run_self_play_multi_device(
             "sample_moves": True,
             "concurrent_games": shard_concurrent,
             "verbose": False,
+            "policy_target_temperature": policy_target_temperature,
+            "policy_target_prior_pseudocount": float(
+                policy_target_prior_pseudocount
+            ),
         }
         if portable_impl == "cpp":
             portable_kwargs["cpu_threads"] = int(portable_cpp_threads)
@@ -1828,6 +1872,8 @@ def train_pipeline_v1(
     temperature_init: float = 1.0,
     temperature_final: float = 0.1,
     temperature_threshold: int = 10,
+    policy_target_temperature: Optional[float] = None,
+    policy_target_prior_pseudocount: float = 0.0,
     exploration_weight: float = 1.0,
     dirichlet_alpha: float = 0.3,
     dirichlet_epsilon: float = 0.25,
@@ -2000,6 +2046,23 @@ def train_pipeline_v1(
             raise ValueError("portable_self_play_workers must be positive")
         if int(portable_cpp_threads) <= 0:
             raise ValueError("portable_cpp_threads must be positive")
+        if (
+            policy_target_temperature is not None
+            and (
+                not math.isfinite(float(policy_target_temperature))
+                or float(policy_target_temperature) < 0.0
+            )
+        ):
+            raise ValueError(
+                "policy_target_temperature must be finite and non-negative"
+            )
+        if (
+            not math.isfinite(float(policy_target_prior_pseudocount))
+            or float(policy_target_prior_pseudocount) < 0.0
+        ):
+            raise ValueError(
+                "policy_target_prior_pseudocount must be finite and non-negative"
+            )
 
         model = _build_model()
         checkpoint_load_sec = 0.0
@@ -2051,6 +2114,14 @@ def train_pipeline_v1(
                 "portable_cpp_threads": int(portable_cpp_threads),
                 "self_play_opening_random_moves": int(self_play_opening_random_moves),
                 "self_play_iteration_seed": int(stage_selfplay_seed),
+                "policy_target_temperature": (
+                    None
+                    if policy_target_temperature is None
+                    else float(policy_target_temperature)
+                ),
+                "policy_target_prior_pseudocount": float(
+                    policy_target_prior_pseudocount
+                ),
             }
             if search_backend_norm == "portable" and int(portable_self_play_workers) > 1:
                 resolved_backend = "process"
@@ -2113,6 +2184,10 @@ def train_pipeline_v1(
                         search_backend=search_backend_norm,
                         portable_mcts_backend=portable_mcts_backend_norm,
                         portable_cpp_threads=int(portable_cpp_threads),
+                        policy_target_temperature=policy_target_temperature,
+                        policy_target_prior_pseudocount=float(
+                            policy_target_prior_pseudocount
+                        ),
                     )
                 )
             else:
@@ -2140,6 +2215,10 @@ def train_pipeline_v1(
                     portable_self_play_workers=int(portable_self_play_workers),
                     portable_mcts_backend=portable_mcts_backend_norm,
                     portable_cpp_threads=int(portable_cpp_threads),
+                    policy_target_temperature=policy_target_temperature,
+                    policy_target_prior_pseudocount=float(
+                        policy_target_prior_pseudocount
+                    ),
                 )
                 value_target_summary = _compute_value_target_summary(samples)
                 soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2573,6 +2652,10 @@ def train_pipeline_v1(
                 portable_self_play_workers=int(portable_self_play_workers),
                 portable_mcts_backend=portable_mcts_backend_norm,
                 portable_cpp_threads=int(portable_cpp_threads),
+                policy_target_temperature=policy_target_temperature,
+                policy_target_prior_pseudocount=float(
+                    policy_target_prior_pseudocount
+                ),
             )
             value_target_summary = _compute_value_target_summary(samples)
             soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2737,6 +2820,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature_init", type=float, default=1.0)
     parser.add_argument("--temperature_final", type=float, default=0.1)
     parser.add_argument("--temperature_threshold", type=int, default=10)
+    parser.add_argument(
+        "--policy_target_temperature",
+        type=float,
+        default=None,
+        help=(
+            "Portable self-play policy-target temperature. Omit to preserve "
+            "the legacy behavior of reusing the action-selection temperature."
+        ),
+    )
+    parser.add_argument(
+        "--policy_target_prior_pseudocount",
+        type=float,
+        default=0.0,
+        help=(
+            "Portable self-play beta in target proportional to N + beta*P. "
+            "Zero preserves legacy visit-only targets."
+        ),
+    )
     parser.add_argument("--exploration_weight", type=float, default=1.0)
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
@@ -2922,6 +3023,8 @@ if __name__ == "__main__":
         temperature_init=args.temperature_init,
         temperature_final=args.temperature_final,
         temperature_threshold=args.temperature_threshold,
+        policy_target_temperature=args.policy_target_temperature,
+        policy_target_prior_pseudocount=args.policy_target_prior_pseudocount,
         exploration_weight=args.exploration_weight,
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,

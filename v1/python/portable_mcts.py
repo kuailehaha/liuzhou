@@ -27,6 +27,8 @@ class PortableMCTSConfig:
     num_simulations: int = 128
     exploration_weight: float = 1.0
     temperature: float = 1.0
+    policy_target_temperature: Optional[float] = None
+    policy_target_prior_pseudocount: float = 0.0
     add_dirichlet_noise: bool = True
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -101,6 +103,9 @@ class PortableSearchOutput:
     model_input: torch.Tensor
     legal_mask: torch.Tensor
     policy_dense: torch.Tensor
+    selection_policy_dense: torch.Tensor
+    root_priors: torch.Tensor
+    root_action_values: torch.Tensor
     root_value: float
     terminal: bool
     chosen_action_index: Optional[int]
@@ -140,6 +145,64 @@ def terminal_value(state: GameState) -> float:
     if winner is None:
         return 0.0
     return 1.0 if winner == state.current_player else -1.0
+
+
+def policy_from_visits_and_priors(
+    visits: torch.Tensor,
+    priors: torch.Tensor,
+    *,
+    temperature: float,
+    prior_pseudocount: float = 0.0,
+) -> torch.Tensor:
+    """Create a stable policy and keep beta=0 bit-compatible with visit targets."""
+
+    visit_values = torch.as_tensor(visits, dtype=torch.float32).view(-1)
+    prior_values = torch.as_tensor(priors, dtype=torch.float32).view(-1)
+    if visit_values.shape != prior_values.shape:
+        raise ValueError(
+            "visits and priors must have the same shape, "
+            f"got {tuple(visit_values.shape)} and {tuple(prior_values.shape)}"
+        )
+    if not bool(torch.isfinite(visit_values).all().item()):
+        raise ValueError("visit counts contain NaN/Inf")
+    if bool((visit_values < 0).any().item()):
+        raise ValueError("visit counts must be non-negative")
+    beta = float(prior_pseudocount)
+    if not math.isfinite(beta) or beta < 0.0:
+        raise ValueError("prior_pseudocount must be finite and non-negative")
+
+    scores = visit_values
+    if beta > 0.0:
+        if not bool(torch.isfinite(prior_values).all().item()):
+            raise ValueError("root priors contain NaN/Inf")
+        normalized_priors = prior_values.clamp_min(1e-8)
+        prior_sum = float(normalized_priors.sum().item())
+        if not math.isfinite(prior_sum) or prior_sum <= 0.0:
+            normalized_priors.fill_(
+                1.0 / max(1, int(normalized_priors.numel()))
+            )
+        else:
+            normalized_priors = normalized_priors / prior_sum
+        scores = visit_values + (beta * normalized_priors)
+
+    total = float(scores.sum().item())
+    if not math.isfinite(total) or total <= 0.0:
+        raise RuntimeError("Expanded non-terminal root has no policy mass after search.")
+    temp = float(temperature)
+    if not math.isfinite(temp) or temp < 0.0:
+        raise ValueError("temperature must be finite and non-negative")
+    if temp <= 1e-6:
+        probabilities = torch.zeros_like(scores)
+        probabilities[int(torch.argmax(scores).item())] = 1.0
+        return probabilities
+
+    logits = torch.full_like(scores, float("-inf"))
+    positive = scores.gt(0)
+    logits[positive] = torch.log(scores[positive]) / max(temp, 1e-6)
+    probabilities = torch.softmax(logits, dim=0)
+    if not bool(torch.isfinite(probabilities).all().item()):
+        raise RuntimeError("Policy construction produced NaN/Inf.")
+    return probabilities
 
 
 class PortableMCTS:
@@ -405,6 +468,7 @@ class PortableMCTS:
         self,
         root: PortableNode,
         temperature: float,
+        prior_pseudocount: float = 0.0,
     ) -> Tuple[torch.Tensor, Dict[int, int]]:
         policy = torch.zeros((TOTAL_DIM,), dtype=torch.float32)
         visit_counts = {
@@ -415,20 +479,37 @@ class PortableMCTS:
             return policy, visit_counts
         indices = sorted(visit_counts)
         visits = torch.tensor([visit_counts[index] for index in indices], dtype=torch.float32)
-        if int(visits.sum().item()) <= 0:
-            raise RuntimeError("Expanded non-terminal root has no child visits after search.")
-        temp = float(temperature)
-        if temp <= 1e-6:
-            best_local = int(torch.argmax(visits).item())
-            probs = torch.zeros_like(visits)
-            probs[best_local] = 1.0
-        else:
-            logits = torch.full_like(visits, float("-inf"))
-            positive = visits.gt(0)
-            logits[positive] = torch.log(visits[positive]) / max(temp, 1e-6)
-            probs = torch.softmax(logits, dim=0)
+        priors = torch.tensor(
+            [root.children[index].prior for index in indices],
+            dtype=torch.float32,
+        )
+        probs = policy_from_visits_and_priors(
+            visits,
+            priors,
+            temperature=float(temperature),
+            prior_pseudocount=float(prior_pseudocount),
+        )
         policy[torch.tensor(indices, dtype=torch.int64)] = probs
         return policy, visit_counts
+
+    @staticmethod
+    def _root_priors(root: PortableNode) -> torch.Tensor:
+        priors = torch.zeros((TOTAL_DIM,), dtype=torch.float32)
+        if root.children:
+            indices = sorted(root.children)
+            priors[torch.tensor(indices, dtype=torch.int64)] = torch.tensor(
+                [root.children[index].prior for index in indices],
+                dtype=torch.float32,
+            )
+        return priors
+
+    @staticmethod
+    def _root_action_values(root: PortableNode) -> torch.Tensor:
+        values = torch.zeros((TOTAL_DIM,), dtype=torch.float32)
+        for action_index, child in root.children.items():
+            if child.visit_count > 0:
+                values[int(action_index)] = float(value_for_parent(root, child))
+        return values
 
     def search_batch(
         self,
@@ -534,6 +615,11 @@ class PortableMCTS:
                         model_input=root.model_input.clone(),
                         legal_mask=root.legal_mask.clone(),
                         policy_dense=torch.zeros((TOTAL_DIM,), dtype=torch.float32),
+                        selection_policy_dense=torch.zeros(
+                            (TOTAL_DIM,), dtype=torch.float32
+                        ),
+                        root_priors=self._root_priors(root),
+                        root_action_values=self._root_action_values(root),
                         root_value=(
                             -1.0 if root.no_legal_terminal else terminal_value(root.state)
                         ),
@@ -545,7 +631,17 @@ class PortableMCTS:
                 )
                 continue
 
-            policy, visit_counts = self._policy_from_visits(root, temp_values[row])
+            selection_policy, visit_counts = self._policy_from_visits(
+                root, temp_values[row]
+            )
+            target_temperature = self.config.policy_target_temperature
+            if target_temperature is None:
+                target_temperature = temp_values[row]
+            policy, _ = self._policy_from_visits(
+                root,
+                float(target_temperature),
+                float(self.config.policy_target_prior_pseudocount),
+            )
             legal_mask = root.legal_mask.to(torch.bool)
             policy = policy * legal_mask.to(torch.float32)
             policy_sum = float(policy.sum().item())
@@ -559,9 +655,11 @@ class PortableMCTS:
                 selected_local = int(torch.randint(int(legal_indices.numel()), (1,)).item())
                 chosen_index = int(legal_indices[selected_local].item())
             elif self.config.sample_moves:
-                chosen_index = int(torch.multinomial(policy, num_samples=1).item())
+                chosen_index = int(
+                    torch.multinomial(selection_policy, num_samples=1).item()
+                )
             else:
-                chosen_index = int(torch.argmax(policy).item())
+                chosen_index = int(torch.argmax(selection_policy).item())
             child = root.children.get(chosen_index)
             if child is None or child.move is None:
                 raise RuntimeError(f"Chosen action {chosen_index} is missing from the root tree.")
@@ -570,6 +668,9 @@ class PortableMCTS:
                     model_input=root.model_input.clone(),
                     legal_mask=legal_mask.clone(),
                     policy_dense=policy.clone(),
+                    selection_policy_dense=selection_policy.clone(),
+                    root_priors=self._root_priors(root),
+                    root_action_values=self._root_action_values(root),
                     root_value=(root.mean_value if root.visit_count > 0 else root.initial_value),
                     terminal=False,
                     chosen_action_index=chosen_index,

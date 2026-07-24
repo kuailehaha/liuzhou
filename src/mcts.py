@@ -106,7 +106,10 @@ class MCTSNode:
 
     def backpropagate(self, value: float) -> None:
         """
-        将价值反向传播到根节点。
+        将当前叶子行动方视角的价值反向传播到根节点。
+
+        六洲棋的原子阶段可能让同一行动方连续操作，因此只有父子节点的
+        ``player_to_act`` 真正变化时才翻转符号。
         """
         node = self
         current_value = value
@@ -121,8 +124,16 @@ class MCTSNode:
             node.visit_count += 1
             node.value_sum += current_value
 
-            node = node.parent
-            current_value = -current_value
+            parent = node.parent
+            if parent is not None and parent.player_to_act != node.player_to_act:
+                current_value = -current_value
+            node = parent
+
+    def value_for_parent(self, child: "MCTSNode") -> float:
+        """Return ``child`` Q in this node's side-to-move perspective."""
+
+        value = child.value()
+        return value if self.player_to_act == child.player_to_act else -value
 
     def apply_virtual_loss(self, loss: float) -> None:
         """
@@ -166,7 +177,7 @@ class MCTSNode:
         best_score = -float("inf")
 
         for child in self.children:
-            Q = child.value()                 # 平均价值（根执手视角）
+            Q = self.value_for_parent(child)
             P = child.prior                   # 先验
             U = exploration_weight * P * math.sqrt(parent_N) / (1 + child.visit_count)
             puct = Q + U
@@ -188,7 +199,7 @@ class MCTSNode:
         for child in self.children:
             if id(child) in banned_child_ids:
                 continue
-            Q = child.value()
+            Q = self.value_for_parent(child)
             P = child.prior
             U = exploration_weight * P * math.sqrt(parent_N) / (1 + child.visit_count)
             puct = Q + U
@@ -511,7 +522,7 @@ class MCTS:
             parent_N = max(1, root.visit_count)
             rows = []
             for idx, child in enumerate(root.children, start=1):
-                Q = child.value()
+                Q = root.value_for_parent(child)
                 N = child.visit_count
                 P = child.prior
                 U = self.exploration_weight * P * math.sqrt(parent_N) / (1 + N)

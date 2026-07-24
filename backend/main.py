@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import mimetypes
 from pathlib import Path
@@ -22,7 +23,13 @@ from v1.python.portable_gameplay_agent import PortableGameplayAgent
 from .game_manager import GameManager, GameSession
 from .model_loader import ModelLoadError, get_model_with_metadata
 from .schemas import MoveRequest, NewGameRequest
-from .utils import build_game_payload, deserialize_move, move_to_key
+from .utils import (
+    build_game_payload,
+    deserialize_move,
+    move_to_key,
+    serialize_game_state,
+    serialize_move,
+)
 from .static_files import NoCacheStaticFiles
 
 
@@ -76,6 +83,30 @@ def _sync_agent(agent: Any, state: GameState) -> None:
 
 def _legal_moves_dict(moves: Iterable[Mapping[str, Any]]) -> Dict[Any, Mapping[str, Any]]:
     return {move_to_key(move): move for move in moves}
+
+
+def _record_move(
+    session: GameSession,
+    *,
+    actor: str,
+    player: Player,
+    phase: str,
+    move: Mapping[str, Any],
+    state_before: GameState,
+    search: Dict[str, Any] | None = None,
+) -> None:
+    session.game_record.append(
+        {
+            "sequence": len(session.game_record) + 1,
+            "actor": str(actor),
+            "player": player.name,
+            "phase": str(phase),
+            "move": serialize_move(move),
+            "stateBefore": serialize_game_state(state_before),
+            "stateAfter": serialize_game_state(session.state),
+            "search": copy.deepcopy(search) if search is not None else None,
+        }
+    )
 
 
 def _create_ai_agent(
@@ -172,8 +203,26 @@ def _maybe_run_ai_turn(session: GameSession) -> List[Mapping[str, Any]]:
             )
 
         move_to_apply = legal_map[key]
+        state_before = session.state.copy()
+        player = session.state.current_player
+        phase = session.state.phase.name
+        search = (
+            copy.deepcopy(session.ai_agent.last_search)
+            if hasattr(session.ai_agent, "last_search")
+            and isinstance(session.ai_agent.last_search, dict)
+            else None
+        )
         session.state = apply_move(session.state, move_to_apply, quiet=True)
         ai_moves.append(move_to_apply)
+        _record_move(
+            session,
+            actor="AI",
+            player=player,
+            phase=phase,
+            move=move_to_apply,
+            state_before=state_before,
+            search=search,
+        )
 
     return ai_moves
 
@@ -264,6 +313,7 @@ def _prepare_payload(session: GameSession, ai_moves: List[Mapping[str, Any]] | N
     }
     if hasattr(session.ai_agent, "audit_metadata"):
         payload["meta"].update(session.ai_agent.audit_metadata())
+    payload["gameRecord"] = copy.deepcopy(session.game_record)
     evaluation = _evaluate_position(session)
     if evaluation is not None:
         payload["evaluation"] = evaluation
@@ -338,7 +388,18 @@ def submit_human_move(game_id: str, request: MoveRequest):
         raise HTTPException(status_code=400, detail="Move is not legal in the current state.")
 
     canonical_move = legal_map[key]
+    state_before = session.state.copy()
+    player = session.state.current_player
+    phase = session.state.phase.name
     session.state = apply_move(session.state, canonical_move, quiet=True)
+    _record_move(
+        session,
+        actor="HUMAN",
+        player=player,
+        phase=phase,
+        move=canonical_move,
+        state_before=state_before,
+    )
     _sync_agent(session.ai_agent, session.state)
 
     return _prepare_payload(session)

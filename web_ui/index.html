@@ -36,18 +36,26 @@
               <input
                 type="text"
                 name="model_path"
-                value="D:\CODES\liuzhou\models\model_iter_3.pt"
-                placeholder="D:\CODES\liuzhou\models\model_iter_3.pt"
+                value=""
+                placeholder="Leave empty to use server MODEL_PATH"
                 autocomplete="off"
               />
             </label>
             <label>
+              Search backend:
+              <select name="search_backend">
+                <option value="portable_cpp" selected>Portable C++</option>
+                <option value="portable_python">Portable Python reference</option>
+                <option value="legacy">Legacy (diagnostics only)</option>
+              </select>
+            </label>
+            <label>
               MCTS simulations per move:
-              <input type="number" name="mcts_simulations" min="1" placeholder="160" />
+              <input type="number" name="mcts_simulations" min="1" placeholder="1024" />
             </label>
             <label>
               Temperature:
-              <input type="number" name="temperature" step="0.01" min="0" placeholder="0.05" />
+              <input type="number" name="temperature" step="0.01" min="0" placeholder="0" />
             </label>
           </fieldset>
 

@@ -76,6 +76,7 @@ function buildRequestBody(form) {
   const data = new FormData(form);
   const payload = {
     human_player: data.get("human_player") || "BLACK",
+    search_backend: data.get("search_backend") || "portable_cpp",
   };
   const modelPath = (data.get("model_path") || "").trim();
   if (modelPath) {

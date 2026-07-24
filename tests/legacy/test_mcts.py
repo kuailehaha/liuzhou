@@ -9,7 +9,7 @@ import torch
 import pytest
 
 from src.mcts import MCTS, MCTSNode
-from src.game_state import GameState, Phase
+from src.game_state import GameState, Phase, Player
 
 
 class DummyModel:
@@ -68,7 +68,47 @@ def test_terminal_value_backpropagated(monkeypatch: pytest.MonkeyPatch):
     assert val == -1.0
     child.backpropagate(child.terminal_value)
     assert parent.visit_count == 1
-    assert parent.value_sum == 1.0
+    assert parent.value_sum == -1.0
+
+
+def test_backpropagate_flips_only_when_player_changes() -> None:
+    same_parent = MCTSNode(GameState(current_player=Player.BLACK))
+    same_child = MCTSNode(
+        GameState(current_player=Player.BLACK),
+        parent=same_parent,
+    )
+    same_child.backpropagate(0.75)
+    assert same_child.value() == pytest.approx(0.75)
+    assert same_parent.value() == pytest.approx(0.75)
+
+    switched_parent = MCTSNode(GameState(current_player=Player.BLACK))
+    switched_child = MCTSNode(
+        GameState(current_player=Player.WHITE),
+        parent=switched_parent,
+    )
+    switched_child.backpropagate(0.75)
+    assert switched_child.value() == pytest.approx(0.75)
+    assert switched_parent.value() == pytest.approx(-0.75)
+
+
+def test_puct_converts_child_value_to_parent_perspective() -> None:
+    parent = MCTSNode(GameState(current_player=Player.BLACK))
+    same = MCTSNode(
+        GameState(current_player=Player.BLACK),
+        parent=parent,
+        prior=0.0,
+    )
+    switched = MCTSNode(
+        GameState(current_player=Player.WHITE),
+        parent=parent,
+        prior=0.0,
+    )
+    same.visit_count = switched.visit_count = 1
+    same.value_sum = switched.value_sum = 0.5
+    parent.children = [same, switched]
+    parent.visit_count = 2
+
+    assert parent.get_best_child(exploration_weight=0.0) is same
 
 
 def test_expand_does_not_increment_counts(monkeypatch: pytest.MonkeyPatch):
@@ -86,4 +126,3 @@ def test_expand_does_not_increment_counts(monkeypatch: pytest.MonkeyPatch):
     assert node.value_sum == 0.0
     assert len(node.children) == 1
     assert pytest.approx(val, rel=0.0, abs=1e-6) == 0.2
-

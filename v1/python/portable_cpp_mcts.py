@@ -18,6 +18,7 @@ from .portable_device import PortableDeviceResolution, resolve_portable_device
 from .portable_mcts import (
     PortableMCTSConfig,
     PortableSearchOutput,
+    policy_from_visits_and_priors,
 )
 
 
@@ -216,26 +217,25 @@ class PortableCppMCTS:
         visits: torch.Tensor,
         legal_mask: torch.Tensor,
         temperature: float,
+        priors: Optional[torch.Tensor] = None,
+        prior_pseudocount: float = 0.0,
     ) -> torch.Tensor:
         policy = torch.zeros((TOTAL_DIM,), dtype=torch.float32)
         indices = torch.where(legal_mask)[0]
         if int(indices.numel()) == 0:
             return policy
         legal_visits = visits[indices].to(torch.float32)
-        if int(legal_visits.sum().item()) <= 0:
-            raise RuntimeError(
-                "Expanded non-terminal C++ root has no child visits after search."
-            )
-        if float(temperature) <= 1e-6:
-            probabilities = torch.zeros_like(legal_visits)
-            probabilities[int(torch.argmax(legal_visits).item())] = 1.0
-        else:
-            logits = torch.full_like(legal_visits, float("-inf"))
-            positive = legal_visits.gt(0)
-            logits[positive] = torch.log(legal_visits[positive]) / max(
-                float(temperature), 1e-6
-            )
-            probabilities = torch.softmax(logits, dim=0)
+        legal_priors = (
+            torch.zeros_like(legal_visits)
+            if priors is None
+            else priors[indices].to(torch.float32)
+        )
+        probabilities = policy_from_visits_and_priors(
+            legal_visits,
+            legal_priors,
+            temperature=float(temperature),
+            prior_pseudocount=float(prior_pseudocount),
+        )
         policy[indices] = probabilities
         return policy
 
@@ -282,14 +282,19 @@ class PortableCppMCTS:
 
         started = time.perf_counter()
         raw = self.trees.root_outputs()
+        root_prior_batch = self.trees.root_priors()
         self.record_timing("cpp_root_output", time.perf_counter() - started)
         model_inputs = torch.from_numpy(raw["model_inputs"]).to(torch.float32)
         legal_masks = torch.from_numpy(raw["legal_masks"]).to(torch.bool)
         visit_matrix = torch.from_numpy(raw["visit_counts"]).to(torch.int32)
+        root_action_values = torch.from_numpy(
+            raw["root_action_values"]
+        ).to(torch.float32)
         root_values = torch.from_numpy(raw["root_values"]).to(torch.float32)
         terminals = torch.from_numpy(raw["terminal"]).to(torch.bool)
         active = torch.from_numpy(raw["active"]).to(torch.bool)
         current_players = torch.from_numpy(raw["current_players"]).to(torch.int32)
+        root_priors = torch.from_numpy(root_prior_batch["priors"]).to(torch.float32)
         self.last_current_players = [
             int(value) for value in current_players.tolist()
         ]
@@ -311,6 +316,11 @@ class PortableCppMCTS:
                         policy_dense=torch.zeros(
                             (TOTAL_DIM,), dtype=torch.float32
                         ),
+                        selection_policy_dense=torch.zeros(
+                            (TOTAL_DIM,), dtype=torch.float32
+                        ),
+                        root_priors=root_priors[row].clone(),
+                        root_action_values=root_action_values[row].clone(),
                         root_value=float(root_values[row].item()),
                         terminal=True,
                         chosen_action_index=None,
@@ -319,8 +329,20 @@ class PortableCppMCTS:
                     )
                 )
                 continue
-            policy = self._policy_from_visits(
+            selection_policy = self._policy_from_visits(
                 visit_matrix[row], legal_mask, temperature_values[row]
+            )
+            target_temperature = self.config.policy_target_temperature
+            if target_temperature is None:
+                target_temperature = temperature_values[row]
+            policy = self._policy_from_visits(
+                visit_matrix[row],
+                legal_mask,
+                float(target_temperature),
+                priors=root_priors[row],
+                prior_pseudocount=float(
+                    self.config.policy_target_prior_pseudocount
+                ),
             )
             policy_sum = float(policy.sum().item())
             if not math.isfinite(policy_sum) or abs(policy_sum - 1.0) > 1e-5:
@@ -339,15 +361,18 @@ class PortableCppMCTS:
                 chosen_index = int(legal_indices[local].item())
             elif self.config.sample_moves:
                 chosen_index = int(
-                    torch.multinomial(policy, num_samples=1).item()
+                    torch.multinomial(selection_policy, num_samples=1).item()
                 )
             else:
-                chosen_index = int(torch.argmax(policy).item())
+                chosen_index = int(torch.argmax(selection_policy).item())
             outputs.append(
                 PortableSearchOutput(
                     model_input=model_inputs[row].clone(),
                     legal_mask=legal_mask,
                     policy_dense=policy,
+                    selection_policy_dense=selection_policy,
+                    root_priors=root_priors[row].clone(),
+                    root_action_values=root_action_values[row].clone(),
                     root_value=float(root_values[row].item()),
                     terminal=False,
                     chosen_action_index=chosen_index,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from src.game_state import GameState, Player
@@ -17,6 +17,8 @@ class GameSession:
     ai_player: Player
     ai_agent: Any
     using_random_agent: bool
+    ai_metadata: Dict[str, Any] = field(default_factory=dict)
+    game_record: List[Dict[str, Any]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
 
@@ -39,6 +41,7 @@ class GameManager:
         ai_agent: Any,
         using_random_agent: bool = False,
         initial_state: Optional[GameState] = None,
+        ai_metadata: Optional[Dict[str, Any]] = None,
     ) -> GameSession:
         game_id = uuid4().hex
         state = initial_state.copy() if initial_state else GameState()
@@ -49,6 +52,7 @@ class GameManager:
             ai_player=human_player.opponent(),
             ai_agent=ai_agent,
             using_random_agent=using_random_agent,
+            ai_metadata=dict(ai_metadata or {}),
         )
         with self._lock:
             self._sessions[game_id] = session
@@ -65,4 +69,3 @@ class GameManager:
     def remove_session(self, game_id: str) -> None:
         with self._lock:
             self._sessions.pop(game_id, None)
-

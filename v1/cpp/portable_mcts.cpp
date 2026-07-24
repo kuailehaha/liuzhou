@@ -669,6 +669,8 @@ class PortableTreeBatch {
              static_cast<py::ssize_t>(v0::kBoardSize)});
         py::array_t<uint8_t> masks({count, static_cast<py::ssize_t>(kActionCount)});
         py::array_t<int32_t> visits({count, static_cast<py::ssize_t>(kActionCount)});
+        py::array_t<float> action_values(
+            {count, static_cast<py::ssize_t>(kActionCount)});
         py::array_t<float> root_values(count);
         py::array_t<int32_t> players(count);
         py::array_t<uint8_t> terminals(count);
@@ -676,6 +678,8 @@ class PortableTreeBatch {
         auto* input_data = static_cast<float*>(inputs.request().ptr);
         auto* mask_data = static_cast<uint8_t*>(masks.request().ptr);
         auto* visit_data = static_cast<int32_t*>(visits.request().ptr);
+        auto* action_value_data =
+            static_cast<float*>(action_values.request().ptr);
         auto* value_data = static_cast<float*>(root_values.request().ptr);
         auto* player_data = static_cast<int32_t*>(players.request().ptr);
         auto* terminal_data = static_cast<uint8_t*>(terminals.request().ptr);
@@ -683,6 +687,10 @@ class PortableTreeBatch {
         std::fill(input_data, input_data + count * kInputSize, 0.0F);
         std::fill(mask_data, mask_data + count * kActionCount, 0);
         std::fill(visit_data, visit_data + count * kActionCount, 0);
+        std::fill(
+            action_value_data,
+            action_value_data + count * kActionCount,
+            0.0F);
 
         for (py::ssize_t row = 0; row < count; ++row) {
             const Tree& tree = trees_[static_cast<std::size_t>(row)];
@@ -704,12 +712,23 @@ class PortableTreeBatch {
                 mask_data[row * kActionCount + child->action_index] = 1;
                 visit_data[row * kActionCount + child->action_index] =
                     child->visit_count;
+                if (child->visit_count > 0) {
+                    double q = child->MeanValue();
+                    if (
+                        root.state.current_player !=
+                        child->state.current_player) {
+                        q = -q;
+                    }
+                    action_value_data[row * kActionCount + child->action_index] =
+                        static_cast<float>(q);
+                }
             }
         }
         py::dict result;
         result["model_inputs"] = std::move(inputs);
         result["legal_masks"] = std::move(masks);
         result["visit_counts"] = std::move(visits);
+        result["root_action_values"] = std::move(action_values);
         result["root_values"] = std::move(root_values);
         result["current_players"] = std::move(players);
         result["terminal"] = std::move(terminals);

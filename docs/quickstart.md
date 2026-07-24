@@ -104,7 +104,7 @@ python scripts/eval_checkpoint.py \
 
 实际选步仍按 `1.0 -> 0.1`；训练 target 固定温度 1，并按合法根动作的 `N + beta*P` 构造。省略 `--policy-target-temperature` 且保留默认 `beta=0` 时与旧 visit target 兼容。self-play JSON 会额外审计合法/正 target/访问支持数、熵、有效支持度、未访问先验质量、one-hot 比例及分 ply 数据。
 
-2026-07-24 的生产形状复测固定同 checkpoint、seed、128 games/concurrency 128、opening 3、完整 512 plies 和一个 C++ 线程，三次中位数为：旧 8-sim `523.24 positions/s`、`23.27s`；新 16-sim `290.82 positions/s`、`41.08s`。结合近期不变的 `36.22s` 训练中位数，完整 iteration 预计为旧配置的 `1.299x`。target 正支持从 `4.13/12.47` 提升到 `12.34/12.34`，熵从 `0.135` 提升到 `0.671`，one-hot 从 `37.18%` 降到 `4.06%`；所有六次运行的 fallback、非法动作和非有限值均为 0。
+2026-07-24 的生产形状复测固定同 checkpoint、seed、128 games/concurrency 128、opening 3、完整 512 plies 和一个 C++ 线程，三次中位数为：旧 8-sim `523.24 positions/s`、`23.27s`；新 16-sim `290.82 positions/s`、`41.08s`。随后把六份 payload 分别从同一 boundary model/optimizer 开始，按相同 replay、batch 和 3 epochs 实际训练；训练阶段中位数为 `35.28s/34.98s`，完整 self-play+train 中位数为 `58.55s/76.05s`，即 `1.299x`。target 正支持从 `4.13/12.47` 提升到 `12.34/12.34`，熵从 `0.135` 提升到 `0.671`，one-hot 从 `37.18%` 降到 `4.06%`；所有六次 self-play/train 的 fallback、非法动作、非有限值和过滤样本均为 0。
 
 合盖运行前必须接交流电、外接显示器和外接键盘/鼠标。`caffeinate` 只保证其子进程存活期间抑制 idle/system/disk sleep，不能代替 Apple silicon 的合盖硬件条件；命令中的 `--require-external-display` 会在没有外接显示器时直接失败。
 

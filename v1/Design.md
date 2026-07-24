@@ -43,11 +43,11 @@ so `--opening-random-anneal-fraction 0.25` reaches zero after the first quarter 
 
 Optimizer resume had a separate correctness bug: loaded param groups retained an old `initial_lr`, and `LambdaLR` reset the requested continued LR to the old `3e-4` base. Most phase-1 iterations therefore did not use the lower LR printed in orchestration commands; this is a plausible plateau contributor and those printed labels must not be treated as effective-LR evidence. Both tensor and streaming bridges now set `lr` and `initial_lr` before scheduler construction. Train metrics expose `optimizer_lr_start/final`; the orchestrator requires both and checks the LR saved in `optimizer.pt`. The corrected path was used for the clean 857–860 completion, whose optimizer ends at the audited `0.000196904486436`.
 
-New incumbent promotions copy the candidate model and its paired optimizer to `best_model.pt` and `best_optimizer.pt`. Historical incumbents that predate optimizer retention are explicitly marked unavailable rather than paired with the wrong optimizer.
+New incumbent promotions commit the candidate model and its paired optimizer to `best_model.pt` and `best_optimizer.pt` through a recoverable pair transaction. If only one alias was replaced, resume restores both old aliases; if both new aliases landed but the state write was interrupted, resume verifies both hashes and finishes the new state. Historical incumbents that predate optimizer retention are explicitly marked unavailable rather than paired with the wrong optimizer.
 
 ### Gameplay search
 
-`v1.python.portable_gameplay_agent.PortableGameplayAgent` supplies persistent Python or C++ portable search for FastAPI/Web play. Production defaults are C++, no Dirichlet noise, temperature 0 and 1024 simulations. The backend synchronizes the tree after a human move, then preserves the subtree across consecutive AI-owned atomic phases. It reports resolved checkpoint path/SHA, device, backend, threads, simulations, temperature, search elapsed time and root top-10 `P/N/Q`. A requested portable extension or checkpoint failure is an HTTP error; no Legacy/Random fallback occurs.
+`v1.python.portable_gameplay_agent.PortableGameplayAgent` supplies persistent Python or C++ portable search for FastAPI/Web play. Production defaults are C++, no Dirichlet noise, temperature 0 and 1024 simulations. The backend synchronizes the tree after a human move, then preserves the subtree across consecutive AI-owned atomic phases. It reports resolved checkpoint path/SHA, device, backend, threads, simulations, temperature, search elapsed time and root top-10 `P/N/Q`. The additive `gameRecord` response contains every actor/player/phase/move, before/after state and the corresponding full AI root audit, so a weak 1024-simulation game can be replayed and attributed to policy, value or search. A requested portable extension or checkpoint failure is an HTTP error; no Legacy/Random fallback occurs.
 
 Legacy `src/mcts.py` is retained for diagnostics, but its backup and PUCT Q conversion now use the same player-change rule. This fixes the prior unconditional per-edge sign flip without making Legacy the production gameplay recommendation.
 
@@ -58,8 +58,9 @@ Legacy `src/mcts.py` is retained for diagnostics, but its backup and PUCT Q conv
 - Production-shape comparison, same checkpoint SHA `4cbab2cd...dec9d`, seed, 128 games/concurrency 128, opening 3, full 512 plies, one C++ thread, three repeats:
   - old 8-sim: median `523.24 positions/s`, `23.27s`, support `4.13/12.47`, entropy `0.135`, one-hot `37.18%`;
   - new 16-sim: median `290.82 positions/s`, `41.08s`, support `12.34/12.34`, entropy `0.671`, one-hot `4.06%`;
-  - self-play elapsed ratio `1.765x`; with unchanged recent training median `36.22s`, complete-iteration ratio `1.299x`, below the `1.5x` ceiling;
-  - all six measurements: fallback 0, illegal actions 0, non-finite values 0.
+  - all six payloads were trained from the same boundary model/optimizer with production replay/batch/3-epoch settings; old/new train-stage medians were `35.28s/34.98s`, and complete self-play-plus-train medians were `58.55s/76.05s`;
+  - self-play elapsed ratio `1.765x`; measured complete-iteration ratio `1.299x`, below the `1.5x` ceiling;
+  - all six self-play and train measurements: fallback 0, illegal actions 0, non-finite or filtered samples 0.
 - Deterministic 16-sim 32x32/32-ply thread and backend sweep:
   - Python `88.62 positions/s`;
   - C++ 1/2/4/8 threads `210.05/196.27/209.92/216.79 positions/s` (`2.37x/2.21x/2.37x/2.45x`);

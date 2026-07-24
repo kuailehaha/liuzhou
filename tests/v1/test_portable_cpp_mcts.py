@@ -243,6 +243,52 @@ def test_cpp_and_python_deterministic_search_match() -> None:
         assert cpp_output.chosen_action_index == python_output.chosen_action_index
 
 
+def test_cpp_and_python_smoothed_policy_targets_match() -> None:
+    _cpp_module()
+    from v1.python.portable_cpp_mcts import PortableCppMCTS
+    from v1.python.portable_mcts import PortableMCTS, PortableMCTSConfig, PortableTree
+
+    python_model = _small_model()
+    cpp_model = _small_model()
+    cpp_model.load_state_dict(python_model.state_dict())
+    config = PortableMCTSConfig(
+        num_simulations=8,
+        exploration_weight=1.0,
+        temperature=0.1,
+        policy_target_temperature=1.0,
+        policy_target_prior_pseudocount=1.0,
+        add_dirichlet_noise=False,
+        sample_moves=False,
+    )
+    state = GameState()
+    python_output = PortableMCTS(python_model, config, "cpu").search_batch(
+        [PortableTree(state)],
+        add_dirichlet_noise=False,
+    )[0]
+    cpp_output = PortableCppMCTS(
+        cpp_model,
+        config,
+        device="cpu",
+        num_threads=2,
+        initial_states=[state],
+    ).search_batch(
+        temperatures=[0.1],
+        add_dirichlet_noise=False,
+    )[0]
+
+    assert cpp_output.visit_counts == python_output.visit_counts
+    assert torch.equal(cpp_output.root_priors, python_output.root_priors)
+    assert torch.equal(
+        cpp_output.selection_policy_dense,
+        python_output.selection_policy_dense,
+    )
+    assert torch.equal(cpp_output.policy_dense, python_output.policy_dense)
+    assert cpp_output.chosen_action_index == python_output.chosen_action_index
+    assert int(cpp_output.policy_dense[cpp_output.legal_mask].count_nonzero().item()) == int(
+        cpp_output.legal_mask.count_nonzero().item()
+    )
+
+
 def test_cpp_self_play_preserves_tensor_contract_and_audit_fields() -> None:
     _cpp_module()
     from v1.python.portable_cpp_self_play import self_play_v1_portable_cpp

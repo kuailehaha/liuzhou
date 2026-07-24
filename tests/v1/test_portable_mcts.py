@@ -317,6 +317,67 @@ def test_policy_is_220d_normalized_visit_distribution() -> None:
     assert sum(output.visit_counts.values()) == 8
 
 
+def test_policy_target_prior_pseudocount_preserves_all_legal_actions() -> None:
+    from v1.python.portable_mcts import policy_from_visits_and_priors
+
+    visits = torch.tensor([8.0, 0.0, 0.0, 0.0])
+    priors = torch.tensor([0.4, 0.3, 0.2, 0.1])
+    legacy = policy_from_visits_and_priors(
+        visits,
+        priors,
+        temperature=1.0,
+        prior_pseudocount=0.0,
+    )
+    smoothed = policy_from_visits_and_priors(
+        visits,
+        priors,
+        temperature=1.0,
+        prior_pseudocount=1.0,
+    )
+
+    assert torch.equal(legacy, torch.tensor([1.0, 0.0, 0.0, 0.0]))
+    assert bool(torch.all(smoothed > 0).item())
+    assert float(smoothed.sum().item()) == pytest.approx(1.0, abs=1e-7)
+    assert torch.allclose(
+        smoothed,
+        (visits + priors) / float((visits + priors).sum().item()),
+        atol=1e-7,
+        rtol=0.0,
+    )
+
+
+def test_policy_target_temperature_does_not_change_action_selection() -> None:
+    from v1.python.portable_mcts import PortableMCTS, PortableMCTSConfig, PortableTree
+
+    model_state = _small_model().state_dict()
+    outputs = []
+    for target_temperature, pseudocount in ((None, 0.0), (1.0, 1.0)):
+        model = _small_model()
+        model.load_state_dict(model_state)
+        search = PortableMCTS(
+            model=model,
+            config=PortableMCTSConfig(
+                num_simulations=8,
+                temperature=0.1,
+                policy_target_temperature=target_temperature,
+                policy_target_prior_pseudocount=pseudocount,
+                add_dirichlet_noise=False,
+                sample_moves=False,
+            ),
+            device="cpu",
+        )
+        outputs.append(search.search_batch([PortableTree(GameState())])[0])
+
+    legacy, smoothed = outputs
+    assert legacy.visit_counts == smoothed.visit_counts
+    assert legacy.chosen_action_index == smoothed.chosen_action_index
+    assert torch.equal(legacy.selection_policy_dense, smoothed.selection_policy_dense)
+    assert not torch.equal(legacy.policy_dense, smoothed.policy_dense)
+    assert int(smoothed.policy_dense[smoothed.legal_mask].count_nonzero().item()) == int(
+        smoothed.legal_mask.count_nonzero().item()
+    )
+
+
 def test_root_puct_reuses_a_fixed_q_after_first_visit() -> None:
     from v1.python.portable_root_puct import allocate_fixed_q_visits
 
@@ -587,6 +648,52 @@ def test_optimizer_state_load_failure_is_reported(tmp_path) -> None:
     )
     assert not metrics["optimizer_loaded"]
     assert metrics["optimizer_load_error"]
+
+
+def test_optimizer_resume_uses_requested_learning_rate(tmp_path) -> None:
+    from v1.python.portable_self_play import self_play_v1_portable
+    from v1.python.train_bridge import train_network_from_tensors
+
+    model = _small_model()
+    samples, _stats = self_play_v1_portable(
+        model=model,
+        num_games=1,
+        mcts_simulations=1,
+        temperature_init=1.0,
+        temperature_final=1.0,
+        temperature_threshold=2,
+        exploration_weight=1.0,
+        device="cpu",
+        add_dirichlet_noise=False,
+        max_game_plies=2,
+        sample_moves=False,
+        concurrent_games=1,
+    )
+    state_path = tmp_path / "optimizer.pt"
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    old_state = optimizer.state_dict()
+    old_state["param_groups"][0]["initial_lr"] = 3e-4
+    torch.save(old_state, state_path)
+
+    requested_lr = 1.25e-4
+    _model, metrics = train_network_from_tensors(
+        model=model,
+        samples=samples,
+        batch_size=2,
+        epochs=1,
+        lr=requested_lr,
+        device="cpu",
+        use_amp=False,
+        parallel_strategy="none",
+        optimizer_state_path=str(state_path),
+    )
+
+    saved = torch.load(state_path, map_location="cpu", weights_only=False)
+    assert metrics["optimizer_loaded"]
+    assert metrics["optimizer_lr_start"] == pytest.approx(requested_lr)
+    assert metrics["optimizer_lr_final"] == pytest.approx(requested_lr)
+    assert saved["param_groups"][0]["lr"] == pytest.approx(requested_lr)
+    assert saved["param_groups"][0]["initial_lr"] == pytest.approx(requested_lr)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is unavailable")
