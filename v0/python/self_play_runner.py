@@ -28,7 +28,6 @@ __all__ = [
     "self_play_v0",
 ]
 
-_SOFT_TAN_INPUT_CLAMP = float((np.pi * 0.5) - 1e-3)
 
 
 def _unwrap_model(model: ChessNet) -> ChessNet:
@@ -244,13 +243,7 @@ def _soft_value_from_state(state: GameState, soft_value_k: float) -> float:
     white_count = state.count_player_pieces(Player.WHITE)
     # In Liuzhou, |black-white| <= 18, so normalize by 18 to use full signal range.
     material_delta = (black_count - white_count) / 18.0
-    scaled = np.clip(
-        float(soft_value_k) * material_delta,
-        -_SOFT_TAN_INPUT_CLAMP,
-        _SOFT_TAN_INPUT_CLAMP,
-    )
-    shaped = np.tan(scaled)
-    return float(np.clip(shaped, -1.0, 1.0))
+    return float(np.tanh(float(soft_value_k) * material_delta))
 
 
 def self_play_single_game_v0(

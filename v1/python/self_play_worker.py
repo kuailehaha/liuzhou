@@ -293,6 +293,7 @@ def run_self_play_worker(
     max_game_plies: int,
     concurrent_games_per_device: int,
     soft_label_alpha: float = 0.0,
+    sample_moves: bool = True,
     target_samples_per_shard: int = 0,
     chunk_target_bytes: int = 0,
     chunk_output_dir: Optional[str] = None,
@@ -368,7 +369,7 @@ def run_self_play_worker(
                     "soft_value_k": float(soft_value_k),
                     "opening_random_moves": int(opening_random_moves),
                     "max_game_plies": int(max_game_plies),
-                    "sample_moves": True,
+                    "sample_moves": bool(sample_moves),
                     "concurrent_games": max(
                         1, min(int(chunk_games), shard_concurrent)
                     ),
@@ -400,7 +401,7 @@ def run_self_play_worker(
                 soft_value_k=float(soft_value_k),
                 opening_random_moves=int(opening_random_moves),
                 max_game_plies=int(max_game_plies),
-                sample_moves=True,
+                sample_moves=bool(sample_moves),
                 concurrent_games=max(1, min(int(chunk_games), shard_concurrent)),
                 sparse_ply=int(sparse_ply),
                 sparse_top_k=int(sparse_top_k),

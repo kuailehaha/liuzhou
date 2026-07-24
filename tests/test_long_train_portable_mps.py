@@ -316,6 +316,69 @@ def test_fork_refuses_elapsed_parent_deadline(tmp_path) -> None:
         PortableLongTrainer(args).initialize()
 
 
+def test_fork_can_reset_elapsed_deadline_with_explicit_authorization(tmp_path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "phase2"
+    (source / "checkpoints").mkdir(parents=True)
+    (source / "replay").mkdir()
+    current = source / "checkpoints" / "current.pt"
+    optimizer = source / "checkpoints" / "optimizer.pt"
+    current.write_bytes(b"current-model")
+    import torch
+
+    torch.save(
+        {
+            "state": {},
+            "param_groups": [{"params": [], "lr": 1.8e-4, "initial_lr": 1.8e-4}],
+        },
+        optimizer,
+    )
+    for iteration in range(847, 851):
+        torch.save(
+            {"metadata": {"self_play_opening_random_moves": 3}},
+            source / "replay" / f"selfplay_iter_{iteration:06d}.pt",
+        )
+    parent_deadline = int(time.time()) - 60
+    source_state = {
+        "schema_version": 1,
+        "deadline_epoch": parent_deadline,
+        "iteration": 850,
+        "last_eval_iteration": 850,
+        "stop_reason": "max_iterations",
+        "latest_checkpoint_sha256": sha256_file(current),
+        "latest_optimizer_sha256": sha256_file(optimizer),
+        "config": _config_signature(build_parser().parse_args([])),
+    }
+    (source / "state.json").write_text(json.dumps(source_state), encoding="utf-8")
+    (source / "run.lock").touch()
+    args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(destination),
+            "--fork-from-run",
+            str(source),
+            "--reset-fork-deadline",
+            "--hours",
+            "40",
+            "--device",
+            "cpu",
+            "--no-require-ac",
+        ]
+    )
+
+    before = int(time.time())
+    trainer = PortableLongTrainer(args)
+    trainer.initialize()
+
+    assert trainer.state["deadline_epoch"] == pytest.approx(
+        before + 40 * 3600,
+        abs=2,
+    )
+    assert trainer.state["fork"]["original_deadline_epoch"] == parent_deadline
+    assert trainer.state["fork"]["deadline_reset_authorized"] is True
+    assert trainer.state["fork"]["phase_hours"] == 40.0
+
+
 def test_best_promotion_saves_matching_optimizer(tmp_path) -> None:
     args = build_parser().parse_args(
         [

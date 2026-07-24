@@ -19,12 +19,8 @@ from .trajectory_buffer import TensorSelfPlayBatch
 
 
 def _soft_value_from_counts(black: int, white: int, soft_value_k: float) -> float:
-    limit = math.pi * 0.5 - 1e-3
-    scaled = max(
-        -limit,
-        min(limit, ((int(black) - int(white)) / 18.0) * float(soft_value_k)),
-    )
-    return max(-1.0, min(1.0, math.tan(scaled)))
+    scaled = ((int(black) - int(white)) / 18.0) * float(soft_value_k)
+    return math.tanh(scaled)
 
 
 def self_play_v1_portable_cpp(

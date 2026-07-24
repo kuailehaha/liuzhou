@@ -36,7 +36,6 @@ LOSE_PIECE_THRESHOLD = int(GameState.LOSE_PIECE_THRESHOLD)
 PHASE_MOVEMENT = int(v0_core.Phase.MOVEMENT)
 PHASE_CAPTURE_SELECTION = int(v0_core.Phase.CAPTURE_SELECTION)
 PHASE_COUNTER_REMOVAL = int(v0_core.Phase.COUNTER_REMOVAL)
-SOFT_TAN_INPUT_CLAMP = float((math.pi * 0.5) - 1e-3)
 
 @dataclass
 class GpuStateBatch:
@@ -676,7 +675,7 @@ class V1RootMCTS:
         return winner_mask.logical_or(draw_mask)
 
     @staticmethod
-    def _soft_tan_from_board_black(
+    def _soft_tanh_from_board_black(
         board: torch.Tensor,
         soft_value_k: float,
     ) -> torch.Tensor:
@@ -684,13 +683,7 @@ class V1RootMCTS:
         white = board.eq(-1).sum(dim=(1, 2)).to(torch.float32)
         # In Liuzhou, |black-white| <= 18, so normalize by 18 to use full signal range.
         material_delta = (black - white) / 18.0
-        scaled = torch.clamp(
-            material_delta * float(soft_value_k),
-            min=-SOFT_TAN_INPUT_CLAMP,
-            max=SOFT_TAN_INPUT_CLAMP,
-        )
-        shaped = torch.tan(scaled)
-        return torch.clamp(shaped, min=-1.0, max=1.0)
+        return torch.tanh(material_delta * float(soft_value_k))
 
     @staticmethod
     def _child_values_to_parent_perspective(
@@ -947,7 +940,7 @@ class V1RootMCTS:
 
         terminal_child = self._terminal_mask_from_next_state(child_batch)
         if bool(terminal_child.any().item()):
-            soft_from_black = self._soft_tan_from_board_black(
+            soft_from_black = self._soft_tanh_from_board_black(
                 child_batch.board,
                 soft_value_k=float(self.config.soft_value_k),
             ).to(torch.float32)
@@ -1133,7 +1126,7 @@ class V1RootMCTS:
         )
         terminal_child = self._terminal_mask_from_next_state(child_batch)
         if bool(terminal_child.any().item()):
-            soft_from_black = self._soft_tan_from_board_black(
+            soft_from_black = self._soft_tanh_from_board_black(
                 child_batch.board,
                 soft_value_k=float(self.config.soft_value_k),
             ).to(torch.float32)
@@ -1358,7 +1351,7 @@ class V1RootMCTS:
             )
             terminal_child = self._terminal_mask_from_next_state(child_batch)
             if bool(terminal_child.any().item()):
-                soft_from_black = self._soft_tan_from_board_black(
+                soft_from_black = self._soft_tanh_from_board_black(
                     child_batch.board,
                     soft_value_k=float(self.config.soft_value_k),
                 ).to(torch.float32)

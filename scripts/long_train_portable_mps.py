@@ -400,6 +400,8 @@ def _preflight(args: argparse.Namespace) -> None:
         )
     if float(args.hours) <= 0.0:
         raise ValueError("--hours must be positive.")
+    if bool(args.reset_fork_deadline) and not str(args.fork_from_run or "").strip():
+        raise ValueError("--reset-fork-deadline requires --fork-from-run.")
     if str(args.portable_mcts_backend).strip().lower() not in {"python", "cpp"}:
         raise ValueError("--portable-mcts-backend must be python or cpp.")
     if str(args.portable_mcts_backend).strip().lower() == "cpp":
@@ -473,6 +475,7 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "temperature_threshold",
         "policy_target_temperature",
         "policy_target_prior_pseudocount",
+        "sample_moves",
         "opening_random_start",
         "opening_random_final",
         "opening_random_anneal_fraction",
@@ -603,7 +606,10 @@ class PortableLongTrainer:
                 f"iteration={parent_iteration} "
                 f"last_eval_iteration={source_state.get('last_eval_iteration')}"
             )
-        if int(time.time()) >= int(source_state.get("deadline_epoch", 0) or 0):
+        if (
+            int(time.time()) >= int(source_state.get("deadline_epoch", 0) or 0)
+            and not bool(self.args.reset_fork_deadline)
+        ):
             raise RuntimeError("fork source deadline has already elapsed")
 
         source_checkpoint_dir = source_dir / "checkpoints"
@@ -659,7 +665,12 @@ class PortableLongTrainer:
         source_dir: Path = fork["source_dir"]
         source_state: Dict[str, Any] = fork["source_state"]
         start_epoch = int(time.time())
-        deadline_epoch = int(source_state["deadline_epoch"])
+        parent_deadline_epoch = int(source_state["deadline_epoch"])
+        deadline_epoch = (
+            start_epoch + int(float(self.args.hours) * 3600)
+            if bool(self.args.reset_fork_deadline)
+            else parent_deadline_epoch
+        )
         parent_iteration = int(fork["parent_iteration"])
 
         atomic_copy(fork["source_current"], self.current_checkpoint)
@@ -750,7 +761,9 @@ class PortableLongTrainer:
                 "parent_checkpoint_sha256": fork["parent_checkpoint_sha256"],
                 "parent_optimizer_sha256": fork["parent_optimizer_sha256"],
                 "parent_stop_reason": source_state.get("stop_reason"),
-                "original_deadline_epoch": deadline_epoch,
+                "original_deadline_epoch": parent_deadline_epoch,
+                "deadline_reset_authorized": bool(self.args.reset_fork_deadline),
+                "phase_hours": float(self.args.hours),
                 "phase_start_checkpoint": str(self.phase_start_checkpoint),
                 "phase_start_checkpoint_sha256": sha256_file(
                     self.phase_start_checkpoint
@@ -780,6 +793,8 @@ class PortableLongTrainer:
             parent_checkpoint_sha256=fork["parent_checkpoint_sha256"],
             parent_optimizer_sha256=fork["parent_optimizer_sha256"],
             deadline_epoch=deadline_epoch,
+            original_deadline_epoch=parent_deadline_epoch,
+            deadline_reset_authorized=bool(self.args.reset_fork_deadline),
             retained_checkpoint=str(retained),
             config_diff=config_diff,
         )
@@ -1140,6 +1155,7 @@ class PortableLongTrainer:
                 "policy_target_prior_pseudocount": float(
                     self.args.policy_target_prior_pseudocount
                 ),
+                "sample_moves": bool(self.args.sample_moves),
                 "opening_random_anneal_fraction": float(
                     self.args.opening_random_anneal_fraction
                 ),
@@ -1402,6 +1418,11 @@ class PortableLongTrainer:
             "--self_play_stats_json",
             str(stats_path),
         ]
+        command.append(
+            "--self_play_sample_moves"
+            if bool(self.args.sample_moves)
+            else "--no-self_play_sample_moves"
+        )
         if self.args.policy_target_temperature is not None:
             command.extend(
                 [
@@ -2048,6 +2069,14 @@ def build_parser() -> argparse.ArgumentParser:
             "while preserving its deadline, optimizer and replay."
         ),
     )
+    parser.add_argument(
+        "--reset-fork-deadline",
+        action="store_true",
+        help=(
+            "Explicitly authorize a fork to use a new deadline computed from "
+            "--hours instead of inheriting the parent deadline."
+        ),
+    )
     parser.add_argument("--initial-checkpoint", default=None)
     parser.add_argument("--initial-optimizer-state", default=None)
     parser.add_argument("--initial-iteration", type=int, default=0)
@@ -2077,6 +2106,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--policy-target-prior-pseudocount",
         type=float,
         default=0.0,
+    )
+    parser.add_argument(
+        "--sample-moves",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sample actual moves; disable for deterministic N/Q/P selection.",
     )
     parser.add_argument("--opening-random-start", type=int, default=6)
     parser.add_argument("--opening-random-final", type=int, default=0)

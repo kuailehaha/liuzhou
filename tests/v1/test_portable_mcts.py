@@ -346,6 +346,30 @@ def test_policy_target_prior_pseudocount_preserves_all_legal_actions() -> None:
     )
 
 
+def test_deterministic_action_breaks_visit_ties_by_q_then_prior_then_index() -> None:
+    from v1.python.portable_mcts import deterministic_action_from_search
+
+    legal = torch.tensor([True, True, True, True, False])
+    visits = torch.tensor([4, 4, 4, 4, 99])
+    values = torch.tensor([0.1, 0.3, 0.3, 0.3, 9.0])
+    priors = torch.tensor([0.9, 0.2, 0.4, 0.4, 1.0])
+
+    assert deterministic_action_from_search(visits, values, priors, legal) == 2
+
+
+def test_portable_soft_value_uses_tanh_k2_scale() -> None:
+    from v1.python.portable_self_play import _soft_value_from_black
+
+    state = GameState()
+    state.board = [[0] * 6 for _ in range(6)]
+    for index in range(8):
+        state.board[index // 6][index % 6] = Player.BLACK.value
+
+    assert _soft_value_from_black(state, 2.0) == pytest.approx(
+        math.tanh(16.0 / 18.0)
+    )
+
+
 def test_policy_target_temperature_does_not_change_action_selection() -> None:
     from v1.python.portable_mcts import PortableMCTS, PortableMCTSConfig, PortableTree
 

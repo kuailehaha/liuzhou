@@ -17,16 +17,17 @@ from v1.python.train_bridge import train_network_from_tensors
 from v1.train import _save_self_play_payload_sharded, train_pipeline_v1
 
 
-def test_v1_soft_tan_range_and_sign() -> None:
+def test_v1_soft_tanh_range_sign_and_scale() -> None:
     board = torch.zeros((3, 6, 6), dtype=torch.int8)
     board[0, :2, :] = 1
     board[1, :2, :] = -1
-    soft = V1RootMCTS._soft_tan_from_board_black(board, soft_value_k=2.0)
+    soft = V1RootMCTS._soft_tanh_from_board_black(board, soft_value_k=2.0)
     assert tuple(soft.shape) == (3,)
     assert torch.all(soft <= 1.0 + 1e-6)
     assert torch.all(soft >= -1.0 - 1e-6)
     assert float(soft[0].item()) > float(soft[2].item())
     assert float(soft[2].item()) > float(soft[1].item())
+    assert float(soft[0].item()) == pytest.approx(math.tanh(4.0 / 3.0))
 
 
 def test_v1_terminal_mask_next_state() -> None:

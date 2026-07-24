@@ -18,6 +18,7 @@ from .portable_device import PortableDeviceResolution, resolve_portable_device
 from .portable_mcts import (
     PortableMCTSConfig,
     PortableSearchOutput,
+    deterministic_action_from_search,
     policy_from_visits_and_priors,
 )
 
@@ -364,7 +365,12 @@ class PortableCppMCTS:
                     torch.multinomial(selection_policy, num_samples=1).item()
                 )
             else:
-                chosen_index = int(torch.argmax(selection_policy).item())
+                chosen_index = deterministic_action_from_search(
+                    visit_matrix[row],
+                    root_action_values[row],
+                    root_priors[row],
+                    legal_mask,
+                )
             outputs.append(
                 PortableSearchOutput(
                     model_input=model_inputs[row].clone(),

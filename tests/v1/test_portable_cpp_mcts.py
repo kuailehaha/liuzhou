@@ -333,6 +333,20 @@ def test_cpp_self_play_preserves_tensor_contract_and_audit_fields() -> None:
     )
 
 
+def test_cpp_and_python_soft_value_helpers_match_tanh_k2() -> None:
+    from v1.python.portable_cpp_self_play import _soft_value_from_counts
+    from v1.python.portable_self_play import _soft_value_from_black
+
+    state = GameState()
+    state.board = [[0] * 6 for _ in range(6)]
+    for index in range(8):
+        state.board[index // 6][index % 6] = Player.BLACK.value
+
+    expected = math.tanh(16.0 / 18.0)
+    assert _soft_value_from_counts(8, 0, 2.0) == pytest.approx(expected)
+    assert _soft_value_from_black(state, 2.0) == pytest.approx(expected)
+
+
 def test_cpp_self_play_is_reproducible_across_thread_counts() -> None:
     _cpp_module()
     from v1.python.portable_cpp_self_play import self_play_v1_portable_cpp

@@ -133,16 +133,19 @@ mkdir -p logs && nohup zsh scripts/run_long_train_mps.sh \
 zsh scripts/run_long_train_mps.sh \
   --run-dir tmp/v1_portable_cpp_quality_phase2_20260723 \
   --fork-from-run tmp/v1_portable_cpp_long_20h_20260723 \
-  --hours 20 \
+  --reset-fork-deadline --hours 40 \
   --device mps \
   --self-play-games 128 --self-play-concurrency 128 \
   --portable-self-play-workers 1 \
   --portable-mcts-backend cpp --portable-cpp-threads 1 \
   --mcts-simulations 16 \
+  --temperature-init 0 --temperature-final 0 \
+  --no-sample-moves \
   --policy-target-temperature 1.0 \
   --policy-target-prior-pseudocount 1.0 \
   --opening-random-final 0 \
   --opening-random-anneal-fraction 0.25 \
+  --soft-label-alpha 0.1 \
   --replay-window 4 --batch-size 256 --epochs 3 \
   --lr-final 0.00005 \
   --checkpoint-retain-every 10 \
@@ -151,7 +154,7 @@ zsh scripts/run_long_train_mps.sh \
   --quality-strength-eval
 ```
 
-fork 会从保存的 optimizer 推导起始 LR，从最新 replay 推导 opening-random 起点，复制最近 replay window 和 incumbent metadata，并继承父 run 的 deadline；`--hours` 不会重置该 deadline。父 deadline 已过时会直接报错。当前 iteration-860 父 run 的 deadline `2026-07-24 09:43:57 UTC+8` 已过，因此上述 phase2 尚未启动；不得为了启动而擅自延长。
+fork 会从保存的 optimizer 推导起始 LR，从最新 replay 推导 opening-random 起点，并复制 replay window 和 incumbent metadata。默认继承父 deadline；只有显式 `--reset-fork-deadline` 才会以 `--hours` 计算新 deadline，并在 state/event 中同时记录父 deadline 和授权标志。当前 phase2 已于 `2026-07-24 17:41:38 UTC+8` 启动，40 小时 deadline 为 `2026-07-26 09:41:38 UTC+8`。
 
 恢复 optimizer 后必须同时覆盖 param group 的 `lr` 和 `initial_lr`，再构造 `LambdaLR`。旧实现只覆盖 `lr`，会被保存的 `initial_lr=3e-4` 重置；现在 train metrics 会写 `optimizer_lr_start/final`，长训编排还会读取保存后的 optimizer 再核对一次。phase-1 的大部分历史 LR 日志仅表示请求值，不表示实际生效值；iteration 857–860 和其后的新 run 才具有这项完整审计。
 

@@ -76,6 +76,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         policy_target_prior_pseudocount=float(
             args.policy_target_prior_pseudocount
         ),
+        self_play_sample_moves=bool(args.self_play_sample_moves),
         exploration_weight=float(args.exploration_weight),
         dirichlet_alpha=float(args.dirichlet_alpha),
         dirichlet_epsilon=float(args.dirichlet_epsilon),
@@ -150,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--policy_target_prior_pseudocount",
         type=float,
         default=0.0,
+    )
+    parser.add_argument(
+        "--self_play_sample_moves",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument("--exploration_weight", type=float, default=1.0)
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3)

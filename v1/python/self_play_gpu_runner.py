@@ -238,7 +238,7 @@ def self_play_v1_gpu(
                 piece_delta_hist.add_(
                     torch.bincount(bucket_indices, minlength=int(_PIECE_DELTA_BUCKET_COUNT))
                 )
-                soft_local = V1RootMCTS._soft_tan_from_board_black(
+                soft_local = V1RootMCTS._soft_tanh_from_board_black(
                     final_boards,
                     soft_value_k=float(soft_value_k),
                 ).to(torch.float32)

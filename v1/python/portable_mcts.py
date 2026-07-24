@@ -205,6 +205,62 @@ def policy_from_visits_and_priors(
     return probabilities
 
 
+def deterministic_action_from_search(
+    visits: torch.Tensor,
+    action_values: torch.Tensor,
+    priors: torch.Tensor,
+    legal_mask: torch.Tensor,
+) -> int:
+    """Choose by N, then Q, then P, with action index as the final tie-break."""
+
+    visits_t = torch.as_tensor(visits).view(-1)
+    values_t = torch.as_tensor(action_values, dtype=torch.float32).view(-1)
+    priors_t = torch.as_tensor(priors, dtype=torch.float32).view(-1)
+    legal_t = torch.as_tensor(legal_mask, dtype=torch.bool).view(-1)
+    if not (
+        visits_t.shape == values_t.shape == priors_t.shape == legal_t.shape
+    ):
+        raise ValueError("deterministic action tensors must have the same shape")
+    indices = torch.where(legal_t)[0]
+    if int(indices.numel()) == 0:
+        raise RuntimeError("cannot choose a deterministic action without legal moves")
+
+    legal_visits = visits_t[indices]
+    max_visits = legal_visits.max()
+    candidates = indices[legal_visits.eq(max_visits)]
+
+    candidate_values = values_t[candidates]
+    candidate_values = torch.where(
+        torch.isfinite(candidate_values),
+        candidate_values,
+        torch.full_like(candidate_values, float("-inf")),
+    )
+    max_value = candidate_values.max()
+    value_tied = torch.isclose(
+        candidate_values,
+        max_value,
+        atol=1e-6,
+        rtol=0.0,
+    )
+    candidates = candidates[value_tied]
+
+    candidate_priors = priors_t[candidates]
+    candidate_priors = torch.where(
+        torch.isfinite(candidate_priors),
+        candidate_priors,
+        torch.full_like(candidate_priors, float("-inf")),
+    )
+    max_prior = candidate_priors.max()
+    prior_tied = torch.isclose(
+        candidate_priors,
+        max_prior,
+        atol=1e-8,
+        rtol=0.0,
+    )
+    candidates = candidates[prior_tied]
+    return int(candidates.min().item())
+
+
 class PortableMCTS:
     """Full PUCT tree search, batched over one selected leaf per tree."""
 
@@ -659,7 +715,15 @@ class PortableMCTS:
                     torch.multinomial(selection_policy, num_samples=1).item()
                 )
             else:
-                chosen_index = int(torch.argmax(selection_policy).item())
+                dense_visits = torch.zeros((TOTAL_DIM,), dtype=torch.int32)
+                for action_index, count in visit_counts.items():
+                    dense_visits[int(action_index)] = int(count)
+                chosen_index = deterministic_action_from_search(
+                    dense_visits,
+                    self._root_action_values(root),
+                    self._root_priors(root),
+                    legal_mask,
+                )
             child = root.children.get(chosen_index)
             if child is None or child.move is None:
                 raise RuntimeError(f"Chosen action {chosen_index} is missing from the root tree.")

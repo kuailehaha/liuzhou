@@ -584,6 +584,7 @@ def _run_self_play_shard(
     opening_random_moves: int,
     max_game_plies: int,
     concurrent_games_per_device: int,
+    sample_moves: bool = True,
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
     seed: int,
@@ -617,7 +618,7 @@ def _run_self_play_shard(
         soft_value_k=float(soft_value_k),
         opening_random_moves=int(opening_random_moves),
         max_game_plies=int(max_game_plies),
-        sample_moves=True,
+        sample_moves=bool(sample_moves),
         concurrent_games=shard_concurrent,
         sparse_ply=int(sparse_ply),
         sparse_top_k=int(sparse_top_k),
@@ -765,6 +766,7 @@ def _run_self_play_multi_device_thread(
     max_game_plies: int,
     concurrent_games_per_device: int,
     iteration_seed: int,
+    sample_moves: bool = True,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     model_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     shards = _split_games(int(num_games), len(devices))
@@ -807,6 +809,7 @@ def _run_self_play_multi_device_thread(
                     opening_random_moves=int(opening_random_moves),
                     max_game_plies=int(max_game_plies),
                     concurrent_games_per_device=int(concurrent_games_per_device),
+                    sample_moves=bool(sample_moves),
                     sparse_ply=int(sparse_ply),
                     sparse_top_k=int(sparse_top_k),
                     seed=int(worker_seed),
@@ -864,6 +867,7 @@ def _run_self_play_multi_device_process(
     portable_cpp_threads: int = 1,
     policy_target_temperature: Optional[float] = None,
     policy_target_prior_pseudocount: float = 0.0,
+    sample_moves: bool = True,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     workspace, auto_cleanup = _prepare_self_play_workspace(
         shard_dir=shard_dir,
@@ -907,6 +911,7 @@ def _run_self_play_multi_device_process(
                 policy_target_prior_pseudocount=float(
                     policy_target_prior_pseudocount
                 ),
+                sample_moves=bool(sample_moves),
             )
         )
         merged_batch, _stats_payload, _meta_payload = _load_self_play_payload(str(manifest_path))
@@ -954,6 +959,7 @@ def _run_self_play_multi_device_process_saved(
     portable_cpp_threads: int = 1,
     policy_target_temperature: Optional[float] = None,
     policy_target_prior_pseudocount: float = 0.0,
+    sample_moves: bool = True,
  ) -> Tuple[SelfPlayV1Stats, Dict[str, Any], Dict[str, Any], Dict[str, Any], int]:
     from v1.python.self_play_worker import run_self_play_worker
 
@@ -1023,6 +1029,7 @@ def _run_self_play_multi_device_process_saved(
                     policy_target_prior_pseudocount=float(
                         policy_target_prior_pseudocount
                     ),
+                    sample_moves=bool(sample_moves),
                     target_samples_per_shard=int(target_samples_per_shard),
                     chunk_target_bytes=int(chunk_target_bytes),
                     chunk_output_dir=str(out_dir),
@@ -1191,6 +1198,7 @@ def _run_self_play_multi_device(
     portable_cpp_threads: int = 1,
     policy_target_temperature: Optional[float] = None,
     policy_target_prior_pseudocount: float = 0.0,
+    sample_moves: bool = True,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     search_backend_norm = _normalize_search_backend(search_backend)
     if search_backend_norm == "portable":
@@ -1236,6 +1244,7 @@ def _run_self_play_multi_device(
                 policy_target_prior_pseudocount=float(
                     policy_target_prior_pseudocount
                 ),
+                sample_moves=bool(sample_moves),
             )
         if portable_impl == "cpp":
             from v1.python.portable_cpp_self_play import (
@@ -1263,7 +1272,7 @@ def _run_self_play_multi_device(
             "soft_value_k": float(soft_value_k),
             "opening_random_moves": int(opening_random_moves),
             "max_game_plies": int(max_game_plies),
-            "sample_moves": True,
+            "sample_moves": bool(sample_moves),
             "concurrent_games": shard_concurrent,
             "verbose": False,
             "policy_target_temperature": policy_target_temperature,
@@ -1297,7 +1306,7 @@ def _run_self_play_multi_device(
             soft_value_k=float(soft_value_k),
             opening_random_moves=int(opening_random_moves),
             max_game_plies=int(max_game_plies),
-            sample_moves=True,
+            sample_moves=bool(sample_moves),
             concurrent_games=shard_concurrent,
             sparse_ply=int(sparse_ply),
             sparse_top_k=int(sparse_top_k),
@@ -1329,6 +1338,7 @@ def _run_self_play_multi_device(
             shard_dir=self_play_shard_dir,
             sparse_ply=int(sparse_ply),
             sparse_top_k=int(sparse_top_k),
+            sample_moves=bool(sample_moves),
         )
     return _run_self_play_multi_device_thread(
         model=model,
@@ -1346,6 +1356,7 @@ def _run_self_play_multi_device(
         max_game_plies=int(max_game_plies),
         concurrent_games_per_device=int(concurrent_games_per_device),
         iteration_seed=int(iteration_seed),
+        sample_moves=bool(sample_moves),
     )
 
 
@@ -1874,6 +1885,7 @@ def train_pipeline_v1(
     temperature_threshold: int = 10,
     policy_target_temperature: Optional[float] = None,
     policy_target_prior_pseudocount: float = 0.0,
+    self_play_sample_moves: bool = True,
     exploration_weight: float = 1.0,
     dirichlet_alpha: float = 0.3,
     dirichlet_epsilon: float = 0.25,
@@ -2122,6 +2134,7 @@ def train_pipeline_v1(
                 "policy_target_prior_pseudocount": float(
                     policy_target_prior_pseudocount
                 ),
+                "self_play_sample_moves": bool(self_play_sample_moves),
             }
             if search_backend_norm == "portable" and int(portable_self_play_workers) > 1:
                 resolved_backend = "process"
@@ -2188,6 +2201,7 @@ def train_pipeline_v1(
                         policy_target_prior_pseudocount=float(
                             policy_target_prior_pseudocount
                         ),
+                        sample_moves=bool(self_play_sample_moves),
                     )
                 )
             else:
@@ -2219,6 +2233,7 @@ def train_pipeline_v1(
                     policy_target_prior_pseudocount=float(
                         policy_target_prior_pseudocount
                     ),
+                    sample_moves=bool(self_play_sample_moves),
                 )
                 value_target_summary = _compute_value_target_summary(samples)
                 soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2656,6 +2671,7 @@ def train_pipeline_v1(
                 policy_target_prior_pseudocount=float(
                     policy_target_prior_pseudocount
                 ),
+                sample_moves=bool(self_play_sample_moves),
             )
             value_target_summary = _compute_value_target_summary(samples)
             soft_value_target_summary = _compute_soft_value_target_summary(samples)
@@ -2836,6 +2852,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Portable self-play beta in target proportional to N + beta*P. "
             "Zero preserves legacy visit-only targets."
+        ),
+    )
+    parser.add_argument(
+        "--self_play_sample_moves",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Sample actual self-play moves from the visit policy. Disable for "
+            "deterministic N/Q/P selection; policy targets remain independent."
         ),
     )
     parser.add_argument("--exploration_weight", type=float, default=1.0)
@@ -3025,6 +3050,7 @@ if __name__ == "__main__":
         temperature_threshold=args.temperature_threshold,
         policy_target_temperature=args.policy_target_temperature,
         policy_target_prior_pseudocount=args.policy_target_prior_pseudocount,
+        self_play_sample_moves=args.self_play_sample_moves,
         exploration_weight=args.exploration_weight,
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,

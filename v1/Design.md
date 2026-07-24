@@ -23,7 +23,7 @@ The change is additive and keeps all cross-layer contracts:
 - `policy_target_temperature: Optional[float] = None`;
 - `policy_target_prior_pseudocount: float = 0.0`.
 
-The actual move continues to use the ordinary selection temperature. The training target uses its own temperature when configured and is proportional to:
+The actual move may use sampled visit probabilities or deterministic search output. Phase 2 disables sampling: after PUCT allocates simulations, the action is chosen lexicographically by maximum `N`, then `Q`, then `P`, then the lowest action index. Opening-random moves may still override that choice and root Dirichlet noise remains active. The training target uses its own temperature and is proportional to:
 
 `target(a) = temperature_transform(N(a) + beta * P(a))`
 
@@ -35,7 +35,7 @@ Portable self-play now persists a target audit containing legal count, positive 
 
 `scripts/long_train_portable_mps.py --fork-from-run <parent>` accepts only a stopped, locked-free parent whose committed iteration is a positive multiple of 10 and whose periodic evaluation completed at that same iteration. It verifies the current model and optimizer against `state.json`, copies the last configured replay window plus chunk files, copies incumbent/best metadata, saves a phase-start model anchor and emits `run_forked` with the configuration delta.
 
-The fork derives its initial LR from the saved optimizer and its opening-random start from the latest replay metadata. It retains the parent deadline. An elapsed parent deadline is a hard error; extending wall-clock budget requires new authorization rather than an implicit `--hours` reset. Phase-2 opening randomization uses:
+The fork derives its initial LR from the saved optimizer and its opening-random start from the latest replay metadata. It retains the parent deadline by default. An elapsed parent deadline is a hard error unless the command explicitly records new authorization with `--reset-fork-deadline`, in which case the new deadline is start time plus `--hours` and both deadlines are persisted. Phase-2 opening randomization uses:
 
 `curriculum_progress = min(1, elapsed_fraction / opening_random_anneal_fraction)`
 
@@ -71,7 +71,11 @@ The small diagnostic favors eight threads by about 3%, but the production 128x12
 
 ### Boundary result and remaining strength acceptance
 
-Phase 1 stopped cleanly at iteration 860 after training and both 500-game evaluations. The candidate scored `139-145-216` (`0.494`) and was not promoted. The boundary current/optimizer hashes are `4cbab2cd...dec9d` and `95adc9c6...c3b4`; saved optimizer LR is `0.000196904486436`. The source deadline `2026-07-24 09:43:57 UTC+8` elapsed before the phase-2 fork could start, so no new run was launched and no deadline was extended.
+Phase 1 stopped cleanly at iteration 860 after training and both 500-game evaluations. The candidate scored `139-145-216` (`0.494`) and was not promoted. The boundary current/optimizer hashes are `4cbab2cd...dec9d` and `95adc9c6...c3b4`; saved optimizer LR is `0.000196904486436`.
+
+After explicit authorization, phase 2 started at `2026-07-24 17:41:38 UTC+8` with a new 40-hour deadline of `2026-07-26 09:41:38 UTC+8`. It uses 16 simulations, deterministic `N/Q/P` action selection, target temperature 1, beta 1, `tanh(k=2)`, `soft_label_alpha=0.1`, and opening randomization `3 -> 0` over the first 25% of wall time. The fork copied replay 857–860 and recorded the parent/new deadlines, model/optimizer hashes and configuration diff. Runtime state and logs are `tmp/v1_portable_cpp_quality_phase2_20260723/` and `logs/portable_cpp_quality_phase2_40h{,.err}.log`.
+
+Iterations 861–864 committed with median `303.71 positions/s` self-play and `34.51s` training. Optimizer restore succeeded each time; fallback, illegal, non-finite and filtered counts remained zero; positive target support equaled legal support. Draw rate moved `69.53% -> 53.12% -> 50.00% -> 48.44%` rather than staying at the first-batch spike, but its four-iteration median `51.56%` remains a metric to monitor through periodic gates. The run is not yet strength evidence.
 
 During development, one staged child loaded the updated Python wrapper before the C++ extension rebuild and failed on the new root-output fields. A later recovery attempt correctly refused to commit because the new optimizer-LR metrics were not yet present in the merged stage report. In both cases the orchestrator retained/restored the last committed iteration-856 model/optimizer pair; after rebuilding and fixing metric propagation, iterations 857–860 completed normally. The stderr history is intentionally retained in `logs/portable_cpp_mps_20h.err.log`; it is not part of the clean final-boundary health claim.
 

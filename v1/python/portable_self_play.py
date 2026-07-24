@@ -66,8 +66,8 @@ class PortableSelfPlayStats:
 def _soft_value_from_black(state: GameState, soft_value_k: float) -> float:
     black = state.count_player_pieces(Player.BLACK)
     white = state.count_player_pieces(Player.WHITE)
-    scaled = max(-(math.pi * 0.5 - 1e-3), min(math.pi * 0.5 - 1e-3, ((black - white) / 18.0) * float(soft_value_k)))
-    return max(-1.0, min(1.0, math.tan(scaled)))
+    scaled = ((black - white) / 18.0) * float(soft_value_k)
+    return math.tanh(scaled)
 
 
 def _result_from_black(state: GameState) -> float:
