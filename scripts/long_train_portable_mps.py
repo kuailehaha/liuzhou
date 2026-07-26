@@ -1868,8 +1868,8 @@ class PortableLongTrainer:
             seed=seed,
             name="strength_vs_phase_start",
             output=primary_output,
-            temperature=0.0,
-            sample_moves=False,
+            temperature=1.0,
+            sample_moves=True,
             simulations=int(self.args.strength_eval_simulations),
             concurrency=min(
                 int(self.args.eval_concurrency),
@@ -1894,8 +1894,8 @@ class PortableLongTrainer:
                 seed=seed + 1,
                 name="strength_confirm_vs_phase_start",
                 output=confirmation_output,
-                temperature=0.0,
-                sample_moves=False,
+                temperature=1.0,
+                sample_moves=True,
                 simulations=int(self.args.strength_eval_simulations),
                 concurrency=min(
                     int(self.args.eval_concurrency),
@@ -1913,8 +1913,8 @@ class PortableLongTrainer:
             seed=seed + 2,
             name="strength_screen_vs_phase_start",
             output=screen_output,
-            temperature=0.0,
-            sample_moves=False,
+            temperature=1.0,
+            sample_moves=True,
             simulations=int(self.args.strength_screen_simulations),
             concurrency=min(
                 int(self.args.eval_concurrency),

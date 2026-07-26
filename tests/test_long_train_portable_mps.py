@@ -179,6 +179,55 @@ def test_long_run_cpp_evaluation_is_explicit_and_audited(
     assert commands[0][commands[0].index("--portable_cpp_threads") + 1] == "4"
 
 
+def test_final_strength_evaluation_samples_at_temperature_one(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.args = SimpleNamespace(
+        quality_strength_eval=True,
+        strength_eval_games=500,
+        strength_eval_simulations=64,
+        strength_screen_games=64,
+        strength_screen_simulations=1024,
+        eval_concurrency=64,
+        incumbent_promotion_score=0.55,
+        seed=20260722,
+        dry_run=False,
+    )
+    trainer.state = {"iteration": 2478}
+    trainer.current_checkpoint = tmp_path / "current.pt"
+    trainer.phase_start_checkpoint = tmp_path / "phase_start_model.pt"
+    trainer.eval_dir = tmp_path / "eval"
+    trainer.eval_dir.mkdir()
+    trainer.current_checkpoint.write_bytes(b"current")
+    trainer.phase_start_checkpoint.write_bytes(b"phase-start")
+    calls = []
+
+    def fake_run_eval(**kwargs):
+        calls.append(kwargs)
+        return {
+            "wins": 300,
+            "losses": 100,
+            "draws": 100,
+            "total_games": 500,
+        }
+
+    monkeypatch.setattr(trainer, "_run_eval", fake_run_eval)
+    monkeypatch.setattr(trainer, "_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer, "_save_state", lambda: None)
+
+    trainer._final_strength_evaluation()
+
+    assert [call["name"] for call in calls] == [
+        "strength_vs_phase_start",
+        "strength_confirm_vs_phase_start",
+        "strength_screen_vs_phase_start",
+    ]
+    assert all(call["temperature"] == pytest.approx(1.0) for call in calls)
+    assert all(call["sample_moves"] is True for call in calls)
+
+
 def test_iteration_checkpoint_retention_is_periodic() -> None:
     trainer = PortableLongTrainer.__new__(PortableLongTrainer)
     trainer.args = SimpleNamespace(checkpoint_retain_every=10)
