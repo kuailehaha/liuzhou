@@ -108,6 +108,8 @@ def _run_v1(args: argparse.Namespace) -> int:
         checkpoint_name=args.checkpoint_name,
         metrics_output=args.metrics_output,
         optimizer_state_path=args.optimizer_state_path,
+        optimizer_name=str(args.optimizer_name),
+        strict_optimizer_restore=bool(args.strict_optimizer_restore),
         warmup_steps=int(args.warmup_steps),
         streaming_load=bool(int(args.streaming_load)),
         streaming_workers=int(args.streaming_workers),
@@ -117,6 +119,8 @@ def _run_v1(args: argparse.Namespace) -> int:
         infer_iters=int(args.infer_iters),
         infer_output=args.infer_output,
         model_init_seed=args.model_init_seed,
+        state_encoding_schema=str(args.state_encoding_schema),
+        symmetry_augmentation=str(args.symmetry_augmentation),
     )
     return 0
 
@@ -210,6 +214,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)
+    parser.add_argument(
+        "--state_encoding_schema",
+        type=str,
+        default="legacy_v1",
+        choices=["legacy_v1", "markov_v2"],
+    )
+    parser.add_argument(
+        "--symmetry_augmentation",
+        type=str,
+        default="none",
+        choices=["none", "random_d4"],
+    )
     parser.add_argument("--device", type=str, default="cuda:0")
 
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_shared")
@@ -262,6 +278,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to save/load optimizer state for training continuity.",
+    )
+    parser.add_argument(
+        "--optimizer_name",
+        choices=["adam", "adamw"],
+        default="adam",
+    )
+    parser.add_argument(
+        "--strict_optimizer_restore",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--streaming_load", type=int, default=0, help="1=streaming DataLoader, 0=monolithic load.")

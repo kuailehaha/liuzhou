@@ -16,7 +16,7 @@ from fastapi.responses import RedirectResponse
 
 from src.game_state import GameState, Player
 from src.move_generator import apply_move, generate_all_legal_moves
-from src.neural_network import state_to_tensor
+from src.neural_network import schema_for_input_channels, state_to_tensor
 from src.evaluate import MCTSAgent
 from v1.python.portable_gameplay_agent import PortableGameplayAgent
 
@@ -265,7 +265,13 @@ def _evaluate_position(session: GameSession) -> Dict[str, Any] | None:
         from src.neural_network import wdl_to_scalar
         # Keep inference on the side-to-move perspective (training-time convention),
         # then convert to AI perspective below if needed.
-        inputs = state_to_tensor(session.state, current_player).to(device)
+        inputs = state_to_tensor(
+            session.state,
+            current_player,
+            schema=schema_for_input_channels(
+                int(getattr(model, "num_input_channels", model.stem_conv.weight.shape[1]))
+            ),
+        ).to(device)
         with torch.inference_mode():
             _, _, _, wdl_logits = model(inputs)
         value_current = float(wdl_to_scalar(wdl_logits).squeeze().detach().to("cpu").item())

@@ -78,6 +78,7 @@ def resolve_shard_specs(
     replay_inputs: List[str],
     replay_budget_per_file: int,
     *,
+    replay_budgets: Optional[List[int]] = None,
     ddp_rank: int = 0,
     ddp_world: int = 1,
 ) -> Tuple[List[ShardSpec], int]:
@@ -88,10 +89,21 @@ def resolve_shard_specs(
     specs: List[ShardSpec] = []
     total = 0
 
-    for path, is_replay in [(primary_input, False)] + [(r, True) for r in replay_inputs]:
-        if not os.path.exists(path):
+    inputs = [(primary_input, False, 0)]
+    for index, replay in enumerate(replay_inputs):
+        budget = (
+            int(replay_budgets[index])
+            if replay_budgets is not None and index < len(replay_budgets)
+            else int(replay_budget_per_file)
+        )
+        if budget <= 0:
             continue
-        budget = replay_budget_per_file if is_replay else 0
+        inputs.append((replay, True, budget))
+
+    for path, is_replay, requested_budget in inputs:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Streaming input is missing: {path}")
+        budget = requested_budget if is_replay else 0
 
         manifest = _torch_load_retry(path)
         if isinstance(manifest, dict) and str(manifest.get("payload_format", "")).strip().lower() == "v1_sharded_manifest":
@@ -105,6 +117,10 @@ def resolve_shard_specs(
                 if not sp:
                     continue
                 full = sp if os.path.isabs(sp) else os.path.join(base_dir, sp)
+                if not os.path.isfile(full):
+                    raise FileNotFoundError(
+                        f"Streaming manifest shard is missing: {full}"
+                    )
                 sz = int(shard_sizes_raw[i]) if i < len(shard_sizes_raw) else 0
                 resolved.append((full, sz))
 
@@ -139,12 +155,12 @@ def resolve_shard_specs(
 
 def _load_shard_tensors(
     path: str,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Load a shard file and return the 5 tensor fields, or None on failure."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load a shard file and return the five required tensor fields."""
     try:
         payload = _torch_load_retry(path)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load streaming shard: {path}") from exc
 
     if isinstance(payload, TensorSelfPlayBatch):
         return (
@@ -163,7 +179,9 @@ def _load_shard_tensors(
             return result  # type: ignore[return-value]
 
     del payload
-    return None
+    raise RuntimeError(
+        f"Streaming shard does not contain the required tensor fields: {path}"
+    )
 
 
 _worker_shard_cache: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -217,8 +235,6 @@ class StreamingSelfPlayDataset(torch.utils.data.IterableDataset):
                 states, masks, policy, values, soft_values = cached
             else:
                 tensors = _load_shard_tensors(spec.path)
-                if tensors is None:
-                    continue
                 states, masks, policy, values, soft_values = tensors
                 _worker_shard_cache[spec.path] = (states, masks, policy, values, soft_values)
 

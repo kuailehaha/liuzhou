@@ -20,7 +20,15 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from src.game_state import GameState
-from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
+from src.neural_network import (
+    ChessNet,
+    LEGACY_NUM_INPUT_CHANNELS,
+    LEGACY_STATE_ENCODING_SCHEMA,
+    checkpoint_state_encoding_schema,
+    input_channels_for_schema,
+    model_input_channels_from_state_dict,
+    state_encoding_feature_names,
+)
 from src.policy_batch import TOTAL_DIM as TOTAL_ACTION_DIM
 from v1.python.self_play_storage import (
     estimate_bytes_per_sample,
@@ -29,7 +37,11 @@ from v1.python.self_play_storage import (
     slice_batch_cpu,
 )
 from v1.python.self_play_types import SelfPlayV1Stats
-from v1.python.train_bridge import train_network_from_tensors, train_network_streaming
+from v1.python.train_bridge import (
+    normalize_optimizer_name,
+    train_network_from_tensors,
+    train_network_streaming,
+)
 from v1.python.trajectory_buffer import TensorSelfPlayBatch
 
 
@@ -221,6 +233,8 @@ def _merge_train_bridge_summary(entry: Dict[str, Any], train_metrics: Dict[str, 
     for key in (
         "optimizer_loaded",
         "optimizer_load_error",
+        "optimizer_name",
+        "strict_optimizer_restore",
         "optimizer_lr_start",
         "optimizer_lr_final",
         "warmup_steps",
@@ -232,6 +246,8 @@ def _merge_train_bridge_summary(entry: Dict[str, Any], train_metrics: Dict[str, 
         "device",
         "device_fallback_count",
         "device_fallback_reasons",
+        "symmetry_augmentation",
+        "symmetry_transform_counts",
     ):
         if key in train_metrics:
             entry[key] = train_metrics.get(key)
@@ -240,7 +256,12 @@ def _merge_train_bridge_summary(entry: Dict[str, Any], train_metrics: Dict[str, 
 def _concat_self_play_batches_cpu(batches: List[TensorSelfPlayBatch]) -> TensorSelfPlayBatch:
     if not batches:
         empty_state = torch.empty(
-            (0, NUM_INPUT_CHANNELS, GameState.BOARD_SIZE, GameState.BOARD_SIZE),
+            (
+                0,
+                LEGACY_NUM_INPUT_CHANNELS,
+                GameState.BOARD_SIZE,
+                GameState.BOARD_SIZE,
+            ),
             dtype=torch.float32,
             device="cpu",
         )
@@ -263,6 +284,78 @@ def _concat_self_play_batches_cpu(batches: List[TensorSelfPlayBatch]) -> TensorS
         value_targets=torch.cat([b.value_targets for b in batches], dim=0),
         soft_value_targets=torch.cat([b.soft_value_targets for b in batches], dim=0),
     )
+
+
+def _validate_self_play_schema(
+    *,
+    samples: Optional[TensorSelfPlayBatch],
+    metadata: object,
+    expected_schema: str,
+    expected_channels: int,
+    source: str,
+) -> None:
+    declared_schema: Optional[str] = None
+    declared_channels: Optional[int] = None
+    if isinstance(metadata, dict):
+        raw_schema = metadata.get("state_encoding_schema")
+        if raw_schema is not None and str(raw_schema).strip():
+            declared_schema = str(raw_schema).strip().lower()
+            input_channels_for_schema(declared_schema)
+        raw_channels = metadata.get("num_input_channels")
+        if raw_channels is not None:
+            declared_channels = int(raw_channels)
+    if declared_schema is not None and declared_schema != expected_schema:
+        raise RuntimeError(
+            f"Self-play schema mismatch for {source}: "
+            f"payload={declared_schema} model={expected_schema}."
+        )
+    if declared_channels is not None and declared_channels != int(expected_channels):
+        raise RuntimeError(
+            f"Self-play channel mismatch for {source}: "
+            f"payload={declared_channels} model={expected_channels}."
+        )
+    if (
+        samples is None
+        and expected_schema != LEGACY_STATE_ENCODING_SCHEMA
+        and declared_schema is None
+        and declared_channels is None
+    ):
+        raise RuntimeError(
+            f"Self-play schema metadata is required for {source} when "
+            f"training {expected_schema}."
+        )
+    if samples is not None:
+        observed_channels = int(samples.state_tensors.shape[1])
+        if observed_channels != int(expected_channels):
+            raise RuntimeError(
+                f"Self-play tensor channel mismatch for {source}: "
+                f"payload={observed_channels} model={expected_channels}."
+            )
+        inferred_schema = (
+            LEGACY_STATE_ENCODING_SCHEMA
+            if observed_channels == LEGACY_NUM_INPUT_CHANNELS
+            else str(expected_schema)
+        )
+        if inferred_schema != expected_schema:
+            raise RuntimeError(
+                f"Self-play tensor schema mismatch for {source}: "
+                f"payload={inferred_schema} model={expected_schema}."
+            )
+
+
+def _distribute_replay_file_budgets(
+    total_budget: int,
+    file_count: int,
+) -> List[int]:
+    count = max(0, int(file_count))
+    if count == 0:
+        return []
+    total = max(0, int(total_budget))
+    base, remainder = divmod(total, count)
+    return [
+        base + (1 if index < remainder else 0)
+        for index in range(count)
+    ]
 
 
 def _normalize_piece_delta_buckets(raw: Any) -> Dict[str, int]:
@@ -597,7 +690,12 @@ def _run_self_play_shard(
         torch.cuda.set_device(shard_dev_obj)
         torch.cuda.manual_seed(int(seed))
 
-    local_model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
+    local_model = ChessNet(
+        board_size=GameState.BOARD_SIZE,
+        num_input_channels=model_input_channels_from_state_dict(
+            model_state_dict_cpu
+        ),
+    )
     local_model.load_state_dict(model_state_dict_cpu, strict=True)
     local_model.to(shard_dev_obj)
     local_model.eval()
@@ -1360,8 +1458,11 @@ def _run_self_play_multi_device(
     )
 
 
-def _build_model() -> ChessNet:
-    return ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
+def _build_model(state_encoding_schema: str = LEGACY_STATE_ENCODING_SCHEMA) -> ChessNet:
+    return ChessNet(
+        board_size=GameState.BOARD_SIZE,
+        num_input_channels=input_channels_for_schema(state_encoding_schema),
+    )
 
 
 def _load_checkpoint_into_model(
@@ -1377,38 +1478,28 @@ def _load_checkpoint_into_model(
     # Deserialize through CPU so checkpoints saved from CPU/MPS/CUDA remain portable.
     # The caller moves the fully loaded model to its execution device afterwards.
     checkpoint = torch.load(load_checkpoint, map_location="cpu")
+    checkpoint_schema = checkpoint_state_encoding_schema(checkpoint)
+    model_schema = checkpoint_state_encoding_schema(
+        {
+            "model_state_dict": model.state_dict(),
+            "num_input_channels": model.num_input_channels,
+        }
+    )
+    if checkpoint_schema != model_schema:
+        raise RuntimeError(
+            "Checkpoint/model state encoding mismatch. Run the explicit schema "
+            "migration tool instead of partial-loading incompatible weights: "
+            f"checkpoint={checkpoint_schema} model={model_schema}."
+        )
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     try:
         model.load_state_dict(state_dict, strict=True)
         _print_rank0(f"[v1.train] loaded checkpoint: {load_checkpoint}")
         return
     except RuntimeError as exc:
-        model_state = model.state_dict()
-        compatible: Dict[str, torch.Tensor] = {}
-        skipped: List[str] = []
-        for key, tensor in state_dict.items():
-            if key not in model_state:
-                skipped.append(key)
-                continue
-            if tuple(model_state[key].shape) != tuple(tensor.shape):
-                skipped.append(key)
-                continue
-            compatible[key] = tensor
-        missing, unexpected = model.load_state_dict(compatible, strict=False)
-        _print_rank0(
-            "[v1.train] loaded checkpoint with partial compatibility "
-            f"(strict load failed: {exc})."
-        )
-        if skipped:
-            preview = ",".join(skipped[:8])
-            suffix = "..." if len(skipped) > 8 else ""
-            _print_rank0(
-                f"[v1.train] skipped incompatible keys ({len(skipped)}): {preview}{suffix}"
-            )
-        if missing:
-            _print_rank0(f"[v1.train] missing keys after load ({len(missing)}).")
-        if unexpected:
-            _print_rank0(f"[v1.train] unexpected keys after load ({len(unexpected)}).")
+        raise RuntimeError(
+            f"Strict checkpoint load failed for {load_checkpoint}: {exc}"
+        ) from exc
 
 
 def _save_json(path: str, payload: Any) -> None:
@@ -1762,7 +1853,11 @@ def _run_inference_shard(
         torch.cuda.manual_seed_all(int(seed))
 
     dev = torch.device(device)
-    model = _build_model()
+    input_channels = model_input_channels_from_state_dict(model_state_dict_cpu)
+    model = ChessNet(
+        board_size=GameState.BOARD_SIZE,
+        num_input_channels=input_channels,
+    )
     model.load_state_dict(model_state_dict_cpu, strict=True)
     model.to(dev)
     model.eval()
@@ -1772,7 +1867,7 @@ def _run_inference_shard(
     warmups = max(0, int(warmup_iters))
     input_dtype = torch.float16 if dev.type == "cuda" else torch.float32
     x = torch.randn(
-        (bs, NUM_INPUT_CHANNELS, GameState.BOARD_SIZE, GameState.BOARD_SIZE),
+        (bs, input_channels, GameState.BOARD_SIZE, GameState.BOARD_SIZE),
         device=dev,
         dtype=input_dtype,
     )
@@ -1916,6 +2011,8 @@ def train_pipeline_v1(
     checkpoint_name: Optional[str] = None,
     metrics_output: Optional[str] = None,
     optimizer_state_path: Optional[str] = None,
+    optimizer_name: str = "adam",
+    strict_optimizer_restore: bool = False,
     warmup_steps: int = 0,
     streaming_load: bool = False,
     streaming_workers: int = 8,
@@ -1927,6 +2024,8 @@ def train_pipeline_v1(
     model_init_seed: Optional[int] = None,
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
+    state_encoding_schema: str = LEGACY_STATE_ENCODING_SCHEMA,
+    symmetry_augmentation: str = "none",
 ) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     stage_norm = str(stage).strip().lower()
@@ -1937,6 +2036,14 @@ def train_pipeline_v1(
     portable_mcts_backend_norm = _normalize_portable_mcts_backend(
         portable_mcts_backend
     )
+    state_encoding_schema_norm = str(state_encoding_schema).strip().lower()
+    model_input_channels = input_channels_for_schema(state_encoding_schema_norm)
+    from v1.python.symmetry import normalize_symmetry_augmentation
+
+    symmetry_augmentation_norm = normalize_symmetry_augmentation(
+        symmetry_augmentation
+    )
+    optimizer_name_norm = normalize_optimizer_name(optimizer_name)
     train_strategy_norm = _normalize_train_strategy(train_strategy)
     if search_backend_norm == "portable":
         if train_strategy_norm == "ddp":
@@ -1988,6 +2095,14 @@ def train_pipeline_v1(
 
         _print_rank0(f"[v1.train] stage={stage_norm} train_strategy={train_strategy_norm}")
         _print_rank0(f"[v1.train] search_backend={search_backend_norm}")
+        _print_rank0(
+            "[v1.train] "
+            f"state_encoding_schema={state_encoding_schema_norm} "
+            f"num_input_channels={model_input_channels} "
+            f"symmetry_augmentation={symmetry_augmentation_norm} "
+            f"optimizer={optimizer_name_norm} "
+            f"strict_optimizer_restore={bool(strict_optimizer_restore)}"
+        )
         if search_backend_norm == "portable":
             _print_rank0(
                 "[v1.train] "
@@ -2076,7 +2191,7 @@ def train_pipeline_v1(
                 "policy_target_prior_pseudocount must be finite and non-negative"
             )
 
-        model = _build_model()
+        model = _build_model(state_encoding_schema_norm)
         checkpoint_load_sec = 0.0
         if load_checkpoint:
             checkpoint_load_start = time.perf_counter()
@@ -2135,6 +2250,11 @@ def train_pipeline_v1(
                     policy_target_prior_pseudocount
                 ),
                 "self_play_sample_moves": bool(self_play_sample_moves),
+                "state_encoding_schema": state_encoding_schema_norm,
+                "num_input_channels": int(model_input_channels),
+                "state_encoding_features": list(
+                    state_encoding_feature_names(state_encoding_schema_norm)
+                ),
             }
             if search_backend_norm == "portable" and int(portable_self_play_workers) > 1:
                 resolved_backend = "process"
@@ -2310,7 +2430,14 @@ def train_pipeline_v1(
 
             replay_inputs_str = str(self_play_replay_inputs or "").strip()
             replay_files = [f.strip() for f in replay_inputs_str.split(",") if f.strip()] if replay_inputs_str else []
-            replay_files = [f for f in replay_files if os.path.exists(f)]
+            missing_replay_files = [
+                path for path in replay_files if not os.path.exists(path)
+            ]
+            if missing_replay_files:
+                raise FileNotFoundError(
+                    "Configured replay inputs are missing: "
+                    + ", ".join(missing_replay_files)
+                )
             parallel_devices = (
                 train_device_list if (train_strategy_norm == "data_parallel" and len(train_device_list) > 1) else None
             )
@@ -2319,11 +2446,15 @@ def train_pipeline_v1(
             payload_load_start = time.perf_counter()
             primary_input_payload = _torch_load_with_retry(str(self_play_input))
             primary_payload_format = ""
+            primary_metadata_payload: Dict[str, Any] = {}
             if isinstance(primary_input_payload, dict):
                 primary_payload_format = str(primary_input_payload.get("payload_format", "")).strip().lower()
                 sp_stats_payload = primary_input_payload.get("stats", {})
                 if not isinstance(sp_stats_payload, dict):
                     sp_stats_payload = {}
+                primary_metadata_payload = primary_input_payload.get("metadata", {})
+                if not isinstance(primary_metadata_payload, dict):
+                    primary_metadata_payload = {}
             auto_streaming_input = primary_payload_format == "v1_sharded_manifest"
             use_streaming = bool(streaming_load) or auto_streaming_input
             if auto_streaming_input and not bool(streaming_load):
@@ -2333,6 +2464,13 @@ def train_pipeline_v1(
                 )
 
             if use_streaming:
+                _validate_self_play_schema(
+                    samples=None,
+                    metadata=primary_metadata_payload,
+                    expected_schema=state_encoding_schema_norm,
+                    expected_channels=model_input_channels,
+                    source=str(self_play_input),
+                )
                 from v1.python.streaming_dataset import (
                     build_streaming_dataloader,
                     resolve_shard_specs,
@@ -2341,6 +2479,26 @@ def train_pipeline_v1(
                 primary_manifest = primary_input_payload
                 if isinstance(primary_manifest, dict):
                     sp_stats_payload = dict(sp_stats_payload)
+                for replay_file in replay_files:
+                    replay_payload = _torch_load_with_retry(replay_file)
+                    replay_metadata: Dict[str, Any] = {}
+                    if isinstance(replay_payload, dict):
+                        replay_metadata_raw = replay_payload.get("metadata", {})
+                        if isinstance(replay_metadata_raw, dict):
+                            replay_metadata = replay_metadata_raw
+                    replay_samples = (
+                        replay_payload
+                        if isinstance(replay_payload, TensorSelfPlayBatch)
+                        else None
+                    )
+                    _validate_self_play_schema(
+                        samples=replay_samples,
+                        metadata=replay_metadata,
+                        expected_schema=state_encoding_schema_norm,
+                        expected_channels=model_input_channels,
+                        source=replay_file,
+                    )
+                    del replay_payload
                 primary_est = 0
                 ddp_rank_i = int(ddp_load_rank or 0)
                 ddp_world_i = int(ddp_load_world or 1)
@@ -2364,12 +2522,19 @@ def train_pipeline_v1(
                 del primary_manifest
                 del primary_input_payload
 
-                replay_budget_per_file = max(1, primary_est // max(1, len(replay_files))) if replay_files else 0
+                replay_budgets = _distribute_replay_file_budgets(
+                    primary_est,
+                    len(replay_files),
+                )
+                replay_budget_per_file = (
+                    replay_budgets[0] if replay_budgets else 0
+                )
 
                 shard_specs, total_est = resolve_shard_specs(
                     primary_input=str(self_play_input),
                     replay_inputs=replay_files,
                     replay_budget_per_file=replay_budget_per_file,
+                    replay_budgets=replay_budgets,
                     ddp_rank=int(ddp_load_rank or 0),
                     ddp_world=int(ddp_load_world or 1),
                 )
@@ -2412,8 +2577,11 @@ def train_pipeline_v1(
                     parallel_devices=parallel_devices,
                     parallel_strategy=train_strategy_norm,
                     optimizer_state_path=optimizer_state_path_norm,
+                    optimizer_name=optimizer_name_norm,
+                    strict_optimizer_restore=bool(strict_optimizer_restore),
                     warmup_steps=int(warmup_steps),
                     streaming_workers=int(streaming_workers),
+                    symmetry_augmentation=symmetry_augmentation_norm,
                 )
                 train_elapsed = time.perf_counter() - train_start
                 value_nonfinite = 0
@@ -2428,46 +2596,63 @@ def train_pipeline_v1(
                     ddp_world_size=ddp_load_world,
                 )
                 del primary_input_payload
+                _validate_self_play_schema(
+                    samples=samples,
+                    metadata=_sp_meta,
+                    expected_schema=state_encoding_schema_norm,
+                    expected_channels=model_input_channels,
+                    source=str(self_play_input),
+                )
                 if replay_files:
                     primary_n = int(samples.num_samples)
                     replay_budget = primary_n
-                    per_file_budget = max(1, replay_budget // len(replay_files))
+                    replay_budgets = _distribute_replay_file_budgets(
+                        replay_budget,
+                        len(replay_files),
+                    )
 
-                    def _load_and_sample_replay(rf_path: str, budget: int) -> Optional[TensorSelfPlayBatch]:
-                        try:
-                            rb, _rs, _rm = _load_self_play_payload(
-                                rf_path, ddp_rank=ddp_load_rank, ddp_world_size=ddp_load_world,
+                    def _load_and_sample_replay(rf_path: str, budget: int) -> TensorSelfPlayBatch:
+                        rb, _rs, replay_meta = _load_self_play_payload(
+                            rf_path,
+                            ddp_rank=ddp_load_rank,
+                            ddp_world_size=ddp_load_world,
+                        )
+                        _validate_self_play_schema(
+                            samples=rb,
+                            metadata=replay_meta,
+                            expected_schema=state_encoding_schema_norm,
+                            expected_channels=model_input_channels,
+                            source=rf_path,
+                        )
+                        rn = int(rb.num_samples)
+                        if rn > budget:
+                            perm_r = torch.randperm(rn)[:budget]
+                            rb = TensorSelfPlayBatch(
+                                state_tensors=rb.state_tensors.index_select(0, perm_r),
+                                legal_masks=rb.legal_masks.index_select(0, perm_r),
+                                policy_targets=rb.policy_targets.index_select(0, perm_r),
+                                value_targets=rb.value_targets.index_select(0, perm_r),
+                                soft_value_targets=rb.soft_value_targets.index_select(0, perm_r),
                             )
-                            rn = int(rb.num_samples)
-                            if rn > budget:
-                                perm_r = torch.randperm(rn)[:budget]
-                                rb = TensorSelfPlayBatch(
-                                    state_tensors=rb.state_tensors.index_select(0, perm_r),
-                                    legal_masks=rb.legal_masks.index_select(0, perm_r),
-                                    policy_targets=rb.policy_targets.index_select(0, perm_r),
-                                    value_targets=rb.value_targets.index_select(0, perm_r),
-                                    soft_value_targets=rb.soft_value_targets.index_select(0, perm_r),
-                                )
-                            _print_rank0(
-                                f"[v1.train] replay loaded {rf_path} "
-                                f"sampled={int(rb.num_samples)}/{rn}"
-                            )
-                            return rb
-                        except Exception as exc:
-                            _print_rank0(f"[v1.train] warning: replay load failed for {rf_path}: {exc}")
-                            return None
+                        _print_rank0(
+                            f"[v1.train] replay loaded {rf_path} "
+                            f"sampled={int(rb.num_samples)}/{rn}"
+                        )
+                        return rb
 
                     replay_batches: List[TensorSelfPlayBatch] = [samples]
                     replay_workers_n = min(_PARALLEL_LOAD_WORKERS, len(replay_files))
                     with ThreadPoolExecutor(max_workers=replay_workers_n, thread_name_prefix="replay-load") as pool:
                         futures = {
-                            pool.submit(_load_and_sample_replay, rf, per_file_budget): rf
-                            for rf in replay_files
+                            pool.submit(_load_and_sample_replay, rf, budget): rf
+                            for rf, budget in zip(
+                                replay_files,
+                                replay_budgets,
+                            )
+                            if budget > 0
                         }
                         for future in as_completed(futures):
-                            result = future.result()
-                            if result is not None:
-                                replay_batches.append(result)
+                            replay_batches.append(future.result())
                     if len(replay_batches) > 1:
                         samples = _concat_self_play_batches_cpu(replay_batches)
                         _print_rank0(
@@ -2530,7 +2715,10 @@ def train_pipeline_v1(
                     parallel_strategy=train_strategy_norm,
                     ddp_pre_sharded=ddp_pre_sharded,
                     optimizer_state_path=optimizer_state_path_norm,
+                    optimizer_name=optimizer_name_norm,
+                    strict_optimizer_restore=bool(strict_optimizer_restore),
                     warmup_steps=int(warmup_steps),
+                    symmetry_augmentation=symmetry_augmentation_norm,
                 )
                 train_elapsed = time.perf_counter() - train_start
                 local_positions = int(samples.num_samples)
@@ -2558,13 +2746,21 @@ def train_pipeline_v1(
                         "iteration": 1,
                         "model_state_dict": model.state_dict(),
                         "board_size": GameState.BOARD_SIZE,
-                        "num_input_channels": NUM_INPUT_CHANNELS,
+                        "num_input_channels": int(model_input_channels),
+                        "state_encoding_schema": state_encoding_schema_norm,
+                        "state_encoding_features": list(
+                            state_encoding_feature_names(
+                                state_encoding_schema_norm
+                            )
+                        ),
                         "self_play_devices": list(self_play_device_list),
                         "train_devices": list(train_device_list),
                         "train_strategy": train_strategy_norm,
                         "search_backend": search_backend_norm,
                         "stage": "train",
                         "self_play_input": str(self_play_input),
+                        "symmetry_augmentation": symmetry_augmentation_norm,
+                        "optimizer_name": optimizer_name_norm,
                     },
                     ckpt_path,
                 )
@@ -2699,6 +2895,9 @@ def train_pipeline_v1(
                 use_amp=(primary_train_device.type == "cuda"),
                 parallel_devices=parallel_devices,
                 parallel_strategy=train_strategy_norm,
+                optimizer_name=optimizer_name_norm,
+                strict_optimizer_restore=bool(strict_optimizer_restore),
+                symmetry_augmentation=symmetry_augmentation_norm,
             )
             train_elapsed = time.perf_counter() - train_start
 
@@ -2708,11 +2907,17 @@ def train_pipeline_v1(
                     "iteration": it_idx,
                     "model_state_dict": model.state_dict(),
                     "board_size": GameState.BOARD_SIZE,
-                    "num_input_channels": NUM_INPUT_CHANNELS,
+                    "num_input_channels": int(model_input_channels),
+                    "state_encoding_schema": state_encoding_schema_norm,
+                    "state_encoding_features": list(
+                        state_encoding_feature_names(state_encoding_schema_norm)
+                    ),
                     "self_play_devices": self_play_device_list,
                     "train_devices": train_device_list,
                     "train_strategy": train_strategy_norm,
                     "search_backend": search_backend_norm,
+                    "symmetry_augmentation": symmetry_augmentation_norm,
+                    "optimizer_name": optimizer_name_norm,
                 },
                 ckpt_path,
             )
@@ -2922,6 +3127,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--soft_value_k", type=float, default=2.0)
     parser.add_argument("--max_game_plies", type=int, default=512)
+    parser.add_argument(
+        "--state_encoding_schema",
+        type=str,
+        default=LEGACY_STATE_ENCODING_SCHEMA,
+        choices=["legacy_v1", "markov_v2"],
+        help="State tensor schema. Legacy remains the compatibility default.",
+    )
+    parser.add_argument(
+        "--symmetry_augmentation",
+        type=str,
+        default="none",
+        choices=["none", "random_d4"],
+        help="Training-only D4 augmentation; self-play payloads remain canonical.",
+    )
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_v1")
     parser.add_argument(
         "--device",
@@ -2977,6 +3196,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to save/load optimizer state for training continuity.",
+    )
+    parser.add_argument(
+        "--optimizer_name",
+        choices=["adam", "adamw"],
+        default="adam",
+    )
+    parser.add_argument(
+        "--strict_optimizer_restore",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument(
@@ -3080,6 +3309,8 @@ if __name__ == "__main__":
         checkpoint_name=args.checkpoint_name,
         metrics_output=args.metrics_output,
         optimizer_state_path=args.optimizer_state_path,
+        optimizer_name=args.optimizer_name,
+        strict_optimizer_restore=args.strict_optimizer_restore,
         warmup_steps=args.warmup_steps,
         infer_devices=args.infer_devices,
         infer_batch_size=args.infer_batch_size,
@@ -3087,4 +3318,6 @@ if __name__ == "__main__":
         infer_iters=args.infer_iters,
         infer_output=args.infer_output,
         model_init_seed=args.model_init_seed,
+        state_encoding_schema=args.state_encoding_schema,
+        symmetry_augmentation=args.symmetry_augmentation,
     )

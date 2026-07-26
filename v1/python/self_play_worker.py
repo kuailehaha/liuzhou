@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from src.game_state import GameState
-from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
+from src.neural_network import ChessNet, model_input_channels_from_state_dict
 from .self_play_types import SelfPlayV1Stats
 from .self_play_storage import (
     estimate_bytes_per_sample,
@@ -332,7 +332,10 @@ def run_self_play_worker(
         # not with total shard_games.
         shard_chunk_games = shard_concurrent
 
-        model = ChessNet(board_size=GameState.BOARD_SIZE, num_input_channels=NUM_INPUT_CHANNELS)
+        model = ChessNet(
+            board_size=GameState.BOARD_SIZE,
+            num_input_channels=model_input_channels_from_state_dict(state_payload),
+        )
         model.load_state_dict(state_payload, strict=True)
         model.to(dev)
         model.eval()

@@ -5,21 +5,123 @@ from typing import Optional
 from src.game_state import GameState, Player, Phase
 from src.move_generator import generate_all_legal_moves, MoveType
 
-# Number of input channels: player pieces, opponent pieces, mark indicators, and phase planes
-NUM_INPUT_CHANNELS = 11
+# ``NUM_INPUT_CHANNELS`` remains the legacy default so old callers/checkpoints do
+# not silently change shape. V1 phase-3 opts into ``markov_v2`` explicitly.
+LEGACY_STATE_ENCODING_SCHEMA = "legacy_v1"
+MARKOV_STATE_ENCODING_SCHEMA = "markov_v2"
+LEGACY_NUM_INPUT_CHANNELS = 11
+MARKOV_NUM_INPUT_CHANNELS = 19
+NUM_INPUT_CHANNELS = LEGACY_NUM_INPUT_CHANNELS
 VALUE_BUCKET_BINS = 101
 
+_LEGACY_STATE_FEATURES = (
+    "self_pieces",
+    "opponent_pieces",
+    "self_marks",
+    "opponent_marks",
+    "phase_placement",
+    "phase_mark_selection",
+    "phase_removal",
+    "phase_movement",
+    "phase_capture_selection",
+    "phase_forced_removal",
+    "phase_counter_removal",
+)
+_MARKOV_STATE_FEATURES = _LEGACY_STATE_FEATURES + (
+    "absolute_black_to_move",
+    "move_count_normalized",
+    "moves_since_capture_normalized",
+    "forced_removals_done_normalized",
+    "pending_marks_required_normalized",
+    "pending_marks_remaining_normalized",
+    "pending_captures_required_normalized",
+    "pending_captures_remaining_normalized",
+)
+
+
+def state_encoding_feature_names(schema: str) -> tuple[str, ...]:
+    normalized = str(schema).strip().lower()
+    if normalized == LEGACY_STATE_ENCODING_SCHEMA:
+        return _LEGACY_STATE_FEATURES
+    if normalized == MARKOV_STATE_ENCODING_SCHEMA:
+        return _MARKOV_STATE_FEATURES
+    raise ValueError(f"Unsupported state encoding schema: {schema!r}")
+
+
+def input_channels_for_schema(schema: str) -> int:
+    return len(state_encoding_feature_names(schema))
+
+
+def schema_for_input_channels(num_input_channels: int) -> str:
+    channels = int(num_input_channels)
+    if channels == LEGACY_NUM_INPUT_CHANNELS:
+        return LEGACY_STATE_ENCODING_SCHEMA
+    if channels == MARKOV_NUM_INPUT_CHANNELS:
+        return MARKOV_STATE_ENCODING_SCHEMA
+    raise ValueError(
+        "Unsupported model input channel count "
+        f"{channels}; expected {LEGACY_NUM_INPUT_CHANNELS} or "
+        f"{MARKOV_NUM_INPUT_CHANNELS}."
+    )
+
+
+def checkpoint_state_encoding_schema(checkpoint: object) -> str:
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Checkpoint must be a mapping.")
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    if not isinstance(state_dict, dict):
+        raise ValueError("Checkpoint does not contain a model state_dict.")
+    stem = state_dict.get("stem_conv.weight")
+    if stem is None:
+        stem = state_dict.get("module.stem_conv.weight")
+    if not isinstance(stem, torch.Tensor) or stem.dim() != 4:
+        raise ValueError("Checkpoint is missing a valid stem_conv.weight tensor.")
+    inferred = schema_for_input_channels(int(stem.shape[1]))
+    declared = checkpoint.get("state_encoding_schema")
+    if declared is not None and str(declared).strip():
+        declared_normalized = str(declared).strip().lower()
+        input_channels_for_schema(declared_normalized)
+        if declared_normalized != inferred:
+            raise ValueError(
+                "Checkpoint state encoding metadata disagrees with stem shape: "
+                f"declared={declared_normalized} inferred={inferred}."
+            )
+    declared_channels = checkpoint.get("num_input_channels")
+    if declared_channels is not None and int(declared_channels) != int(stem.shape[1]):
+        raise ValueError(
+            "Checkpoint num_input_channels disagrees with stem shape: "
+            f"declared={declared_channels} stem={int(stem.shape[1])}."
+        )
+    return inferred
+
+
+def model_input_channels_from_state_dict(state_dict: dict) -> int:
+    stem = state_dict.get("stem_conv.weight")
+    if stem is None:
+        stem = state_dict.get("module.stem_conv.weight")
+    if not isinstance(stem, torch.Tensor) or stem.dim() != 4:
+        raise ValueError("Model state_dict is missing a valid stem_conv.weight.")
+    channels = int(stem.shape[1])
+    schema_for_input_channels(channels)
+    return channels
 
 
 @torch.no_grad()
-def state_to_tensor(state: GameState, player_to_act: Player) -> torch.Tensor:
+def state_to_tensor(
+    state: GameState,
+    player_to_act: Player,
+    *,
+    schema: str = LEGACY_STATE_ENCODING_SCHEMA,
+) -> torch.Tensor:
     """
     Vectorized: (C,H,W) -> add batch -> (1,C,H,W)
     """
     board_size = state.BOARD_SIZE
     device = torch.device("cpu")  # 仍返回CPU张量，调用处再 .to(device)
 
-    x = torch.zeros((NUM_INPUT_CHANNELS, board_size, board_size), device=device)
+    normalized_schema = str(schema).strip().lower()
+    num_input_channels = input_channels_for_schema(normalized_schema)
+    x = torch.zeros((num_input_channels, board_size, board_size), device=device)
 
     # board -> tensor
     # 假设 state.board 是 HxW 的 Python 列表/列表；若是 np.ndarray 亦可 torch.from_numpy
@@ -61,6 +163,29 @@ def state_to_tensor(state: GameState, player_to_act: Player) -> torch.Tensor:
     ch = phase2ch.get(state.phase, None)
     if ch is not None:
         x[ch].fill_(1.0)
+
+    if normalized_schema == MARKOV_STATE_ENCODING_SCHEMA:
+        scalar_planes = (
+            1.0 if state.current_player == Player.BLACK else 0.0,
+            min(max(float(state.move_count) / float(GameState.MAX_MOVE_COUNT), 0.0), 1.0),
+            min(
+                max(
+                    float(state.moves_since_capture)
+                    / float(GameState.NO_CAPTURE_DRAW_LIMIT),
+                    0.0,
+                ),
+                1.0,
+            ),
+            min(max(float(state.forced_removals_done) / 2.0, 0.0), 1.0),
+            min(max(float(state.pending_marks_required) / 2.0, 0.0), 1.0),
+            min(max(float(state.pending_marks_remaining) / 2.0, 0.0), 1.0),
+            min(max(float(state.pending_captures_required) / 2.0, 0.0), 1.0),
+            min(max(float(state.pending_captures_remaining) / 2.0, 0.0), 1.0),
+        )
+        for offset, value in enumerate(
+            scalar_planes, start=LEGACY_NUM_INPUT_CHANNELS
+        ):
+            x[offset].fill_(value)
 
     return x.unsqueeze(0)  # (1,C,H,W)
 

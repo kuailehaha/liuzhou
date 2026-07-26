@@ -156,6 +156,52 @@ zsh scripts/run_long_train_mps.sh \
 
 fork 会从保存的 optimizer 推导起始 LR，从最新 replay 推导 opening-random 起点，并复制 replay window 和 incumbent metadata。默认继承父 deadline；只有显式 `--reset-fork-deadline` 才会以 `--hours` 计算新 deadline，并在 state/event 中同时记录父 deadline 和授权标志。当前 phase2 已于 `2026-07-24 17:41:38 UTC+8` 启动，40 小时 deadline 为 `2026-07-26 09:41:38 UTC+8`。
 
+### Portable MPS Phase 3：Markov v2、联盟 gate 与自动选型
+
+Phase 3 不改变规则或 220 维动作空间，但训练输入必须显式选择 19 通道 `markov_v2`。旧 checkpoint 通过迁移脚本扩展 stem；旧 replay 因缺少历史计数不能用于 Phase 3：
+
+```bash
+python scripts/upgrade_v1_state_schema.py \
+  --source-checkpoint tmp/v1_portable_cpp_quality_phase2_20260723/checkpoints/best_model.pt \
+  --source-optimizer tmp/v1_portable_cpp_quality_phase2_20260723/checkpoints/best_optimizer.pt \
+  --output-checkpoint tmp/v1_markov_phase3_bootstrap_20260726/phase3_start_markov_v2.pt \
+  --output-optimizer tmp/v1_markov_phase3_bootstrap_20260726/phase3_start_optimizer.pt \
+  --report-json tmp/v1_markov_phase3_bootstrap_20260726/phase3_start_migration.json \
+  --parent-iteration 2478
+```
+
+迁移会复制原 11 个 stem 通道、将新增 8 通道及其 optimizer moments 置零，并拒绝覆盖已有输出。Phase 3 train 命令使用 `--optimizer_name adamw --strict_optimizer_restore`；恢复失败会直接退出，不会新建 optimizer。
+
+完整的 16/32 等时 pilot、选型和正式 40 小时训练由一个可恢复工作流负责：
+
+```bash
+unset PYTORCH_ENABLE_MPS_FALLBACK
+exec /usr/bin/caffeinate -ims \
+  /opt/homebrew/Caskroom/miniconda/base/envs/torchenv/bin/python \
+  scripts/run_phase3_portable_mps.py \
+  --root-dir tmp/v1_markov_phase3_20260726 \
+  --phase2-parent-run tmp/v1_portable_cpp_quality_phase2_20260723 \
+  --initial-checkpoint tmp/v1_markov_phase3_bootstrap_20260726/phase3_start_markov_v2.pt \
+  --initial-optimizer tmp/v1_markov_phase3_bootstrap_20260726/phase3_start_optimizer.pt \
+  --anchor phase2_start=tmp/v1_markov_phase3_bootstrap_20260726/anchor_phase2_start.pt \
+  --anchor phase2_best_2100=tmp/v1_markov_phase3_bootstrap_20260726/phase3_start_markov_v2.pt \
+  --anchor phase2_final_2478=tmp/v1_markov_phase3_bootstrap_20260726/anchor_phase2_final.pt \
+  --pilot-hours 3 --formal-hours 40 \
+  --seed 2026072605
+```
+
+两个 pilot 都从同一模型/optimizer 和空 replay 启动，分别使用 16/32 simulations 三小时。工作流随后执行 64-simulation、temperature 1 且实际采样的 500 局直接对拍和每 anchor 200 局对拍；选择完成后，再从原始暖启动点开始新的 40 小时 deadline，不继承 pilot 权重或用时。
+
+每 10 iteration 才允许进入联盟 gate。未到边界即结束、screen/full gate 失败或进程中断恢复时，current model、optimizer 和 accepted replay 必须作为一组回滚。固定 gate 为 incumbent 128/500 局、每个 anchor 64/200 局，阈值分别为 screen `48%/40%` 和 full `55%/50%`；评测固定 64 simulations、temperature 1、采样、无随机开局、黑白各半。`state.json`、`events.jsonl`、`pilot_selection.json`、最终 league report 和每阶段 `resources_summary.json` 提供完整审计。
+
+正式运行推荐继续使用一次性 `RunAtLoad=true`、`KeepAlive=false` LaunchAgent，且不得设置 `ProcessType=Background`。机器必须接交流电；采用当前开盖方式时保持上盖打开。查看进度：
+
+```bash
+tail -f tmp/v1_markov_phase3_20260726/workflow.log
+python -m json.tool tmp/v1_markov_phase3_20260726/workflow_state.json
+python -m json.tool tmp/v1_markov_phase3_20260726/pilot_16sim_3h/state.json
+```
+
 恢复 optimizer 后必须同时覆盖 param group 的 `lr` 和 `initial_lr`，再构造 `LambdaLR`。旧实现只覆盖 `lr`，会被保存的 `initial_lr=3e-4` 重置；现在 train metrics 会写 `optimizer_lr_start/final`，长训编排还会读取保存后的 optimizer 再核对一次。phase-1 的大部分历史 LR 日志仅表示请求值，不表示实际生效值；iteration 857–860 和其后的新 run 才具有这项完整审计。
 
 跨终端或 Codex 断联运行时，优先把同一命令注册为 `RunAtLoad=true`、`KeepAlive=false` 的一次性用户 LaunchAgent，并在交付前核对任务进程、日志、`state.json` 和 `pmset -g assertions` 中的 `caffeinate` 断言；直接 `nohup` 只适合当前 shell 生命周期可靠的环境。

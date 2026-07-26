@@ -2,6 +2,42 @@
 Date: 2026-02-16  
 Scope: Design for migrating v0 CPU-bottleneck self-play to a GPU-first v1 pipeline.
 
+## Addendum (2026-07-26): Markov v2 and Conservative League-Gated Phase 3
+
+### Input schema and migration contract
+
+Phase 3 adds the opt-in `markov_v2` schema while leaving `legacy_v1` as the default. `legacy_v1` remains the original 11 player-relative board/mark/phase planes. `markov_v2` appends eight spatially constant planes: absolute black-to-move, `move_count / 144`, `moves_since_capture / 36`, `forced_removals_done / 2`, and mark/capture required and remaining counts divided by 2. The resulting tensor is `[B,19,6,6]`. These counters affect draw or forced atomic-phase behavior and therefore must be observable by policy/value search.
+
+Every new checkpoint and replay manifest records `state_encoding_schema`, `num_input_channels` and the ordered feature names. A metadata-free 11-channel checkpoint is recognized only from its stem shape. Unknown stem sizes, declared/observed disagreements, missing Markov replay metadata, legacy replay supplied to a Markov model, missing replay files and unreadable streaming shards are hard errors. The old 11-channel path remains readable, but Phase 3 begins with an empty replay because old tensors cannot be upgraded without the missing historical counters.
+
+`scripts/upgrade_v1_state_schema.py` performs the only supported 11-to-19 migration. It copies the first 11 stem channels exactly, zeroes the eight new channels and zero-extends the matching optimizer first/second moments. All other model and optimizer state is preserved. Phase 3 uses AdamW updates with strict restore: a missing or incompatible paired optimizer aborts rather than fresh-starting. With zero new stem weights, a real migrated Phase-2 model produced bit-identical policy/value outputs (`max_abs_error=0`) before the first Phase-3 update.
+
+The warm-start lineage is Phase-2 run `tmp/v1_portable_cpp_quality_phase2_20260723`, parent final iteration 2478 and retained best iteration 2100. The source best model/optimizer SHA-256 values are `016d8a8f...db478` and `02ab06f6...0b3f`; migrated artifacts are `f8c4371d...2bf9` and `775a2eb2...1a78`. The fixed Phase-2 start and final anchors were separately migrated by zero-extending their stems. Phase-3 iteration numbering restarts at zero and does not import Phase-2 replay.
+
+### D4 augmentation and unchanged game contracts
+
+`random_d4` chooses one of all eight rotations/reflections independently for every sample in every epoch. It transforms every state plane, legal mask and dense policy target together. Placement and selection indices transform by coordinate; movement source and direction transform together under the existing cell-major `36 + cell*4 + direction` layout; indices 216–219 remain fixed. The transform is a bijection over all 220 indices and commutes with legal application in every atomic phase. It does not exchange black and white because forced-removal ordering is absolute.
+
+This change does not alter rules, phases, the 220-dimensional payload, legal-action semantics, black-positive/white-negative training values, conditional player-change backup, `N + P` targets, target temperature 1, `beta=1`, or `tanh(k=2)`. Phase 3 disables sampled training moves and uses root `N`, then `Q/P/action-index` tie-breaking after PUCT. Root Dirichlet noise remains enabled; opening randomization is `3 -> 0` over the first 25% of wall time; `soft_label_alpha=0`.
+
+### Challenger blocks and replay rollback
+
+Every 10 iterations form one challenger block. At block start the orchestrator atomically records incumbent model/optimizer hashes and the exact accepted replay list with per-file hashes. A failed or incomplete block restores the paired incumbent files and deletes every non-accepted replay file. Promotion uses the recoverable best-pair transaction; its accepted iteration and replay snapshot are part of the same recovery record, so a crash between alias replacement and state persistence cannot leave an unpaired incumbent. Only multiples of 10 may enter a league gate; crossing a wall-clock deadline in a partial block causes rollback rather than an early promotion.
+
+The replay window is 16 accepted/history payloads. Historical sampling is capped at the current primary position count and divided across replay inputs, so widening the window does not increase optimizer-step budget. Every promotion retains its prior incumbent in `hall_of_fame/`. At the next gate, the candidate first plays all older Phase-3 incumbents at 16 simulations/64 games, and the lowest-scoring one becomes the cycle anchor.
+
+Formal gates use portable C++ MCTS, 64 simulations, temperature 1 with actual sampling, zero random opening, fixed seed and exact color balance. Screening is 128 games against the incumbent and 64 per fixed/cycle anchor; scores below 48% or 40% reject immediately. A surviving candidate expands to 500 incumbent games and 200 per anchor; promotion requires at least 55% against the incumbent and at least 50% against every anchor. Optimizer restore, schema, illegal actions, non-finite values, fallback and color balance are audited as hard conditions.
+
+### Pilot selection, formal run and evaluation
+
+`scripts/run_phase3_portable_mps.py` is the resumable top-level workflow. It runs independent 16- and 32-simulation pilots for three hours each from the same migrated model/optimizer and identical seed/configuration. `tools/select_phase3_pilot.py` then runs the predeclared 64-simulation sampled evaluation: 500 games between pilots and 200 games from each pilot to each fixed anchor. Health failures eliminate a pilot; otherwise the direct-55%, worst-anchor, league-average and final 16-simulation throughput tie-break rules are applied in that order. The selected simulation count starts a fresh 40-hour run from the original migration, not pilot weights. The formal deadline is created by the formal trainer process at actual start.
+
+`tools/eval_portable_league.py` emits the pairwise score/games matrix, centered Bradley–Terry/Elo estimates, worst-opponent score, directed three-cycles, per-color W/L/D, Wilson win intervals and C++ health audit. Final strength is 64 simulations, temperature 1 with sampling and 500 games against the Phase-3 start, followed by an independent seed only after reaching 55%. Separate deterministic diagnostics use 64 simulations/64 games and 256 simulations/64 games; they do not replace the sampled 500-game conclusion. `tools/monitor_portable_mps_resources.py` records process-tree CPU, RSS and Apple GPU device utilization throughout each pilot/formal run.
+
+Fresh pre-pilot evidence: 87 focused portable/schema/migration/D4/orchestrator tests pass. A real 4-game MPS AdamW smoke restored the migrated optimizer strictly, trained one D4-augmented iteration and reported 452 positions. The following production-search smoke used 20 games/concurrency 20, 16 simulations and full 512-ply games: 1,987 positions at `104.17 positions/s`, 10 draws, mean target support `12.66/12.66`, entropy `1.184` and one-hot `3.12%`. Both runs had zero fallback, illegal actions, non-finite/filtered samples or device fallback. Stopping before the 10-iteration gate restored model and optimizer to the exact warm-start hashes and removed the challenger replay. The 6-hour pilots and 40-hour formal strength conditions remain runtime acceptance and must not be described as achieved before their reports exist.
+
+The automated workflow began at `2026-07-26 18:02:29 UTC+8` under one-shot LaunchAgent `com.liuzhou.portable-markov-phase3`. The first 16-simulation pilot has a fixed deadline of `21:02:30 UTC+8`; the formal deadline remains unset until pilot selection finishes. launchd reports daemon/Standard-equivalent scheduling at PRI 20, and the machine is on AC with the lid open and all three `caffeinate -ims` assertions active. Its first full 128-game iteration committed 12,881 positions at `350.25 positions/s`; three-epoch AdamW training took `21.80s`, optimizer restore succeeded, and all fallback/illegal/non-finite/filtered counters were zero. Early resource samples observed roughly 80–82% Apple GPU utilization and 40–42% aggregate process-tree CPU in macOS `%CPU` units.
+
 ## Addendum (2026-07-24): Portable MPS Policy-Quality Phase
 
 ### Problem and invariants

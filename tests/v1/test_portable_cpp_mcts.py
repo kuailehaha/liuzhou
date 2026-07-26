@@ -9,7 +9,13 @@ import torch
 
 from src.game_state import GameState, Phase, Player
 from src.move_generator import apply_move, generate_all_legal_moves
-from src.neural_network import ChessNet, NUM_INPUT_CHANNELS, state_to_tensor
+from src.neural_network import (
+    ChessNet,
+    MARKOV_NUM_INPUT_CHANNELS,
+    MARKOV_STATE_ENCODING_SCHEMA,
+    NUM_INPUT_CHANNELS,
+    state_to_tensor,
+)
 from src.policy_batch import TOTAL_DIM, action_to_index
 
 
@@ -188,6 +194,52 @@ def test_cpp_rules_actions_encoding_and_transitions_match_python() -> None:
             cpp_next = cpp.apply_action(state, index)
             python_next = apply_move(state, move_by_index[index], quiet=True)
             _assert_state_payload_matches(cpp_next, python_next)
+
+
+def test_cpp_markov_v2_model_input_matches_python() -> None:
+    cpp = _cpp_module()
+    for state in _representative_states():
+        inspected = cpp.inspect_state(
+            state,
+            input_channels=MARKOV_NUM_INPUT_CHANNELS,
+        )
+        expected = state_to_tensor(
+            state,
+            state.current_player,
+            schema=MARKOV_STATE_ENCODING_SCHEMA,
+        )[0]
+        assert torch.equal(torch.from_numpy(inspected["model_input"]), expected)
+
+
+def test_cpp_search_accepts_markov_v2_model() -> None:
+    _cpp_module()
+    from v1.python.portable_cpp_mcts import PortableCppMCTS
+    from v1.python.portable_mcts import PortableMCTSConfig
+
+    torch.manual_seed(9)
+    model = ChessNet(
+        board_size=GameState.BOARD_SIZE,
+        num_input_channels=MARKOV_NUM_INPUT_CHANNELS,
+        trunk_channels=8,
+        num_blocks=1,
+        policy_channels=4,
+        value_channels=4,
+        value_mlp_channels=8,
+    ).eval()
+    search = PortableCppMCTS(
+        model,
+        PortableMCTSConfig(
+            num_simulations=2,
+            add_dirichlet_noise=False,
+            sample_moves=False,
+        ),
+        device="cpu",
+        num_threads=2,
+        initial_states=[GameState()],
+    )
+    output = search.search_batch(add_dirichlet_noise=False)[0]
+    assert output.model_input.shape == (MARKOV_NUM_INPUT_CHANNELS, 6, 6)
+    assert search.trees.input_channels == MARKOV_NUM_INPUT_CHANNELS
 
 
 def test_cpp_backup_flips_only_on_actual_player_change() -> None:

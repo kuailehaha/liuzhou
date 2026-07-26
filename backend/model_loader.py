@@ -8,7 +8,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from src.game_state import GameState
-from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
+from src.neural_network import ChessNet, model_input_channels_from_state_dict
 
 
 class ModelLoadError(RuntimeError):
@@ -33,12 +33,12 @@ def _get_model_cached(
     checkpoint_sha256: str,
 ) -> ChessNet:
     del checkpoint_sha256  # Included in the cache key to invalidate mutable aliases.
-    model = ChessNet(
-        board_size=GameState.BOARD_SIZE,
-        num_input_channels=NUM_INPUT_CHANNELS,
-    )
     payload = torch.load(resolved_path, map_location="cpu", weights_only=False)
     state_dict = _extract_state_dict(payload)
+    model = ChessNet(
+        board_size=GameState.BOARD_SIZE,
+        num_input_channels=model_input_channels_from_state_dict(state_dict),
+    )
     model.load_state_dict(state_dict)
     model.to(device or "cpu")
     model.eval()

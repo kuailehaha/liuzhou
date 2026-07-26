@@ -27,13 +27,13 @@ namespace py = pybind11;
 
 namespace {
 
-constexpr int kInputChannels = 11;
+constexpr int kLegacyInputChannels = 11;
+constexpr int kMarkovInputChannels = 19;
 constexpr int kActionCount = 220;
 constexpr int kPlacementCount = 36;
 constexpr int kMovementCount = 144;
 constexpr int kSelectionOffset = kPlacementCount + kMovementCount;
 constexpr int kProcessRemovalAction = kSelectionOffset + 36;
-constexpr int kInputSize = kInputChannels * v0::kCellCount;
 
 const std::array<v0::Coord, 4> kDirections = {
     v0::Coord{-1, 0},
@@ -238,8 +238,23 @@ LegalMoves BuildLegalMoves(const v0::GameState& state) {
     return result;
 }
 
-std::array<float, kInputSize> EncodeModelInput(const v0::GameState& state) {
-    std::array<float, kInputSize> result{};
+int ValidateInputChannels(int input_channels) {
+    if (
+        input_channels != kLegacyInputChannels &&
+        input_channels != kMarkovInputChannels) {
+        throw std::runtime_error(
+            "input_channels must be 11 (legacy_v1) or 19 (markov_v2)");
+    }
+    return input_channels;
+}
+
+std::vector<float> EncodeModelInput(
+    const v0::GameState& state,
+    int input_channels) {
+    ValidateInputChannels(input_channels);
+    std::vector<float> result(
+        static_cast<std::size_t>(input_channels * v0::kCellCount),
+        0.0F);
     const int player = v0::PlayerValue(state.current_player);
     const v0::MarkSet& self_marks = state.Marks(state.current_player);
     const v0::MarkSet& opponent_marks = state.Marks(v0::Opponent(state.current_player));
@@ -254,12 +269,56 @@ std::array<float, kInputSize> EncodeModelInput(const v0::GameState& state) {
             opponent_marks.ContainsIndex(cell) ? 1.0F : 0.0F;
     }
     const int phase_channel = 3 + static_cast<int>(state.phase);
-    if (phase_channel >= 4 && phase_channel < kInputChannels) {
+    if (phase_channel >= 4 && phase_channel < kLegacyInputChannels) {
         const int offset = phase_channel * v0::kCellCount;
         std::fill(
             result.begin() + offset,
             result.begin() + offset + v0::kCellCount,
             1.0F);
+    }
+    if (input_channels == kMarkovInputChannels) {
+        const std::array<float, 8> scalar_planes = {
+            state.current_player == v0::Player::kBlack ? 1.0F : 0.0F,
+            std::clamp(
+                static_cast<float>(state.move_count) / 144.0F,
+                0.0F,
+                1.0F),
+            std::clamp(
+                static_cast<float>(state.moves_since_capture) / 36.0F,
+                0.0F,
+                1.0F),
+            std::clamp(
+                static_cast<float>(state.forced_removals_done) / 2.0F,
+                0.0F,
+                1.0F),
+            std::clamp(
+                static_cast<float>(state.pending_marks_required) / 2.0F,
+                0.0F,
+                1.0F),
+            std::clamp(
+                static_cast<float>(state.pending_marks_remaining) / 2.0F,
+                0.0F,
+                1.0F),
+            std::clamp(
+                static_cast<float>(state.pending_captures_required) / 2.0F,
+                0.0F,
+                1.0F),
+            std::clamp(
+                static_cast<float>(state.pending_captures_remaining) / 2.0F,
+                0.0F,
+                1.0F),
+        };
+        for (std::size_t offset = 0; offset < scalar_planes.size(); ++offset) {
+            const auto begin =
+                result.begin() +
+                static_cast<std::ptrdiff_t>(
+                    (kLegacyInputChannels + static_cast<int>(offset)) *
+                    v0::kCellCount);
+            std::fill(
+                begin,
+                begin + v0::kCellCount,
+                scalar_planes[offset]);
+        }
     }
     return result;
 }
@@ -436,7 +495,7 @@ struct PendingEvaluation {
     Node* node{nullptr};
     std::vector<Node*> path;
     LegalMoves legal;
-    std::array<float, kInputSize> model_input{};
+    std::vector<float> model_input;
 };
 
 enum class PendingKind {
@@ -450,8 +509,11 @@ class PortableTreeBatch {
     PortableTreeBatch(
         const std::vector<v0::GameState>& states,
         double exploration_weight,
-        int num_threads)
-        : exploration_weight_(exploration_weight), pool_(num_threads) {
+        int num_threads,
+        int input_channels)
+        : exploration_weight_(exploration_weight),
+          input_channels_(ValidateInputChannels(input_channels)),
+          pool_(num_threads) {
         if (states.empty()) {
             throw std::runtime_error("PortableTreeBatch requires at least one state");
         }
@@ -466,6 +528,10 @@ class PortableTreeBatch {
 
     int NumTrees() const {
         return static_cast<int>(trees_.size());
+    }
+
+    int InputChannels() const {
+        return input_channels_;
     }
 
     int NumThreads() const {
@@ -499,7 +565,8 @@ class PortableTreeBatch {
                 row->node = root;
                 row->path = {root};
                 row->legal = BuildLegalMoves(root->state);
-                row->model_input = EncodeModelInput(root->state);
+                row->model_input =
+                    EncodeModelInput(root->state, input_channels_);
                 rows[index] = std::move(row);
             }
         });
@@ -539,7 +606,8 @@ class PortableTreeBatch {
             row->node = leaf;
             row->path = std::move(path);
             row->legal = BuildLegalMoves(leaf->state);
-            row->model_input = EncodeModelInput(leaf->state);
+            row->model_input =
+                EncodeModelInput(leaf->state, input_channels_);
             rows[index] = std::move(row);
         });
         for (auto& row : rows) {
@@ -664,7 +732,7 @@ class PortableTreeBatch {
     py::dict RootOutputs() const {
         const py::ssize_t count = static_cast<py::ssize_t>(trees_.size());
         py::array_t<float> inputs(
-            {count, static_cast<py::ssize_t>(kInputChannels),
+            {count, static_cast<py::ssize_t>(input_channels_),
              static_cast<py::ssize_t>(v0::kBoardSize),
              static_cast<py::ssize_t>(v0::kBoardSize)});
         py::array_t<uint8_t> masks({count, static_cast<py::ssize_t>(kActionCount)});
@@ -684,7 +752,9 @@ class PortableTreeBatch {
         auto* player_data = static_cast<int32_t*>(players.request().ptr);
         auto* terminal_data = static_cast<uint8_t*>(terminals.request().ptr);
         auto* active_data = static_cast<uint8_t*>(active.request().ptr);
-        std::fill(input_data, input_data + count * kInputSize, 0.0F);
+        const auto input_size =
+            static_cast<py::ssize_t>(input_channels_ * v0::kCellCount);
+        std::fill(input_data, input_data + count * input_size, 0.0F);
         std::fill(mask_data, mask_data + count * kActionCount, 0);
         std::fill(visit_data, visit_data + count * kActionCount, 0);
         std::fill(
@@ -695,11 +765,12 @@ class PortableTreeBatch {
         for (py::ssize_t row = 0; row < count; ++row) {
             const Tree& tree = trees_[static_cast<std::size_t>(row)];
             const Node& root = *tree.root;
-            const auto encoded = EncodeModelInput(root.state);
+            const auto encoded =
+                EncodeModelInput(root.state, input_channels_);
             std::copy(
                 encoded.begin(),
                 encoded.end(),
-                input_data + row * kInputSize);
+                input_data + row * input_size);
             player_data[row] = v0::PlayerValue(root.state.current_player);
             terminal_data[row] =
                 (root.terminal || root.children.empty()) ? 1 : 0;
@@ -941,7 +1012,7 @@ class PortableTreeBatch {
     py::dict PendingBatchToPython() const {
         const py::ssize_t count = static_cast<py::ssize_t>(pending_.size());
         py::array_t<float> inputs(
-            {count, static_cast<py::ssize_t>(kInputChannels),
+            {count, static_cast<py::ssize_t>(input_channels_),
              static_cast<py::ssize_t>(v0::kBoardSize),
              static_cast<py::ssize_t>(v0::kBoardSize)});
         py::array_t<uint8_t> masks({count, static_cast<py::ssize_t>(kActionCount)});
@@ -955,7 +1026,9 @@ class PortableTreeBatch {
             std::copy(
                 pending.model_input.begin(),
                 pending.model_input.end(),
-                input_data + row * kInputSize);
+                input_data +
+                    row * static_cast<py::ssize_t>(
+                        input_channels_ * v0::kCellCount));
             std::copy(
                 pending.legal.mask.begin(),
                 pending.legal.mask.end(),
@@ -971,6 +1044,7 @@ class PortableTreeBatch {
 
     std::vector<Tree> trees_;
     double exploration_weight_{1.0};
+    int input_channels_{kLegacyInputChannels};
     ThreadPool pool_;
     std::vector<PendingEvaluation> pending_;
     PendingKind pending_kind_{PendingKind::kNone};
@@ -978,12 +1052,13 @@ class PortableTreeBatch {
     std::atomic<int> non_finite_count_{0};
 };
 
-py::dict InspectState(const py::object& object) {
+py::dict InspectState(const py::object& object, int input_channels) {
+    input_channels = ValidateInputChannels(input_channels);
     const v0::GameState state = StateFromPython(object);
     const LegalMoves legal = BuildLegalMoves(state);
-    const auto encoded = EncodeModelInput(state);
+    const auto encoded = EncodeModelInput(state, input_channels);
     py::array_t<float> model_input(
-        {static_cast<py::ssize_t>(kInputChannels),
+        {static_cast<py::ssize_t>(input_channels),
          static_cast<py::ssize_t>(v0::kBoardSize),
          static_cast<py::ssize_t>(v0::kBoardSize)});
     std::copy(
@@ -1053,8 +1128,13 @@ PYBIND11_MODULE(_liuzhou_portable_cpp, module) {
     module.doc() =
         "CPU-only threaded portable MCTS core for V1 PyTorch/MPS self-play";
     module.attr("ACTION_COUNT") = kActionCount;
-    module.attr("INPUT_CHANNELS") = kInputChannels;
-    module.def("inspect_state", &InspectState, py::arg("state"));
+    module.attr("INPUT_CHANNELS") = kLegacyInputChannels;
+    module.attr("MARKOV_INPUT_CHANNELS") = kMarkovInputChannels;
+    module.def(
+        "inspect_state",
+        &InspectState,
+        py::arg("state"),
+        py::arg("input_channels") = kLegacyInputChannels);
     module.def(
         "apply_action",
         &ApplyAction,
@@ -1071,17 +1151,23 @@ PYBIND11_MODULE(_liuzhou_portable_cpp, module) {
             py::init([](
                 const py::iterable& states,
                 double exploration_weight,
-                int num_threads) {
+                int num_threads,
+                int input_channels) {
                 return std::make_unique<PortableTreeBatch>(
                     StatesFromPython(states),
                     exploration_weight,
-                    num_threads);
+                    num_threads,
+                    input_channels);
             }),
             py::arg("states"),
             py::arg("exploration_weight") = 1.0,
-            py::arg("num_threads") = 1)
+            py::arg("num_threads") = 1,
+            py::arg("input_channels") = kLegacyInputChannels)
         .def_property_readonly("num_trees", &PortableTreeBatch::NumTrees)
         .def_property_readonly("num_threads", &PortableTreeBatch::NumThreads)
+        .def_property_readonly(
+            "input_channels",
+            &PortableTreeBatch::InputChannels)
         .def_property_readonly(
             "illegal_action_count",
             &PortableTreeBatch::IllegalActionCount)

@@ -61,6 +61,10 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert args.eval_concurrency == 64
     assert args.incumbent_promotion_score == pytest.approx(0.55)
     assert args.target_win_rate == pytest.approx(0.99)
+    assert args.state_encoding_schema == "legacy_v1"
+    assert args.symmetry_augmentation == "none"
+    assert not args.league_gate
+    assert not args.rollback_on_gate_fail
 
 
 def test_direct_script_execution_adds_repository_root_to_sys_path(monkeypatch) -> None:
@@ -188,8 +192,12 @@ def test_final_strength_evaluation_samples_at_temperature_one(
         quality_strength_eval=True,
         strength_eval_games=500,
         strength_eval_simulations=64,
+        strength_diagnostic_games=64,
+        strength_diagnostic_simulations=64,
         strength_screen_games=64,
         strength_screen_simulations=1024,
+        strength_screen_temperature=1.0,
+        strength_screen_sample_moves=True,
         eval_concurrency=64,
         incumbent_promotion_score=0.55,
         seed=20260722,
@@ -222,10 +230,17 @@ def test_final_strength_evaluation_samples_at_temperature_one(
     assert [call["name"] for call in calls] == [
         "strength_vs_phase_start",
         "strength_confirm_vs_phase_start",
+        "strength_diagnostic_temperature_zero",
         "strength_screen_vs_phase_start",
     ]
-    assert all(call["temperature"] == pytest.approx(1.0) for call in calls)
-    assert all(call["sample_moves"] is True for call in calls)
+    assert calls[0]["temperature"] == pytest.approx(1.0)
+    assert calls[0]["sample_moves"] is True
+    assert calls[1]["temperature"] == pytest.approx(1.0)
+    assert calls[1]["sample_moves"] is True
+    assert calls[2]["temperature"] == pytest.approx(0.0)
+    assert calls[2]["sample_moves"] is False
+    assert calls[3]["temperature"] == pytest.approx(1.0)
+    assert calls[3]["sample_moves"] is True
 
 
 def test_iteration_checkpoint_retention_is_periodic() -> None:
@@ -593,6 +608,54 @@ def test_replay_discovery_and_pruning_handle_worker_chunks(tmp_path) -> None:
     assert not manifests[0].exists()
     assert not chunks[0].exists()
     assert all(path.exists() for path in manifests[1:] + chunks[1:])
+
+
+def test_failed_league_challenger_restores_pair_and_discards_branch_replay(
+    tmp_path,
+) -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.replay_dir = tmp_path / "replay"
+    trainer.replay_dir.mkdir()
+    trainer.current_checkpoint = tmp_path / "current.pt"
+    trainer.optimizer_checkpoint = tmp_path / "optimizer.pt"
+    trainer.best_checkpoint = tmp_path / "best_model.pt"
+    trainer.best_optimizer_checkpoint = tmp_path / "best_optimizer.pt"
+    trainer.state_path = tmp_path / "state.json"
+    trainer.events_path = tmp_path / "events.jsonl"
+    trainer.args = SimpleNamespace(replay_window=16)
+    trainer.state = {
+        "iteration": 20,
+        "accepted_iteration": 10,
+        "latest_checkpoint_sha256": None,
+        "latest_optimizer_sha256": None,
+    }
+    trainer.current_checkpoint.write_bytes(b"candidate-model")
+    trainer.optimizer_checkpoint.write_bytes(b"candidate-optimizer")
+    trainer.best_checkpoint.write_bytes(b"incumbent-model")
+    trainer.best_optimizer_checkpoint.write_bytes(b"incumbent-optimizer")
+    for iteration in (9, 10, 11, 20):
+        manifest = (
+            trainer.replay_dir / f"selfplay_iter_{iteration:06d}.pt"
+        )
+        manifest.write_bytes(b"manifest")
+        (
+            trainer.replay_dir
+            / f"selfplay_iter_{iteration:06d}.w00.chunk00000.pt"
+        ).write_bytes(b"chunk")
+
+    trainer._rollback_to_incumbent(
+        rejected_iteration=20,
+        gate_result={"passed": False, "reason": "test"},
+    )
+
+    assert trainer.current_checkpoint.read_bytes() == b"incumbent-model"
+    assert trainer.optimizer_checkpoint.read_bytes() == b"incumbent-optimizer"
+    assert [trainer._replay_iteration(path) for path in trainer._replay_files()] == [
+        9,
+        10,
+    ]
+    assert trainer.state["last_rejected_iteration"] == 20
+    assert json.loads(trainer.state_path.read_text())["accepted_iteration"] == 10
 
 
 def test_random_rank_and_incumbent_gate() -> None:

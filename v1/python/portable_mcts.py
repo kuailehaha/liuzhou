@@ -16,7 +16,11 @@ import torch
 
 from src.game_state import GameState, Player
 from src.move_generator import MoveType, apply_move, generate_all_legal_moves
-from src.neural_network import bucket_logits_to_scalar, state_to_tensor
+from src.neural_network import (
+    bucket_logits_to_scalar,
+    schema_for_input_channels,
+    state_to_tensor,
+)
 from src.policy_batch import TOTAL_DIM, action_to_index, build_combined_logits
 
 from .portable_device import PortableDeviceResolution, resolve_portable_device
@@ -275,6 +279,14 @@ class PortableMCTS:
         self.device = self.device_resolution.device
         self.model = model.to(device=self.device, dtype=torch.float32)
         self.model.eval()
+        self.input_channels = int(
+            getattr(
+                self.model,
+                "num_input_channels",
+                self.model.stem_conv.weight.shape[1],
+            )
+        )
+        self.state_encoding_schema = schema_for_input_channels(self.input_channels)
         self.inference_batches = 0
         self.timing_seconds: Dict[str, float] = {}
         self.timing_calls: Dict[str, int] = {}
@@ -321,7 +333,9 @@ class PortableMCTS:
 
         if not states:
             return PortableEvaluationBatch(
-                model_inputs=torch.empty((0, 11, 6, 6), dtype=torch.float32),
+                model_inputs=torch.empty(
+                    (0, self.input_channels, 6, 6), dtype=torch.float32
+                ),
                 legal_masks=torch.empty((0, TOTAL_DIM), dtype=torch.bool),
                 priors=torch.empty((0, TOTAL_DIM), dtype=torch.float32),
                 values=torch.empty((0,), dtype=torch.float32),
@@ -332,10 +346,18 @@ class PortableMCTS:
 
         started = time.perf_counter()
         model_inputs = torch.cat(
-            [state_to_tensor(state, state.current_player) for state in states], dim=0
+            [
+                state_to_tensor(
+                    state,
+                    state.current_player,
+                    schema=self.state_encoding_schema,
+                )
+                for state in states
+            ],
+            dim=0,
         ).to(torch.float32)
         self.record_timing("state_encode", time.perf_counter() - started)
-        if tuple(model_inputs.shape[1:]) != (11, 6, 6):
+        if tuple(model_inputs.shape[1:]) != (self.input_channels, 6, 6):
             raise ValueError(f"Unexpected model input shape: {tuple(model_inputs.shape)}")
 
         started = time.perf_counter()
@@ -662,7 +684,11 @@ class PortableMCTS:
         for row, tree in enumerate(trees):
             root = tree.root
             if root.model_input is None:
-                root.model_input = state_to_tensor(root.state, root.current_player)[0]
+                root.model_input = state_to_tensor(
+                    root.state,
+                    root.current_player,
+                    schema=self.state_encoding_schema,
+                )[0]
             if root.legal_mask is None:
                 root.legal_mask = torch.zeros((TOTAL_DIM,), dtype=torch.bool)
             if root.terminal or not root.children:

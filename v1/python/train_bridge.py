@@ -22,9 +22,40 @@ from src.policy_batch import (
 
 from .trajectory_buffer import TensorSelfPlayBatch
 from .portable_device import resolve_portable_device
+from .symmetry import (
+    D4_TRANSFORM_COUNT,
+    SYMMETRY_AUGMENTATION_RANDOM_D4,
+    normalize_symmetry_augmentation,
+    transform_training_batch,
+)
 
 _WDL_AUX_LOSS_WEIGHT = 0.0
 _WDL_LOG_EPS = 1e-8
+
+
+def normalize_optimizer_name(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in {"adam", "adamw"}:
+        raise ValueError(
+            f"Unsupported optimizer {value!r}; expected adam or adamw."
+        )
+    return normalized
+
+
+def _build_optimizer(
+    model: nn.Module,
+    *,
+    optimizer_name: str,
+    lr: float,
+    weight_decay: float,
+) -> optim.Optimizer:
+    normalized = normalize_optimizer_name(optimizer_name)
+    optimizer_type = optim.AdamW if normalized == "adamw" else optim.Adam
+    return optimizer_type(
+        model.parameters(),
+        lr=float(lr),
+        weight_decay=float(weight_decay),
+    )
 
 
 def _bucket_logits_to_wdl_probs(value_logits: torch.Tensor) -> torch.Tensor:
@@ -124,6 +155,9 @@ def train_network_from_tensors(
     parallel_strategy: str = "data_parallel",
     ddp_pre_sharded: bool = False,
     optimizer_state_path: Optional[str] = None,
+    optimizer_name: str = "adam",
+    strict_optimizer_restore: bool = False,
+    symmetry_augmentation: str = "none",
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train directly from tensor-native self-play output."""
 
@@ -132,6 +166,8 @@ def train_network_from_tensors(
 
     device_resolution = resolve_portable_device(device)
     device_obj = device_resolution.device
+    optimizer_name_norm = normalize_optimizer_name(optimizer_name)
+    symmetry_mode = normalize_symmetry_augmentation(symmetry_augmentation)
     strategy_raw = str(parallel_strategy).strip().lower()
     if strategy_raw in {"dp", "data_parallel"}:
         strategy = "data_parallel"
@@ -238,10 +274,20 @@ def train_network_from_tensors(
             )
         return model, {"epoch_stats": [], "num_samples": 0}
 
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = _build_optimizer(
+        model,
+        optimizer_name=optimizer_name_norm,
+        lr=lr,
+        weight_decay=weight_decay,
+    )
     optimizer_loaded = False
     optimizer_load_error: Optional[str] = None
-    if optimizer_state_path and os.path.exists(optimizer_state_path):
+    if optimizer_state_path and not os.path.exists(optimizer_state_path):
+        if strict_optimizer_restore:
+            raise FileNotFoundError(
+                f"Required optimizer state is missing: {optimizer_state_path}"
+            )
+    elif optimizer_state_path:
         try:
             opt_state = torch.load(optimizer_state_path, map_location=device_obj)
             optimizer.load_state_dict(opt_state)
@@ -251,10 +297,16 @@ def train_network_from_tensors(
             optimizer_loaded = True
         except Exception as exc:
             optimizer_load_error = repr(exc)
+            if strict_optimizer_restore:
+                raise RuntimeError(
+                    "Strict optimizer restore failed: "
+                    f"path={optimizer_state_path} optimizer={optimizer_name_norm}"
+                ) from exc
             if strategy != "ddp" or ddp_rank == 0:
                 print(
                     "[v1.train] warning: failed to load optimizer state; "
-                    f"start with fresh Adam. path={optimizer_state_path} err={exc}"
+                    f"start with fresh {optimizer_name_norm}. "
+                    f"path={optimizer_state_path} err={exc}"
                 )
     use_amp_enabled = bool(use_amp and device_obj.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=True) if use_amp_enabled else None
@@ -288,6 +340,7 @@ def train_network_from_tensors(
     epoch_stats: List[Dict[str, Any]] = []
     first_batch_sec: float = 0.0
     first_batch_recorded = False
+    symmetry_counts = [0] * D4_TRANSFORM_COUNT
 
     for epoch in range(num_epochs):
         perm = _train_permutation(num_samples, device_obj)
@@ -321,6 +374,25 @@ def train_network_from_tensors(
             batch_values = raw_batch_values
             batch_soft = soft_targets.index_select(0, idx)
             hard_draw_mask = raw_batch_values.abs().lt(1e-8)
+
+            if symmetry_mode == SYMMETRY_AUGMENTATION_RANDOM_D4:
+                transform_ids = torch.randint(
+                    0,
+                    D4_TRANSFORM_COUNT,
+                    (int(batch_states.size(0)),),
+                    device=device_obj,
+                )
+                batch_states, batch_masks, batch_policy = transform_training_batch(
+                    batch_states,
+                    batch_masks,
+                    batch_policy,
+                    transform_ids,
+                )
+                counts = torch.bincount(
+                    transform_ids, minlength=D4_TRANSFORM_COUNT
+                ).to("cpu")
+                for transform, count in enumerate(counts.tolist()):
+                    symmetry_counts[transform] += int(count)
 
             if abs(anti_draw) > 1e-9:
                 batch_values = batch_values.clone()
@@ -505,6 +577,10 @@ def train_network_from_tensors(
         try:
             torch.save(optimizer.state_dict(), optimizer_state_path)
         except Exception as exc:
+            if strict_optimizer_restore:
+                raise RuntimeError(
+                    f"Strict optimizer save failed: {optimizer_state_path}"
+                ) from exc
             print(
                 "[v1.train] warning: failed to save optimizer state; "
                 f"continuity disabled for next iter. path={optimizer_state_path} err={exc}"
@@ -522,8 +598,12 @@ def train_network_from_tensors(
         "dropped_samples_for_sync": int(dropped_samples_for_sync),
         "optimizer_loaded": bool(optimizer_loaded),
         "optimizer_load_error": optimizer_load_error,
+        "optimizer_name": optimizer_name_norm,
+        "strict_optimizer_restore": bool(strict_optimizer_restore),
         "optimizer_lr_start": optimizer_lr_start,
         "optimizer_lr_final": optimizer_lr_final,
+        "symmetry_augmentation": symmetry_mode,
+        "symmetry_transform_counts": list(symmetry_counts),
         "device": str(device_obj),
         "device_fallback_count": int(device_resolution.fallback_count),
         "device_fallback_reasons": list(device_resolution.fallback_reasons),
@@ -563,12 +643,17 @@ def train_network_streaming(
     parallel_devices: Optional[List[str]] = None,
     parallel_strategy: str = "data_parallel",
     optimizer_state_path: Optional[str] = None,
+    optimizer_name: str = "adam",
+    strict_optimizer_restore: bool = False,
     streaming_workers: int = 8,
+    symmetry_augmentation: str = "none",
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train from a streaming DataLoader — data is loaded on-the-fly per batch."""
 
     device_resolution = resolve_portable_device(device)
     device_obj = device_resolution.device
+    optimizer_name_norm = normalize_optimizer_name(optimizer_name)
+    symmetry_mode = normalize_symmetry_augmentation(symmetry_augmentation)
     strategy_raw = str(parallel_strategy).strip().lower()
     if strategy_raw in {"dp", "data_parallel"}:
         strategy = "data_parallel"
@@ -627,10 +712,20 @@ def train_network_streaming(
     total_train_steps = int(est_batches_per_epoch * num_epochs)
     warmup_n = min(max(0, int(warmup_steps)), total_train_steps // 2)
 
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = _build_optimizer(
+        model,
+        optimizer_name=optimizer_name_norm,
+        lr=lr,
+        weight_decay=weight_decay,
+    )
     optimizer_loaded = False
     optimizer_load_error: Optional[str] = None
-    if optimizer_state_path and os.path.exists(optimizer_state_path):
+    if optimizer_state_path and not os.path.exists(optimizer_state_path):
+        if strict_optimizer_restore:
+            raise FileNotFoundError(
+                f"Required optimizer state is missing: {optimizer_state_path}"
+            )
+    elif optimizer_state_path:
         try:
             opt_state = torch.load(optimizer_state_path, map_location=device_obj)
             optimizer.load_state_dict(opt_state)
@@ -640,10 +735,16 @@ def train_network_streaming(
             optimizer_loaded = True
         except Exception as exc:
             optimizer_load_error = repr(exc)
+            if strict_optimizer_restore:
+                raise RuntimeError(
+                    "Strict optimizer restore failed: "
+                    f"path={optimizer_state_path} optimizer={optimizer_name_norm}"
+                ) from exc
             if strategy != "ddp" or ddp_rank == 0:
                 print(
                     "[v1.train] warning: failed to load optimizer state; "
-                    f"start with fresh Adam. path={optimizer_state_path} err={exc}"
+                    f"start with fresh {optimizer_name_norm}. "
+                    f"path={optimizer_state_path} err={exc}"
                 )
 
     use_amp_enabled = bool(use_amp and device_obj.type == "cuda")
@@ -667,6 +768,7 @@ def train_network_streaming(
     first_batch_recorded = False
     total_filtered = 0
     total_samples_seen_all = 0
+    symmetry_counts = [0] * D4_TRANSFORM_COUNT
 
     for epoch in range(num_epochs):
         total_loss_sum = 0.0
@@ -732,6 +834,24 @@ def train_network_streaming(
                 b_soft = b_soft.index_select(0, keep)
 
             hard_draw_mask = raw_b_values.abs().lt(1e-8)
+            if symmetry_mode == SYMMETRY_AUGMENTATION_RANDOM_D4:
+                transform_ids = torch.randint(
+                    0,
+                    D4_TRANSFORM_COUNT,
+                    (int(b_states.size(0)),),
+                    device=device_obj,
+                )
+                b_states, b_masks, b_policy = transform_training_batch(
+                    b_states,
+                    b_masks,
+                    b_policy,
+                    transform_ids,
+                )
+                counts = torch.bincount(
+                    transform_ids, minlength=D4_TRANSFORM_COUNT
+                ).to("cpu")
+                for transform, count in enumerate(counts.tolist()):
+                    symmetry_counts[transform] += int(count)
             if abs(anti_draw) > 1e-9:
                 b_values = b_values.clone()
                 b_values[hard_draw_mask] = anti_draw
@@ -906,6 +1026,10 @@ def train_network_streaming(
         try:
             torch.save(optimizer.state_dict(), optimizer_state_path)
         except Exception as exc:
+            if strict_optimizer_restore:
+                raise RuntimeError(
+                    f"Strict optimizer save failed: {optimizer_state_path}"
+                ) from exc
             print(
                 "[v1.train] warning: failed to save optimizer state; "
                 f"continuity disabled for next iter. path={optimizer_state_path} err={exc}"
@@ -921,8 +1045,12 @@ def train_network_streaming(
         "est_batches_per_epoch": est_batches_per_epoch,
         "optimizer_loaded": bool(optimizer_loaded),
         "optimizer_load_error": optimizer_load_error,
+        "optimizer_name": optimizer_name_norm,
+        "strict_optimizer_restore": bool(strict_optimizer_restore),
         "optimizer_lr_start": optimizer_lr_start,
         "optimizer_lr_final": optimizer_lr_final,
+        "symmetry_augmentation": symmetry_mode,
+        "symmetry_transform_counts": list(symmetry_counts),
         "device": str(device_obj),
         "device_fallback_count": int(device_resolution.fallback_count),
         "device_fallback_reasons": list(device_resolution.fallback_reasons),

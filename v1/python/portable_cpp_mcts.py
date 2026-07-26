@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from src.game_state import GameState
-from src.neural_network import bucket_logits_to_scalar
+from src.neural_network import bucket_logits_to_scalar, schema_for_input_channels
 from src.policy_batch import TOTAL_DIM, build_combined_logits
 
 from .portable_cpp_loader import load_portable_cpp
@@ -45,11 +45,20 @@ class PortableCppMCTS:
         self.device = self.device_resolution.device
         self.model = model.to(device=self.device, dtype=torch.float32)
         self.model.eval()
+        self.input_channels = int(
+            getattr(
+                self.model,
+                "num_input_channels",
+                self.model.stem_conv.weight.shape[1],
+            )
+        )
+        self.state_encoding_schema = schema_for_input_channels(self.input_channels)
         self.cpp = load_portable_cpp(required=True)
         self.trees = self.cpp.PortableTreeBatch(
             states,
             exploration_weight=float(config.exploration_weight),
             num_threads=int(num_threads),
+            input_channels=self.input_channels,
         )
         self.inference_batches = 0
         self.timing_seconds: Dict[str, float] = {}
@@ -98,7 +107,12 @@ class PortableCppMCTS:
         model_inputs = torch.from_numpy(pending["model_inputs"]).to(torch.float32)
         legal_masks = torch.from_numpy(pending["legal_masks"]).to(torch.bool)
         count = int(model_inputs.size(0))
-        if tuple(model_inputs.shape) != (count, 11, 6, 6):
+        if tuple(model_inputs.shape) != (
+            count,
+            self.input_channels,
+            6,
+            6,
+        ):
             raise ValueError(
                 f"Unexpected C++ model input shape: {tuple(model_inputs.shape)}"
             )

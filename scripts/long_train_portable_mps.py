@@ -37,6 +37,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import torch
+from src.neural_network import checkpoint_state_encoding_schema
 
 
 STATE_SCHEMA_VERSION = 1
@@ -99,6 +100,19 @@ def candidate_beats_incumbent(row: Dict[str, Any], promotion_score: float) -> bo
     draws = int(row.get("draws", 0) or 0)
     score = (wins + (0.5 * draws)) / float(total_games)
     return score >= float(promotion_score)
+
+
+def match_score(row: Dict[str, Any]) -> float:
+    total_games = int(row.get("total_games", 0) or 0)
+    if total_games <= 0:
+        return 0.0
+    return float(
+        (
+            int(row.get("wins", 0) or 0)
+            + 0.5 * int(row.get("draws", 0) or 0)
+        )
+        / total_games
+    )
 
 
 def target_requires_confirmation(state: Dict[str, Any], target_win_rate: float) -> bool:
@@ -266,16 +280,22 @@ def audit_selfplay_stats(path: Path, *, expected_games: int) -> Dict[str, Any]:
 
 def audit_checkpoint(path: Path) -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    state_encoding_schema = checkpoint_state_encoding_schema(checkpoint)
     state = checkpoint.get("model_state_dict", checkpoint)
     if not isinstance(state, dict) or not state:
         raise RuntimeError(f"checkpoint has no model state: {path}")
     bad = [name for name, tensor in state.items() if not bool(torch.isfinite(tensor).all().item())]
     if bad:
         raise RuntimeError(f"checkpoint contains non-finite tensors: {bad[:5]} path={path}")
+    stem = state.get("stem_conv.weight")
+    if stem is None:
+        stem = state.get("module.stem_conv.weight")
     return {
         "sha256": sha256_file(path),
         "tensor_count": len(state),
         "parameter_elements": sum(int(tensor.numel()) for tensor in state.values()),
+        "state_encoding_schema": state_encoding_schema,
+        "num_input_channels": int(stem.shape[1]),
     }
 
 
@@ -421,10 +441,25 @@ def _preflight(args: argparse.Namespace) -> None:
         value = int(getattr(args, name))
         if value <= 0 or value % 2 != 0:
             raise ValueError(f"--{name.replace('_', '-')} must be a positive even number.")
-    for name in ("strength_eval_games", "strength_screen_games"):
+    for name in (
+        "strength_eval_games",
+        "strength_diagnostic_games",
+        "strength_screen_games",
+    ):
         value = int(getattr(args, name))
         if value <= 0 or value % 2 != 0:
             raise ValueError(f"--{name.replace('_', '-')} must be a positive even number.")
+    for name in (
+        "league_screen_incumbent_games",
+        "league_screen_anchor_games",
+        "league_full_anchor_games",
+        "league_cycle_screen_games",
+    ):
+        value = int(getattr(args, name))
+        if value <= 0 or value % 2 != 0:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be a positive even number."
+            )
     if int(args.eval_every) <= 0:
         raise ValueError("--eval-every must be positive.")
     if int(args.batch_size) <= 0 or int(args.epochs) <= 0:
@@ -457,6 +492,22 @@ def _preflight(args: argparse.Namespace) -> None:
         raise ValueError("--target-win-rate must be in (0, 1].")
     if not 0.5 < float(args.incumbent_promotion_score) <= 1.0:
         raise ValueError("--incumbent-promotion-score must be in (0.5, 1].")
+    if not 0.0 <= float(args.league_anchor_min_score) <= 1.0:
+        raise ValueError("--league-anchor-min-score must be in [0, 1].")
+    if str(args.state_encoding_schema) not in {"legacy_v1", "markov_v2"}:
+        raise ValueError("--state-encoding-schema must be legacy_v1 or markov_v2.")
+    if str(args.symmetry_augmentation) not in {"none", "random_d4"}:
+        raise ValueError("--symmetry-augmentation must be none or random_d4.")
+    if bool(args.league_gate):
+        for anchor in args.promotion_anchor:
+            if not _absolute_path(anchor).is_file():
+                raise FileNotFoundError(f"promotion anchor not found: {anchor}")
+        if not bool(args.rollback_on_gate_fail):
+            raise ValueError("--league-gate requires --rollback-on-gate-fail.")
+        if not bool(args.strict_optimizer_restore):
+            raise ValueError(
+                "--league-gate requires --strict-optimizer-restore."
+            )
 
 
 def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
@@ -464,11 +515,16 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "hours",
         "device",
         "initial_iteration",
+        "lineage_parent_run",
+        "lineage_parent_iteration",
+        "lineage_parent_best_iteration",
         "self_play_games",
         "self_play_concurrency",
         "portable_self_play_workers",
         "portable_mcts_backend",
         "portable_cpp_threads",
+        "state_encoding_schema",
+        "symmetry_augmentation",
         "mcts_simulations",
         "temperature_init",
         "temperature_final",
@@ -486,6 +542,8 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "checkpoint_retain_every",
         "batch_size",
         "epochs",
+        "optimizer_name",
+        "strict_optimizer_restore",
         "lr_start",
         "lr_final",
         "weight_decay",
@@ -495,12 +553,25 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "eval_simulations",
         "eval_concurrency",
         "incumbent_promotion_score",
+        "rollback_on_gate_fail",
+        "league_gate",
+        "promotion_anchor",
+        "league_anchor_min_score",
+        "league_screen_incumbent_games",
+        "league_screen_anchor_games",
+        "league_full_anchor_games",
+        "league_cycle_screen_games",
+        "league_cycle_screen_simulations",
         "target_win_rate",
         "quality_strength_eval",
         "strength_eval_games",
         "strength_eval_simulations",
+        "strength_diagnostic_games",
+        "strength_diagnostic_simulations",
         "strength_screen_games",
         "strength_screen_simulations",
+        "strength_screen_temperature",
+        "strength_screen_sample_moves",
         "seed",
     )
     return {key: getattr(args, key) for key in keys}
@@ -526,6 +597,7 @@ class PortableLongTrainer:
         self.replay_dir = self.run_dir / "replay"
         self.metrics_dir = self.run_dir / "metrics"
         self.eval_dir = self.run_dir / "eval"
+        self.hall_of_fame_dir = self.run_dir / "hall_of_fame"
         self.state_path = self.run_dir / "state.json"
         self.events_path = self.run_dir / "events.jsonl"
         self.summary_path = self.run_dir / "final_summary.json"
@@ -871,6 +943,28 @@ class PortableLongTrainer:
             "gate_result": gate_result,
             "created_utc": utc_now(),
         }
+        if (
+            bool(self.args.league_gate)
+            and isinstance(gate_result, dict)
+            and bool(gate_result.get("passed", False))
+        ):
+            replay_window = max(0, int(self.args.replay_window))
+            accepted_files = (
+                self._replay_files()[-replay_window:]
+                if replay_window > 0
+                else []
+            )
+            transaction["accepted_replay"] = [
+                {
+                    "path": str(path),
+                    "iteration": self._replay_iteration(path),
+                    "sha256": sha256_file(path),
+                }
+                for path in accepted_files
+            ]
+            incumbent_history = self.state.get("incumbent_history")
+            if isinstance(incumbent_history, list):
+                transaction["incumbent_history"] = incumbent_history
         atomic_write_json(self.best_pair_transaction, transaction)
         return transaction
 
@@ -885,6 +979,18 @@ class PortableLongTrainer:
         gate_result = transaction.get("gate_result")
         if isinstance(gate_result, dict):
             self.state["best_gate_result"] = gate_result
+            if bool(self.args.league_gate) and bool(
+                gate_result.get("passed", False)
+            ):
+                self.state["accepted_iteration"] = int(
+                    transaction["iteration"]
+                )
+                accepted_replay = transaction.get("accepted_replay")
+                if isinstance(accepted_replay, list):
+                    self.state["accepted_replay"] = accepted_replay
+                incumbent_history = transaction.get("incumbent_history")
+                if isinstance(incumbent_history, list):
+                    self.state["incumbent_history"] = incumbent_history
 
     def _recover_best_pair_transaction(self) -> bool:
         if not self.best_pair_transaction.is_file():
@@ -1124,6 +1230,7 @@ class PortableLongTrainer:
             self.replay_dir,
             self.metrics_dir,
             self.eval_dir,
+            self.hall_of_fame_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -1149,8 +1256,21 @@ class PortableLongTrainer:
                 "portable_self_play_workers": int(self.args.portable_self_play_workers),
                 "portable_mcts_backend": str(self.args.portable_mcts_backend),
                 "portable_cpp_threads": int(self.args.portable_cpp_threads),
+                "state_encoding_schema": str(self.args.state_encoding_schema),
+                "symmetry_augmentation": str(self.args.symmetry_augmentation),
+                "optimizer_name": str(self.args.optimizer_name),
+                "strict_optimizer_restore": bool(
+                    self.args.strict_optimizer_restore
+                ),
                 "checkpoint_retain_every": int(self.args.checkpoint_retain_every),
                 "initial_iteration": int(self.args.initial_iteration),
+                "lineage_parent_run": self.args.lineage_parent_run,
+                "lineage_parent_iteration": int(
+                    self.args.lineage_parent_iteration
+                ),
+                "lineage_parent_best_iteration": int(
+                    self.args.lineage_parent_best_iteration
+                ),
                 "policy_target_temperature": self.args.policy_target_temperature,
                 "policy_target_prior_pseudocount": float(
                     self.args.policy_target_prior_pseudocount
@@ -1164,9 +1284,42 @@ class PortableLongTrainer:
                 "strength_eval_simulations": int(
                     self.args.strength_eval_simulations
                 ),
+                "strength_diagnostic_games": int(
+                    self.args.strength_diagnostic_games
+                ),
+                "strength_diagnostic_simulations": int(
+                    self.args.strength_diagnostic_simulations
+                ),
                 "strength_screen_games": int(self.args.strength_screen_games),
                 "strength_screen_simulations": int(
                     self.args.strength_screen_simulations
+                ),
+                "strength_screen_temperature": float(
+                    self.args.strength_screen_temperature
+                ),
+                "strength_screen_sample_moves": bool(
+                    self.args.strength_screen_sample_moves
+                ),
+                "rollback_on_gate_fail": bool(self.args.rollback_on_gate_fail),
+                "league_gate": bool(self.args.league_gate),
+                "promotion_anchor": list(self.args.promotion_anchor),
+                "league_anchor_min_score": float(
+                    self.args.league_anchor_min_score
+                ),
+                "league_screen_incumbent_games": int(
+                    self.args.league_screen_incumbent_games
+                ),
+                "league_screen_anchor_games": int(
+                    self.args.league_screen_anchor_games
+                ),
+                "league_full_anchor_games": int(
+                    self.args.league_full_anchor_games
+                ),
+                "league_cycle_screen_games": int(
+                    self.args.league_cycle_screen_games
+                ),
+                "league_cycle_screen_simulations": int(
+                    self.args.league_cycle_screen_simulations
                 ),
             }
             if isinstance(previous_signature, dict):
@@ -1284,6 +1437,13 @@ class PortableLongTrainer:
                 "platform": platform.platform(),
                 "device": str(self.args.device),
             },
+            "lineage": {
+                "parent_run": self.args.lineage_parent_run,
+                "parent_iteration": int(self.args.lineage_parent_iteration),
+                "parent_best_iteration": int(
+                    self.args.lineage_parent_best_iteration
+                ),
+            },
         }
         initial = str(self.args.initial_checkpoint or "").strip()
         initial_optimizer = str(self.args.initial_optimizer_state or "").strip()
@@ -1302,6 +1462,14 @@ class PortableLongTrainer:
                 raise FileNotFoundError(f"initial checkpoint not found: {initial_path}")
             atomic_copy(initial_path, self.current_checkpoint)
             audit = audit_checkpoint(self.current_checkpoint)
+            if str(audit.get("state_encoding_schema")) != str(
+                self.args.state_encoding_schema
+            ):
+                raise RuntimeError(
+                    "initial checkpoint state encoding mismatch: "
+                    f"expected={self.args.state_encoding_schema} "
+                    f"observed={audit.get('state_encoding_schema')}"
+                )
             self.state["initial_checkpoint"] = str(initial_path)
             self.state["initial_checkpoint_audit"] = audit
             self.state["latest_checkpoint_sha256"] = audit["sha256"]
@@ -1313,6 +1481,24 @@ class PortableLongTrainer:
             self.state["initial_optimizer_state"] = str(optimizer_path)
             self.state["latest_optimizer_sha256"] = sha256_file(
                 self.optimizer_checkpoint
+            )
+        if (
+            bool(self.args.league_gate)
+            and self.current_checkpoint.is_file()
+            and self.optimizer_checkpoint.is_file()
+        ):
+            atomic_copy(self.current_checkpoint, self.phase_start_checkpoint)
+            self._promote_best_pair(iteration=initial_iteration)
+            self.state["accepted_iteration"] = int(initial_iteration)
+            self.state["incumbent_history"] = []
+            self._record_accepted_replay_snapshot()
+            self._event(
+                "league_incumbent_bootstrapped",
+                iteration=initial_iteration,
+                model_sha256=sha256_file(self.best_checkpoint),
+                optimizer_sha256=sha256_file(
+                    self.best_optimizer_checkpoint
+                ),
             )
         if self.current_checkpoint.is_file():
             if self._should_retain_iteration_checkpoint(initial_iteration):
@@ -1346,13 +1532,137 @@ class PortableLongTrainer:
             if re.fullmatch(r"selfplay_iter_\d{6}\.pt", path.name)
         )
 
+    def _accepted_replay_snapshot(self) -> List[Dict[str, Any]]:
+        accepted_iteration = int(self.state.get("accepted_iteration", 0) or 0)
+        files = [
+            path
+            for path in self._replay_files()
+            if self._replay_iteration(path) <= accepted_iteration
+        ]
+        replay_window = max(0, int(self.args.replay_window))
+        files = files[-replay_window:] if replay_window > 0 else []
+        return [
+            {
+                "path": str(path),
+                "iteration": self._replay_iteration(path),
+                "sha256": sha256_file(path),
+            }
+            for path in files
+        ]
+
+    def _record_accepted_replay_snapshot(self) -> List[Dict[str, Any]]:
+        snapshot = self._accepted_replay_snapshot()
+        self.state["accepted_replay"] = snapshot
+        return snapshot
+
+    def _begin_challenger_block(self, next_iteration: int) -> None:
+        block_size = max(1, int(self.args.eval_every))
+        if (int(next_iteration) - 1) % block_size != 0:
+            return
+        accepted_replay = self._record_accepted_replay_snapshot()
+        block = {
+            "start_iteration": int(next_iteration),
+            "incumbent_iteration": int(
+                self.state.get("accepted_iteration", 0) or 0
+            ),
+            "model_sha256": sha256_file(self.best_checkpoint),
+            "optimizer_sha256": sha256_file(
+                self.best_optimizer_checkpoint
+            ),
+            "accepted_replay": accepted_replay,
+        }
+        self.state["challenger_block"] = block
+        self._save_state()
+        self._event("challenger_block_started", **block)
+
     def _prune_replay(self) -> None:
-        keep = max(0, int(self.args.replay_window)) + 1
+        extra = (
+            int(getattr(self.args, "eval_every", 0))
+            if bool(getattr(self.args, "league_gate", False))
+            else 0
+        )
+        keep = max(0, int(self.args.replay_window)) + extra + 1
         files = self._replay_files()
         for path in files[:-keep] if keep > 0 else files:
             path.unlink(missing_ok=True)
             for chunk in self.replay_dir.glob(f"{path.stem}.w*.chunk*.pt"):
                 chunk.unlink(missing_ok=True)
+
+    def _prune_replay_to_accepted_window(self) -> None:
+        keep = max(0, int(self.args.replay_window))
+        files = self._replay_files()
+        for path in files[:-keep] if keep > 0 else files:
+            path.unlink(missing_ok=True)
+            for chunk in self.replay_dir.glob(f"{path.stem}.w*.chunk*.pt"):
+                chunk.unlink(missing_ok=True)
+
+    @staticmethod
+    def _replay_iteration(path: Path) -> int:
+        match = re.fullmatch(r"selfplay_iter_(\d{6})\.pt", path.name)
+        if match is None:
+            raise ValueError(f"unexpected replay filename: {path}")
+        return int(match.group(1))
+
+    def _rollback_to_incumbent(
+        self,
+        *,
+        rejected_iteration: int,
+        gate_result: Dict[str, Any],
+    ) -> None:
+        if not self.best_checkpoint.is_file():
+            raise RuntimeError("cannot roll back without best_model.pt")
+        if not self.best_optimizer_checkpoint.is_file():
+            raise RuntimeError("cannot roll back without best_optimizer.pt")
+        accepted_iteration = int(self.state.get("accepted_iteration", 0) or 0)
+        accepted_rows = self.state.get("accepted_replay")
+        if not isinstance(accepted_rows, list):
+            accepted_rows = self._record_accepted_replay_snapshot()
+        accepted_paths: set[Path] = set()
+        for row in accepted_rows:
+            if not isinstance(row, dict):
+                raise RuntimeError("accepted replay snapshot is malformed")
+            path = Path(str(row.get("path", ""))).resolve()
+            expected_sha = str(row.get("sha256", ""))
+            if not path.is_file() or sha256_file(path) != expected_sha:
+                raise RuntimeError(
+                    "accepted replay cannot be restored exactly: "
+                    f"path={path} expected_sha256={expected_sha}"
+                )
+            accepted_paths.add(path)
+        removed: List[str] = []
+        for manifest in self._replay_files():
+            if manifest.resolve() in accepted_paths:
+                continue
+            removed.append(str(manifest))
+            manifest.unlink(missing_ok=True)
+            for chunk in self.replay_dir.glob(f"{manifest.stem}.w*.chunk*.pt"):
+                chunk.unlink(missing_ok=True)
+        atomic_copy(self.best_checkpoint, self.current_checkpoint)
+        atomic_copy(
+            self.best_optimizer_checkpoint,
+            self.optimizer_checkpoint,
+        )
+        self.state["latest_checkpoint_sha256"] = sha256_file(
+            self.current_checkpoint
+        )
+        self.state["latest_optimizer_sha256"] = sha256_file(
+            self.optimizer_checkpoint
+        )
+        self.state["last_rejected_iteration"] = int(rejected_iteration)
+        self.state["last_league_gate_result"] = dict(gate_result)
+        self._prune_replay_to_accepted_window()
+        self._save_state()
+        self._event(
+            "challenger_rolled_back",
+            iteration=int(rejected_iteration),
+            accepted_iteration=accepted_iteration,
+            restored_model_sha256=self.state["latest_checkpoint_sha256"],
+            restored_optimizer_sha256=self.state[
+                "latest_optimizer_sha256"
+            ],
+            removed_replay=removed,
+            gate_result=gate_result,
+        )
 
     def _run_selfplay(self, iteration: int, progress: float) -> Tuple[Path, Dict[str, Any]]:
         tag = f"{iteration:06d}"
@@ -1393,6 +1703,8 @@ class PortableLongTrainer:
             str(self.args.portable_mcts_backend),
             "--portable_cpp_threads",
             str(int(self.args.portable_cpp_threads)),
+            "--state_encoding_schema",
+            str(self.args.state_encoding_schema),
             "--self_play_opening_random_moves",
             str(opening_moves),
             "--mcts_simulations",
@@ -1495,6 +1807,12 @@ class PortableLongTrainer:
             str(self.args.device),
             "--train_strategy",
             "none",
+            "--state_encoding_schema",
+            str(self.args.state_encoding_schema),
+            "--symmetry_augmentation",
+            str(self.args.symmetry_augmentation),
+            "--optimizer_name",
+            str(self.args.optimizer_name),
             "--batch_size",
             str(int(self.args.batch_size)),
             "--epochs",
@@ -1520,6 +1838,11 @@ class PortableLongTrainer:
             "--model_init_seed",
             str(int(self.args.seed)),
         ]
+        command.append(
+            "--strict_optimizer_restore"
+            if bool(self.args.strict_optimizer_restore)
+            else "--no-strict_optimizer_restore"
+        )
         if replay_inputs:
             command.extend(
                 ["--self_play_replay_inputs", ",".join(str(path) for path in replay_inputs)]
@@ -1556,6 +1879,14 @@ class PortableLongTrainer:
                     f"expected={learning_rate:.12g} {key}={observed_lr!r}"
                 )
         checkpoint_audit = audit_checkpoint(self.candidate_checkpoint)
+        if str(checkpoint_audit.get("state_encoding_schema")) != str(
+            self.args.state_encoding_schema
+        ):
+            raise RuntimeError(
+                "candidate checkpoint state encoding mismatch: "
+                f"expected={self.args.state_encoding_schema} "
+                f"observed={checkpoint_audit.get('state_encoding_schema')}"
+            )
         saved_optimizer_lr = optimizer_learning_rate(self.optimizer_work)
         if not math.isclose(
             saved_optimizer_lr,
@@ -1687,17 +2018,326 @@ class PortableLongTrainer:
         if int(row.get("seed", -1)) != int(seed):
             raise RuntimeError(f"evaluation seed mismatch in {output}")
         colors = row.get("color_breakdown")
-        if not isinstance(colors, dict) or sum(
-            int(value.get("games", 0) or 0)
-            for value in colors.values()
-            if isinstance(value, dict)
-        ) != int(games):
+        color_games = (
+            [
+                int(value.get("games", 0) or 0)
+                for value in colors.values()
+                if isinstance(value, dict)
+            ]
+            if isinstance(colors, dict)
+            else []
+        )
+        if (
+            len(color_games) != 2
+            or sum(color_games) != int(games)
+            or any(count != int(games) // 2 for count in color_games)
+        ):
             raise RuntimeError(f"evaluation color breakdown is missing/inconsistent: {output}")
         return row
+
+    def _fixed_promotion_anchors(self) -> List[Path]:
+        return [
+            _absolute_path(path)
+            for path in self.args.promotion_anchor
+        ]
+
+    def _archive_incumbent_for_history(self) -> Optional[Path]:
+        if not self.best_checkpoint.is_file():
+            return None
+        incumbent_iteration = int(
+            self.state.get(
+                "best_iteration",
+                self.state.get("accepted_iteration", 0),
+            )
+            or 0
+        )
+        destination = (
+            self.hall_of_fame_dir
+            / f"incumbent_iter_{incumbent_iteration:06d}.pt"
+        )
+        if not destination.exists():
+            atomic_copy(self.best_checkpoint, destination)
+        row = {
+            "iteration": incumbent_iteration,
+            "checkpoint": str(destination),
+            "sha256": sha256_file(destination),
+        }
+        history = self.state.get("incumbent_history")
+        if not isinstance(history, list):
+            history = []
+        if not any(
+            isinstance(item, dict)
+            and str(item.get("sha256")) == row["sha256"]
+            for item in history
+        ):
+            history.append(row)
+        self.state["incumbent_history"] = history
+        return destination
+
+    def _select_cycle_anchor(
+        self,
+        *,
+        iteration: int,
+    ) -> Tuple[Optional[Path], List[Dict[str, Any]]]:
+        history = self.state.get("incumbent_history")
+        if not isinstance(history, list):
+            return None, []
+        fixed_shas = {
+            sha256_file(path)
+            for path in self._fixed_promotion_anchors()
+            if path.is_file()
+        }
+        incumbent_sha = (
+            sha256_file(self.best_checkpoint)
+            if self.best_checkpoint.is_file()
+            else None
+        )
+        rows: List[Dict[str, Any]] = []
+        for offset, item in enumerate(history):
+            if not isinstance(item, dict):
+                continue
+            path = Path(str(item.get("checkpoint", "")))
+            if not path.is_file():
+                continue
+            candidate_sha = str(item.get("sha256") or sha256_file(path))
+            if candidate_sha == incumbent_sha or candidate_sha in fixed_shas:
+                continue
+            name = f"cycle_screen_{offset:03d}"
+            row = self._run_eval(
+                challenger=self.current_checkpoint,
+                opponent=path,
+                games=int(self.args.league_cycle_screen_games),
+                seed=int(self.args.seed) + 20_000_000 + iteration * 1000 + offset,
+                name=name,
+                output=(
+                    self.eval_dir
+                    / f"league_cycle_{iteration:06d}_{offset:03d}.json"
+                ),
+                temperature=1.0,
+                sample_moves=True,
+                simulations=int(self.args.league_cycle_screen_simulations),
+            )
+            rows.append(
+                {
+                    "checkpoint": str(path),
+                    "sha256": candidate_sha,
+                    "score": match_score(row),
+                    "result": row,
+                }
+            )
+        if not rows:
+            return None, []
+        worst = min(rows, key=lambda row: (float(row["score"]), row["sha256"]))
+        return Path(str(worst["checkpoint"])), rows
+
+    def _run_league_gate(
+        self,
+        iteration: int,
+        *,
+        label: str,
+    ) -> Dict[str, Any]:
+        if not self.best_checkpoint.is_file():
+            self._promote_best_pair(iteration=iteration)
+            self.state["accepted_iteration"] = int(iteration)
+            self.state["incumbent_history"] = []
+            self.state["last_eval_iteration"] = int(iteration)
+            self._save_state()
+            result = {"passed": True, "bootstrapped": True}
+            self._event(
+                "league_incumbent_bootstrapped",
+                iteration=iteration,
+                result=result,
+            )
+            return result
+
+        cycle_anchor, cycle_screen = self._select_cycle_anchor(
+            iteration=iteration
+        )
+        anchors = self._fixed_promotion_anchors()
+        if cycle_anchor is not None:
+            anchors.append(cycle_anchor)
+        unique_anchors: List[Path] = []
+        seen_shas: set[str] = set()
+        for anchor in anchors:
+            anchor_sha = sha256_file(anchor)
+            if anchor_sha in seen_shas:
+                continue
+            seen_shas.add(anchor_sha)
+            unique_anchors.append(anchor)
+
+        seed_base = int(self.args.seed) + 30_000_000 + iteration * 100
+        incumbent_screen = self._run_eval(
+            challenger=self.current_checkpoint,
+            opponent=self.best_checkpoint,
+            games=int(self.args.league_screen_incumbent_games),
+            seed=seed_base,
+            name="league_screen_incumbent",
+            output=self.eval_dir / f"{label}_league_screen_incumbent_{iteration:06d}.json",
+            temperature=1.0,
+            sample_moves=True,
+            simulations=int(self.args.eval_simulations),
+        )
+        anchor_screens: List[Dict[str, Any]] = []
+        for offset, anchor in enumerate(unique_anchors):
+            row = self._run_eval(
+                challenger=self.current_checkpoint,
+                opponent=anchor,
+                games=int(self.args.league_screen_anchor_games),
+                seed=seed_base + offset + 1,
+                name=f"league_screen_anchor_{offset}",
+                output=(
+                    self.eval_dir
+                    / f"{label}_league_screen_anchor_{iteration:06d}_{offset:02d}.json"
+                ),
+                temperature=1.0,
+                sample_moves=True,
+                simulations=int(self.args.eval_simulations),
+            )
+            anchor_screens.append(
+                {
+                    "checkpoint": str(anchor),
+                    "sha256": sha256_file(anchor),
+                    "score": match_score(row),
+                    "result": row,
+                }
+            )
+        screen_incumbent_score = match_score(incumbent_screen)
+        screen_anchor_min = min(
+            (float(row["score"]) for row in anchor_screens),
+            default=1.0,
+        )
+        screen_passed = (
+            screen_incumbent_score >= 0.48
+            and screen_anchor_min >= 0.40
+        )
+        gate_result: Dict[str, Any] = {
+            "iteration": int(iteration),
+            "simulations": int(self.args.eval_simulations),
+            "temperature": 1.0,
+            "sample_moves": True,
+            "cycle_screen": cycle_screen,
+            "cycle_anchor": (
+                str(cycle_anchor) if cycle_anchor is not None else None
+            ),
+            "screen": {
+                "incumbent": incumbent_screen,
+                "incumbent_score": screen_incumbent_score,
+                "anchors": anchor_screens,
+                "anchor_min_score": screen_anchor_min,
+                "passed": bool(screen_passed),
+            },
+            "passed": False,
+        }
+        if not screen_passed:
+            gate_result["reason"] = "screen_threshold"
+            self._rollback_to_incumbent(
+                rejected_iteration=iteration,
+                gate_result=gate_result,
+            )
+            self.state["last_eval_iteration"] = int(iteration)
+            self._save_state()
+            return gate_result
+
+        incumbent_full = self._run_eval(
+            challenger=self.current_checkpoint,
+            opponent=self.best_checkpoint,
+            games=int(self.args.eval_games_best),
+            seed=seed_base + 50,
+            name="league_full_incumbent",
+            output=self.eval_dir / f"{label}_league_full_incumbent_{iteration:06d}.json",
+            temperature=1.0,
+            sample_moves=True,
+            simulations=int(self.args.eval_simulations),
+        )
+        anchor_full: List[Dict[str, Any]] = []
+        for offset, anchor in enumerate(unique_anchors):
+            row = self._run_eval(
+                challenger=self.current_checkpoint,
+                opponent=anchor,
+                games=int(self.args.league_full_anchor_games),
+                seed=seed_base + 100 + offset,
+                name=f"league_full_anchor_{offset}",
+                output=(
+                    self.eval_dir
+                    / f"{label}_league_full_anchor_{iteration:06d}_{offset:02d}.json"
+                ),
+                temperature=1.0,
+                sample_moves=True,
+                simulations=int(self.args.eval_simulations),
+            )
+            anchor_full.append(
+                {
+                    "checkpoint": str(anchor),
+                    "sha256": sha256_file(anchor),
+                    "score": match_score(row),
+                    "result": row,
+                }
+            )
+        incumbent_score = match_score(incumbent_full)
+        anchor_min_score = min(
+            (float(row["score"]) for row in anchor_full),
+            default=1.0,
+        )
+        passed = (
+            incumbent_score >= float(self.args.incumbent_promotion_score)
+            and anchor_min_score >= float(self.args.league_anchor_min_score)
+        )
+        gate_result["full"] = {
+            "incumbent": incumbent_full,
+            "incumbent_score": incumbent_score,
+            "anchors": anchor_full,
+            "anchor_min_score": anchor_min_score,
+        }
+        gate_result["passed"] = bool(passed)
+        if passed:
+            archived = self._archive_incumbent_for_history()
+            self._promote_best_pair(
+                iteration=iteration,
+                gate_result=gate_result,
+            )
+            self.state["accepted_iteration"] = int(iteration)
+            self.state["last_league_gate_result"] = gate_result
+            self.state["last_eval_iteration"] = int(iteration)
+            self._prune_replay_to_accepted_window()
+            self._record_accepted_replay_snapshot()
+            self._save_state()
+            self._event(
+                "league_incumbent_promoted",
+                iteration=iteration,
+                archived_incumbent=(
+                    str(archived) if archived is not None else None
+                ),
+                result=gate_result,
+            )
+        else:
+            gate_result["reason"] = "full_threshold"
+            self._rollback_to_incumbent(
+                rejected_iteration=iteration,
+                gate_result=gate_result,
+            )
+            self.state["last_eval_iteration"] = int(iteration)
+            self._save_state()
+        return gate_result
 
     def evaluate_current(self, iteration: int, *, label: str = "periodic") -> Dict[str, Any]:
         if not self.current_checkpoint.is_file():
             raise RuntimeError("cannot evaluate without current.pt")
+        if bool(self.args.league_gate):
+            if (
+                str(label) == "initial"
+                and int(self.state.get("accepted_iteration", -1))
+                == int(iteration)
+            ):
+                result = {
+                    "passed": True,
+                    "bootstrapped": True,
+                    "iteration": int(iteration),
+                }
+                self.state["last_eval_iteration"] = int(iteration)
+                self.state["last_league_gate_result"] = result
+                self._save_state()
+                return result
+            return self._run_league_gate(iteration, label=label)
         random_seed = int(self.args.seed) + 1_000_000 + (iteration * 2)
         random_output = self.eval_dir / f"{label}_random_iter_{iteration:06d}.json"
         random_row = self._run_eval(
@@ -1903,18 +2543,44 @@ class PortableLongTrainer:
                 ),
             )
 
+        diagnostic: Optional[Dict[str, Any]] = None
+        if int(self.args.strength_diagnostic_games) > 0:
+            diagnostic_output = self.eval_dir / (
+                f"strength_diagnostic_t0_"
+                f"{int(self.args.strength_diagnostic_simulations)}_"
+                f"iter_{iteration:06d}.json"
+            )
+            diagnostic = self._run_eval(
+                challenger=self.current_checkpoint,
+                opponent=self.phase_start_checkpoint,
+                games=int(self.args.strength_diagnostic_games),
+                seed=seed + 2,
+                name="strength_diagnostic_temperature_zero",
+                output=diagnostic_output,
+                temperature=0.0,
+                sample_moves=False,
+                simulations=int(
+                    self.args.strength_diagnostic_simulations
+                ),
+                concurrency=min(
+                    int(self.args.eval_concurrency),
+                    int(self.args.strength_diagnostic_games),
+                ),
+            )
+
         screen_output = self.eval_dir / (
-            f"strength_screen_1024_iter_{iteration:06d}.json"
+            f"strength_screen_{int(self.args.strength_screen_simulations)}_"
+            f"iter_{iteration:06d}.json"
         )
         screen = self._run_eval(
             challenger=self.current_checkpoint,
             opponent=self.phase_start_checkpoint,
             games=int(self.args.strength_screen_games),
-            seed=seed + 2,
+            seed=seed + 3,
             name="strength_screen_vs_phase_start",
             output=screen_output,
-            temperature=1.0,
-            sample_moves=True,
+            temperature=float(self.args.strength_screen_temperature),
+            sample_moves=bool(self.args.strength_screen_sample_moves),
             simulations=int(self.args.strength_screen_simulations),
             concurrency=min(
                 int(self.args.eval_concurrency),
@@ -1929,7 +2595,8 @@ class PortableLongTrainer:
             "primary": primary,
             "primary_score": primary_score,
             "confirmation": confirmation,
-            "screen_1024": screen,
+            "temperature_zero_diagnostic": diagnostic,
+            "high_budget_screen": screen,
         }
         self.state["final_strength_evaluation"] = result
         self._event(
@@ -1967,6 +2634,8 @@ class PortableLongTrainer:
                 break
 
             next_iteration = iteration + 1
+            if bool(self.args.league_gate):
+                self._begin_challenger_block(next_iteration)
             progress = self._progress()
             log(
                 f"iteration={next_iteration} progress={progress:.4f} "
@@ -2002,9 +2671,12 @@ class PortableLongTrainer:
                 ),
             )
 
-            should_eval = (
+            completed_gate_block = (
                 next_iteration % max(1, int(self.args.eval_every)) == 0
-                or int(time.time()) >= int(self.state["deadline_epoch"])
+            )
+            should_eval = completed_gate_block or (
+                not bool(self.args.league_gate)
+                and int(time.time()) >= int(self.state["deadline_epoch"])
             )
             if should_eval:
                 self.evaluate_current(next_iteration)
@@ -2013,6 +2685,18 @@ class PortableLongTrainer:
                     break
 
         if not bool(self.args.dry_run):
+            if (
+                bool(self.args.league_gate)
+                and int(self.state.get("iteration", 0))
+                != int(self.state.get("accepted_iteration", 0))
+            ):
+                self._rollback_to_incumbent(
+                    rejected_iteration=int(self.state.get("iteration", 0)),
+                    gate_result={
+                        "passed": False,
+                        "reason": "run_ended_before_gate",
+                    },
+                )
             final_row = self._final_evaluation()
             final_strength = self._final_strength_evaluation()
             self.state["ended_utc"] = utc_now()
@@ -2080,6 +2764,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-checkpoint", default=None)
     parser.add_argument("--initial-optimizer-state", default=None)
     parser.add_argument("--initial-iteration", type=int, default=0)
+    parser.add_argument("--lineage-parent-run", default=None)
+    parser.add_argument("--lineage-parent-iteration", type=int, default=0)
+    parser.add_argument("--lineage-parent-best-iteration", type=int, default=0)
     parser.add_argument("--device", choices=["mps", "cpu"], default="mps")
     parser.add_argument("--require-ac", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-external-display", action="store_true")
@@ -2097,6 +2784,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="python",
     )
     parser.add_argument("--portable-cpp-threads", type=int, default=1)
+    parser.add_argument(
+        "--state-encoding-schema",
+        choices=["legacy_v1", "markov_v2"],
+        default="legacy_v1",
+    )
+    parser.add_argument(
+        "--symmetry-augmentation",
+        choices=["none", "random_d4"],
+        default="none",
+    )
     parser.add_argument("--mcts-simulations", type=int, default=8)
     parser.add_argument("--temperature-init", type=float, default=1.0)
     parser.add_argument("--temperature-final", type=float, default=0.1)
@@ -2128,6 +2825,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument(
+        "--optimizer-name",
+        choices=["adam", "adamw"],
+        default="adam",
+    )
+    parser.add_argument(
+        "--strict-optimizer-restore",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--lr-start", type=float, default=3e-4)
     parser.add_argument("--lr-final", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -2139,6 +2846,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-concurrency", type=int, default=64)
     parser.add_argument("--eval-at-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--incumbent-promotion-score", type=float, default=0.55)
+    parser.add_argument(
+        "--rollback-on-gate-fail",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--league-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--promotion-anchor",
+        action="append",
+        default=[],
+        help="Repeatable fixed checkpoint used by the league non-regression gate.",
+    )
+    parser.add_argument("--league-anchor-min-score", type=float, default=0.50)
+    parser.add_argument("--league-screen-incumbent-games", type=int, default=128)
+    parser.add_argument("--league-screen-anchor-games", type=int, default=64)
+    parser.add_argument("--league-full-anchor-games", type=int, default=200)
+    parser.add_argument("--league-cycle-screen-games", type=int, default=64)
+    parser.add_argument("--league-cycle-screen-simulations", type=int, default=16)
     parser.add_argument("--target-win-rate", type=float, default=0.99)
     parser.add_argument("--stop-on-target", action="store_true")
     parser.add_argument("--final-eval", action=argparse.BooleanOptionalAction, default=True)
@@ -2146,8 +2875,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quality-strength-eval", action="store_true")
     parser.add_argument("--strength-eval-games", type=int, default=500)
     parser.add_argument("--strength-eval-simulations", type=int, default=64)
+    parser.add_argument("--strength-diagnostic-games", type=int, default=64)
+    parser.add_argument(
+        "--strength-diagnostic-simulations",
+        type=int,
+        default=64,
+    )
     parser.add_argument("--strength-screen-games", type=int, default=64)
     parser.add_argument("--strength-screen-simulations", type=int, default=1024)
+    parser.add_argument("--strength-screen-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--strength-screen-sample-moves",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--seed", type=int, default=20260722)
     return parser
 
