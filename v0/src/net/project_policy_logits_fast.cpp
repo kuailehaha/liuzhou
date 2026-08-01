@@ -7,6 +7,18 @@
 
 namespace v0 {
 
+#if defined(V0_HAS_CUDA_POLICY_PROJECTION)
+std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_cuda(
+    const torch::Tensor& log_p1,
+    const torch::Tensor& log_p2,
+    const torch::Tensor& log_pmc,
+    const torch::Tensor& legal_mask,
+    int64_t placement_dim,
+    int64_t movement_dim,
+    int64_t selection_dim,
+    int64_t auxiliary_dim);
+#endif
+
 namespace {
 
 constexpr int kDirections[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
@@ -22,6 +34,19 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
     int64_t movement_dim,
     int64_t selection_dim,
     int64_t auxiliary_dim) {
+#if defined(V0_HAS_CUDA_POLICY_PROJECTION)
+    if (log_p1.is_cuda()) {
+        return project_policy_logits_cuda(
+            log_p1,
+            log_p2,
+            log_pmc,
+            legal_mask,
+            placement_dim,
+            movement_dim,
+            selection_dim,
+            auxiliary_dim);
+    }
+#endif
     TORCH_CHECK(log_p1.dim() == 2, "log_p1 must be 2D (B, placement_dim)");
     TORCH_CHECK(log_p2.dim() == 2, "log_p2 must be 2D (B, placement_dim)");
     TORCH_CHECK(log_pmc.dim() == 2, "log_pmc must be 2D (B, placement_dim)");
@@ -131,34 +156,35 @@ std::tuple<torch::Tensor, torch::Tensor> project_policy_logits_fast(
 
     auto illegal_mask = legal_mask.logical_not();
     auto masked_logits = combined.masked_fill(illegal_mask, neginf);
-    auto probs = torch::zeros_like(combined);
-
-    using torch::indexing::Slice;
-
     auto has_legal = legal_mask.any(1);
-    if (has_legal.any().item<bool>()) {
-        auto legal_indices = has_legal.nonzero().squeeze(1).to(torch::kLong).contiguous();
-        auto legal_logits = masked_logits.index_select(0, legal_indices);
-        auto legal_has_finite = legal_logits.isfinite().any(1);
+    auto legal_has_finite = masked_logits.isfinite().any(1);
+    auto valid_rows = has_legal & legal_has_finite;
 
-        auto valid_positions = legal_has_finite.nonzero().squeeze(1).to(torch::kLong).contiguous();
-        if (valid_positions.numel() > 0) {
-            auto valid_batch_indices = legal_indices.index_select(0, valid_positions);
-            auto valid_logits = legal_logits.index_select(0, valid_positions);
-            auto legal_probs = torch::softmax(valid_logits, 1);
-            probs.index_put_({valid_batch_indices, Slice()}, legal_probs);
-        }
+    // Avoid data-dependent nonzero()/item() control flow here.  Full-tree MCTS
+    // calls policy projection once per simulation; a host scalar check would
+    // serialize every round.  Invalid rows use zero logits only as a safe
+    // softmax input, then are masked back to the prior all-zero probability
+    // contract.
+    auto safe_logits = torch::where(
+        valid_rows.unsqueeze(1),
+        masked_logits,
+        torch::zeros_like(masked_logits));
+    auto all_probs = torch::softmax(safe_logits, 1);
+    auto probs = torch::where(
+        valid_rows.unsqueeze(1),
+        all_probs,
+        torch::zeros_like(all_probs));
 
-        auto invalid_positions =
-            legal_has_finite.logical_not().nonzero().squeeze(1).to(torch::kLong).contiguous();
-        if (invalid_positions.numel() > 0) {
-            auto invalid_batch_indices = legal_indices.index_select(0, invalid_positions);
-            auto invalid_rows = masked_logits.index_select(0, invalid_batch_indices);
-            auto invalid_legal_mask = legal_mask.index_select(0, invalid_batch_indices);
-            invalid_rows.masked_fill_(invalid_legal_mask, 0);
-            masked_logits.index_put_({invalid_batch_indices, Slice()}, invalid_rows);
-        }
-    }
+    // Preserve the diagnostic masked-logit behavior for a row that has legal
+    // actions but no finite legal model score: legal slots become zero while
+    // illegal slots remain -inf.
+    auto invalid_finite_rows = has_legal & legal_has_finite.logical_not();
+    auto fallback_logits = torch::where(
+        legal_mask,
+        torch::zeros_like(masked_logits),
+        torch::full_like(masked_logits, neginf));
+    masked_logits = torch::where(
+        invalid_finite_rows.unsqueeze(1), fallback_logits, masked_logits);
 
     return {probs, masked_logits};
 }

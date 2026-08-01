@@ -36,7 +36,7 @@ from v1.python.self_play_storage import (
     save_self_play_payload as save_self_play_payload_shared,
     slice_batch_cpu,
 )
-from v1.python.self_play_types import SelfPlayV1Stats
+from v1.python.self_play_types import SelfPlayV1Stats, merge_mcts_metrics
 from v1.python.train_bridge import (
     normalize_optimizer_name,
     train_network_from_tensors,
@@ -397,6 +397,7 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
     fallback_count = 0
     fallback_reasons: List[str] = []
     devices: List[str] = []
+    mcts_metric_rows: List[Dict[str, Any]] = []
     for s in stats:
         for k, v in s.step_timing_ms.items():
             step_ms[k] = float(step_ms.get(k, 0.0) + float(v))
@@ -409,6 +410,9 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
         device_name = str(getattr(s, "device", ""))
         if device_name and device_name not in devices:
             devices.append(device_name)
+        metric_row = getattr(s, "mcts_metrics", {})
+        if isinstance(metric_row, dict):
+            mcts_metric_rows.append(metric_row)
 
     legacy_keys = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
     for k in legacy_keys:
@@ -441,6 +445,7 @@ def _merge_self_play_stats(stats: List[SelfPlayV1Stats], elapsed_sec: float) -> 
         step_timing_ratio=step_ratio,
         step_timing_calls=step_calls,
         mcts_counters=counter_sum,
+        mcts_metrics=merge_mcts_metrics(mcts_metric_rows, elapsed),
         piece_delta_buckets=piece_delta_buckets,
         device=",".join(devices),
         fallback_count=int(fallback_count),
@@ -800,8 +805,10 @@ def _normalize_search_backend(backend: str) -> str:
         return "cuda_root"
     if raw in {"portable", "reference", "full_mcts"}:
         return "portable"
+    if raw in {"cuda_tree", "gpu_tree", "full_mcts_cuda"}:
+        return "cuda_tree"
     raise ValueError(
-        f"Unsupported search_backend={backend!r}; expected cuda_root or portable."
+        f"Unsupported search_backend={backend!r}; expected cuda_root, cuda_tree, or portable."
     )
 
 
@@ -1289,6 +1296,7 @@ def _run_self_play_multi_device(
     self_play_backend: Optional[str],
     self_play_shard_dir: Optional[str],
     search_backend: str = "cuda_root",
+    cuda_tree_precision: str = "amp_fp16",
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
     portable_self_play_workers: int = 1,
@@ -1384,6 +1392,10 @@ def _run_self_play_multi_device(
             **portable_kwargs,
         )
 
+    if search_backend_norm == "cuda_tree" and len(devices) != 1:
+        raise RuntimeError(
+            "cuda_tree currently requires exactly one CUDA device per self-play process"
+        )
     if len(devices) <= 1:
         from v1.python.self_play_gpu_runner import self_play_v1_gpu
 
@@ -1408,6 +1420,12 @@ def _run_self_play_multi_device(
             concurrent_games=shard_concurrent,
             sparse_ply=int(sparse_ply),
             sparse_top_k=int(sparse_top_k),
+            search_backend=search_backend_norm,
+            cuda_tree_precision=str(cuda_tree_precision),
+            policy_target_temperature=policy_target_temperature,
+            policy_target_prior_pseudocount=float(
+                policy_target_prior_pseudocount
+            ),
             verbose=False,
         )
 
@@ -1991,6 +2009,7 @@ def train_pipeline_v1(
     self_play_opening_random_moves: int = 0,
     self_play_backend: Optional[str] = None,
     search_backend: str = "cuda_root",
+    cuda_tree_precision: str = "amp_fp16",
     self_play_shard_dir: Optional[str] = None,
     self_play_target_samples_per_shard: int = 0,
     self_play_chunk_target_bytes: int = 0,
@@ -2033,6 +2052,11 @@ def train_pipeline_v1(
         raise ValueError(f"Unsupported stage={stage!r}; expected all/selfplay/train/infer.")
 
     search_backend_norm = _normalize_search_backend(search_backend)
+    cuda_tree_precision_norm = str(cuda_tree_precision).strip().lower()
+    if cuda_tree_precision_norm not in {"fp32", "amp_fp16"}:
+        raise ValueError(
+            "cuda_tree_precision must be one of: fp32, amp_fp16"
+        )
     portable_mcts_backend_norm = _normalize_portable_mcts_backend(
         portable_mcts_backend
     )
@@ -2072,6 +2096,10 @@ def train_pipeline_v1(
             if self_play_backend is not None
             else None
         )
+        if search_backend_norm == "cuda_tree" and backend_arg == "process":
+            raise RuntimeError(
+                "cuda_tree does not yet support process self-play; use auto or thread"
+            )
         shard_dir_arg = str(self_play_shard_dir).strip() if self_play_shard_dir is not None else ""
         shard_dir_arg = shard_dir_arg or None
 
@@ -2232,6 +2260,7 @@ def train_pipeline_v1(
                 "self_play_devices": list(self_play_device_list),
                 "self_play_backend": backend_arg if backend_arg is not None else "auto",
                 "search_backend": search_backend_norm,
+                "cuda_tree_precision": cuda_tree_precision_norm,
                 "self_play_shard_dir": shard_dir_arg,
                 "mcts_simulations": int(mcts_simulations),
                 "self_play_games": int(self_play_games),
@@ -2344,6 +2373,7 @@ def train_pipeline_v1(
                     self_play_backend=backend_arg,
                     self_play_shard_dir=shard_dir_arg,
                     search_backend=search_backend_norm,
+                    cuda_tree_precision=cuda_tree_precision_norm,
                     sparse_ply=int(sparse_ply),
                     sparse_top_k=int(sparse_top_k),
                     portable_self_play_workers=int(portable_self_play_workers),
@@ -2858,6 +2888,7 @@ def train_pipeline_v1(
                 self_play_backend=backend_arg,
                 self_play_shard_dir=shard_dir_arg,
                 search_backend=search_backend_norm,
+                cuda_tree_precision=cuda_tree_precision_norm,
                 sparse_ply=int(sparse_ply),
                 sparse_top_k=int(sparse_top_k),
                 portable_self_play_workers=int(portable_self_play_workers),
@@ -3098,11 +3129,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--search_backend",
         type=str,
         default="cuda_root",
-        choices=["cuda_root", "portable"],
+        choices=["cuda_root", "cuda_tree", "portable"],
         help=(
             "Search implementation used by self-play. cuda_root preserves the existing "
-            "v0_core/CUDA path; portable uses full CPU-tree MCTS with PyTorch inference."
+            "root-only path; cuda_tree uses GPU-resident full MCTS; portable uses the CPU reference."
         ),
+    )
+    parser.add_argument(
+        "--cuda_tree_precision",
+        type=str,
+        default="amp_fp16",
+        choices=["fp32", "amp_fp16"],
     )
     parser.add_argument(
         "--self_play_shard_dir",
@@ -3290,6 +3327,7 @@ if __name__ == "__main__":
         self_play_opening_random_moves=args.self_play_opening_random_moves,
         self_play_backend=args.self_play_backend,
         search_backend=args.search_backend,
+        cuda_tree_precision=args.cuda_tree_precision,
         self_play_shard_dir=args.self_play_shard_dir,
         self_play_target_samples_per_shard=args.self_play_target_samples_per_shard,
         self_play_chunk_target_bytes=args.self_play_chunk_target_bytes,

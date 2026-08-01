@@ -329,7 +329,14 @@ def test_cpp_and_python_smoothed_policy_targets_match() -> None:
     )[0]
 
     assert cpp_output.visit_counts == python_output.visit_counts
-    assert torch.equal(cpp_output.root_priors, python_output.root_priors)
+    # The C++ round-trip can differ by one float32 ULP across MSVC/libtorch
+    # builds even though visits, targets and the selected action are identical.
+    assert torch.allclose(
+        cpp_output.root_priors,
+        python_output.root_priors,
+        rtol=1e-6,
+        atol=2e-9,
+    )
     assert torch.equal(
         cpp_output.selection_policy_dense,
         python_output.selection_policy_dense,

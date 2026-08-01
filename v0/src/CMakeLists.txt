@@ -43,6 +43,8 @@ if(BUILD_CUDA_KERNELS)
     game/fast_legal_mask_cuda.cu
     game/fast_apply_moves_cuda.cu
     mcts/root_puct_fused.cu
+    mcts/cuda_tree.cu
+    net/project_policy_logits_cuda.cu
   )
 endif()
 
@@ -147,7 +149,7 @@ target_compile_definitions(
 )
 
 if(BUILD_CUDA_KERNELS)
-  target_compile_definitions(v0_core PRIVATE V0_HAS_CUDA_LEGAL_MASK V0_HAS_CUDA_APPLY_MOVES V0_HAS_CUDA_ROOT_PUCT)
+  target_compile_definitions(v0_core PRIVATE V0_HAS_CUDA_LEGAL_MASK V0_HAS_CUDA_APPLY_MOVES V0_HAS_CUDA_ROOT_PUCT V0_HAS_CUDA_TREE V0_HAS_CUDA_POLICY_PROJECTION)
 endif()
 
 if(C10_CUDA_LIBRARY)

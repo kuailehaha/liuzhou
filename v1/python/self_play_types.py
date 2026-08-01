@@ -6,6 +6,39 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
 
+def merge_mcts_metrics(
+    rows: list[Dict[str, Any]], elapsed_sec: float
+) -> Dict[str, Any]:
+    rows = [dict(row) for row in rows if isinstance(row, dict) and row]
+    if not rows:
+        return {}
+    sum_keys = {
+        "leaf_evaluations",
+        "inference_batches",
+        "arena_overflow",
+        "illegal_actions",
+        "non_finite",
+        "fallback",
+        "graph_capture",
+        "graph_replay",
+    }
+    merged: Dict[str, Any] = {}
+    for key in sum_keys:
+        merged[key] = int(sum(int(row.get(key, 0) or 0) for row in rows))
+    merged["arena_peak_bytes"] = int(
+        max(int(row.get("arena_peak_bytes", 0) or 0) for row in rows)
+    )
+    for key in ("precision", "search_backend"):
+        values = sorted({str(row[key]) for row in rows if row.get(key) is not None})
+        if values:
+            merged[key] = values[0] if len(values) == 1 else ",".join(values)
+    elapsed = max(1e-9, float(elapsed_sec))
+    merged["leaf_evaluations_per_sec"] = float(
+        merged["leaf_evaluations"] / elapsed
+    )
+    return merged
+
+
 @dataclass
 class SelfPlayV1Stats:
     num_games: int
@@ -22,6 +55,7 @@ class SelfPlayV1Stats:
     step_timing_calls: Dict[str, int]
     mcts_counters: Dict[str, int]
     piece_delta_buckets: Dict[str, int]
+    mcts_metrics: Dict[str, Any] = field(default_factory=dict)
     policy_target_audit: Dict[str, Any] = field(default_factory=dict)
     device: str = ""
     fallback_count: int = 0
@@ -43,6 +77,7 @@ class SelfPlayV1Stats:
         payload["step_timing_ratio"] = {k: float(v) for k, v in self.step_timing_ratio.items()}
         payload["step_timing_calls"] = {k: int(v) for k, v in self.step_timing_calls.items()}
         payload["mcts_counters"] = {k: int(v) for k, v in self.mcts_counters.items()}
+        payload["mcts_metrics"] = dict(self.mcts_metrics or {})
         payload["piece_delta_buckets"] = {
             k: int(v) for k, v in self.piece_delta_buckets.items()
         }

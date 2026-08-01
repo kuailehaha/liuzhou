@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable wall-clock V1 portable training for Apple Silicon.
+"""Resumable wall-clock V1 portable training across supported accelerators.
 
 The orchestrator keeps immutable per-iteration model checkpoints together with
 rolling recovery state and two best-model aliases:
@@ -16,7 +16,7 @@ module owns only scheduling, persistence, validation and promotion policy.
 from __future__ import annotations
 
 import argparse
-import fcntl
+import ctypes
 import hashlib
 import json
 import math
@@ -38,6 +38,11 @@ if str(ROOT_DIR) not in sys.path:
 
 import torch
 from src.neural_network import checkpoint_state_encoding_schema
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 STATE_SCHEMA_VERSION = 1
@@ -156,6 +161,37 @@ def append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
+
+
+def _try_lock_handle(handle: Any) -> bool:
+    """Acquire a non-blocking one-owner lock on an open run-lock handle."""
+
+    if os.name != "nt":
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write("0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    handle.seek(0)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_handle(handle: Any) -> None:
+    if os.name != "nt":
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def atomic_copy(source: Path, destination: Path) -> None:
@@ -357,6 +393,21 @@ def _git_metadata() -> Dict[str, Any]:
 
 
 def _on_ac_power() -> bool:
+    if platform.system() == "Windows":
+        class SystemPowerStatus(ctypes.Structure):
+            _fields_ = [
+                ("ac_line_status", ctypes.c_ubyte),
+                ("battery_flag", ctypes.c_ubyte),
+                ("battery_life_percent", ctypes.c_ubyte),
+                ("system_status_flag", ctypes.c_ubyte),
+                ("battery_life_time", ctypes.c_ulong),
+                ("battery_full_life_time", ctypes.c_ulong),
+            ]
+
+        status = SystemPowerStatus()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+            return False
+        return int(status.ac_line_status) == 1
     if platform.system() != "Darwin":
         return True
     result = subprocess.run(
@@ -388,8 +439,9 @@ def _launchd_spawn_type() -> Optional[str]:
     service_name = os.environ.get("XPC_SERVICE_NAME", "").strip()
     if not service_name:
         return None
+    uid = int(getattr(os, "getuid", lambda: 0)())
     result = subprocess.run(
-        ["launchctl", "print", f"gui/{os.getuid()}/{service_name}"],
+        ["launchctl", "print", f"gui/{uid}/{service_name}"],
         text=True,
         capture_output=True,
         check=False,
@@ -403,8 +455,9 @@ def _launchd_spawn_type() -> Optional[str]:
 def _preflight(args: argparse.Namespace) -> None:
     if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "").strip() == "1":
         raise RuntimeError("PYTORCH_ENABLE_MPS_FALLBACK=1 is forbidden for verified portable runs.")
-    if str(args.device) == "mps" and not torch.backends.mps.is_available():
-        raise RuntimeError("MPS was requested but torch.backends.mps.is_available() is false.")
+    from v1.python.portable_device import resolve_portable_device
+
+    resolve_portable_device(str(args.device))
     if bool(args.require_ac) and not _on_ac_power():
         raise RuntimeError("Long training requires AC power; connect the power adapter first.")
     if bool(args.require_external_display) and not _external_display_connected():
@@ -630,14 +683,9 @@ class PortableLongTrainer:
     def _assert_run_unlocked(run_dir: Path) -> None:
         lock_path = run_dir / "run.lock"
         with lock_path.open("a+", encoding="utf-8") as handle:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise RuntimeError(
-                    f"cannot fork an active source run: {run_dir}"
-                ) from exc
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if not _try_lock_handle(handle):
+                raise RuntimeError(f"cannot fork an active source run: {run_dir}")
+            _unlock_handle(handle)
 
     def _prepare_fork(self) -> Optional[Dict[str, Any]]:
         raw_source = str(self.args.fork_from_run or "").strip()
@@ -2740,7 +2788,7 @@ class PortableLongTrainer:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Resumable wall-clock portable MPS training with random and incumbent gating."
+        description="Resumable wall-clock portable training with random and incumbent gating."
     )
     parser.add_argument("--run-dir", default="tmp/v1_portable_long_20h")
     parser.add_argument("--hours", type=float, default=20.0)
@@ -2767,7 +2815,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lineage-parent-run", default=None)
     parser.add_argument("--lineage-parent-iteration", type=int, default=0)
     parser.add_argument("--lineage-parent-best-iteration", type=int, default=0)
-    parser.add_argument("--device", choices=["mps", "cpu"], default="mps")
+    parser.add_argument(
+        "--device",
+        default="mps",
+        help="Explicit portable inference/training device: cpu, mps, cuda, or cuda:N.",
+    )
     parser.add_argument("--require-ac", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-external-display", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
@@ -2901,11 +2953,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     lock_path = run_dir / "run.lock"
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        if not _try_lock_handle(lock_handle):
+            raise RuntimeError(f"another process already owns {lock_path}")
         try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(f"another process already owns {lock_path}") from exc
-        return PortableLongTrainer(args).run()
+            return PortableLongTrainer(args).run()
+        finally:
+            _unlock_handle(lock_handle)
 
 
 if __name__ == "__main__":

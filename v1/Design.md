@@ -2059,3 +2059,36 @@ Data-effectiveness standard fields (must be preserved in reports):
 - 增大训练 batch、减少 epochs/replay、降低 simulations、改变评测局数或并发拆批都会改变优化步数、数据分布、搜索量或实验条件，不能作为等价性能优化直接应用到当前冻结 run。提升 simulations、调整 soft label/draw weight 或开局课程也属于质量实验，需要独立 equal-wall-clock A/B 和固定 checkpoint 复核。
 - 本次 20h 是从旧 checkpoint/optimizer 开始的新墙钟周期，所以 cosine LR 和 opening-random schedule 从新周期起点重新展开；这不是静默 optimizer reset，但也不等价于旧周期的单调延长。当前 loss、非有限值、optimizer continuity 与 55% gate 均健康，故不在正式运行中途改动；未来续训应在启动前明确选择“新周期再热启动”或“延续原 schedule”，并把选择写入 run metadata。
 - `current.pt`/`optimizer.pt` 继续每轮原子更新以保证恢复；不可变 `model_iter_*` 已按用户要求只保留 10 的倍数（当前为 480、490），没有用删除恢复锚点换取表面 I/O 收益。
+
+### RTX 3060 GPU-resident full-tree MCTS (2026-08-01)
+
+- 新增显式 `--search_backend cuda_tree`。每棵树保持顺序 PUCT，树间批量并行；SoA arena、合法动作、先验、visit/value、父子关系和状态均驻留 CUDA。arena 固定为 `simulations + 1` 个节点，延迟分配 child；backup 只在 parent/child 行动方变化时翻转，PUCT tie 使用较小 action index。
+- `cuda_tree` 使用 FP32 prior/策略与 FP64 value sum，支持 `fp32`/`amp_fp16` 模型推理。固定 batch 的完整搜索（状态编码、legal/apply、64 次 select/eval/backup 和输出）由外层 CUDA Graph 捕获；模型副本采用 channels-last、FP16、TorchScript freeze/optimize。self-play 使用固定槽位并在棋局完成后立即补入下一局；最后无新局可补时按 `512→256→128→...` 幂次 bucket 缩小 Graph，只把活跃行写入轨迹，避免逐个 active-count 重捕获或让少数尾局持续计算整批。
+- 220 维策略投影改为单 CUDA kernel 完成 movement 投影、legal mask 和 row softmax；FP32 与 ATen 参考最大概率差 `5.96e-8`，FP16 最大差 `4.88e-4`，NaN/Inf 诊断行为保持一致。真实 checkpoint、48 个随机合法状态、sim64 下，相同精度的融合/ATen 路径 visits 与动作均完全一致。
+- Windows CUDA 12.6 / PyTorch 2.8 / sm86 fresh build 成功。focused CUDA/V1 suite 为 `20 passed`；扩大 legal/apply/schema/portable suite 为 `40 passed, 2 failed`，仅失败于既有 `tests/v0/test_actions.py` 对终局 MOVEMENT 状态的 Legacy-empty/V0-mask-moves 历史差异。
+- best checkpoint 的 staged smoke 生成 4 局/32 positions，随后在 CUDA 上完成 train/checkpoint，并从 AdamW state 严格恢复继续训练；`optimizer_loaded=true`，非有限过滤和 device fallback 均为 0。accepted model/optimizer SHA 保持 `6e9af600...9077` / `66ba2990...e6a22`。
+- 短时 sim64、batch 512 完整搜索 Graph 的 12 次 replay 中位为 `1044.2 positions/s`，最后 5 次为 `1018.5`，健康计数全 0。完整 512 局/106 plies 实测为 54,272 positions / 84.51s = `642.17 positions/s`；GPU 在 87°C 从约 2.0 GHz 降到 900 MHz，leaf eval 为 `41.74k/s`。纯 TorchScript 网络热浸也从 `82.9k` 降至 `46.8k states/s`，低于 sim64 达到 1000 positions/s 所需约 `65k states/s`，因此 30 分钟验收未通过。
+- 后续随机训练形状的 512 games、64 max plies 诊断为 32,768 positions / 153.59s = `213.35 positions/s`；noise/sample search-only A/B 仅约 1% 差异，根因仍是累计热浸。搜索期间遥测为 100% GPU utilization、89°C，SM clock 从 532 MHz 继续降到 307 MHz，功耗约 40–47W。当前非提权会话的 `nvidia-smi -lgc` 与 `-pl` 均被 Insufficient Permissions 拒绝。
+- Torch-TensorRT 2.8/10.12 的 NCHW FP16 分段图达到约 `125k states/s`，但随机状态 sim64 对拍有 20/48 行 visits 与 1/48 行动作不同，故按语义门槛拒绝接入。旧 Windows 长训任务保持 disabled；在完整棋局门槛通过前不得启动新的正式长训。
+
+### Windows RTX 3060 Portable/CUDA Continuation (2026-08-01)
+
+#### 目标、边界与实现
+
+- 不改变已修复的 portable full-MCTS、220 维动作编码、阶段流转或 value 翻转语义。CPU/C++ 继续负责规则与持久树，CUDA 仅承担 PyTorch 批量推理和训练；fresh V0 CUDA build 用于算子对拍，不替换 portable 搜索。
+- long trainer 增加 Windows `msvcrt` 排他锁、`cuda:N` 显式设备和 `GetSystemPowerStatus` AC 预检。Windows launcher 使用 `SetThreadExecutionState(ES_SYSTEM_REQUIRED|ES_AWAYMODE_REQUIRED)`，通过 JSON 数组保留无歧义命令，并把 PID、状态、退出码和日志路径原子写入 runtime state。
+- benchmark 入口移除 POSIX-only `resource/ps/getloadavg` 假设，支持 Windows process/GPU 采样和 checkpoint 的 19-channel `markov_v2` 构造。MSVC/libtorch 下 C++ root prior 与 Python 最大差为 `1.862645149e-09`；visits、dense targets 与选中动作完全一致，因此跨实现 prior 断言使用 `atol=2e-9, rtol=1e-6`，没有放宽行为契约。
+
+#### 构建与验证
+
+- 环境为 Windows 11、RTX 3060 Laptop 6 GiB、Python 3.13.5、PyTorch 2.8.0+cu126、CUDA toolkit 12.6、MSVC 19.44。portable C++ 扩展重编成功；fresh `build/v0_cuda_win3060` 以 `sm_86` 编译 legal mask、apply moves 和 fused root-PUCT 并链接 `v0_core`。
+- focused suite 为 `70 passed, 2 skipped`。fresh CUDA 扩展的 fast legal mask 与 fast apply moves 均通过真实 CPU/CUDA 对拍（`2 passed, 2 slow deselected`）。既有 `tests/v0/test_actions.py` 仍会把已终局但 phase 保持 MOVEMENT 的状态送入不含终局字段的 fast mask，产生 Legacy-empty/V0-moves 差异；这是独立历史契约债务，不属于本次 portable 长训的通过范围。
+- 4-game/64-simulation full-game smoke 产生 376 positions，严格加载匹配 AdamW state，LR 前后均为 `8.34947360208e-05`，loss 有限，D4 八种变换均出现，fallback/illegal/non-finite/filtered 为 0。源模型与 optimizer SHA 未改变。
+- 同 checkpoint/seed、16 concurrency、64 simulations、64 plies 的 C++/Python payload fingerprint 完全一致；C++ 为 `17.79 positions/s`，Python 为 `5.72`，即 `3.11x`。64 concurrency 达约 `55.2 positions/s`；128 concurrency 达约 `84.5`，但热浸后为 85 C，超过 81 C target，因此多日配置保守冻结为 64 concurrency。
+
+#### 活跃长训与恢复口径
+
+- scheduled task `Liuzhou-Win3060-64sim-72h` 于 `2026-08-01 00:46:21 UTC+8` 启动，trainer 固定 deadline 为 `2026-08-04 00:46:26 UTC+8`。任务每 15 分钟触发、IgnoreNew、零执行时限、失败重试、WakeToRun，并沿用 Windows 默认 AC-only start/stop；S4U 因权限被拒，当前为 `InteractiveToken`，因此不依赖 Codex 进程但要求用户会话保持登录。
+- runtime 为 ignored 的 `tmp/win3060_cuda_long_64sim_20260801/`。源 pair 是 `models/best_model.pt` / `best_optimizer.pt`，SHA `6e9af600...9077` / `66ba2990...e6a22`，外层 lineage 记录 iteration 150。配置为 64 games/concurrency 64、64 simulations、完整 512 plies、无重新 opening random、policy target `N+P`、replay 16、batch 256、3 epochs、AdamW strict restore、random D4、LR 从已保存的 `8.34947360208e-05` 退火到 `2e-05`。
+- 每 10 iteration 使用 64-simulation league gate；初始 best 同时作为固定 non-regression anchor。candidate 在 gate 通过前不得描述为新 best，partial block 到 deadline 时回滚 incumbent pair/replay。
+- 首个生产 iteration 151 已原子提交：64 games、6,249 positions、`43.98 positions/s`、黑/白胜 `13/12`、39 draws；训练 75 steps / 10.54s，loss `0.72714`，strict optimizer restore 为 true，八种 D4 计数均非零，所有 fallback/illegal/non-finite/filtered 计数为 0。current pair 更新为 `c6762d3d...f6ae` / `24374845...6cb0`，best pair 仍保持源 SHA，等待 iteration 160 gate。

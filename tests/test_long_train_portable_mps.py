@@ -14,6 +14,8 @@ from scripts.long_train_portable_mps import (
     PortableLongTrainer,
     _config_signature,
     _launchd_spawn_type,
+    _try_lock_handle,
+    _unlock_handle,
     _preflight,
     audit_train_metrics,
     build_parser,
@@ -65,6 +67,23 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert args.symmetry_augmentation == "none"
     assert not args.league_gate
     assert not args.rollback_on_gate_fail
+
+
+def test_windows_cuda_device_is_an_explicit_supported_choice() -> None:
+    args = build_parser().parse_args(["--device", "cuda:0"])
+    assert args.device == "cuda:0"
+
+
+def test_run_lock_is_exclusive_and_recoverable(tmp_path) -> None:
+    lock_path = tmp_path / "run.lock"
+    with lock_path.open("a+", encoding="utf-8") as first, lock_path.open(
+        "a+", encoding="utf-8"
+    ) as second:
+        assert _try_lock_handle(first)
+        assert not _try_lock_handle(second)
+        _unlock_handle(first)
+        assert _try_lock_handle(second)
+        _unlock_handle(second)
 
 
 def test_direct_script_execution_adds_repository_root_to_sys_path(monkeypatch) -> None:

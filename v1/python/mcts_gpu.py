@@ -145,14 +145,58 @@ class GpuStateBatch:
         )
 
 
-def states_to_model_input(batch: GpuStateBatch) -> torch.Tensor:
-    return v0_core.states_to_model_input(
-        batch.board,
-        batch.marks_black,
-        batch.marks_white,
-        batch.phase,
-        batch.current_player,
+def states_to_model_input(
+    batch: GpuStateBatch,
+    num_input_channels: int = 11,
+) -> torch.Tensor:
+    current = batch.current_player.view(batch.batch_size, 1, 1)
+    self_pieces = batch.board.eq(current).to(torch.float32)
+    opponent_pieces = batch.board.eq(-current).to(torch.float32)
+    black_to_move = batch.current_player.eq(1).view(batch.batch_size, 1, 1)
+    self_marks = torch.where(black_to_move, batch.marks_black, batch.marks_white).to(
+        torch.float32
     )
+    opponent_marks = torch.where(
+        black_to_move, batch.marks_white, batch.marks_black
+    ).to(torch.float32)
+    phase_ids = torch.arange(1, 8, dtype=torch.int64, device=batch.device)
+    phase_planes = (
+        batch.phase.view(batch.batch_size, 1)
+        .eq(phase_ids.view(1, 7))
+        .to(torch.float32)
+        .view(batch.batch_size, 7, 1, 1)
+        .expand(batch.batch_size, 7, 6, 6)
+    )
+    legacy = torch.cat(
+        (
+            self_pieces.unsqueeze(1),
+            opponent_pieces.unsqueeze(1),
+            self_marks.unsqueeze(1),
+            opponent_marks.unsqueeze(1),
+            phase_planes,
+        ),
+        dim=1,
+    ).contiguous()
+    channels = int(num_input_channels)
+    if channels == 11:
+        return legacy
+    if channels != 19:
+        raise ValueError(f"Unsupported V1 model input channels: {channels}")
+    scalars = torch.stack(
+        (
+            batch.current_player.eq(1).to(torch.float32),
+            (batch.move_count.to(torch.float32) / 144.0).clamp(0.0, 1.0),
+            (batch.moves_since_capture.to(torch.float32) / 36.0).clamp(0.0, 1.0),
+            (batch.forced_removals_done.to(torch.float32) / 2.0).clamp(0.0, 1.0),
+            (batch.pending_marks_required.to(torch.float32) / 2.0).clamp(0.0, 1.0),
+            (batch.pending_marks_remaining.to(torch.float32) / 2.0).clamp(0.0, 1.0),
+            (batch.pending_captures_required.to(torch.float32) / 2.0).clamp(0.0, 1.0),
+            (batch.pending_captures_remaining.to(torch.float32) / 2.0).clamp(0.0, 1.0),
+        ),
+        dim=1,
+    ).view(batch.batch_size, 8, 1, 1)
+    scalar_planes = scalars.expand(batch.batch_size, 8, 6, 6)
+    return torch.cat((legacy, scalar_planes), dim=1).contiguous()
 
 
 def encode_actions_fast(batch: GpuStateBatch) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -292,6 +336,14 @@ class V1RootMCTS:
         self.config = config
         self.device = torch.device(device)
         self.inference_engine = inference_engine
+        model_channels = getattr(model, "num_input_channels", None)
+        if model_channels is None:
+            stem = getattr(model, "stem_conv", None)
+            weight = getattr(stem, "weight", None)
+            if weight is None or weight.dim() != 4:
+                raise ValueError("model must expose num_input_channels or stem_conv.weight")
+            model_channels = int(weight.shape[1])
+        self._num_input_channels = int(model_channels)
         self._collect_timing = bool(collect_timing)
         self._timing_ms: Dict[str, float] = {
             "root_puct_ms": 0.0,
@@ -641,6 +693,8 @@ class V1RootMCTS:
         if self.device.type != "cuda":
             return torch.autocast("cpu", enabled=False)
         dtype_key = str(self.config.autocast_dtype).strip().lower()
+        if dtype_key in ("fp32", "float32", "off", "none"):
+            return torch.autocast(device_type="cuda", enabled=False)
         if dtype_key in ("bf16", "bfloat16"):
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -787,7 +841,7 @@ class V1RootMCTS:
     def _evaluate_batch(
         self, batch: GpuStateBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        inputs = states_to_model_input(batch)
+        inputs = states_to_model_input(batch, self._num_input_channels)
         log_p1, log_p2, log_pmc, raw_values = self._forward_model(inputs)
         values = self._to_scalar_value(raw_values).float()
         legal_mask, metadata = encode_actions_fast(batch)
@@ -804,7 +858,7 @@ class V1RootMCTS:
         return inputs, legal_mask, metadata, probs.float(), values
 
     def _evaluate_values_only(self, batch: GpuStateBatch) -> torch.Tensor:
-        inputs = states_to_model_input(batch)
+        inputs = states_to_model_input(batch, self._num_input_channels)
         _log_p1, _log_p2, _log_pmc, raw_values = self._forward_model(inputs)
         values = self._to_scalar_value(raw_values).float()
         return values

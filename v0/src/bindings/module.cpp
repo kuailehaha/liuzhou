@@ -10,6 +10,7 @@
 
 #include "v0/fast_legal_mask.hpp"
 #include "v0/fast_apply_moves.hpp"
+#include "v0/cuda_tree.hpp"
 #include "v0/game_state.hpp"
 #include "v0/move_generator.hpp"
 #include "v0/net_encoding.hpp"
@@ -1354,6 +1355,32 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("valid_mask"),
         py::arg("num_simulations"),
         py::arg("exploration_weight"));
+#if defined(V0_HAS_CUDA_TREE)
+    m.def(
+        "cuda_tree_select",
+        &v0::cuda_tree_select,
+        py::arg("priors"),
+        py::arg("legal_mask"),
+        py::arg("child_index"),
+        py::arg("node_visits"),
+        py::arg("node_value_sum"),
+        py::arg("node_player"),
+        py::arg("expanded"),
+        py::arg("terminal"),
+        py::arg("node_parent"),
+        py::arg("node_action"),
+        py::arg("node_count"),
+        py::arg("exploration_weight"));
+    m.def(
+        "cuda_tree_backup",
+        &v0::cuda_tree_backup,
+        py::arg("paths"),
+        py::arg("path_lengths"),
+        py::arg("node_player"),
+        py::arg("leaf_values"),
+        py::arg("node_visits"),
+        py::arg("node_value_sum"));
+#endif
     m.def(
         "root_pack_sparse_actions",
         &RootPackSparseActions,

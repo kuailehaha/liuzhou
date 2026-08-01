@@ -89,6 +89,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         sparse_top_k=int(args.sparse_top_k),
         self_play_backend=args.self_play_backend,
         search_backend=str(args.search_backend),
+        cuda_tree_precision=str(args.cuda_tree_precision),
         self_play_shard_dir=args.self_play_shard_dir,
         self_play_target_samples_per_shard=int(args.self_play_target_samples_per_shard),
         self_play_chunk_target_bytes=int(args.self_play_chunk_target_bytes),
@@ -187,8 +188,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--search_backend",
         type=str,
         default="cuda_root",
-        choices=["cuda_root", "portable"],
+        choices=["cuda_root", "cuda_tree", "portable"],
         help="V1 search implementation; ignored by v0.",
+    )
+    parser.add_argument(
+        "--cuda_tree_precision",
+        type=str,
+        default="amp_fp16",
+        choices=["fp32", "amp_fp16"],
     )
     parser.add_argument(
         "--self_play_shard_dir",

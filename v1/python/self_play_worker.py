@@ -11,7 +11,7 @@ import torch
 
 from src.game_state import GameState
 from src.neural_network import ChessNet, model_input_channels_from_state_dict
-from .self_play_types import SelfPlayV1Stats
+from .self_play_types import SelfPlayV1Stats, merge_mcts_metrics
 from .self_play_storage import (
     estimate_bytes_per_sample,
     plan_sample_ranges,
@@ -212,6 +212,7 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
     fallback_reasons: List[str] = []
     devices: List[str] = []
     policy_target_audits: List[Dict[str, Any]] = []
+    mcts_metric_rows: List[Dict[str, Any]] = []
     for stats in stats_list:
         for k, v in stats.step_timing_ms.items():
             step_timing_ms[str(k)] = float(step_timing_ms.get(str(k), 0.0) + float(v))
@@ -230,6 +231,9 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
         audit = getattr(stats, "policy_target_audit", {})
         if isinstance(audit, dict):
             policy_target_audits.append(audit)
+        metric_row = getattr(stats, "mcts_metrics", {})
+        if isinstance(metric_row, dict):
+            mcts_metric_rows.append(metric_row)
 
     legacy_keys = ("root_puct_ms", "pack_writeback_ms", "self_play_step_ms", "finalize_ms")
     for k in legacy_keys:
@@ -263,6 +267,7 @@ def _merge_self_play_stats(stats_list: List[SelfPlayV1Stats], elapsed_sec: float
         step_timing_ratio=step_timing_ratio,
         step_timing_calls=step_timing_calls,
         mcts_counters=mcts_counters,
+        mcts_metrics=merge_mcts_metrics(mcts_metric_rows, elapsed),
         piece_delta_buckets=piece_delta_buckets,
         policy_target_audit=merge_policy_target_audits(
             policy_target_audits

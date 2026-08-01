@@ -9,7 +9,6 @@ import json
 import os
 import platform
 import re
-import resource
 import statistics
 import subprocess
 import sys
@@ -19,6 +18,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
 import torch
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional diagnostics dependency
+    psutil = None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -44,28 +48,50 @@ def _sha256(path: Path) -> str:
 
 
 def _load_model(checkpoint: Optional[Path]) -> ChessNet:
-    model = ChessNet(
-        board_size=GameState.BOARD_SIZE,
-        num_input_channels=NUM_INPUT_CHANNELS,
-    )
+    payload: Any = None
+    state: Optional[Dict[str, torch.Tensor]] = None
+    num_input_channels = NUM_INPUT_CHANNELS
     if checkpoint is not None:
         payload = torch.load(str(checkpoint), map_location="cpu")
         if isinstance(payload, dict) and isinstance(
             payload.get("model_state_dict"), dict
         ):
             state = payload["model_state_dict"]
+            num_input_channels = int(
+                payload.get("num_input_channels", state["stem_conv.weight"].shape[1])
+            )
         elif isinstance(payload, dict):
             state = payload
+            num_input_channels = int(state["stem_conv.weight"].shape[1])
         else:
             raise RuntimeError(
                 f"unsupported checkpoint payload: {type(payload)!r}"
             )
+    model = ChessNet(
+        board_size=GameState.BOARD_SIZE,
+        num_input_channels=num_input_channels,
+    )
+    if state is not None:
         model.load_state_dict(state, strict=True)
     model.eval()
     return model
 
 
 def _competing_processes() -> list[str]:
+    if platform.system() == "Windows":
+        if psutil is None:
+            return []
+        rows: list[str] = []
+        for process in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                command = subprocess.list2cmdline(process.info.get("cmdline") or [])
+            except (OSError, psutil.Error):
+                continue
+            if process.pid == os.getpid() or "benchmark_portable_cpp.py" in command:
+                continue
+            if TRAINING_PATTERNS.search(command):
+                rows.append(f"{process.pid} {command}")
+        return rows
     result = subprocess.run(
         ["ps", "-axo", "pid=,command="],
         check=True,
@@ -90,6 +116,22 @@ def _competing_processes() -> list[str]:
 
 
 def _read_gpu_utilization() -> tuple[Optional[float], Optional[int]]:
+    if platform.system() == "Windows":
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            return float(result.stdout.splitlines()[0].strip()), None
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            return None, None
     if platform.system() != "Darwin":
         return None, None
     try:
@@ -188,18 +230,12 @@ def _run_case(
     }
     if backend == "cpp":
         kwargs["cpu_threads"] = int(threads)
-    usage_before = resource.getrusage(resource.RUSAGE_SELF)
+    cpu_before = time.process_time()
     wall_started = time.perf_counter()
     with _GpuSampler() as gpu:
         samples, stats = runner(**kwargs)
     wall_elapsed = max(1e-9, time.perf_counter() - wall_started)
-    usage_after = resource.getrusage(resource.RUSAGE_SELF)
-    cpu_seconds = (
-        usage_after.ru_utime
-        + usage_after.ru_stime
-        - usage_before.ru_utime
-        - usage_before.ru_stime
-    )
+    cpu_seconds = time.process_time() - cpu_before
     policy_non_finite = int(
         (~torch.isfinite(samples.policy_targets)).sum().item()
     )
@@ -313,7 +349,7 @@ def _median_rows(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--device", choices=["cpu", "mps"], default="mps")
+    parser.add_argument("--device", default="mps")
     parser.add_argument("--games", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--simulations", type=int, default=8)
@@ -346,8 +382,9 @@ def main() -> int:
             "controlled benchmark refused because training/evaluation processes are active:\n"
             + "\n".join(competing)
         )
-    if str(args.device) == "mps" and not torch.backends.mps.is_available():
-        raise RuntimeError("MPS benchmark requested but MPS is unavailable")
+    from v1.python.portable_device import resolve_portable_device
+
+    resolve_portable_device(str(args.device))
 
     model = _load_model(args.checkpoint)
     rows: list[Dict[str, Any]] = []
@@ -474,7 +511,9 @@ def main() -> int:
                 "seed": int(args.seed),
             },
             "case_order_rotated_per_repeat": True,
-            "load_average_before": list(os.getloadavg()),
+            "load_average_before": (
+                list(os.getloadavg()) if hasattr(os, "getloadavg") else None
+            ),
             "competing_processes": competing,
         },
         "rows": rows,

@@ -11,7 +11,24 @@
 ### Windows 本地环境
 
 - Conda 环境：`conda activate torchenv`
-- 常见用途：本地功能验证、小规模回归、人机对战
+- 常见用途：本地功能验证、小规模回归、人机对战，以及单卡 portable/CUDA 续训
+
+Windows 可复用 portable full-MCTS 的 CPU 规则/树语义，并把 PyTorch 推理和训练显式放在 CUDA。先在当前 `torchenv` 重编 portable C++ 扩展；需要验收 V0 CUDA 算子时，另用 CMake 构建 `sm_86` 的 `v0_core`，不要把 V0 root-only 路径替换成 portable 正确性路径：
+
+```powershell
+python scripts/build_portable_cpp.py --force
+
+python scripts/train_entry.py `
+  --pipeline v1 --stage selfplay `
+  --search_backend portable --portable_mcts_backend cpp `
+  --portable_cpp_threads 1 --device cuda:0 --devices cuda:0 `
+  --state_encoding_schema markov_v2 `
+  --self_play_games 4 --self_play_concurrent_games 4 `
+  --mcts_simulations 64 --max_game_plies 64 `
+  --self_play_output tmp/win_portable_smoke.pt
+```
+
+`scripts/long_train_portable_mps.py` 的文件名保留兼容性，但设备现可显式选择 `cpu`、`mps`、`cuda` 或 `cuda:N`。Windows 长任务应通过 `scripts/launch_long_train_windows.py` 交给 Task Scheduler；launcher 会持有系统防睡眠请求并记录父/子 PID，trainer 的 `--resume`、原子 model/optimizer 对和 replay 审计负责失败恢复。正式启动前仍须完成真实 CUDA 冒烟、优化器严格恢复、AC 检查和本机温度/并发测量。
 
 ### macOS Apple Silicon portable 环境
 

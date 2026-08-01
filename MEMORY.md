@@ -1,5 +1,13 @@
 # MEMORY
 
+## Current Conclusions (2026-08-01): Windows RTX 3060 Portable/CUDA Continuation
+
+- Windows 11 / RTX 3060 Laptop / Python 3.13.5 / PyTorch 2.8.0+cu126 uses the corrected portable full-MCTS path: CPU owns rules and the C++ tree, while `cuda:0` owns batched network inference and training. The source pair is `models/best_model.pt` / `models/best_optimizer.pt`, SHA-256 `6e9af600...9077` / `66ba2990...e6a22`, with `markov_v2`, 19 channels, random D4 and strict AdamW state continuity.
+- `scripts/long_train_portable_mps.py` now supports Windows locks, explicit CUDA devices and real Windows AC preflight. `scripts/launch_long_train_windows.py` holds `ES_SYSTEM_REQUIRED|ES_AWAYMODE_REQUIRED`, records launcher/child state and accepts an exact JSON command for Task Scheduler. S4U registration was denied locally; the active task therefore uses `InteractiveToken` and survives Codex disconnects but requires the Windows user session to remain logged in.
+- CUDA 12.6 / MSVC 19.44 / sm_86 rebuilt `v0_core` under ignored `build/v0_cuda_win3060`; CPU/CUDA legal-mask and apply-moves parity both passed. The production portable C++ extension was also freshly rebuilt. A focused portable/orchestrator suite passed 70 tests with two platform skips.
+- The 72-hour run is active as scheduled task `Liuzhou-Win3060-64sim-72h`, with 15-minute repeated recovery triggers, zero execution limit, failure restart, AC-only start/stop policy and `--resume`. Runtime state is `tmp/win3060_cuda_long_64sim_20260801/`; it started at `2026-08-01 00:46:26 UTC+8`, deadline `2026-08-04 00:46:26 UTC+8`, and uses 64 games/concurrency 64, 64 simulations, replay 16, batch 256, 3 epochs and LR `8.34947360208e-05 -> 2e-05` without reheating the opening curriculum.
+- Production iteration 151 committed 64 games / 6,249 positions at `43.98 positions/s`, with 13 black wins, 12 white wins and 39 draws. Strict optimizer restore succeeded, all eight D4 transforms were used, loss was finite, and fallback/illegal/non-finite/filtered counts were zero. GPU held near its 81 C target at this production shape. The candidate SHA pair is `c6762d3d...f6ae` / `24374845...6cb0`; the incumbent remains the exact source pair until the first 10-iteration league gate at iteration 160.
+
 ## Current Conclusions (2026-07-26): Markov v2 Phase 3
 
 - Phase 2 ended at iteration 2478 without proving the final current stronger at the preregistered 64-simulation/500-game sampled condition. Phase 3 therefore treats incomplete state observability and candidate drift as the primary engineering targets; it does not claim that network capacity is the current bottleneck or that transitive dominance can be guaranteed.
@@ -393,3 +401,11 @@ Current recommendation order:
   - `vs Random` win rate
   - self-play draw rate
   - wall-clock efficiency (games/hour, positions/hour)
+
+## Windows RTX 3060 cuda_tree status (2026-08-01)
+
+- `cuda_tree` full-MCTS 已实现并在本机 CUDA 12.6 / PyTorch 2.8 / sm86 编译。固定 sim64、batch 512 的短时完整搜索 CUDA Graph 中位为 `1044.2 positions/s`；overflow、illegal、non-finite、fallback 均为 0。
+- 完整 512 局、54,272 trajectory positions 的持续结果为 `642.17 positions/s`。RTX 3060 Laptop 在 87°C 从约 2.0 GHz 热降频到 900 MHz；纯网络热浸稳定值约 `46.8k states/s`，低于 sim64 达到 1000 positions/s 所需约 `65k states/s`。因此 30 分钟性能 gate 未通过，不能用短时结果宣称达标。
+- 继续热浸后，随机训练形状 512 games、64 max plies 只有 `213.35 positions/s`；实时遥测为 89°C、100% utilization、SM clock 532→307 MHz。Dirichlet/sample on/off 的 search-only 差异约 1%，不是主要慢点。固定槽即时补局和幂次 bucket 尾部已接入，但无法弥补硬件深度热保护。当前会话无权执行 `nvidia-smi -lgc` 或 `-pl`。
+- TensorRT 虽达到约 `125k states/s`，但 sim64 随机合法状态对拍出现 visits/action 差异，已拒绝接入。正确性优先于吞吐，不使用近似路径、降 simulations 或 root-only 替代。
+- accepted lineage 仍为 `models/best_model.pt` SHA `6e9af600...9077` 与 `models/best_optimizer.pt` SHA `66ba2990...e6a22`。严格 optimizer restore 冒烟已通过；旧任务 `Liuzhou-Win3060-64sim-72h` 保持 disabled，新长训必须等完整棋局 30 分钟 gate 通过后再创建。

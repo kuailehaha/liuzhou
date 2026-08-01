@@ -9,13 +9,55 @@ from typing import Dict, List, Tuple
 import torch
 import v0_core
 
-from .mcts_gpu import GpuStateBatch, TOTAL_ACTION_DIM, V1RootMCTS, V1RootMCTSConfig
+from .mcts_gpu import (
+    GpuStateBatch,
+    RootSearchBatchOutput,
+    TOTAL_ACTION_DIM,
+    V1RootMCTS,
+    V1RootMCTSConfig,
+)
 from .self_play_types import SelfPlayV1Stats
 from .trajectory_buffer import TensorSelfPlayBatch, TensorTrajectoryBuffer
 
 _PIECE_DELTA_MIN = -18
 _PIECE_DELTA_MAX = 18
 _PIECE_DELTA_BUCKET_COUNT = (_PIECE_DELTA_MAX - _PIECE_DELTA_MIN) + 1
+
+
+def _select_search_rows(
+    search: RootSearchBatchOutput, indices: torch.Tensor
+) -> RootSearchBatchOutput:
+    return RootSearchBatchOutput(
+        model_input=search.model_input.index_select(0, indices),
+        legal_mask=search.legal_mask.index_select(0, indices),
+        policy_dense=search.policy_dense.index_select(0, indices),
+        root_value=search.root_value.index_select(0, indices),
+        terminal_mask=search.terminal_mask.index_select(0, indices),
+        chosen_action_indices=search.chosen_action_indices.index_select(0, indices),
+        chosen_action_codes=search.chosen_action_codes.index_select(0, indices),
+        chosen_valid_mask=search.chosen_valid_mask.index_select(0, indices),
+    )
+
+
+def _pad_state_batch(states: GpuStateBatch, target_size: int) -> GpuStateBatch:
+    current = int(states.batch_size)
+    target = int(target_size)
+    if target < current:
+        raise ValueError("target_size must not be smaller than the state batch")
+    if target == current:
+        return states
+    padding = GpuStateBatch.initial(states.device, batch_size=target - current)
+    return GpuStateBatch(
+        **{
+            field: torch.cat((getattr(states, field), getattr(padding, field)), dim=0)
+            for field in states.__dataclass_fields__
+        }
+    )
+
+
+def _power_of_two_bucket(size: int) -> int:
+    value = max(1, int(size))
+    return 1 << (value - 1).bit_length()
 
 
 def self_play_v1_gpu(
@@ -41,6 +83,10 @@ def self_play_v1_gpu(
     inference_engine=None,
     collect_step_timing: bool = False,
     verbose: bool = False,
+    search_backend: str = "cuda_root",
+    cuda_tree_precision: str = "amp_fp16",
+    policy_target_temperature: float | None = None,
+    policy_target_prior_pseudocount: float = 0.0,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
     """Run v1 self-play fully in tensor form and return training-ready tensors."""
 
@@ -65,13 +111,43 @@ def self_play_v1_gpu(
         sparse_top_k=max(1, int(sparse_top_k)),
     )
     collect_timing = bool(collect_step_timing)
-    mcts = V1RootMCTS(
-        model=model,
-        config=mcts_cfg,
-        device=dev,
-        inference_engine=inference_engine,
-        collect_timing=collect_timing,
-    )
+    backend = str(search_backend).strip().lower()
+    if backend == "cuda_tree":
+        from .mcts_cuda_tree import CudaTreeMCTS, CudaTreeMCTSConfig
+
+        if int(sparse_ply) != 1:
+            raise ValueError("cuda_tree is full MCTS and does not use sparse_ply")
+        mcts = CudaTreeMCTS(
+            model=model,
+            config=CudaTreeMCTSConfig(
+                num_simulations=max(1, int(mcts_simulations)),
+                exploration_weight=float(exploration_weight),
+                temperature=float(temperature_init),
+                add_dirichlet_noise=bool(add_dirichlet_noise),
+                dirichlet_alpha=float(dirichlet_alpha),
+                dirichlet_epsilon=float(dirichlet_epsilon),
+                sample_moves=bool(sample_moves),
+                precision=str(cuda_tree_precision),
+                policy_target_temperature=policy_target_temperature,
+                policy_target_prior_pseudocount=float(
+                    policy_target_prior_pseudocount
+                ),
+            ),
+            device=dev,
+            inference_engine=inference_engine,
+        )
+    elif backend == "cuda_root":
+        mcts = V1RootMCTS(
+            model=model,
+            config=mcts_cfg,
+            device=dev,
+            inference_engine=inference_engine,
+            collect_timing=collect_timing,
+        )
+    else:
+        raise ValueError(
+            f"self_play_v1_gpu expected cuda_root or cuda_tree, got {search_backend!r}"
+        )
     buffer = TensorTrajectoryBuffer(
         device=dev,
         action_dim=TOTAL_ACTION_DIM,
@@ -156,13 +232,22 @@ def self_play_v1_gpu(
 
     started = time.perf_counter()
 
-    for wave_base in range(0, int(num_games), wave_size):
+    wave_bases = (
+        (0,) if backend == "cuda_tree" else range(0, int(num_games), wave_size)
+    )
+    for wave_base in wave_bases:
         wave_games = min(wave_size, int(num_games) - wave_base)
         states = GpuStateBatch.initial(dev, batch_size=wave_games)
-        step_index_matrix = torch.full((wave_games, max_plies), -1, dtype=torch.int64, device=dev)
-        step_counts = torch.zeros((wave_games,), dtype=torch.int64, device=dev)
+        trajectory_games = int(num_games) if backend == "cuda_tree" else wave_games
+        step_index_matrix = torch.full(
+            (trajectory_games, max_plies), -1, dtype=torch.int64, device=dev
+        )
+        step_counts = torch.zeros((trajectory_games,), dtype=torch.int64, device=dev)
         plies = torch.zeros((wave_games,), dtype=torch.int64, device=dev)
         done = torch.zeros((wave_games,), dtype=torch.bool, device=dev)
+        slot_game_ids = torch.arange(wave_games, dtype=torch.int64, device=dev)
+        next_game_id = int(wave_games)
+        completed_games = 0
 
         while True:
             active_idx = torch.where(~done)[0]
@@ -171,21 +256,52 @@ def self_play_v1_gpu(
 
             active_states = states.select(active_idx)
             active_plies = plies.index_select(0, active_idx)
-            active_temps = torch.where(
-                active_plies < int(temperature_threshold),
-                torch.full_like(active_plies, float(temperature_init), dtype=torch.float32),
-                torch.full_like(active_plies, float(temperature_final), dtype=torch.float32),
+            if backend == "cuda_tree":
+                search_size = min(wave_games, _power_of_two_bucket(int(active_idx.numel())))
+                search_states = (
+                    states
+                    if int(active_idx.numel()) == wave_games
+                    else _pad_state_batch(active_states, search_size)
+                )
+                search_plies = active_plies
+                if search_size > int(active_idx.numel()):
+                    search_plies = torch.cat(
+                        (
+                            search_plies,
+                            torch.full(
+                                (search_size - int(active_idx.numel()),),
+                                int(temperature_threshold),
+                                dtype=search_plies.dtype,
+                                device=dev,
+                            ),
+                        )
+                    )
+            else:
+                search_states = active_states
+                search_size = int(active_idx.numel())
+                search_plies = active_plies
+            search_temps = torch.where(
+                search_plies < int(temperature_threshold),
+                torch.full_like(search_plies, float(temperature_init), dtype=torch.float32),
+                torch.full_like(search_plies, float(temperature_final), dtype=torch.float32),
             )
-            active_force_uniform = (
-                active_plies < opening_random_n if opening_random_n > 0 else None
+            search_force_uniform = (
+                search_plies < opening_random_n if opening_random_n > 0 else None
             )
             with _nvtx_range("v1.search_batch"):
                 search = mcts.search_batch(
-                    active_states,
-                    temperatures=active_temps,
+                    search_states,
+                    temperatures=search_temps,
                     add_dirichlet_noise=add_dirichlet_noise,
-                    force_uniform_random_mask=active_force_uniform,
+                    force_uniform_random_mask=search_force_uniform,
                 )
+                if backend == "cuda_tree" and search_size != int(active_idx.numel()):
+                    search = _select_search_rows(
+                        search,
+                        torch.arange(
+                            int(active_idx.numel()), dtype=torch.int64, device=dev
+                        ),
+                    )
 
             step_indices = buffer.append_steps(
                 model_input=search.model_input,
@@ -193,11 +309,16 @@ def self_play_v1_gpu(
                 policy_dense=search.policy_dense,
                 player_sign=active_states.current_player,
             )
-            step_positions = step_counts.index_select(0, active_idx)
-            step_index_matrix[active_idx, step_positions] = step_indices
+            trajectory_ids = (
+                slot_game_ids.index_select(0, active_idx)
+                if backend == "cuda_tree"
+                else active_idx
+            )
+            step_positions = step_counts.index_select(0, trajectory_ids)
+            step_index_matrix[trajectory_ids, step_positions] = step_indices
             step_counts.index_add_(
                 0,
-                active_idx,
+                trajectory_ids,
                 torch.ones((int(active_idx.numel()),), dtype=torch.int64, device=dev),
             )
             with _nvtx_range("v1.self_play_step_inplace"), _timed("self_play_step_ms"):
@@ -243,20 +364,57 @@ def self_play_v1_gpu(
                     soft_value_k=float(soft_value_k),
                 ).to(torch.float32)
                 with _nvtx_range("v1.finalize_trajectory_inplace"), _timed("finalize_ms"):
+                    trajectory_finalize_slots = (
+                        slot_game_ids.index_select(0, finalize_slots)
+                        if backend == "cuda_tree"
+                        else finalize_slots
+                    )
                     finalized_slots, finalized_lengths, outcome_delta = buffer.finalize_games_inplace(
                         step_index_matrix=step_index_matrix,
                         step_counts=step_counts,
-                        slots=finalize_slots,
+                        slots=trajectory_finalize_slots,
                         result_from_black=result_local,
                         soft_value_from_black=soft_local,
                     )
                 if int(finalized_slots.numel()) > 0:
-                    global_slots = finalized_slots + int(wave_base)
+                    global_slots = (
+                        finalized_slots
+                        if backend == "cuda_tree"
+                        else finalized_slots + int(wave_base)
+                    )
                     game_lengths.index_copy_(0, global_slots, finalized_lengths)
                 outcome_counts.add_(outcome_delta)
 
+                if backend == "cuda_tree":
+                    finished_count = int(finalize_slots.numel())
+                    completed_games += finished_count
+                    refill_count = min(
+                        finished_count, int(num_games) - int(next_game_id)
+                    )
+                    if refill_count > 0:
+                        refill_slots = finalize_slots[:refill_count]
+                        refill_ids = torch.arange(
+                            next_game_id,
+                            next_game_id + refill_count,
+                            dtype=torch.int64,
+                            device=dev,
+                        )
+                        fresh = GpuStateBatch.initial(dev, batch_size=refill_count)
+                        for field in fresh.__dataclass_fields__:
+                            getattr(states, field).index_copy_(
+                                0, refill_slots, getattr(fresh, field)
+                            )
+                        slot_game_ids.index_copy_(0, refill_slots, refill_ids)
+                        plies.index_fill_(0, refill_slots, 0)
+                        done.index_fill_(0, refill_slots, False)
+                        next_game_id += refill_count
+
         if verbose:
-            completed = min(wave_base + wave_games, int(num_games))
+            completed = (
+                completed_games
+                if backend == "cuda_tree"
+                else min(wave_base + wave_games, int(num_games))
+            )
             black_wins = int(outcome_counts[0].item())
             white_wins = int(outcome_counts[1].item())
             draws = int(outcome_counts[2].item())
@@ -268,7 +426,27 @@ def self_play_v1_gpu(
     elapsed = max(1e-9, time.perf_counter() - started)
     _drain_timing_events(force=True)
     batch = buffer.build()
-    mcts_timing = mcts.get_timing(reset=False)
+    if backend == "cuda_tree":
+        cuda_tree_metrics = mcts.metrics()
+        mcts_timing = {
+            "timing_ms": {},
+            "timing_calls": {},
+            "counters": {
+                key: int(value)
+                for key, value in cuda_tree_metrics.items()
+                if isinstance(value, int)
+            },
+        }
+        mcts_metrics = {
+            **cuda_tree_metrics,
+            "search_backend": "cuda_tree",
+            "leaf_evaluations_per_sec": float(
+                int(cuda_tree_metrics.get("leaf_evaluations", 0)) / elapsed
+            ),
+        }
+    else:
+        mcts_timing = mcts.get_timing(reset=False)
+        mcts_metrics = {"search_backend": "cuda_root"}
     for key, value in mcts_timing.get("timing_ms", {}).items():
         step_timing_ms[key] = float(step_timing_ms.get(key, 0.0) + float(value))
     for key, value in mcts_timing.get("timing_calls", {}).items():
@@ -303,5 +481,6 @@ def self_play_v1_gpu(
         step_timing_calls={k: int(step_timing_calls.get(k, 0)) for k in tracked_keys},
         mcts_counters={k: int(v) for k, v in mcts_timing.get("counters", {}).items()},
         piece_delta_buckets=piece_delta_buckets,
+        mcts_metrics=mcts_metrics,
     )
     return batch, stats
