@@ -1,6 +1,15 @@
 # TODOS
 
-TODO以产生时间为准。最近审查：2026.07.21
+TODO以产生时间为准。最近审查：2026.08.01
+
+### 2026.08.01 — RTX 3060 CUDA full-MCTS 持久子树复用
+
+- [x] `cuda_tree` 在实际落子后保留选中 child 的完整可达子树，并在 GPU arena 内压缩为下一根节点；保留 `N/W`、prior、terminal、行动方和延迟分配状态，不退化为只缓存 root。
+- [x] 固定 sim64 时，每个新局面继续执行 64 次 simulation；复用统计只改变起始树状态，不降低 simulation 数、不采用 virtual loss，也不改变 220 维动作编码或换手才翻转的价值语义。
+- [x] 支持 fixed-slot refill 与尾部 batch 收缩：新棋局槽位显式重置，存活槽位迁移子树，任何容量重置/复用失败必须计数且不可静默。
+- [x] 用无噪声 FP32 对 portable C++ 做至少连续两步的 visits、root policy、动作、root value 和树节点统计对拍，并覆盖同玩家连续阶段。
+- [ ] 通过 CUDA 单测、V1 tensor self-play smoke 和 sim64 完整棋局性能冒烟后，记录复用命中率、保留节点数、容量重置、arena 峰值及持续吞吐。
+  - 当前部分证据：best checkpoint 连续 12 步 FP32 visits/action/root value 完全一致；512×sim64×64-ply 为 32,768/32,768 reuse hit，miss/reset/state-mismatch/overflow/illegal/non-finite/fallback 均为 0，最大保留 266 节点。仍缺自然结束完整棋局和 30 分钟 ≥1000 positions/s 验收。
 
 ### 2026.07.21 — 正确的 CPU 搜索参考实现与 macOS Apple Silicon MPS 训练
 

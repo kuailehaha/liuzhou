@@ -28,7 +28,7 @@ def _arena(batch: int = 1, nodes: int = 5, actions: int = 4):
     return v0_core, arena
 
 
-def _select(v0_core, arena, exploration: float = 1.0):
+def _select(v0_core, arena, exploration: float = 1.0, max_path_length: int = 0):
     return v0_core.cuda_tree_select(
         arena["priors"],
         arena["legal"],
@@ -42,6 +42,7 @@ def _select(v0_core, arena, exploration: float = 1.0):
         arena["action"],
         arena["count"],
         exploration,
+        max_path_length,
     )
 
 
@@ -92,6 +93,53 @@ def test_cuda_tree_backup_flips_only_when_side_to_move_changes():
         [-0.25, 0.25, 0.0, 0.0, 0.0],
         [0.5, 0.5, 0.0, 0.0, 0.0],
     ]
+
+
+def test_cuda_tree_path_capacity_is_independent_from_arena_capacity():
+    v0_core, arena = _arena(nodes=9)
+    arena["player"][0, 0] = 1
+    arena["expanded"][0, 0] = True
+    arena["legal"][0, 0, 0] = True
+    arena["priors"][0, 0, 0] = 1.0
+
+    leaf, paths, lengths, _actions, _allocated, overflow = _select(
+        v0_core, arena, max_path_length=3
+    )
+    assert tuple(paths.shape) == (1, 3)
+    assert lengths.cpu().tolist() == [2]
+    assert overflow.cpu().tolist() == [False]
+    arena["player"][0, leaf[0].to(torch.int64)] = -1
+    v0_core.cuda_tree_backup(
+        paths,
+        lengths,
+        arena["player"],
+        torch.tensor([0.5], dtype=torch.float64, device="cuda"),
+        arena["visits"],
+        arena["value_sum"],
+    )
+    assert arena["visits"][0, :2].cpu().tolist() == [1, 1]
+
+
+def test_cuda_tree_reports_path_capacity_overflow_instead_of_truncating_silently():
+    v0_core, arena = _arena(nodes=9)
+    arena["count"][0] = 3
+    for node in range(3):
+        arena["player"][0, node] = 1
+        arena["expanded"][0, node] = True
+        arena["legal"][0, node, 0] = True
+        arena["priors"][0, node, 0] = 1.0
+    arena["children"][0, 0, 0] = 1
+    arena["children"][0, 1, 0] = 2
+    arena["parent"][0, 1] = 0
+    arena["parent"][0, 2] = 1
+
+    _leaf, paths, lengths, _actions, allocated, overflow = _select(
+        v0_core, arena, max_path_length=2
+    )
+    assert tuple(paths.shape) == (1, 2)
+    assert lengths.cpu().tolist() == [2]
+    assert allocated.cpu().tolist() == [False]
+    assert overflow.cpu().tolist() == [True]
 
 
 def test_cuda_tree_visited_child_q_affects_next_puct_choice():

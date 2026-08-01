@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <tuple>
 
 #include <torch/extension.h>
@@ -28,7 +29,8 @@ cuda_tree_select(
     torch::Tensor node_parent,
     torch::Tensor node_action,
     torch::Tensor node_count,
-    double exploration_weight);
+    double exploration_weight,
+    int64_t max_path_length = 0);
 
 // Back up leaf values along paths produced by cuda_tree_select.  Values are
 // interpreted from the selected leaf's side-to-move perspective and are only

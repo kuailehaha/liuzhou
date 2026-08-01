@@ -105,6 +105,75 @@ class _CudaStateArena:
             target.index_copy_(0, indices, merged)
 
 
+class _CudaTreeArena:
+    """Fixed-capacity SoA tree storage whose rows survive real game moves."""
+
+    def __init__(self, roots: GpuStateBatch, max_nodes: int) -> None:
+        self.batch_size = int(roots.batch_size)
+        self.max_nodes = int(max_nodes)
+        self.device = roots.device
+        self.states = _CudaStateArena(roots, max_nodes=max_nodes)
+        node_shape = (self.batch_size, self.max_nodes)
+        edge_shape = (self.batch_size, self.max_nodes, TOTAL_ACTION_DIM)
+        self.priors = torch.zeros(edge_shape, dtype=torch.float32, device=self.device)
+        self.legal = torch.zeros(edge_shape, dtype=torch.bool, device=self.device)
+        self.metadata = torch.zeros(
+            (*edge_shape, 4), dtype=torch.int32, device=self.device
+        )
+        self.children = torch.full(
+            edge_shape, -1, dtype=torch.int32, device=self.device
+        )
+        self.visits = torch.zeros(node_shape, dtype=torch.int32, device=self.device)
+        self.value_sum = torch.zeros(
+            node_shape, dtype=torch.float64, device=self.device
+        )
+        self.initial_value = torch.zeros(
+            node_shape, dtype=torch.float64, device=self.device
+        )
+        self.terminal_value = torch.zeros(
+            node_shape, dtype=torch.float64, device=self.device
+        )
+        self.player = torch.zeros(node_shape, dtype=torch.int8, device=self.device)
+        self.expanded = torch.zeros(node_shape, dtype=torch.bool, device=self.device)
+        self.terminal = torch.zeros(node_shape, dtype=torch.bool, device=self.device)
+        self.parent = torch.full(
+            node_shape, -1, dtype=torch.int32, device=self.device
+        )
+        self.node_action = torch.full(
+            node_shape, -1, dtype=torch.int32, device=self.device
+        )
+        self.node_count = torch.ones(
+            (self.batch_size,), dtype=torch.int32, device=self.device
+        )
+        self.needs_init = torch.ones(
+            (self.batch_size,), dtype=torch.bool, device=self.device
+        )
+
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.priors,
+            self.legal,
+            self.metadata,
+            self.children,
+            self.visits,
+            self.value_sum,
+            self.initial_value,
+            self.terminal_value,
+            self.player,
+            self.expanded,
+            self.terminal,
+            self.parent,
+            self.node_action,
+            self.node_count,
+            self.needs_init,
+            *(getattr(self.states, field) for field in _STATE_FIELDS),
+        )
+
+    @property
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self.tensors())
+
+
 @dataclass
 class _ForwardGraphEntry:
     graph: torch.cuda.CUDAGraph
@@ -118,7 +187,15 @@ class _SearchGraphEntry:
     states: GpuStateBatch
     temperatures: torch.Tensor
     force_uniform_random_mask: torch.Tensor
+    arena: _CudaTreeArena
     outputs: RootSearchBatchOutput
+
+
+@dataclass
+class _AdvanceGraphEntry:
+    graph: torch.cuda.CUDAGraph
+    actions: torch.Tensor
+    arena: _CudaTreeArena
 
 
 class _CudaModelGraphRunner:
@@ -254,12 +331,35 @@ class CudaTreeMCTS:
             "fallback": 0,
             "graph_capture": 0,
             "graph_replay": 0,
+            "subtree_compactions": 0,
+            "subtree_reuse_hits": 0,
+            "subtree_reuse_misses": 0,
+            "subtree_retained_nodes": 0,
+            "subtree_max_retained_nodes": 0,
+            "subtree_layout_migrations": 0,
+            "subtree_capacity_resets": 0,
+            "subtree_state_mismatches": 0,
+            "subtree_graph_capture": 0,
+            "subtree_graph_replay": 0,
         }
         self._device_overflow = torch.zeros((), dtype=torch.int64, device=self.device)
         self._device_illegal = torch.zeros((), dtype=torch.int64, device=self.device)
         self._device_non_finite = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._device_reuse_hits = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._device_reuse_misses = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._device_retained_nodes = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._device_max_retained_nodes = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self._device_capacity_resets = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._device_state_mismatches = torch.zeros((), dtype=torch.int64, device=self.device)
         self._search_graphs: dict[tuple[int, bool], _SearchGraphEntry] = {}
         self._search_graph_warmed: set[tuple[int, bool]] = set()
+        self._advance_graphs: dict[int, _AdvanceGraphEntry] = {}
+        self._advance_graph_warmed: set[int] = set()
+        self._arenas: dict[int, _CudaTreeArena] = {}
+        self._tree_ids: dict[int, torch.Tensor] = {}
+        self._active_batch_size: Optional[int] = None
         self._peak_arena_bytes = 0
         self.last_root_visits: Optional[torch.Tensor] = None
         self.last_root_priors: Optional[torch.Tensor] = None
@@ -372,6 +472,7 @@ class CudaTreeMCTS:
     def _search_batch_impl(
         self,
         states: GpuStateBatch,
+        arena: _CudaTreeArena,
         temperatures: Optional[float | torch.Tensor | list] = None,
         add_dirichlet_noise: Optional[bool] = None,
         force_uniform_random_mask: Optional[torch.Tensor] = None,
@@ -380,48 +481,24 @@ class CudaTreeMCTS:
             states = states.to(self.device)
         batch_size = int(states.batch_size)
         simulations = int(self.config.num_simulations)
-        max_nodes = simulations + 1
+        max_nodes = int(arena.max_nodes)
         action_dim = TOTAL_ACTION_DIM
-        state_arena = _CudaStateArena(states, max_nodes=max_nodes)
-        shape_nodes = (batch_size, max_nodes)
-        shape_edges = (batch_size, max_nodes, action_dim)
-        priors = torch.zeros(shape_edges, dtype=torch.float32, device=self.device)
-        legal = torch.zeros(shape_edges, dtype=torch.bool, device=self.device)
-        metadata = torch.zeros((*shape_edges, 4), dtype=torch.int32, device=self.device)
-        children = torch.full(shape_edges, -1, dtype=torch.int32, device=self.device)
-        visits = torch.zeros(shape_nodes, dtype=torch.int32, device=self.device)
-        value_sum = torch.zeros(shape_nodes, dtype=torch.float64, device=self.device)
-        initial_value = torch.zeros(shape_nodes, dtype=torch.float64, device=self.device)
-        terminal_value = torch.zeros(shape_nodes, dtype=torch.float64, device=self.device)
-        player = torch.zeros(shape_nodes, dtype=torch.int8, device=self.device)
-        expanded = torch.zeros(shape_nodes, dtype=torch.bool, device=self.device)
-        terminal = torch.zeros(shape_nodes, dtype=torch.bool, device=self.device)
-        parent = torch.full(shape_nodes, -1, dtype=torch.int32, device=self.device)
-        node_action = torch.full(shape_nodes, -1, dtype=torch.int32, device=self.device)
-        node_count = torch.ones((batch_size,), dtype=torch.int32, device=self.device)
+        state_arena = arena.states
+        priors = arena.priors
+        legal = arena.legal
+        metadata = arena.metadata
+        children = arena.children
+        visits = arena.visits
+        value_sum = arena.value_sum
+        initial_value = arena.initial_value
+        terminal_value = arena.terminal_value
+        player = arena.player
+        expanded = arena.expanded
+        terminal = arena.terminal
+        parent = arena.parent
+        node_action = arena.node_action
+        node_count = arena.node_count
         tree_indices = torch.arange(batch_size, device=self.device, dtype=torch.int64)
-
-        arena_tensors = (
-            priors,
-            legal,
-            metadata,
-            children,
-            visits,
-            value_sum,
-            initial_value,
-            terminal_value,
-            player,
-            expanded,
-            terminal,
-            parent,
-            node_action,
-            node_count,
-            *(getattr(state_arena, field) for field in _STATE_FIELDS),
-        )
-        self._peak_arena_bytes = max(
-            self._peak_arena_bytes,
-            sum(t.numel() * t.element_size() for t in arena_tensors),
-        )
 
         root_inputs, root_legal, root_metadata, root_priors, root_network_values = self._evaluate(states)
         root_state_terminal, root_terminal_values = self._terminal_mask_and_value(states)
@@ -436,15 +513,58 @@ class CudaTreeMCTS:
                 root_network_values.to(torch.float64),
             ),
         )
+        root_matches = torch.ones((batch_size,), dtype=torch.bool, device=self.device)
+        for field in _STATE_FIELDS:
+            stored = getattr(state_arena, field)[:, 0]
+            incoming = getattr(states, field)
+            root_matches &= stored.eq(incoming).view(batch_size, -1).all(dim=1)
+        state_mismatch = ~arena.needs_init & ~root_matches
+        self._device_state_mismatches.add_(state_mismatch.sum(dtype=torch.int64))
+        capacity_reset = node_count.gt(max_nodes - simulations)
+        self._device_capacity_resets.add_(capacity_reset.sum(dtype=torch.int64))
+        initialize = arena.needs_init | capacity_reset | state_mismatch
         effective_root_legal = root_legal.to(torch.bool) & ~root_terminal.view(-1, 1)
-        priors[:, 0].copy_(root_priors.to(torch.float32) * effective_root_legal)
-        legal[:, 0].copy_(effective_root_legal)
-        metadata[:, 0].copy_(root_metadata.to(torch.int32))
-        player[:, 0].copy_(states.current_player.to(torch.int8))
-        expanded[:, 0] = True
-        terminal[:, 0].copy_(root_terminal)
-        initial_value[:, 0].copy_(root_values)
-        terminal_value[:, 0].copy_(root_values)
+        init_edges = initialize.view(-1, 1)
+        priors[:, 0].copy_(
+            torch.where(
+                init_edges,
+                root_priors.to(torch.float32) * effective_root_legal,
+                priors[:, 0],
+            )
+        )
+        legal[:, 0].copy_(torch.where(init_edges, effective_root_legal, legal[:, 0]))
+        metadata[:, 0].copy_(
+            torch.where(initialize.view(-1, 1, 1), root_metadata.to(torch.int32), metadata[:, 0])
+        )
+        children[:, 0].copy_(
+            torch.where(init_edges, torch.full_like(children[:, 0], -1), children[:, 0])
+        )
+        visits[:, 0].copy_(torch.where(initialize, torch.zeros_like(visits[:, 0]), visits[:, 0]))
+        value_sum[:, 0].copy_(
+            torch.where(initialize, torch.zeros_like(value_sum[:, 0]), value_sum[:, 0])
+        )
+        player[:, 0].copy_(
+            torch.where(initialize, states.current_player.to(torch.int8), player[:, 0])
+        )
+        expanded[:, 0].copy_(torch.where(initialize, torch.ones_like(expanded[:, 0]), expanded[:, 0]))
+        terminal[:, 0].copy_(torch.where(initialize, root_terminal, terminal[:, 0]))
+        initial_value[:, 0].copy_(
+            torch.where(initialize, root_values, initial_value[:, 0])
+        )
+        terminal_value[:, 0].copy_(
+            torch.where(initialize, root_values, terminal_value[:, 0])
+        )
+        parent[:, 0].fill_(-1)
+        node_action[:, 0].copy_(
+            torch.where(initialize, torch.full_like(node_action[:, 0], -1), node_action[:, 0])
+        )
+        node_count.copy_(torch.where(initialize, torch.ones_like(node_count), node_count))
+        for field in _STATE_FIELDS:
+            root_state = getattr(state_arena, field)[:, 0]
+            incoming = getattr(states, field)
+            shape = (batch_size,) + (1,) * (incoming.dim() - 1)
+            root_state.copy_(torch.where(initialize.view(shape), incoming, root_state))
+        arena.needs_init.fill_(False)
 
         use_noise = self.config.add_dirichlet_noise if add_dirichlet_noise is None else bool(add_dirichlet_noise)
         if use_noise:
@@ -470,6 +590,7 @@ class CudaTreeMCTS:
                 node_action,
                 node_count,
                 float(self.config.exploration_weight),
+                2 * simulations + 1,
             )
             leaf_long = leaf.to(torch.int64)
             parent_nodes = parent[tree_indices, leaf_long].to(torch.int64).clamp_min(0)
@@ -559,9 +680,9 @@ class CudaTreeMCTS:
             torch.where(root_players.eq(child_players), child_mean, -child_mean),
             torch.zeros_like(child_mean),
         ).to(torch.float32)
-        self.last_root_visits = child_visits.detach()
-        self.last_root_priors = root_priors.detach()
-        self.last_root_action_values = action_values.detach()
+        self.last_root_visits = child_visits.detach().clone()
+        self.last_root_priors = root_priors.detach().clone()
+        self.last_root_action_values = action_values.detach().clone()
         root_visits = visits[:, 0]
         root_values_out = torch.where(
             root_visits.gt(0),
@@ -615,10 +736,10 @@ class CudaTreeMCTS:
 
         return RootSearchBatchOutput(
             model_input=root_inputs.detach(),
-            legal_mask=root_legal.detach(),
+            legal_mask=root_legal.detach().clone(),
             policy_dense=policy_dense.detach(),
             root_value=root_values_out.detach(),
-            terminal_mask=terminal[:, 0].detach(),
+            terminal_mask=terminal[:, 0].detach().clone(),
             chosen_action_indices=chosen_indices.detach(),
             chosen_action_codes=chosen_codes.detach(),
             chosen_valid_mask=valid_roots.detach(),
@@ -635,12 +756,281 @@ class CudaTreeMCTS:
             **{field: torch.empty_like(getattr(source, field)) for field in _STATE_FIELDS}
         )
 
+    def _new_arena(self, states: GpuStateBatch) -> _CudaTreeArena:
+        # One search can allocate at most ``num_simulations`` nodes.  Five
+        # additional budgets retain the selected descendants observed in
+        # sustained sim64 play; rows that still outgrow this fixed bound are
+        # reset explicitly and counted before another search starts.
+        max_nodes = 6 * int(self.config.num_simulations) + 1
+        arena = _CudaTreeArena(states, max_nodes=max_nodes)
+        self._peak_arena_bytes = max(self._peak_arena_bytes, arena.nbytes)
+        return arena
+
+    @staticmethod
+    def _copy_arena_rows(
+        destination: _CudaTreeArena,
+        source: _CudaTreeArena,
+        source_rows: torch.Tensor,
+        found: torch.Tensor,
+    ) -> None:
+        row_mask = found.to(torch.bool)
+        for destination_tensor, source_tensor in zip(
+            destination.tensors(), source.tensors()
+        ):
+            gathered = source_tensor.index_select(0, source_rows)
+            shape = (destination.batch_size,) + (1,) * (gathered.dim() - 1)
+            destination_tensor.copy_(
+                torch.where(row_mask.view(shape), gathered, destination_tensor)
+            )
+
+    def _drop_batch_arena(self, batch_size: int) -> None:
+        self._arenas.pop(int(batch_size), None)
+        self._tree_ids.pop(int(batch_size), None)
+        for key in [key for key in self._search_graphs if key[0] == int(batch_size)]:
+            del self._search_graphs[key]
+        self._search_graph_warmed = {
+            key for key in self._search_graph_warmed if key[0] != int(batch_size)
+        }
+        self._advance_graphs.pop(int(batch_size), None)
+        self._advance_graph_warmed.discard(int(batch_size))
+
+    def _prepare_arena_layout(
+        self,
+        states: GpuStateBatch,
+        tree_ids: torch.Tensor,
+        layout_changed: bool,
+    ) -> _CudaTreeArena:
+        batch_size = int(states.batch_size)
+        existing = self._arenas.get(batch_size)
+        if existing is None:
+            existing = self._new_arena(states)
+            source_batch = self._active_batch_size
+            source = (
+                self._arenas.get(int(source_batch))
+                if source_batch is not None
+                else None
+            )
+            source_ids = (
+                self._tree_ids.get(int(source_batch))
+                if source_batch is not None
+                else None
+            )
+            if layout_changed and source is not None and source_ids is not None:
+                matches = (
+                    tree_ids.view(-1, 1).eq(source_ids.view(1, -1))
+                    & tree_ids.view(-1, 1).ge(0)
+                )
+                found = matches.any(dim=1)
+                source_rows = matches.to(torch.int64).argmax(dim=1)
+                self._copy_arena_rows(existing, source, source_rows, found)
+                self._counters["subtree_layout_migrations"] += 1
+            self._arenas[batch_size] = existing
+            self._tree_ids[batch_size] = tree_ids.clone()
+            if (
+                layout_changed
+                and source_batch is not None
+                and int(source_batch) != batch_size
+            ):
+                self._drop_batch_arena(int(source_batch))
+            self._active_batch_size = batch_size
+            return existing
+        if not layout_changed:
+            self._active_batch_size = batch_size
+            return existing
+
+        source_batch = self._active_batch_size
+        source = self._arenas.get(int(source_batch)) if source_batch is not None else None
+        source_ids = self._tree_ids.get(int(source_batch)) if source_batch is not None else None
+        replacement = self._new_arena(states)
+        if source is not None and source_ids is not None:
+            matches = tree_ids.view(-1, 1).eq(source_ids.view(1, -1)) & tree_ids.view(-1, 1).ge(0)
+            found = matches.any(dim=1)
+            source_rows = matches.to(torch.int64).argmax(dim=1)
+            self._copy_arena_rows(replacement, source, source_rows, found)
+        self._arenas[batch_size] = replacement
+        self._tree_ids[batch_size] = tree_ids.clone()
+        self._active_batch_size = batch_size
+        for key in [key for key in self._search_graphs if key[0] == batch_size]:
+            del self._search_graphs[key]
+        self._search_graph_warmed = {
+            key for key in self._search_graph_warmed if key[0] != batch_size
+        }
+        self._advance_graphs.pop(batch_size, None)
+        self._advance_graph_warmed.discard(batch_size)
+        if source_batch is not None and int(source_batch) != batch_size:
+            self._drop_batch_arena(int(source_batch))
+        self._counters["subtree_layout_migrations"] += 1
+        return replacement
+
+    @staticmethod
+    def _gather_compacted_nodes(
+        tensor: torch.Tensor,
+        new_to_old: torch.Tensor,
+        valid_destinations: torch.Tensor,
+        fill_value: int | float | bool,
+    ) -> torch.Tensor:
+        shape = (*new_to_old.shape, *((1,) * (tensor.dim() - 2)))
+        gather_index = new_to_old.view(shape).expand_as(tensor)
+        gathered = torch.gather(tensor, 1, gather_index)
+        mask_shape = (*valid_destinations.shape, *((1,) * (tensor.dim() - 2)))
+        return torch.where(
+            valid_destinations.view(mask_shape),
+            gathered,
+            torch.full_like(gathered, fill_value),
+        )
+
+    def _advance_roots_impl(
+        self, arena: _CudaTreeArena, actions: torch.Tensor
+    ) -> None:
+        batch_size = int(arena.batch_size)
+        tree_indices = torch.arange(batch_size, device=self.device, dtype=torch.int64)
+        valid_action = actions.ge(0) & actions.lt(TOTAL_ACTION_DIM)
+        safe_actions = actions.clamp(min=0, max=TOTAL_ACTION_DIM - 1)
+        selected = arena.children[:, 0][tree_indices, safe_actions].to(torch.int64)
+        valid = valid_action & selected.ge(0)
+
+        node_ids = torch.arange(
+            arena.max_nodes, device=self.device, dtype=torch.int64
+        ).view(1, -1).expand(batch_size, -1)
+        up = arena.parent.to(torch.int64).clamp_min(0)
+        reachable = node_ids.eq(selected.view(-1, 1))
+        rounds = max(1, int(arena.max_nodes - 1).bit_length())
+        for _ in range(rounds):
+            reachable = reachable | torch.gather(reachable, 1, up)
+            up = torch.gather(up, 1, up)
+        reachable &= valid.view(-1, 1)
+        reachable &= node_ids.lt(arena.node_count.to(torch.int64).view(-1, 1))
+        retained = reachable.sum(dim=1, dtype=torch.int64)
+        valid &= retained.gt(0)
+
+        sort_keys = torch.where(reachable, node_ids, node_ids + arena.max_nodes)
+        new_to_old = torch.argsort(sort_keys, dim=1)
+        new_positions = torch.arange(
+            arena.max_nodes, device=self.device, dtype=torch.int64
+        ).view(1, -1)
+        valid_destinations = new_positions.lt(retained.view(-1, 1)) & valid.view(-1, 1)
+        ranks = reachable.to(torch.int64).cumsum(dim=1) - 1
+        old_to_new = torch.where(reachable, ranks, torch.full_like(ranks, -1))
+
+        for tensor, fill in (
+            (arena.priors, 0.0),
+            (arena.legal, False),
+            (arena.metadata, 0),
+            (arena.visits, 0),
+            (arena.value_sum, 0.0),
+            (arena.initial_value, 0.0),
+            (arena.terminal_value, 0.0),
+            (arena.player, 0),
+            (arena.expanded, False),
+            (arena.terminal, False),
+            (arena.node_action, -1),
+        ):
+            tensor.copy_(
+                self._gather_compacted_nodes(
+                    tensor, new_to_old, valid_destinations, fill
+                )
+            )
+
+        old_children = self._gather_compacted_nodes(
+            arena.children, new_to_old, valid_destinations, -1
+        )
+        mapped_children = torch.gather(
+            old_to_new,
+            1,
+            old_children.to(torch.int64).clamp_min(0).view(batch_size, -1),
+        ).view_as(old_children)
+        arena.children.copy_(
+            torch.where(old_children.ge(0), mapped_children.to(torch.int32), old_children)
+        )
+        old_parent = self._gather_compacted_nodes(
+            arena.parent, new_to_old, valid_destinations, -1
+        )
+        mapped_parent = torch.gather(
+            old_to_new, 1, old_parent.to(torch.int64).clamp_min(0)
+        )
+        arena.parent.copy_(
+            torch.where(old_parent.ge(0), mapped_parent.to(torch.int32), old_parent)
+        )
+        arena.parent[:, 0].fill_(-1)
+        arena.node_action[:, 0].fill_(-1)
+        for field in _STATE_FIELDS:
+            tensor = getattr(arena.states, field)
+            tensor.copy_(
+                self._gather_compacted_nodes(
+                    tensor, new_to_old, valid_destinations, False
+                )
+            )
+        arena.node_count.copy_(
+            torch.where(valid, retained.to(torch.int32), torch.ones_like(arena.node_count))
+        )
+        arena.needs_init.copy_(~valid)
+        self._device_reuse_hits.add_(valid.sum(dtype=torch.int64))
+        self._device_reuse_misses.add_((~valid).sum(dtype=torch.int64))
+        self._device_retained_nodes.add_(
+            torch.where(valid, retained, torch.zeros_like(retained)).sum(dtype=torch.int64)
+        )
+        self._device_max_retained_nodes.copy_(
+            torch.maximum(
+                self._device_max_retained_nodes,
+                torch.where(valid, retained, torch.zeros_like(retained)).max(),
+            )
+        )
+
+    def advance_roots(self, actions: torch.Tensor) -> None:
+        """Keep every node reachable from the selected child on the GPU."""
+        if self._active_batch_size is None:
+            raise RuntimeError("advance_roots requires a preceding search_batch call")
+        batch_size = int(self._active_batch_size)
+        arena = self._arenas[batch_size]
+        actions = actions.to(self.device, dtype=torch.int64).view(-1)
+        if int(actions.numel()) != batch_size:
+            raise ValueError("advance_roots actions must match the active tree batch")
+        self._counters["subtree_compactions"] += 1
+        entry = self._advance_graphs.get(batch_size)
+        if entry is not None and entry.arena is arena:
+            entry.actions.copy_(actions)
+            entry.graph.replay()
+            self._counters["subtree_graph_replay"] += 1
+            return
+        if batch_size not in self._advance_graph_warmed:
+            self._advance_graph_warmed.add(batch_size)
+            self._advance_roots_impl(arena, actions)
+            return
+
+        static_actions = actions.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph), torch.inference_mode():
+            self._advance_roots_impl(arena, static_actions)
+        self._advance_graphs[batch_size] = _AdvanceGraphEntry(
+            graph=graph,
+            actions=static_actions,
+            arena=arena,
+        )
+        self._counters["subtree_graph_capture"] += 1
+        graph.replay()
+        self._counters["subtree_graph_replay"] += 1
+
+    def reset_tree_rows(self, rows: torch.Tensor) -> None:
+        """Invalidate refilled fixed slots; their next external state becomes root."""
+        if self._active_batch_size is None:
+            return
+        arena = self._arenas[int(self._active_batch_size)]
+        rows = rows.to(self.device, dtype=torch.int64).view(-1)
+        if int(rows.numel()) == 0:
+            return
+        if bool(rows.lt(0).any().item()) or bool(rows.ge(arena.batch_size).any().item()):
+            raise ValueError("reset_tree_rows row is out of range")
+        arena.needs_init.index_fill_(0, rows, True)
+        arena.node_count.index_fill_(0, rows, 1)
+
     def search_batch(
         self,
         states: GpuStateBatch,
         temperatures: Optional[float | torch.Tensor | list] = None,
         add_dirichlet_noise: Optional[bool] = None,
         force_uniform_random_mask: Optional[torch.Tensor] = None,
+        tree_ids: Optional[torch.Tensor] = None,
+        tree_layout_changed: bool = False,
     ) -> RootSearchBatchOutput:
         if states.device != self.device:
             states = states.to(self.device)
@@ -663,6 +1053,18 @@ class CudaTreeMCTS:
         )
         if int(force_uniform.numel()) != batch_size:
             raise ValueError("force_uniform_random_mask must match the state batch")
+        normalized_tree_ids = (
+            torch.arange(batch_size, dtype=torch.int64, device=self.device)
+            if tree_ids is None
+            else tree_ids.to(self.device, dtype=torch.int64).view(-1)
+        )
+        if int(normalized_tree_ids.numel()) != batch_size:
+            raise ValueError("tree_ids must match the state batch")
+        arena = self._prepare_arena_layout(
+            states,
+            normalized_tree_ids,
+            bool(tree_layout_changed),
+        )
 
         key = (batch_size, use_noise)
         self._counters["leaf_evaluations"] += batch_size * (
@@ -684,6 +1086,7 @@ class CudaTreeMCTS:
             self._search_graph_warmed.add(key)
             return self._search_batch_impl(
                 states,
+                arena,
                 temperatures=temperature_values,
                 add_dirichlet_noise=use_noise,
                 force_uniform_random_mask=force_uniform,
@@ -697,6 +1100,7 @@ class CudaTreeMCTS:
         with torch.cuda.graph(graph), torch.inference_mode():
             outputs = self._search_batch_impl(
                 static_states,
+                arena,
                 temperatures=static_temperatures,
                 add_dirichlet_noise=use_noise,
                 force_uniform_random_mask=static_force_uniform,
@@ -706,6 +1110,7 @@ class CudaTreeMCTS:
             states=static_states,
             temperatures=static_temperatures,
             force_uniform_random_mask=static_force_uniform,
+            arena=arena,
             outputs=outputs,
         )
         self._counters["graph_capture"] += 1
@@ -720,8 +1125,28 @@ class CudaTreeMCTS:
         self._counters["arena_overflow"] = int(self._device_overflow.item())
         self._counters["illegal_actions"] = int(self._device_illegal.item())
         self._counters["non_finite"] = int(self._device_non_finite.item())
+        self._counters["subtree_reuse_hits"] = int(self._device_reuse_hits.item())
+        self._counters["subtree_reuse_misses"] = int(self._device_reuse_misses.item())
+        self._counters["subtree_retained_nodes"] = int(
+            self._device_retained_nodes.item()
+        )
+        self._counters["subtree_max_retained_nodes"] = int(
+            self._device_max_retained_nodes.item()
+        )
+        self._counters["subtree_capacity_resets"] = int(
+            self._device_capacity_resets.item()
+        )
+        self._counters["subtree_state_mismatches"] = int(
+            self._device_state_mismatches.item()
+        )
         return {
             **self._counters,
             "arena_peak_bytes": int(self._peak_arena_bytes),
+            "cuda_peak_allocated_bytes": int(
+                torch.cuda.max_memory_allocated(self.device)
+            ),
+            "cuda_peak_reserved_bytes": int(
+                torch.cuda.max_memory_reserved(self.device)
+            ),
             "precision": str(self.config.precision),
         }

@@ -2062,8 +2062,11 @@ Data-effectiveness standard fields (must be preserved in reports):
 
 ### RTX 3060 GPU-resident full-tree MCTS (2026-08-01)
 
-- 新增显式 `--search_backend cuda_tree`。每棵树保持顺序 PUCT，树间批量并行；SoA arena、合法动作、先验、visit/value、父子关系和状态均驻留 CUDA。arena 固定为 `simulations + 1` 个节点，延迟分配 child；backup 只在 parent/child 行动方变化时翻转，PUCT tie 使用较小 action index。
+- 新增显式 `--search_backend cuda_tree`。每棵树保持顺序 PUCT，树间批量并行；SoA arena、合法动作、先验、visit/value、父子关系和状态均驻留 CUDA。backup 只在 parent/child 行动方变化时翻转，PUCT tie 使用较小 action index。
 - `cuda_tree` 使用 FP32 prior/策略与 FP64 value sum，支持 `fp32`/`amp_fp16` 模型推理。固定 batch 的完整搜索（状态编码、legal/apply、64 次 select/eval/backup 和输出）由外层 CUDA Graph 捕获；模型副本采用 channels-last、FP16、TorchScript freeze/optimize。self-play 使用固定槽位并在棋局完成后立即补入下一局；最后无新局可补时按 `512→256→128→...` 幂次 bucket 缩小 Graph，只把活跃行写入轨迹，避免逐个 active-count 重捕获或让少数尾局持续计算整批。
+- 真实落子后显式执行 `advance_roots`：选中 child 的全部可达节点在 GPU 上重排到 arena 前缀，保留 `N/W`、prior、terminal、行动方、父子关系和节点状态；压缩过程本身由独立 CUDA Graph replay。新局 fixed slot 显式失效，尾部 bucket 通过稳定 tree id 迁移存活行并释放旧尺寸 arena/Graph。每次搜索还逐字段核对外部真实状态和缓存 root，任何 mismatch、未展开随机动作、容量重置或 path overflow 都有独立计数。
+- sim64 的生产 arena 固定为 `6 * simulations + 1 = 385` 节点，选择路径缓冲与 arena 容量解耦为 `2 * simulations + 1 = 129`；`cuda_tree_select` 新增向后兼容的可选 path capacity，backup 支持 path 宽度小于 arena 宽度。512 树、64 ply 实测最大保留 266 节点，容量安全线为 321；32,768/32,768 次 advance 命中，miss/capacity-reset/state-mismatch/path-overflow/illegal/non-finite/fallback 均为 0。arena 本体约 1.05 GiB，进程峰值 allocated/reserved 约 3.16/3.91 GiB，满足 6 GiB 卡的显存余量要求。
+- 无噪声 FP32 使用 `models/best_model.pt` 连续 12 个真实落子与 portable C++ 对拍，每一步 visits 和动作完全一致，root value 绝对差均为 0；另有连续 `MARK_SELECTION` 同玩家阶段跨步回归。512×sim64 的捕获后 replay 搜索为约 `1140–1151 positions/s`，加 GPU 子树压缩后为 `1054–1065 positions/s`；包含 warmup/capture 的 64-ply 热浸为 `393.35 positions/s`，仍受 RTX 3060 Laptop 持续热降频影响，不能替代 30 分钟性能验收。
 - 220 维策略投影改为单 CUDA kernel 完成 movement 投影、legal mask 和 row softmax；FP32 与 ATen 参考最大概率差 `5.96e-8`，FP16 最大差 `4.88e-4`，NaN/Inf 诊断行为保持一致。真实 checkpoint、48 个随机合法状态、sim64 下，相同精度的融合/ATen 路径 visits 与动作均完全一致。
 - Windows CUDA 12.6 / PyTorch 2.8 / sm86 fresh build 成功。focused CUDA/V1 suite 为 `20 passed`；扩大 legal/apply/schema/portable suite 为 `40 passed, 2 failed`，仅失败于既有 `tests/v0/test_actions.py` 对终局 MOVEMENT 状态的 Legacy-empty/V0-mask-moves 历史差异。
 - best checkpoint 的 staged smoke 生成 4 局/32 positions，随后在 CUDA 上完成 train/checkpoint，并从 AdamW state 严格恢复继续训练；`optimizer_loaded=true`，非有限过滤和 device fallback 均为 0。accepted model/optimizer SHA 保持 `6e9af600...9077` / `66ba2990...e6a22`。

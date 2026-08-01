@@ -26,6 +26,7 @@ __global__ void CudaTreeSelectKernel(
     int32_t* __restrict__ node_count,
     int64_t batch_size,
     int64_t max_nodes,
+    int64_t path_capacity,
     int64_t action_dim,
     double exploration_weight,
     int32_t* __restrict__ leaf_nodes,
@@ -41,14 +42,15 @@ __global__ void CudaTreeSelectKernel(
 
     const int64_t node_base = tree * max_nodes;
     const int64_t edge_base = node_base * action_dim;
-    const int64_t path_base = tree * max_nodes;
+    const int64_t path_base = tree * path_capacity;
     int32_t node = 0;
     int32_t depth = 0;
     int32_t picked_action = -1;
     bool did_allocate = false;
     bool did_overflow = false;
+    bool finished_selection = false;
 
-    while (depth < max_nodes) {
+    while (depth < path_capacity) {
         paths[path_base + depth] = node;
         ++depth;
         const int64_t global_node = node_base + node;
@@ -58,6 +60,7 @@ __global__ void CudaTreeSelectKernel(
             if (node == 0 && depth == 1 && terminal[global_node]) {
                 depth = 0;
             }
+            finished_selection = true;
             break;
         }
 
@@ -93,6 +96,7 @@ __global__ void CudaTreeSelectKernel(
         }
 
         if (best_action < 0) {
+            finished_selection = true;
             break;
         }
         picked_action = best_action;
@@ -113,14 +117,18 @@ __global__ void CudaTreeSelectKernel(
         }
         node = child;
         if (did_allocate) {
-            if (depth < max_nodes) {
+            if (depth < path_capacity) {
                 paths[path_base + depth] = node;
                 ++depth;
             } else {
                 did_overflow = true;
             }
+            finished_selection = true;
             break;
         }
+    }
+    if (!finished_selection) {
+        did_overflow = true;
     }
 
     leaf_nodes[tree] = node;
@@ -138,35 +146,37 @@ __global__ void CudaTreeBackupKernel(
     int32_t* __restrict__ node_visits,
     double* __restrict__ node_value_sum,
     int64_t batch_size,
-    int64_t max_nodes) {
+    int64_t path_capacity,
+    int64_t arena_max_nodes) {
     const int64_t tree = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tree >= batch_size) {
         return;
     }
     const int32_t length = path_lengths[tree];
-    if (length <= 0 || length > max_nodes) {
+    if (length <= 0 || length > path_capacity) {
         return;
     }
     const double input_value = leaf_values[tree];
     if (!isfinite(input_value)) {
         return;
     }
-    const int64_t base = tree * max_nodes;
+    const int64_t path_base = tree * path_capacity;
+    const int64_t node_base = tree * arena_max_nodes;
     double value = input_value;
     for (int32_t reverse = length; reverse > 0; --reverse) {
-        const int32_t node = paths[base + reverse - 1];
-        if (node < 0 || node >= max_nodes) {
+        const int32_t node = paths[path_base + reverse - 1];
+        if (node < 0 || node >= arena_max_nodes) {
             return;
         }
-        const int64_t global_node = base + node;
+        const int64_t global_node = node_base + node;
         node_visits[global_node] += 1;
         node_value_sum[global_node] += value;
         if (reverse > 1) {
-            const int32_t parent = paths[base + reverse - 2];
-            if (parent < 0 || parent >= max_nodes) {
+            const int32_t parent = paths[path_base + reverse - 2];
+            if (parent < 0 || parent >= arena_max_nodes) {
                 return;
             }
-            if (node_player[base + parent] != node_player[global_node]) {
+            if (node_player[node_base + parent] != node_player[global_node]) {
                 value = -value;
             }
         }
@@ -199,7 +209,8 @@ cuda_tree_select(
     torch::Tensor node_parent,
     torch::Tensor node_action,
     torch::Tensor node_count,
-    double exploration_weight) {
+    double exploration_weight,
+    int64_t max_path_length) {
     CheckCudaArenaTensor(priors, "priors");
 #define CHECK_ARENA_INPUT(tensor)                                                \
     CheckCudaArenaTensor(tensor, #tensor);                                      \
@@ -230,7 +241,10 @@ cuda_tree_select(
     const int64_t batch_size = priors.size(0);
     const int64_t max_nodes = priors.size(1);
     const int64_t action_dim = priors.size(2);
+    const int64_t path_capacity = max_path_length > 0 ? max_path_length : max_nodes;
     TORCH_CHECK(max_nodes > 0 && action_dim > 0, "arena dimensions must be positive");
+    TORCH_CHECK(path_capacity > 0 && path_capacity <= max_nodes,
+                "max_path_length must be in [1, max_nodes]");
     TORCH_CHECK(legal_mask.sizes() == priors.sizes(), "legal_mask shape mismatch");
     TORCH_CHECK(child_index.sizes() == priors.sizes(), "child_index shape mismatch");
     const auto node_shape = std::vector<int64_t>{batch_size, max_nodes};
@@ -248,7 +262,7 @@ cuda_tree_select(
     auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(priors.device());
     auto bool_options = torch::TensorOptions().dtype(torch::kBool).device(priors.device());
     auto leaf_nodes = torch::zeros({batch_size}, int_options);
-    auto paths = torch::full({batch_size, max_nodes}, -1, int_options);
+    auto paths = torch::full({batch_size, path_capacity}, -1, int_options);
     auto path_lengths = torch::zeros({batch_size}, int_options);
     auto selected_actions = torch::full({batch_size}, -1, int_options);
     auto allocated = torch::zeros({batch_size}, bool_options);
@@ -275,6 +289,7 @@ cuda_tree_select(
         node_count.data_ptr<int32_t>(),
         batch_size,
         max_nodes,
+        path_capacity,
         action_dim,
         exploration_weight,
         leaf_nodes.data_ptr<int32_t>(),
@@ -308,17 +323,21 @@ void cuda_tree_backup(
     TORCH_CHECK(paths.scalar_type() == torch::kInt32 && paths.dim() == 2,
                 "paths must be int32 [B, N]");
     const int64_t batch_size = paths.size(0);
-    const int64_t max_nodes = paths.size(1);
+    const int64_t path_capacity = paths.size(1);
     TORCH_CHECK(path_lengths.scalar_type() == torch::kInt32 && path_lengths.numel() == batch_size,
                 "path_lengths must be int32 [B]");
-    TORCH_CHECK(node_player.scalar_type() == torch::kInt8 &&
-                node_player.sizes() == paths.sizes(), "node_player must be int8 [B, N]");
+    TORCH_CHECK(node_player.scalar_type() == torch::kInt8 && node_player.dim() == 2 &&
+                node_player.size(0) == batch_size,
+                "node_player must be int8 [B, arena_nodes]");
+    const int64_t arena_max_nodes = node_player.size(1);
     TORCH_CHECK(leaf_values.scalar_type() == torch::kFloat64 && leaf_values.numel() == batch_size,
                 "leaf_values must be float64 [B]");
     TORCH_CHECK(node_visits.scalar_type() == torch::kInt32 &&
-                node_visits.sizes() == paths.sizes(), "node_visits must be int32 [B, N]");
+                node_visits.sizes() == node_player.sizes(),
+                "node_visits must be int32 [B, arena_nodes]");
     TORCH_CHECK(node_value_sum.scalar_type() == torch::kFloat64 &&
-                node_value_sum.sizes() == paths.sizes(), "node_value_sum must be float64 [B, N]");
+                node_value_sum.sizes() == node_player.sizes(),
+                "node_value_sum must be float64 [B, arena_nodes]");
     if (batch_size == 0) {
         return;
     }
@@ -333,7 +352,8 @@ void cuda_tree_backup(
         node_visits.data_ptr<int32_t>(),
         node_value_sum.data_ptr<double>(),
         batch_size,
-        max_nodes);
+        path_capacity,
+        arena_max_nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

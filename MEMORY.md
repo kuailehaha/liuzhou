@@ -405,6 +405,9 @@ Current recommendation order:
 ## Windows RTX 3060 cuda_tree status (2026-08-01)
 
 - `cuda_tree` full-MCTS 已实现并在本机 CUDA 12.6 / PyTorch 2.8 / sm86 编译。固定 sim64、batch 512 的短时完整搜索 CUDA Graph 中位为 `1044.2 positions/s`；overflow、illegal、non-finite、fallback 均为 0。
+- GPU 持久子树复用已接入：实际落子保留选中 child 的完整可达 SoA 子树，fixed-slot refill 显式重置，尾部 bucket 按 tree id 迁移存活行；外部状态与缓存 root 逐字段核对。sim64 使用 385-node arena 与独立 129-node path capacity，新扩展 SHA256 为 `16c3cac3815aad9c8c772807b60d9d29979e5a98dd74985b345e3b1ea61ed36f`。
+- `models/best_model.pt` 无噪声 FP32 连续 12 步对 portable C++ 的 visits/action/root value 全部一致；同玩家连续 `MARK_SELECTION` 也有回归测试。512 树×64 ply 共 32,768 次复用全部命中，最大保留 266 节点，capacity reset、state mismatch、path/arena overflow、illegal、non-finite 和 fallback 全为 0。
+- 当前复用版捕获后稳态为搜索 `1140–1151 positions/s`，包含 GPU 压缩为 `1054–1065 positions/s`；64-ply 热浸（含 warmup/capture）为 `393.35 positions/s`。arena 本体约 1.05 GiB，进程 peak allocated/reserved 约 3.16/3.91 GiB。实现正确性已具备新鲜证据，但自然结束完整棋局与 30 分钟 ≥1000 positions/s 仍未通过，因此不启动长训。
 - 完整 512 局、54,272 trajectory positions 的持续结果为 `642.17 positions/s`。RTX 3060 Laptop 在 87°C 从约 2.0 GHz 热降频到 900 MHz；纯网络热浸稳定值约 `46.8k states/s`，低于 sim64 达到 1000 positions/s 所需约 `65k states/s`。因此 30 分钟性能 gate 未通过，不能用短时结果宣称达标。
 - 继续热浸后，随机训练形状 512 games、64 max plies 只有 `213.35 positions/s`；实时遥测为 89°C、100% utilization、SM clock 532→307 MHz。Dirichlet/sample on/off 的 search-only 差异约 1%，不是主要慢点。固定槽即时补局和幂次 bucket 尾部已接入，但无法弥补硬件深度热保护。当前会话无权执行 `nvidia-smi -lgc` 或 `-pl`。
 - TensorRT 虽达到约 `125k states/s`，但 sim64 随机合法状态对拍出现 visits/action 差异，已拒绝接入。正确性优先于吞吐，不使用近似路径、降 simulations 或 root-only 替代。

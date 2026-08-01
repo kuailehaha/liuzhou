@@ -248,6 +248,7 @@ def self_play_v1_gpu(
         slot_game_ids = torch.arange(wave_games, dtype=torch.int64, device=dev)
         next_game_id = int(wave_games)
         completed_games = 0
+        tree_layout_changed = False
 
         while True:
             active_idx = torch.where(~done)[0]
@@ -276,6 +277,19 @@ def self_play_v1_gpu(
                             ),
                         )
                     )
+                search_tree_ids = active_idx
+                if search_size > int(active_idx.numel()):
+                    search_tree_ids = torch.cat(
+                        (
+                            search_tree_ids,
+                            -torch.arange(
+                                1,
+                                search_size - int(active_idx.numel()) + 1,
+                                dtype=torch.int64,
+                                device=dev,
+                            ),
+                        )
+                    )
             else:
                 search_states = active_states
                 search_size = int(active_idx.numel())
@@ -294,7 +308,18 @@ def self_play_v1_gpu(
                     temperatures=search_temps,
                     add_dirichlet_noise=add_dirichlet_noise,
                     force_uniform_random_mask=search_force_uniform,
+                    **(
+                        {
+                            "tree_ids": search_tree_ids,
+                            "tree_layout_changed": tree_layout_changed,
+                        }
+                        if backend == "cuda_tree"
+                        else {}
+                    ),
                 )
+                if backend == "cuda_tree":
+                    mcts.advance_roots(search.chosen_action_indices)
+                    tree_layout_changed = False
                 if backend == "cuda_tree" and search_size != int(active_idx.numel()):
                     search = _select_search_rows(
                         search,
@@ -407,7 +432,15 @@ def self_play_v1_gpu(
                         slot_game_ids.index_copy_(0, refill_slots, refill_ids)
                         plies.index_fill_(0, refill_slots, 0)
                         done.index_fill_(0, refill_slots, False)
+                        reset_rows = torch.where(
+                            search_tree_ids.view(-1, 1)
+                            .eq(refill_slots.view(1, -1))
+                            .any(dim=1)
+                        )[0]
+                        mcts.reset_tree_rows(reset_rows)
                         next_game_id += refill_count
+                    if finished_count > refill_count:
+                        tree_layout_changed = True
 
         if verbose:
             completed = (

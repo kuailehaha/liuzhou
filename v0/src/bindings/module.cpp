@@ -1370,7 +1370,8 @@ PYBIND11_MODULE(v0_core, m) {
         py::arg("node_parent"),
         py::arg("node_action"),
         py::arg("node_count"),
-        py::arg("exploration_weight"));
+        py::arg("exploration_weight"),
+        py::arg("max_path_length") = 0);
     m.def(
         "cuda_tree_backup",
         &v0::cuda_tree_backup,
