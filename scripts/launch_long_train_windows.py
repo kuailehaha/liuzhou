@@ -93,6 +93,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     set_system_awake(True)
     try:
+        child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        python_paths = [str(ROOT_DIR)]
+        v0_build = ROOT_DIR / "build" / "v0" / "src"
+        if v0_build.is_dir():
+            python_paths.insert(0, str(v0_build))
+        inherited_pythonpath = child_env.get("PYTHONPATH", "").strip()
+        if inherited_pythonpath:
+            python_paths.append(inherited_pythonpath)
+        child_env["PYTHONPATH"] = os.pathsep.join(python_paths)
+        state["child_pythonpath"] = child_env["PYTHONPATH"]
         with log_path.open("a", encoding="utf-8", buffering=1) as log_handle:
             log_handle.write(
                 f"[{utc_now()}] [windows_launcher] pid={os.getpid()} command={command!r}\n"
@@ -100,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             process = subprocess.Popen(
                 command,
                 cwd=ROOT_DIR,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=child_env,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
             )

@@ -90,6 +90,7 @@ def _run_v1(args: argparse.Namespace) -> int:
         self_play_backend=args.self_play_backend,
         search_backend=str(args.search_backend),
         cuda_tree_precision=str(args.cuda_tree_precision),
+        cuda_tree_arena_multiplier=int(args.cuda_tree_arena_multiplier),
         self_play_shard_dir=args.self_play_shard_dir,
         self_play_target_samples_per_shard=int(args.self_play_target_samples_per_shard),
         self_play_chunk_target_bytes=int(args.self_play_chunk_target_bytes),
@@ -197,6 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="amp_fp16",
         choices=["fp32", "amp_fp16"],
     )
+    parser.add_argument("--cuda_tree_arena_multiplier", type=int, default=6)
     parser.add_argument(
         "--self_play_shard_dir",
         type=str,

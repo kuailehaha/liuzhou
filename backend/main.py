@@ -57,6 +57,14 @@ DEFAULT_SIMULATIONS = int(os.getenv("MCTS_SIMULATIONS", "1024"))
 DEFAULT_TEMPERATURE = float(os.getenv("MCTS_TEMPERATURE", "0"))
 DEFAULT_SEARCH_BACKEND = os.getenv("GAMEPLAY_SEARCH_BACKEND", "portable_cpp")
 DEFAULT_CPP_THREADS = int(os.getenv("PORTABLE_CPP_THREADS", "1"))
+DEFAULT_CUDA_TREE_PRECISION = os.getenv("CUDA_TREE_PRECISION", "amp_fp16")
+DEFAULT_CUDA_TREE_PONDER = os.getenv("CUDA_TREE_PONDER", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DEFAULT_CUDA_TREE_PONDER_CHUNK = int(os.getenv("CUDA_TREE_PONDER_CHUNK", "64"))
 
 app = FastAPI(title="Liuzhou Web API", version="0.1.0")
 
@@ -127,7 +135,29 @@ def _create_ai_agent(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     backend = str(search_backend).strip().lower()
-    if backend in {"portable_cpp", "portable_python"}:
+    if backend == "cuda_tree":
+        from v1.python.cuda_tree_gameplay_agent import CudaTreeGameplayAgent
+
+        try:
+            agent = CudaTreeGameplayAgent(
+                model=model,
+                mcts_simulations=simulations,
+                temperature=temperature,
+                device=device,
+                precision=DEFAULT_CUDA_TREE_PRECISION,
+                ponder_enabled=DEFAULT_CUDA_TREE_PONDER,
+                ponder_chunk_simulations=DEFAULT_CUDA_TREE_PONDER_CHUNK,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Requested gameplay backend cuda_tree is unavailable; "
+                    "no fallback was attempted. "
+                    f"{exc}"
+                ),
+            ) from exc
+    elif backend in {"portable_cpp", "portable_python"}:
         implementation = "cpp" if backend == "portable_cpp" else "python"
         try:
             agent = PortableGameplayAgent(
@@ -167,6 +197,12 @@ def _create_ai_agent(
         "temperature": float(temperature),
         "portableCppThreads": (
             DEFAULT_CPP_THREADS if backend == "portable_cpp" else 0
+        ),
+        "precision": (
+            DEFAULT_CUDA_TREE_PRECISION if backend == "cuda_tree" else "fp32"
+        ),
+        "ponderEnabled": bool(
+            backend == "cuda_tree" and DEFAULT_CUDA_TREE_PONDER
         ),
     }
     return agent, False, metadata
@@ -243,6 +279,43 @@ def _ensure_ai_turn(session: GameSession) -> None:
         )
 
 
+def _sync_agent_after_external_move(
+    agent: Any,
+    state_before: GameState,
+    move: Mapping[str, Any],
+    state_after: GameState,
+) -> None:
+    if hasattr(agent, "observe_external_move"):
+        agent.observe_external_move(state_before, move, state_after)
+    else:
+        _sync_agent(agent, state_after)
+
+
+def _stop_agent_pondering(agent: Any) -> None:
+    if hasattr(agent, "stop_pondering"):
+        agent.stop_pondering()
+
+
+def _start_agent_pondering(session: GameSession) -> None:
+    if (
+        not session.state.is_game_over()
+        and session.state.current_player == session.human_player
+        and hasattr(session.ai_agent, "start_pondering")
+    ):
+        session.ai_agent.start_pondering(session.state)
+
+
+def _prepare_payload_then_ponder(
+    session: GameSession,
+    ai_moves: List[Mapping[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    payload = _prepare_payload(session, ai_moves=ai_moves)
+    _start_agent_pondering(session)
+    if hasattr(session.ai_agent, "audit_metadata"):
+        payload["meta"].update(session.ai_agent.audit_metadata())
+    return payload
+
+
 def _evaluate_position(session: GameSession) -> Dict[str, Any] | None:
     """
     Run the value head of the AI model on the current state (when available).
@@ -251,6 +324,8 @@ def _evaluate_position(session: GameSession) -> Dict[str, Any] | None:
     if torch is None:
         return None
     agent = getattr(session, "ai_agent", None)
+    if bool(getattr(agent, "ponder_active", False)):
+        return None
     model = getattr(agent, "model", None)
     if model is None:
         return None
@@ -357,7 +432,7 @@ def create_new_game(request: NewGameRequest):
     _sync_agent(session.ai_agent, session.state)
 
     ai_moves = _maybe_run_ai_turn(session)
-    return _prepare_payload(session, ai_moves=ai_moves or None)
+    return _prepare_payload_then_ponder(session, ai_moves=ai_moves or None)
 
 
 @app.get("/api/game/{game_id}")
@@ -394,6 +469,7 @@ def submit_human_move(game_id: str, request: MoveRequest):
         raise HTTPException(status_code=400, detail="Move is not legal in the current state.")
 
     canonical_move = legal_map[key]
+    _stop_agent_pondering(session.ai_agent)
     state_before = session.state.copy()
     player = session.state.current_player
     phase = session.state.phase.name
@@ -406,9 +482,14 @@ def submit_human_move(game_id: str, request: MoveRequest):
         move=canonical_move,
         state_before=state_before,
     )
-    _sync_agent(session.ai_agent, session.state)
+    _sync_agent_after_external_move(
+        session.ai_agent,
+        state_before,
+        canonical_move,
+        session.state,
+    )
 
-    return _prepare_payload(session)
+    return _prepare_payload_then_ponder(session)
 
 
 @app.post("/api/game/{game_id}/ai-move")
@@ -423,12 +504,18 @@ def submit_ai_move(game_id: str):
 
     _ensure_ai_turn(session)
 
+    _stop_agent_pondering(session.ai_agent)
     ai_moves = _maybe_run_ai_turn(session)
-    return _prepare_payload(session, ai_moves=ai_moves or None)
+    return _prepare_payload_then_ponder(session, ai_moves=ai_moves or None)
 
 
 @app.delete("/api/game/{game_id}")
 def delete_game(game_id: str):
+    try:
+        session = game_manager.get_session(game_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Game not found")
+    _stop_agent_pondering(session.ai_agent)
     game_manager.remove_session(game_id)
     return {"gameId": game_id, "deleted": True}
 

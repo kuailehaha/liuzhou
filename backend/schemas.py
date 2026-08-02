@@ -22,9 +22,11 @@ class NewGameRequest(BaseModel):
         ge=0.0,
         description="Optional temperature override for the AI policy head.",
     )
-    search_backend: Optional[Literal["portable_cpp", "portable_python", "legacy"]] = Field(
+    search_backend: Optional[
+        Literal["cuda_tree", "portable_cpp", "portable_python", "legacy"]
+    ] = Field(
         default=None,
-        description="Search implementation; portable_cpp is the production Apple path.",
+        description="Search implementation; cuda_tree is the GPU-resident full MCTS path.",
     )
 
 

@@ -44,7 +44,9 @@
             <label>
               Search backend:
               <select name="search_backend">
-                <option value="portable_cpp" selected>Portable C++</option>
+                <option value="" selected>Server default</option>
+                <option value="cuda_tree">CUDA full tree (GPU resident)</option>
+                <option value="portable_cpp">Portable C++ (CPU tree + model device)</option>
                 <option value="portable_python">Portable Python reference</option>
                 <option value="legacy">Legacy (diagnostics only)</option>
               </select>
@@ -89,6 +91,6 @@
       </small>
     </footer>
 
-    <script src="app.js?v=20251031" type="module"></script>
+    <script src="app.js?v=20260801" type="module"></script>
   </body>
 </html>

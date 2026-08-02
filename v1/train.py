@@ -1297,6 +1297,7 @@ def _run_self_play_multi_device(
     self_play_shard_dir: Optional[str],
     search_backend: str = "cuda_root",
     cuda_tree_precision: str = "amp_fp16",
+    cuda_tree_arena_multiplier: int = 6,
     sparse_ply: int = 1,
     sparse_top_k: int = 8,
     portable_self_play_workers: int = 1,
@@ -1422,6 +1423,7 @@ def _run_self_play_multi_device(
             sparse_top_k=int(sparse_top_k),
             search_backend=search_backend_norm,
             cuda_tree_precision=str(cuda_tree_precision),
+            cuda_tree_arena_multiplier=int(cuda_tree_arena_multiplier),
             policy_target_temperature=policy_target_temperature,
             policy_target_prior_pseudocount=float(
                 policy_target_prior_pseudocount
@@ -2010,6 +2012,7 @@ def train_pipeline_v1(
     self_play_backend: Optional[str] = None,
     search_backend: str = "cuda_root",
     cuda_tree_precision: str = "amp_fp16",
+    cuda_tree_arena_multiplier: int = 6,
     self_play_shard_dir: Optional[str] = None,
     self_play_target_samples_per_shard: int = 0,
     self_play_chunk_target_bytes: int = 0,
@@ -2057,6 +2060,9 @@ def train_pipeline_v1(
         raise ValueError(
             "cuda_tree_precision must be one of: fp32, amp_fp16"
         )
+    cuda_tree_arena_multiplier_norm = int(cuda_tree_arena_multiplier)
+    if cuda_tree_arena_multiplier_norm < 6:
+        raise ValueError("cuda_tree_arena_multiplier must be at least 6")
     portable_mcts_backend_norm = _normalize_portable_mcts_backend(
         portable_mcts_backend
     )
@@ -2261,6 +2267,7 @@ def train_pipeline_v1(
                 "self_play_backend": backend_arg if backend_arg is not None else "auto",
                 "search_backend": search_backend_norm,
                 "cuda_tree_precision": cuda_tree_precision_norm,
+                "cuda_tree_arena_multiplier": cuda_tree_arena_multiplier_norm,
                 "self_play_shard_dir": shard_dir_arg,
                 "mcts_simulations": int(mcts_simulations),
                 "self_play_games": int(self_play_games),
@@ -2374,6 +2381,7 @@ def train_pipeline_v1(
                     self_play_shard_dir=shard_dir_arg,
                     search_backend=search_backend_norm,
                     cuda_tree_precision=cuda_tree_precision_norm,
+                    cuda_tree_arena_multiplier=cuda_tree_arena_multiplier_norm,
                     sparse_ply=int(sparse_ply),
                     sparse_top_k=int(sparse_top_k),
                     portable_self_play_workers=int(portable_self_play_workers),
@@ -2889,6 +2897,7 @@ def train_pipeline_v1(
                 self_play_shard_dir=shard_dir_arg,
                 search_backend=search_backend_norm,
                 cuda_tree_precision=cuda_tree_precision_norm,
+                cuda_tree_arena_multiplier=cuda_tree_arena_multiplier_norm,
                 sparse_ply=int(sparse_ply),
                 sparse_top_k=int(sparse_top_k),
                 portable_self_play_workers=int(portable_self_play_workers),
@@ -3141,6 +3150,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="amp_fp16",
         choices=["fp32", "amp_fp16"],
     )
+    parser.add_argument("--cuda_tree_arena_multiplier", type=int, default=6)
     parser.add_argument(
         "--self_play_shard_dir",
         type=str,
@@ -3328,6 +3338,7 @@ if __name__ == "__main__":
         self_play_backend=args.self_play_backend,
         search_backend=args.search_backend,
         cuda_tree_precision=args.cuda_tree_precision,
+        cuda_tree_arena_multiplier=args.cuda_tree_arena_multiplier,
         self_play_shard_dir=args.self_play_shard_dir,
         self_play_target_samples_per_shard=args.self_play_target_samples_per_shard,
         self_play_chunk_target_bytes=args.self_play_chunk_target_bytes,

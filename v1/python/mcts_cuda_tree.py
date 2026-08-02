@@ -56,6 +56,7 @@ class CudaTreeMCTSConfig:
     precision: str = "amp_fp16"
     policy_target_temperature: Optional[float] = None
     policy_target_prior_pseudocount: float = 0.0
+    arena_node_multiplier: int = 6
 
 
 class _CudaStateArena:
@@ -294,6 +295,8 @@ class CudaTreeMCTS:
             raise ValueError("cuda_tree precision must be 'fp32' or 'amp_fp16'")
         if int(config.num_simulations) <= 0:
             raise ValueError("num_simulations must be positive")
+        if int(config.arena_node_multiplier) < 6:
+            raise ValueError("arena_node_multiplier must be at least 6")
         if not hasattr(v0_core, "cuda_tree_select") or not hasattr(v0_core, "cuda_tree_backup"):
             raise RuntimeError(
                 "v0_core was built without cuda_tree kernels; rebuild with BUILD_CUDA_KERNELS=ON"
@@ -353,8 +356,12 @@ class CudaTreeMCTS:
         )
         self._device_capacity_resets = torch.zeros((), dtype=torch.int64, device=self.device)
         self._device_state_mismatches = torch.zeros((), dtype=torch.int64, device=self.device)
-        self._search_graphs: dict[tuple[int, bool], _SearchGraphEntry] = {}
-        self._search_graph_warmed: set[tuple[int, bool]] = set()
+        self._device_state_field_mismatches = {
+            field: torch.zeros((), dtype=torch.int64, device=self.device)
+            for field in _STATE_FIELDS
+        }
+        self._search_graphs: dict[tuple[int, bool, int], _SearchGraphEntry] = {}
+        self._search_graph_warmed: set[tuple[int, bool, int]] = set()
         self._advance_graphs: dict[int, _AdvanceGraphEntry] = {}
         self._advance_graph_warmed: set[int] = set()
         self._arenas: dict[int, _CudaTreeArena] = {}
@@ -476,11 +483,16 @@ class CudaTreeMCTS:
         temperatures: Optional[float | torch.Tensor | list] = None,
         add_dirichlet_noise: Optional[bool] = None,
         force_uniform_random_mask: Optional[torch.Tensor] = None,
+        num_simulations: Optional[int] = None,
     ) -> RootSearchBatchOutput:
         if states.device != self.device:
             states = states.to(self.device)
         batch_size = int(states.batch_size)
-        simulations = int(self.config.num_simulations)
+        simulations = (
+            int(self.config.num_simulations)
+            if num_simulations is None
+            else int(num_simulations)
+        )
         max_nodes = int(arena.max_nodes)
         action_dim = TOTAL_ACTION_DIM
         state_arena = arena.states
@@ -517,7 +529,11 @@ class CudaTreeMCTS:
         for field in _STATE_FIELDS:
             stored = getattr(state_arena, field)[:, 0]
             incoming = getattr(states, field)
-            root_matches &= stored.eq(incoming).view(batch_size, -1).all(dim=1)
+            field_matches = stored.eq(incoming).view(batch_size, -1).all(dim=1)
+            self._device_state_field_mismatches[field].add_(
+                (~arena.needs_init & ~field_matches).sum(dtype=torch.int64)
+            )
+            root_matches &= field_matches
         state_mismatch = ~arena.needs_init & ~root_matches
         self._device_state_mismatches.add_(state_mismatch.sum(dtype=torch.int64))
         capacity_reset = node_count.gt(max_nodes - simulations)
@@ -590,7 +606,7 @@ class CudaTreeMCTS:
                 node_action,
                 node_count,
                 float(self.config.exploration_weight),
-                2 * simulations + 1,
+                max_nodes,
             )
             leaf_long = leaf.to(torch.int64)
             parent_nodes = parent[tree_indices, leaf_long].to(torch.int64).clamp_min(0)
@@ -761,7 +777,11 @@ class CudaTreeMCTS:
         # additional budgets retain the selected descendants observed in
         # sustained sim64 play; rows that still outgrow this fixed bound are
         # reset explicitly and counted before another search starts.
-        max_nodes = 6 * int(self.config.num_simulations) + 1
+        max_nodes = (
+            int(self.config.arena_node_multiplier)
+            * int(self.config.num_simulations)
+            + 1
+        )
         arena = _CudaTreeArena(states, max_nodes=max_nodes)
         self._peak_arena_bytes = max(self._peak_arena_bytes, arena.nbytes)
         return arena
@@ -884,10 +904,11 @@ class CudaTreeMCTS:
     ) -> None:
         batch_size = int(arena.batch_size)
         tree_indices = torch.arange(batch_size, device=self.device, dtype=torch.int64)
+        tracked = self._tree_ids[batch_size].ge(0)
         valid_action = actions.ge(0) & actions.lt(TOTAL_ACTION_DIM)
         safe_actions = actions.clamp(min=0, max=TOTAL_ACTION_DIM - 1)
         selected = arena.children[:, 0][tree_indices, safe_actions].to(torch.int64)
-        valid = valid_action & selected.ge(0)
+        valid = tracked & valid_action & selected.ge(0)
 
         node_ids = torch.arange(
             arena.max_nodes, device=self.device, dtype=torch.int64
@@ -965,7 +986,7 @@ class CudaTreeMCTS:
         )
         arena.needs_init.copy_(~valid)
         self._device_reuse_hits.add_(valid.sum(dtype=torch.int64))
-        self._device_reuse_misses.add_((~valid).sum(dtype=torch.int64))
+        self._device_reuse_misses.add_((tracked & ~valid).sum(dtype=torch.int64))
         self._device_retained_nodes.add_(
             torch.where(valid, retained, torch.zeros_like(retained)).sum(dtype=torch.int64)
         )
@@ -1023,6 +1044,13 @@ class CudaTreeMCTS:
         arena.needs_init.index_fill_(0, rows, True)
         arena.node_count.index_fill_(0, rows, 1)
 
+    def active_root_visit_counts(self) -> torch.Tensor:
+        """Return retained root visits for the currently active tree layout."""
+        if self._active_batch_size is None:
+            raise RuntimeError("active_root_visit_counts requires a preceding search")
+        arena = self._arenas[int(self._active_batch_size)]
+        return arena.visits[:, 0].detach().clone()
+
     def search_batch(
         self,
         states: GpuStateBatch,
@@ -1031,10 +1059,20 @@ class CudaTreeMCTS:
         force_uniform_random_mask: Optional[torch.Tensor] = None,
         tree_ids: Optional[torch.Tensor] = None,
         tree_layout_changed: bool = False,
+        num_simulations: Optional[int] = None,
     ) -> RootSearchBatchOutput:
         if states.device != self.device:
             states = states.to(self.device)
         batch_size = int(states.batch_size)
+        simulations = (
+            int(self.config.num_simulations)
+            if num_simulations is None
+            else int(num_simulations)
+        )
+        if simulations <= 0 or simulations > int(self.config.num_simulations):
+            raise ValueError(
+                "num_simulations must be in [1, config.num_simulations]"
+            )
         use_noise = (
             bool(self.config.add_dirichlet_noise)
             if add_dirichlet_noise is None
@@ -1065,12 +1103,17 @@ class CudaTreeMCTS:
             normalized_tree_ids,
             bool(tree_layout_changed),
         )
+        padding_rows = torch.where(normalized_tree_ids.lt(0))[0]
+        if int(padding_rows.numel()) > 0:
+            # Power-of-two padding is not a persistent game tree. Its input is
+            # a fresh initial state every call, so retaining its selected child
+            # would create false state-mismatch and reuse health counters.
+            arena.needs_init.index_fill_(0, padding_rows, True)
+            arena.node_count.index_fill_(0, padding_rows, 1)
 
-        key = (batch_size, use_noise)
-        self._counters["leaf_evaluations"] += batch_size * (
-            int(self.config.num_simulations) + 1
-        )
-        self._counters["inference_batches"] += int(self.config.num_simulations) + 1
+        key = (batch_size, use_noise, simulations)
+        self._counters["leaf_evaluations"] += batch_size * (simulations + 1)
+        self._counters["inference_batches"] += simulations + 1
         entry = self._search_graphs.get(key)
         if entry is not None:
             self._copy_states(entry.states, states)
@@ -1090,6 +1133,7 @@ class CudaTreeMCTS:
                 temperatures=temperature_values,
                 add_dirichlet_noise=use_noise,
                 force_uniform_random_mask=force_uniform,
+                num_simulations=simulations,
             )
 
         static_states = self._empty_states_like(states)
@@ -1104,6 +1148,7 @@ class CudaTreeMCTS:
                 temperatures=static_temperatures,
                 add_dirichlet_noise=use_noise,
                 force_uniform_random_mask=static_force_uniform,
+                num_simulations=simulations,
             )
         self._search_graphs[key] = _SearchGraphEntry(
             graph=graph,
@@ -1115,8 +1160,7 @@ class CudaTreeMCTS:
         )
         self._counters["graph_capture"] += 1
         # Capture records kernels but its side effects are not a supported
-        # substitute for replay.  Replay once so this call returns results for
-        # the current static inputs (not allocator-initialized arena contents).
+        # substitute for replay. Replay once so this call returns live output.
         graph.replay()
         self._counters["graph_replay"] += 1
         return outputs
@@ -1139,7 +1183,7 @@ class CudaTreeMCTS:
         self._counters["subtree_state_mismatches"] = int(
             self._device_state_mismatches.item()
         )
-        return {
+        metrics = {
             **self._counters,
             "arena_peak_bytes": int(self._peak_arena_bytes),
             "cuda_peak_allocated_bytes": int(
@@ -1150,3 +1194,10 @@ class CudaTreeMCTS:
             ),
             "precision": str(self.config.precision),
         }
+        metrics.update(
+            {
+                f"subtree_state_mismatch_{field}": int(counter.item())
+                for field, counter in self._device_state_field_mismatches.items()
+            }
+        )
+        return metrics

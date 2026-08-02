@@ -477,6 +477,43 @@ def _preflight(args: argparse.Namespace) -> None:
         raise ValueError("--reset-fork-deadline requires --fork-from-run.")
     if str(args.portable_mcts_backend).strip().lower() not in {"python", "cpp"}:
         raise ValueError("--portable-mcts-backend must be python or cpp.")
+    if str(args.search_backend).strip().lower() not in {"portable", "cuda_tree"}:
+        raise ValueError("--search-backend must be portable or cuda_tree.")
+    if str(args.cuda_tree_precision).strip().lower() not in {"fp32", "amp_fp16"}:
+        raise ValueError("--cuda-tree-precision must be fp32 or amp_fp16.")
+    if int(args.cuda_tree_arena_multiplier) < 6:
+        raise ValueError("--cuda-tree-arena-multiplier must be at least 6.")
+    if not (
+        float(args.cuda_resume_temp_c) == 0.0
+        or 40.0 <= float(args.cuda_resume_temp_c) <= 90.0
+    ):
+        raise ValueError("--cuda-resume-temp-c must be 0 or within [40, 90].")
+    if float(args.cuda_thermal_poll_seconds) <= 0.0:
+        raise ValueError("--cuda-thermal-poll-seconds must be positive.")
+    if int(args.plateau_patience_iterations) < 0:
+        raise ValueError("--plateau-patience-iterations cannot be negative.")
+    if int(args.plateau_patience_iterations) > 0:
+        if not bool(args.league_gate):
+            raise ValueError(
+                "--plateau-patience-iterations requires --league-gate so model "
+                "updates have an unambiguous accepted-incumbent meaning."
+            )
+        if int(args.plateau_simulations) <= int(args.mcts_simulations):
+            raise ValueError(
+                "--plateau-simulations must be greater than --mcts-simulations."
+            )
+    if str(args.search_backend).strip().lower() == "cuda_tree":
+        import torch
+        import v0_core
+
+        if torch.device(str(args.device)).type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("cuda_tree long training requires an available CUDA device.")
+        if not hasattr(v0_core, "cuda_tree_select") or not hasattr(
+            v0_core, "cuda_tree_backup"
+        ):
+            raise RuntimeError(
+                "v0_core lacks cuda_tree kernels; rebuild with BUILD_CUDA_KERNELS=ON."
+            )
     if str(args.portable_mcts_backend).strip().lower() == "cpp":
         from v1.python.portable_cpp_loader import load_portable_cpp
 
@@ -576,9 +613,16 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "portable_self_play_workers",
         "portable_mcts_backend",
         "portable_cpp_threads",
+        "search_backend",
+        "cuda_tree_precision",
+        "cuda_tree_arena_multiplier",
+        "cuda_resume_temp_c",
+        "cuda_thermal_poll_seconds",
         "state_encoding_schema",
         "symmetry_augmentation",
         "mcts_simulations",
+        "plateau_patience_iterations",
+        "plateau_simulations",
         "temperature_init",
         "temperature_final",
         "temperature_threshold",
@@ -613,6 +657,7 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "league_screen_incumbent_games",
         "league_screen_anchor_games",
         "league_full_anchor_games",
+        "league_cycle_anchor",
         "league_cycle_screen_games",
         "league_cycle_screen_simulations",
         "target_win_rate",
@@ -1299,11 +1344,21 @@ class PortableLongTrainer:
                 raise RuntimeError(f"unsupported state schema: {state.get('schema_version')}")
             previous_signature = state.get("config")
             migrated_config: Dict[str, Any] = {}
+            resume_config_updates: Dict[str, Dict[str, Any]] = {}
             additive_defaults = {
                 "incumbent_promotion_score": float(self.args.incumbent_promotion_score),
                 "portable_self_play_workers": int(self.args.portable_self_play_workers),
                 "portable_mcts_backend": str(self.args.portable_mcts_backend),
                 "portable_cpp_threads": int(self.args.portable_cpp_threads),
+                "search_backend": str(self.args.search_backend),
+                "cuda_tree_precision": str(self.args.cuda_tree_precision),
+                "cuda_tree_arena_multiplier": int(
+                    self.args.cuda_tree_arena_multiplier
+                ),
+                "cuda_resume_temp_c": float(self.args.cuda_resume_temp_c),
+                "cuda_thermal_poll_seconds": float(
+                    self.args.cuda_thermal_poll_seconds
+                ),
                 "state_encoding_schema": str(self.args.state_encoding_schema),
                 "symmetry_augmentation": str(self.args.symmetry_augmentation),
                 "optimizer_name": str(self.args.optimizer_name),
@@ -1327,6 +1382,10 @@ class PortableLongTrainer:
                 "opening_random_anneal_fraction": float(
                     self.args.opening_random_anneal_fraction
                 ),
+                "plateau_patience_iterations": int(
+                    self.args.plateau_patience_iterations
+                ),
+                "plateau_simulations": int(self.args.plateau_simulations),
                 "quality_strength_eval": bool(self.args.quality_strength_eval),
                 "strength_eval_games": int(self.args.strength_eval_games),
                 "strength_eval_simulations": int(
@@ -1363,6 +1422,7 @@ class PortableLongTrainer:
                 "league_full_anchor_games": int(
                     self.args.league_full_anchor_games
                 ),
+                "league_cycle_anchor": bool(self.args.league_cycle_anchor),
                 "league_cycle_screen_games": int(
                     self.args.league_cycle_screen_games
                 ),
@@ -1376,6 +1436,15 @@ class PortableLongTrainer:
                     if field_name not in previous_signature:
                         previous_signature[field_name] = default_value
                         migrated_config[field_name] = default_value
+                field_name = "cuda_thermal_poll_seconds"
+                previous_value = previous_signature.get(field_name)
+                resumed_value = signature[field_name]
+                if previous_value != resumed_value:
+                    previous_signature[field_name] = resumed_value
+                    resume_config_updates[field_name] = {
+                        "previous_value": previous_value,
+                        "value": resumed_value,
+                    }
                 state["config"] = previous_signature
             if previous_signature != signature:
                 raise RuntimeError(
@@ -1406,6 +1475,14 @@ class PortableLongTrainer:
                     field=field_name,
                     value=field_value,
                 )
+            for field_name, update in resume_config_updates.items():
+                self._event(
+                    "resume_config_updated",
+                    field=field_name,
+                    previous_value=update["previous_value"],
+                    value=update["value"],
+                    reason="runtime_poll_cadence",
+                )
             best_pair_reconciled = self._recover_best_pair_transaction()
             reconciled = self._recover_interrupted_commit()
             retained_checkpoint: Optional[Path] = None
@@ -1413,13 +1490,28 @@ class PortableLongTrainer:
             if self.current_checkpoint.is_file() and self._should_retain_iteration_checkpoint(
                 int(state.get("iteration", 0))
             ):
-                retained_checkpoint = self._iteration_checkpoint_path(
+                retained_path = self._iteration_checkpoint_path(
                     int(state.get("iteration", 0))
                 )
-                retained_checkpoint_created = not retained_checkpoint.exists()
-                retained_checkpoint = self._preserve_iteration_checkpoint(
-                    int(state.get("iteration", 0))
+                retained_checkpoint_created = not retained_path.exists()
+                retained_sha256 = (
+                    sha256_file(retained_path) if retained_path.is_file() else None
                 )
+                recorded_retained_path = state.get("latest_iteration_checkpoint")
+                recorded_retained_sha256 = state.get(
+                    "latest_iteration_checkpoint_sha256"
+                )
+                retained_is_recorded = (
+                    retained_sha256 is not None
+                    and str(recorded_retained_path) == str(retained_path)
+                    and str(recorded_retained_sha256) == retained_sha256
+                )
+                if retained_is_recorded:
+                    retained_checkpoint = retained_path
+                else:
+                    retained_checkpoint = self._preserve_iteration_checkpoint(
+                        int(state.get("iteration", 0))
+                    )
             if reconciled or best_pair_reconciled:
                 self._event(
                     "commit_state_reconciled",
@@ -1443,6 +1535,7 @@ class PortableLongTrainer:
                 or best_pair_reconciled
                 or resumed
                 or retained_checkpoint is not None
+                or bool(resume_config_updates)
             ):
                 self._save_state()
             if resumed:
@@ -1573,12 +1666,104 @@ class PortableLongTrainer:
         duration = max(1, int(self.state["deadline_epoch"]) - int(self.state["start_epoch"]))
         return _clamp_progress((time.time() - int(self.state["start_epoch"])) / duration)
 
+    def _wait_for_cuda_cooldown(self, stage: str) -> None:
+        threshold = float(getattr(self.args, "cuda_resume_temp_c", 0.0))
+        if threshold <= 0.0 or torch.device(str(self.args.device)).type != "cuda":
+            return
+        device = torch.device(str(self.args.device))
+        gpu_index = 0 if device.index is None else int(device.index)
+        command = [
+            "nvidia-smi",
+            f"--id={gpu_index}",
+            "--query-gpu=temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+        started = time.monotonic()
+        waiting = False
+        while True:
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "nvidia-smi temperature query failed: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
+            try:
+                temperature = float(result.stdout.strip().splitlines()[0])
+            except (IndexError, ValueError) as exc:
+                raise RuntimeError(
+                    f"invalid nvidia-smi temperature output: {result.stdout!r}"
+                ) from exc
+            if temperature <= threshold:
+                if waiting:
+                    waited = time.monotonic() - started
+                    self._event(
+                        "cuda_cooldown_complete",
+                        stage=str(stage),
+                        temperature_c=temperature,
+                        threshold_c=threshold,
+                        waited_sec=waited,
+                    )
+                    log(
+                        f"cuda cooldown complete stage={stage} temp={temperature:.0f}C "
+                        f"waited_sec={waited:.1f}"
+                    )
+                return
+            if not waiting:
+                waiting = True
+                self._event(
+                    "cuda_cooldown_started",
+                    stage=str(stage),
+                    temperature_c=temperature,
+                    threshold_c=threshold,
+                )
+                log(
+                    f"cuda cooldown waiting stage={stage} temp={temperature:.0f}C "
+                    f"threshold={threshold:.0f}C"
+                )
+            time.sleep(float(getattr(self.args, "cuda_thermal_poll_seconds", 10.0)))
+
     def _replay_files(self) -> List[Path]:
         return sorted(
             path
             for path in self.replay_dir.glob("selfplay_iter_*.pt")
             if re.fullmatch(r"selfplay_iter_\d{6}\.pt", path.name)
         )
+
+    def _selfplay_simulations(self, iteration: int) -> int:
+        """Resolve the next iteration's frozen search budget from accepted lineage."""
+        base = int(self.args.mcts_simulations)
+        patience = int(self.args.plateau_patience_iterations)
+        accepted = int(
+            self.state.get("accepted_iteration", self.args.initial_iteration) or 0
+        )
+        completed_before = max(0, int(iteration) - 1)
+        stagnant = max(0, completed_before - accepted)
+        simulations = (
+            int(self.args.plateau_simulations)
+            if patience > 0 and stagnant >= patience
+            else base
+        )
+        previous = int(self.state.get("active_mcts_simulations", base))
+        self.state["incumbent_stagnation_iterations"] = stagnant
+        self.state["active_mcts_simulations"] = simulations
+        if simulations != previous:
+            reason = "incumbent_plateau" if simulations > base else "incumbent_promoted"
+            self._event(
+                "mcts_simulations_changed",
+                iteration=int(iteration),
+                accepted_iteration=accepted,
+                stagnant_iterations=stagnant,
+                previous_simulations=previous,
+                simulations=simulations,
+                reason=reason,
+            )
+            self._save_state()
+        return simulations
 
     def _accepted_replay_snapshot(self) -> List[Dict[str, Any]]:
         accepted_iteration = int(self.state.get("accepted_iteration", 0) or 0)
@@ -1713,6 +1898,7 @@ class PortableLongTrainer:
         )
 
     def _run_selfplay(self, iteration: int, progress: float) -> Tuple[Path, Dict[str, Any]]:
+        self._wait_for_cuda_cooldown(f"selfplay_iter_{iteration:06d}")
         tag = f"{iteration:06d}"
         output = self.replay_dir / f"selfplay_iter_{tag}.pt"
         stats_path = self.metrics_dir / f"selfplay_iter_{tag}.json"
@@ -1724,6 +1910,7 @@ class PortableLongTrainer:
                 float(self.args.opening_random_anneal_fraction),
             ),
         )
+        simulations = self._selfplay_simulations(iteration)
         command = [
             self.python,
             "scripts/train_entry.py",
@@ -1732,7 +1919,7 @@ class PortableLongTrainer:
             "--stage",
             "selfplay",
             "--search_backend",
-            "portable",
+            str(self.args.search_backend),
             "--device",
             str(self.args.device),
             "--devices",
@@ -1756,7 +1943,7 @@ class PortableLongTrainer:
             "--self_play_opening_random_moves",
             str(opening_moves),
             "--mcts_simulations",
-            str(int(self.args.mcts_simulations)),
+            str(simulations),
             "--temperature_init",
             str(float(self.args.temperature_init)),
             "--temperature_final",
@@ -1778,6 +1965,15 @@ class PortableLongTrainer:
             "--self_play_stats_json",
             str(stats_path),
         ]
+        if str(self.args.search_backend) == "cuda_tree":
+            command.extend(
+                [
+                    "--cuda_tree_precision",
+                    str(self.args.cuda_tree_precision),
+                    "--cuda_tree_arena_multiplier",
+                    str(int(self.args.cuda_tree_arena_multiplier)),
+                ]
+            )
         command.append(
             "--self_play_sample_moves"
             if bool(self.args.sample_moves)
@@ -1806,7 +2002,10 @@ class PortableLongTrainer:
 
         run_command(
             command,
-            label=f"selfplay(iter={iteration},opening={opening_moves})",
+            label=(
+                f"selfplay(iter={iteration},opening={opening_moves},"
+                f"simulations={simulations})"
+            ),
             retries=int(self.args.stage_retries),
             dry_run=bool(self.args.dry_run),
             prepare_attempt=prepare_selfplay_attempt,
@@ -1816,11 +2015,16 @@ class PortableLongTrainer:
         if not output.is_file() or not stats_path.is_file():
             raise RuntimeError(f"self-play artifacts are missing for iteration {iteration}")
         stats = audit_selfplay_stats(stats_path, expected_games=int(self.args.self_play_games))
+        stats["orchestrator_mcts_simulations"] = simulations
+        stats["orchestrator_incumbent_stagnation_iterations"] = int(
+            self.state.get("incumbent_stagnation_iterations", 0)
+        )
         return output, stats
 
     def _run_train(
         self, iteration: int, progress: float, primary: Path
     ) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+        self._wait_for_cuda_cooldown(f"train_iter_{iteration:06d}")
         tag = f"{iteration:06d}"
         metrics_path = self.metrics_dir / f"train_iter_{tag}.json"
         had_optimizer = self.optimizer_checkpoint.is_file()
@@ -1846,7 +2050,7 @@ class PortableLongTrainer:
             "--stage",
             "train",
             "--search_backend",
-            "portable",
+            str(self.args.search_backend),
             "--device",
             str(self.args.device),
             "--devices",
@@ -1886,6 +2090,15 @@ class PortableLongTrainer:
             "--model_init_seed",
             str(int(self.args.seed)),
         ]
+        if str(self.args.search_backend) == "cuda_tree":
+            command.extend(
+                [
+                    "--cuda_tree_precision",
+                    str(self.args.cuda_tree_precision),
+                    "--cuda_tree_arena_multiplier",
+                    str(int(self.args.cuda_tree_arena_multiplier)),
+                ]
+            )
         command.append(
             "--strict_optimizer_restore"
             if bool(self.args.strict_optimizer_restore)
@@ -1971,6 +2184,7 @@ class PortableLongTrainer:
         simulations: Optional[int] = None,
         concurrency: Optional[int] = None,
     ) -> Dict[str, Any]:
+        self._wait_for_cuda_cooldown(f"eval_{name}")
         command = [
             self.python,
             "scripts/eval_checkpoint.py",
@@ -2127,6 +2341,8 @@ class PortableLongTrainer:
         *,
         iteration: int,
     ) -> Tuple[Optional[Path], List[Dict[str, Any]]]:
+        if not bool(self.args.league_cycle_anchor):
+            return None, []
         history = self.state.get("incumbent_history")
         if not isinstance(history, list):
             return None, []
@@ -2829,6 +3045,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--self-play-games", type=int, default=128)
     parser.add_argument("--self-play-concurrency", type=int, default=128)
+    parser.add_argument(
+        "--search-backend",
+        choices=["portable", "cuda_tree"],
+        default="portable",
+    )
+    parser.add_argument(
+        "--cuda-tree-precision",
+        choices=["fp32", "amp_fp16"],
+        default="amp_fp16",
+    )
+    parser.add_argument("--cuda-tree-arena-multiplier", type=int, default=6)
+    parser.add_argument(
+        "--cuda-resume-temp-c",
+        type=float,
+        default=0.0,
+        help="Wait before each GPU stage until this temperature; 0 disables.",
+    )
+    parser.add_argument("--cuda-thermal-poll-seconds", type=float, default=10.0)
     parser.add_argument("--portable-self-play-workers", type=int, default=1)
     parser.add_argument(
         "--portable-mcts-backend",
@@ -2847,6 +3081,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
     )
     parser.add_argument("--mcts-simulations", type=int, default=8)
+    parser.add_argument(
+        "--plateau-patience-iterations",
+        type=int,
+        default=0,
+        help=(
+            "After this many completed iterations without a league-accepted incumbent "
+            "update, use --plateau-simulations for subsequent self-play; 0 disables."
+        ),
+    )
+    parser.add_argument("--plateau-simulations", type=int, default=128)
     parser.add_argument("--temperature-init", type=float, default=1.0)
     parser.add_argument("--temperature-final", type=float, default=0.1)
     parser.add_argument("--temperature-threshold", type=int, default=10)
@@ -2918,6 +3162,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--league-screen-incumbent-games", type=int, default=128)
     parser.add_argument("--league-screen-anchor-games", type=int, default=64)
     parser.add_argument("--league-full-anchor-games", type=int, default=200)
+    parser.add_argument(
+        "--league-cycle-anchor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--league-cycle-screen-games", type=int, default=64)
     parser.add_argument("--league-cycle-screen-simulations", type=int, default=16)
     parser.add_argument("--target-win-rate", type=float, default=0.99)

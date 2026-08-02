@@ -5,6 +5,7 @@ import torch
 from fastapi import HTTPException
 
 from backend.model_loader import clear_model_cache, get_model_with_metadata
+from backend.schemas import NewGameRequest
 from src.game_state import GameState, Phase, Player
 from src.move_generator import apply_move
 from src.neural_network import ChessNet, NUM_INPUT_CHANNELS
@@ -16,6 +17,12 @@ def _model() -> ChessNet:
         board_size=GameState.BOARD_SIZE,
         num_input_channels=NUM_INPUT_CHANNELS,
     )
+
+
+def test_backend_schema_accepts_cuda_tree_search() -> None:
+    request = NewGameRequest(search_backend="cuda_tree")
+
+    assert request.search_backend == "cuda_tree"
 
 
 def test_mutable_checkpoint_alias_is_reloaded_by_sha(tmp_path) -> None:

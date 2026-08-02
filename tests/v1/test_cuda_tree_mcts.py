@@ -89,6 +89,65 @@ def test_cuda_tree_two_simulations_visit_first_two_tied_actions():
     assert search.metrics()["arena_overflow"] == 0
 
 
+def test_cuda_tree_accepts_smaller_repeated_simulation_chunks() -> None:
+    from v1.python.mcts_cuda_tree import CudaTreeMCTS, CudaTreeMCTSConfig
+    from v1.python.mcts_gpu import GpuStateBatch
+
+    search = CudaTreeMCTS(
+        _UniformModel().cuda().eval(),
+        CudaTreeMCTSConfig(
+            num_simulations=8,
+            add_dirichlet_noise=False,
+            sample_moves=False,
+            precision="fp32",
+        ),
+        "cuda:0",
+    )
+    states = GpuStateBatch.initial("cuda:0", batch_size=1)
+
+    search.search_batch(states, num_simulations=2)
+    assert search.active_root_visit_counts().cpu().tolist() == [2]
+    search.search_batch(states, num_simulations=3)
+    assert search.active_root_visit_counts().cpu().tolist() == [5]
+
+    metrics = search.metrics()
+    assert int(metrics["leaf_evaluations"]) == 7
+    assert int(metrics["inference_batches"]) == 7
+
+
+def test_cuda_tree_padding_rows_do_not_report_reuse_or_state_mismatch() -> None:
+    from v1.python.mcts_cuda_tree import CudaTreeMCTS, CudaTreeMCTSConfig
+    from v1.python.mcts_gpu import GpuStateBatch, batch_apply_moves_compat
+    from v1.python.self_play_gpu_runner import _pad_state_batch
+
+    search = CudaTreeMCTS(
+        _UniformModel().cuda().eval(),
+        CudaTreeMCTSConfig(
+            num_simulations=2,
+            add_dirichlet_noise=False,
+            sample_moves=False,
+            precision="fp32",
+        ),
+        "cuda:0",
+    )
+    padded = GpuStateBatch.initial("cuda:0", batch_size=2)
+    tree_ids = torch.tensor([7, -1], dtype=torch.int64, device="cuda:0")
+    first = search.search_batch(padded, tree_ids=tree_ids)
+    search.advance_roots(first.chosen_action_indices)
+
+    real_next = batch_apply_moves_compat(
+        padded.select(torch.tensor([0], dtype=torch.int64, device="cuda:0")),
+        first.chosen_action_codes[:1],
+        torch.zeros((1,), dtype=torch.int64, device="cuda:0"),
+    )
+    search.search_batch(_pad_state_batch(real_next, 2), tree_ids=tree_ids)
+
+    metrics = search.metrics()
+    assert int(metrics["subtree_reuse_hits"]) == 1
+    assert int(metrics["subtree_reuse_misses"]) == 0
+    assert int(metrics["subtree_state_mismatches"]) == 0
+
+
 @pytest.mark.parametrize("simulations", [1, 2, 8, 64])
 def test_cuda_tree_uniform_full_search_matches_portable_cpp(simulations: int):
     import v0_core

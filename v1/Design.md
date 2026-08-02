@@ -85,6 +85,10 @@ New incumbent promotions commit the candidate model and its paired optimizer to 
 
 `v1.python.portable_gameplay_agent.PortableGameplayAgent` supplies persistent Python or C++ portable search for FastAPI/Web play. Production defaults are C++, no Dirichlet noise, temperature 0 and 1024 simulations. The backend synchronizes the tree after a human move, then preserves the subtree across consecutive AI-owned atomic phases. It reports resolved checkpoint path/SHA, device, backend, threads, simulations, temperature, search elapsed time and root top-10 `P/N/Q`. The additive `gameRecord` response contains every actor/player/phase/move, before/after state and the corresponding full AI root audit, so a weak 1024-simulation game can be replayed and attributed to policy, value or search. A requested portable extension or checkpoint failure is an HTTP error; no Legacy/Random fallback occurs.
 
+CUDA hosts may explicitly select `cuda_tree` in the Web/API gameplay route. The single-game adapter retains the selected GPU subtree across AI atomic phases and advances the root by the human action index after an external move; an unvisited branch is an observable reuse miss and is initialized from the authoritative Python state without algorithm fallback. The Web form delegates to the server default unless the user selects a backend, so CUDA and portable/MPS deployments keep platform-specific defaults. Gameplay responses add precision, arena health and subtree reuse/mismatch counters.
+
+During a CUDA-tree human turn, the backend ponders the authoritative human-to-move root in a daemon worker. Search is appended in one fixed 64-simulation Graph shape, bounded to four times the requested move budget; a legal human request stops after the current chunk, advances by the actual action index, and the AI replays only enough fixed chunks to reach the requested root-visit budget. This bounds stop latency and Graph-cache variants while preserving sequential full-MCTS semantics. Ponder activity, rounds, simulations, elapsed time/error, retained root visits, synchronous simulations and all reuse/capacity/numerical counters are additive response metadata. Model evaluation is skipped for read-only payloads while pondering owns the inference replica, avoiding concurrent execution on the same model.
+
 Legacy `src/mcts.py` is retained for diagnostics, but its backup and PUCT Q conversion now use the same player-change rule. This fixes the prior unconditional per-edge sign flip without making Legacy the production gameplay recommendation.
 
 ### Fresh acceptance evidence
@@ -2073,6 +2077,17 @@ Data-effectiveness standard fields (must be preserved in reports):
 - 短时 sim64、batch 512 完整搜索 Graph 的 12 次 replay 中位为 `1044.2 positions/s`，最后 5 次为 `1018.5`，健康计数全 0。完整 512 局/106 plies 实测为 54,272 positions / 84.51s = `642.17 positions/s`；GPU 在 87°C 从约 2.0 GHz 降到 900 MHz，leaf eval 为 `41.74k/s`。纯 TorchScript 网络热浸也从 `82.9k` 降至 `46.8k states/s`，低于 sim64 达到 1000 positions/s 所需约 `65k states/s`，因此 30 分钟验收未通过。
 - 后续随机训练形状的 512 games、64 max plies 诊断为 32,768 positions / 153.59s = `213.35 positions/s`；noise/sample search-only A/B 仅约 1% 差异，根因仍是累计热浸。搜索期间遥测为 100% GPU utilization、89°C，SM clock 从 532 MHz 继续降到 307 MHz，功耗约 40–47W。当前非提权会话的 `nvidia-smi -lgc` 与 `-pl` 均被 Insufficient Permissions 拒绝。
 - Torch-TensorRT 2.8/10.12 的 NCHW FP16 分段图达到约 `125k states/s`，但随机状态 sim64 对拍有 20/48 行 visits 与 1/48 行动作不同，故按语义门槛拒绝接入。旧 Windows 长训任务保持 disabled；在完整棋局门槛通过前不得启动新的正式长训。
+
+#### 7-day adaptive-simulation continuation
+
+- 用户把这次正式训练的起始预算改为 sim32，并显式授权 7 日长训；原 sim64、30 分钟 `>=1000 positions/s` 的性能验收仍未达标，不能把本次启动表述为该性能 Goal 完成。
+- natural full-game arena 使用 `16 * configured_simulations + 1`，选择路径容量与 arena 一致。power-of-two padding 使用负 tree id；这些行每轮强制初始化，并从 reuse hit/miss 与 state-mismatch 健康口径中排除。修复前观测到的 mismatch 仅来自被推进后又填回初始棋盘的 padding 行，真实 game row 的 cached child 与外部 apply 逐字段一致。
+- 平台期调度只读取 `accepted_iteration`：在下一轮开始时，以“已提交 iteration - 最近 league-accepted iteration”计算停滞轮数；达到 200 后由 sim32 切到 sim64，incumbent 晋级后恢复 sim32。预算变化写入 `mcts_simulations_changed` event，self-play metrics 记录实际 simulations 与停滞轮数，resume config 冻结这两个参数。
+- promotion 不使用 fixed anchor 或 hall-of-fame cycle anchor；challenger 对当前 incumbent 完整评估 500 局，强制 challenger 黑白各 250，以 `(wins + 0.5 * draws) / 500 >= 0.55` 晋级。screen 只作提前淘汰，不能替代 500 局 gate。
+- RTX 3060 生产选型中，sim32/concurrency 128 自然完整局为 `421.32 positions/s`，concurrency 64 为 `274.29 positions/s`，两者尾段温度均约 86°C。正式编排使用 concurrency 128，并在 self-play/train/eval 前等待 GPU 降至 78°C；首轮实际为 12,128 positions / 29.84s = `406.47 positions/s`，随后冷却 11.4s，训练 144 steps / 8.92s，optimizer strict restore 为 true，所有 CUDA health/非有限过滤计数为 0。
+- Windows task `Liuzhou-Win3060-CudaTree-sim32-7d` 使用独立目录 `tmp/win3060_cuda_tree_sim32_7d_20260801_230527/`，从 accepted iteration 150 的 model SHA `6e9af600...9077` 与 optimizer SHA `66ba2990...e6a22` 启动，deadline 为 `2026-08-08 23:10:02 UTC+8`。任务为 AC-only、零执行时限、失败 5 分钟重试、WakeToRun；launcher 注入本机 CUDA build PYTHONPATH 并持有 Windows system/away-mode awake assertion。
+- CUDA thermal polling cadence 是运行时编排参数，不改变搜索或训练语义，因此允许 resume 时单独更新并写入 `resume_config_updated`；其他冻结配置仍逐字段一致。2026-08-02 将活跃 run 从 10 秒改为 2 秒，deadline 未延长。续跑第 431 轮完整提交，self-play `448.00 positions/s`，首批观测 cooldown 为 10.59s、21.56s，符合约 2 秒采样粒度。
+- resume 对 retained checkpoint 的处理区分“当前 accepted 模型”和“该 iteration 的已保留 candidate”：gate rollback 后两者 SHA 可以不同。只有 state 中路径与 SHA 都匹配时才复用既有 `model_iter_N.pt`；否则继续走拒绝覆盖保护。该边界由 gate-rollback resume 回归测试覆盖。
 
 ### Windows RTX 3060 Portable/CUDA Continuation (2026-08-01)
 

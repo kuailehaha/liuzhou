@@ -76,8 +76,11 @@ function buildRequestBody(form) {
   const data = new FormData(form);
   const payload = {
     human_player: data.get("human_player") || "BLACK",
-    search_backend: data.get("search_backend") || "portable_cpp",
   };
+  const searchBackend = (data.get("search_backend") || "").trim();
+  if (searchBackend) {
+    payload.search_backend = searchBackend;
+  }
   const modelPath = (data.get("model_path") || "").trim();
   if (modelPath) {
     payload.model_path = modelPath;
@@ -130,6 +133,15 @@ function updateMeta(meta) {
     `AI: ${meta.aiPlayer}`,
     `Agent: ${meta.usingRandomAgent ? "Random" : "MCTS"}`,
   ];
+  if (meta.searchBackend) {
+    parts.push(`Backend: ${meta.searchBackend}`);
+  }
+  if (meta.ponderEnabled) {
+    parts.push(
+      `Ponder: ${meta.ponderActive ? "running" : "ready"}` +
+        (Number.isFinite(meta.ponderSimulations) ? ` (${meta.ponderSimulations} sims)` : ""),
+    );
+  }
   if (meta.note) {
     parts.push(`Note: ${meta.note}`);
   }

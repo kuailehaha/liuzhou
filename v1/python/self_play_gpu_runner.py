@@ -85,6 +85,7 @@ def self_play_v1_gpu(
     verbose: bool = False,
     search_backend: str = "cuda_root",
     cuda_tree_precision: str = "amp_fp16",
+    cuda_tree_arena_multiplier: int = 6,
     policy_target_temperature: float | None = None,
     policy_target_prior_pseudocount: float = 0.0,
 ) -> Tuple[TensorSelfPlayBatch, SelfPlayV1Stats]:
@@ -128,6 +129,7 @@ def self_play_v1_gpu(
                 dirichlet_epsilon=float(dirichlet_epsilon),
                 sample_moves=bool(sample_moves),
                 precision=str(cuda_tree_precision),
+                arena_node_multiplier=int(cuda_tree_arena_multiplier),
                 policy_target_temperature=policy_target_temperature,
                 policy_target_prior_pseudocount=float(
                     policy_target_prior_pseudocount

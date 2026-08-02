@@ -52,6 +52,13 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert args.portable_self_play_workers == 1
     assert args.portable_mcts_backend == "python"
     assert args.portable_cpp_threads == 1
+    assert args.search_backend == "portable"
+    assert args.cuda_tree_precision == "amp_fp16"
+    assert args.cuda_tree_arena_multiplier == 6
+    assert args.cuda_resume_temp_c == 0.0
+    assert args.cuda_thermal_poll_seconds == 10.0
+    assert args.plateau_patience_iterations == 0
+    assert args.plateau_simulations == 128
     assert args.checkpoint_retain_every == 10
     assert args.policy_target_temperature is None
     assert args.policy_target_prior_pseudocount == 0.0
@@ -66,12 +73,110 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert args.state_encoding_schema == "legacy_v1"
     assert args.symmetry_augmentation == "none"
     assert not args.league_gate
+    assert args.league_cycle_anchor
     assert not args.rollback_on_gate_fail
 
 
 def test_windows_cuda_device_is_an_explicit_supported_choice() -> None:
     args = build_parser().parse_args(["--device", "cuda:0"])
     assert args.device == "cuda:0"
+
+
+def test_cuda_tree_long_run_selfplay_command_is_explicit(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.python = sys.executable
+    trainer.replay_dir = tmp_path / "replay"
+    trainer.metrics_dir = tmp_path / "metrics"
+    trainer.replay_dir.mkdir()
+    trainer.metrics_dir.mkdir()
+    trainer.checkpoint_dir = tmp_path / "checkpoints"
+    trainer.checkpoint_dir.mkdir()
+    trainer.current_checkpoint = trainer.checkpoint_dir / "current.pt"
+    trainer.args = SimpleNamespace(
+        search_backend="cuda_tree",
+        cuda_tree_precision="amp_fp16",
+        cuda_tree_arena_multiplier=16,
+        cuda_resume_temp_c=0.0,
+        cuda_thermal_poll_seconds=1.0,
+        device="cuda:0",
+        self_play_games=64,
+        self_play_concurrency=128,
+        portable_self_play_workers=1,
+        portable_mcts_backend="cpp",
+        portable_cpp_threads=1,
+        state_encoding_schema="markov_v2",
+        opening_random_start=0,
+        opening_random_final=0,
+        opening_random_anneal_fraction=1.0,
+        mcts_simulations=64,
+        plateau_patience_iterations=200,
+        plateau_simulations=128,
+        initial_iteration=150,
+        temperature_init=1.0,
+        temperature_final=1.0,
+        temperature_threshold=10,
+        max_game_plies=512,
+        seed=20260801,
+        soft_label_alpha=0.0,
+        sample_moves=False,
+        policy_target_temperature=1.0,
+        policy_target_prior_pseudocount=1.0,
+        stage_retries=0,
+        dry_run=True,
+    )
+    trainer.state = {"accepted_iteration": 150}
+    trainer._event = lambda *_args, **_kwargs: None
+    trainer._save_state = lambda: None
+    commands = []
+    monkeypatch.setattr(
+        "scripts.long_train_portable_mps.run_command",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    trainer._run_selfplay(iteration=151, progress=0.0)
+
+    assert commands
+    command = commands[0]
+    assert command[command.index("--search_backend") + 1] == "cuda_tree"
+    assert command[command.index("--cuda_tree_precision") + 1] == "amp_fp16"
+    assert command[command.index("--cuda_tree_arena_multiplier") + 1] == "16"
+    assert command[command.index("--mcts_simulations") + 1] == "64"
+
+
+def test_selfplay_simulations_escalate_after_200_unaccepted_iterations() -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.args = SimpleNamespace(
+        mcts_simulations=64,
+        plateau_patience_iterations=200,
+        plateau_simulations=128,
+        initial_iteration=150,
+    )
+    trainer.state = {"accepted_iteration": 150}
+    events = []
+    trainer._event = lambda name, **payload: events.append((name, payload))
+    trainer._save_state = lambda: None
+
+    assert trainer._selfplay_simulations(350) == 64
+    assert trainer.state["incumbent_stagnation_iterations"] == 199
+    assert trainer._selfplay_simulations(351) == 128
+    assert trainer.state["incumbent_stagnation_iterations"] == 200
+    assert events[-1][0] == "mcts_simulations_changed"
+    assert events[-1][1]["reason"] == "incumbent_plateau"
+
+    trainer.state["accepted_iteration"] = 350
+    assert trainer._selfplay_simulations(352) == 64
+    assert events[-1][1]["reason"] == "incumbent_promoted"
+
+
+def test_disabled_cycle_anchor_never_reads_incumbent_history() -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.args = SimpleNamespace(league_cycle_anchor=False)
+    trainer.state = {"incumbent_history": [{"checkpoint": "missing.pt"}]}
+
+    assert trainer._select_cycle_anchor(iteration=350) == (None, [])
 
 
 def test_run_lock_is_exclusive_and_recoverable(tmp_path) -> None:
@@ -791,6 +896,101 @@ def test_resume_migrates_legacy_incumbent_gate_to_explicit_default(tmp_path) -> 
     assert trainer.state["config"]["portable_self_play_workers"] == 1
     assert trainer.state["config"]["portable_mcts_backend"] == "python"
     assert trainer.state["config"]["portable_cpp_threads"] == 1
+
+
+def test_resume_allows_cuda_thermal_poll_cadence_update(tmp_path) -> None:
+    original_args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--resume",
+            "--cuda-thermal-poll-seconds",
+            "10",
+        ]
+    )
+    resumed_args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--resume",
+            "--cuda-thermal-poll-seconds",
+            "2",
+        ]
+    )
+    trainer = PortableLongTrainer(resumed_args)
+    trainer.checkpoint_dir.mkdir(parents=True)
+    trainer.current_checkpoint.write_bytes(b"model")
+    trainer.optimizer_checkpoint.write_bytes(b"optimizer")
+    trainer.state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deadline_epoch": int(time.time()) + 3600,
+                "iteration": 50,
+                "stop_reason": None,
+                "config": _config_signature(original_args),
+                "latest_checkpoint_sha256": sha256_file(trainer.current_checkpoint),
+                "latest_optimizer_sha256": sha256_file(
+                    trainer.optimizer_checkpoint
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trainer.initialize()
+
+    assert trainer.state["config"]["cuda_thermal_poll_seconds"] == pytest.approx(2.0)
+    events = [
+        json.loads(line)
+        for line in trainer.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        event.get("event") == "resume_config_updated"
+        and event.get("field") == "cuda_thermal_poll_seconds"
+        and event.get("previous_value") == pytest.approx(10.0)
+        and event.get("value") == pytest.approx(2.0)
+        for event in events
+    )
+
+
+def test_resume_after_gate_rollback_reuses_retained_candidate(tmp_path) -> None:
+    args = build_parser().parse_args(["--run-dir", str(tmp_path), "--resume"])
+    trainer = PortableLongTrainer(args)
+    trainer.checkpoint_dir.mkdir(parents=True)
+    trainer.current_checkpoint.write_bytes(b"accepted-model")
+    trainer.optimizer_checkpoint.write_bytes(b"accepted-optimizer")
+    retained = trainer._iteration_checkpoint_path(50)
+    retained.write_bytes(b"rejected-candidate")
+    trainer.state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deadline_epoch": int(time.time()) + 3600,
+                "iteration": 50,
+                "accepted_iteration": 40,
+                "last_rejected_iteration": 50,
+                "stop_reason": None,
+                "config": _config_signature(args),
+                "latest_checkpoint_sha256": sha256_file(trainer.current_checkpoint),
+                "latest_optimizer_sha256": sha256_file(
+                    trainer.optimizer_checkpoint
+                ),
+                "latest_iteration_checkpoint": str(retained),
+                "latest_iteration_checkpoint_sha256": sha256_file(retained),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trainer.initialize()
+
+    assert trainer.current_checkpoint.read_bytes() == b"accepted-model"
+    assert retained.read_bytes() == b"rejected-candidate"
+    assert trainer.state["latest_iteration_checkpoint"] == str(retained)
+    assert trainer.state["latest_iteration_checkpoint_sha256"] == sha256_file(
+        retained
+    )
 
 
 def test_interrupted_model_optimizer_commit_restores_previous_pair(tmp_path) -> None:
