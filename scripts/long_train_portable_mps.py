@@ -502,6 +502,10 @@ def _preflight(args: argparse.Namespace) -> None:
             raise ValueError(
                 "--plateau-simulations must be greater than --mcts-simulations."
             )
+        if int(args.plateau_max_simulations) < int(args.plateau_simulations):
+            raise ValueError(
+                "--plateau-max-simulations must be at least --plateau-simulations."
+            )
     if str(args.search_backend).strip().lower() == "cuda_tree":
         import torch
         import v0_core
@@ -623,6 +627,8 @@ def _config_signature(args: argparse.Namespace) -> Dict[str, Any]:
         "mcts_simulations",
         "plateau_patience_iterations",
         "plateau_simulations",
+        "plateau_max_simulations",
+        "sticky_plateau_simulations",
         "temperature_init",
         "temperature_final",
         "temperature_threshold",
@@ -1386,6 +1392,12 @@ class PortableLongTrainer:
                     self.args.plateau_patience_iterations
                 ),
                 "plateau_simulations": int(self.args.plateau_simulations),
+                "plateau_max_simulations": int(
+                    self.args.plateau_max_simulations
+                ),
+                "sticky_plateau_simulations": bool(
+                    self.args.sticky_plateau_simulations
+                ),
                 "quality_strength_eval": bool(self.args.quality_strength_eval),
                 "strength_eval_games": int(self.args.strength_eval_games),
                 "strength_eval_simulations": int(
@@ -1436,15 +1448,21 @@ class PortableLongTrainer:
                     if field_name not in previous_signature:
                         previous_signature[field_name] = default_value
                         migrated_config[field_name] = default_value
-                field_name = "cuda_thermal_poll_seconds"
-                previous_value = previous_signature.get(field_name)
-                resumed_value = signature[field_name]
-                if previous_value != resumed_value:
-                    previous_signature[field_name] = resumed_value
-                    resume_config_updates[field_name] = {
-                        "previous_value": previous_value,
-                        "value": resumed_value,
-                    }
+                mutable_runtime_fields = {
+                    "cuda_resume_temp_c": "runtime_thermal_threshold",
+                    "cuda_thermal_poll_seconds": "runtime_poll_cadence",
+                    "plateau_patience_iterations": "user_requested_plateau_patience",
+                }
+                for field_name, reason in mutable_runtime_fields.items():
+                    previous_value = previous_signature.get(field_name)
+                    resumed_value = signature[field_name]
+                    if previous_value != resumed_value:
+                        previous_signature[field_name] = resumed_value
+                        resume_config_updates[field_name] = {
+                            "previous_value": previous_value,
+                            "value": resumed_value,
+                            "reason": reason,
+                        }
                 state["config"] = previous_signature
             if previous_signature != signature:
                 raise RuntimeError(
@@ -1481,7 +1499,7 @@ class PortableLongTrainer:
                     field=field_name,
                     previous_value=update["previous_value"],
                     value=update["value"],
-                    reason="runtime_poll_cadence",
+                    reason=update["reason"],
                 )
             best_pair_reconciled = self._recover_best_pair_transaction()
             reconciled = self._recover_interrupted_commit()
@@ -1738,30 +1756,100 @@ class PortableLongTrainer:
         """Resolve the next iteration's frozen search budget from accepted lineage."""
         base = int(self.args.mcts_simulations)
         patience = int(self.args.plateau_patience_iterations)
+        sticky = bool(getattr(self.args, "sticky_plateau_simulations", False))
+        plateau = int(self.args.plateau_simulations)
+        plateau_max = int(getattr(self.args, "plateau_max_simulations", plateau))
         accepted = int(
             self.state.get("accepted_iteration", self.args.initial_iteration) or 0
         )
         completed_before = max(0, int(iteration) - 1)
         stagnant = max(0, completed_before - accepted)
-        simulations = (
-            int(self.args.plateau_simulations)
+        requested = (
+            plateau
             if patience > 0 and stagnant >= patience
             else base
         )
         previous = int(self.state.get("active_mcts_simulations", base))
+        peak_initialized = "peak_mcts_simulations" in self.state
+        peak = max(base, previous, int(self.state.get("peak_mcts_simulations", base)))
+        restored_from_events = False
+        if sticky and not peak_initialized:
+            events_path = getattr(self, "events_path", None)
+            if isinstance(events_path, Path) and events_path.is_file():
+                with events_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            event = json.loads(line)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        if event.get("event") != "mcts_simulations_changed":
+                            continue
+                        event_simulations = event.get("simulations")
+                        if isinstance(event_simulations, int):
+                            peak = max(peak, event_simulations)
+            restored_from_events = peak > max(base, previous)
+        tier_anchor_initialized = "mcts_simulation_tier_anchor_iteration" in self.state
+        tier_anchor = int(
+            self.state.get("mcts_simulation_tier_anchor_iteration", accepted)
+            or accepted
+        )
+        if accepted > tier_anchor:
+            tier_anchor = accepted
+        tier_stagnant = max(0, completed_before - tier_anchor)
+        tier_increased = False
+        if sticky:
+            simulations = peak
+            if patience > 0 and tier_stagnant >= patience and peak < plateau_max:
+                simulations = (
+                    plateau
+                    if peak < plateau
+                    else min(plateau_max, peak * 2)
+                )
+                tier_increased = simulations > peak
+                if tier_increased:
+                    tier_anchor = completed_before
+                    tier_stagnant = 0
+        else:
+            simulations = requested
+        if sticky:
+            self.state["peak_mcts_simulations"] = max(peak, simulations)
+            self.state["mcts_simulation_tier_anchor_iteration"] = tier_anchor
+            self.state["mcts_simulation_tier_stagnation_iterations"] = tier_stagnant
         self.state["incumbent_stagnation_iterations"] = stagnant
         self.state["active_mcts_simulations"] = simulations
         if simulations != previous:
-            reason = "incumbent_plateau" if simulations > base else "incumbent_promoted"
+            if tier_increased:
+                reason = (
+                    "incumbent_plateau"
+                    if previous < plateau
+                    else "incumbent_plateau_next_tier"
+                )
+            elif not sticky and requested > previous:
+                reason = "incumbent_plateau"
+            elif sticky and simulations > requested:
+                reason = "plateau_budget_retained"
+            else:
+                reason = "incumbent_promoted"
             self._event(
                 "mcts_simulations_changed",
                 iteration=int(iteration),
                 accepted_iteration=accepted,
                 stagnant_iterations=stagnant,
+                tier_stagnant_iterations=tier_stagnant,
                 previous_simulations=previous,
                 simulations=simulations,
                 reason=reason,
             )
+        if restored_from_events:
+            self._event(
+                "mcts_simulations_high_watermark_restored",
+                iteration=int(iteration),
+                peak_mcts_simulations=int(peak),
+                source="events_jsonl",
+            )
+        if simulations != previous or (
+            sticky and (not peak_initialized or not tier_anchor_initialized)
+        ):
             self._save_state()
         return simulations
 
@@ -2018,6 +2106,9 @@ class PortableLongTrainer:
         stats["orchestrator_mcts_simulations"] = simulations
         stats["orchestrator_incumbent_stagnation_iterations"] = int(
             self.state.get("incumbent_stagnation_iterations", 0)
+        )
+        stats["orchestrator_mcts_tier_stagnation_iterations"] = int(
+            self.state.get("mcts_simulation_tier_stagnation_iterations", 0)
         )
         return output, stats
 
@@ -3091,6 +3182,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--plateau-simulations", type=int, default=128)
+    parser.add_argument(
+        "--plateau-max-simulations",
+        type=int,
+        default=128,
+        help=(
+            "Maximum sticky self-play simulation tier. Each additional plateau "
+            "doubles the active tier up to this value."
+        ),
+    )
+    parser.add_argument(
+        "--sticky-plateau-simulations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Keep the highest plateau-triggered self-play simulation budget after "
+            "future incumbent promotions instead of returning to the base budget."
+        ),
+    )
     parser.add_argument("--temperature-init", type=float, default=1.0)
     parser.add_argument("--temperature-final", type=float, default=0.1)
     parser.add_argument("--temperature-threshold", type=int, default=10)

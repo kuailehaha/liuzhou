@@ -59,6 +59,8 @@ def test_m5_long_run_defaults_are_frozen() -> None:
     assert args.cuda_thermal_poll_seconds == 10.0
     assert args.plateau_patience_iterations == 0
     assert args.plateau_simulations == 128
+    assert args.plateau_max_simulations == 128
+    assert not args.sticky_plateau_simulations
     assert args.checkpoint_retain_every == 10
     assert args.policy_target_temperature is None
     assert args.policy_target_prior_pseudocount == 0.0
@@ -114,6 +116,7 @@ def test_cuda_tree_long_run_selfplay_command_is_explicit(
         mcts_simulations=64,
         plateau_patience_iterations=200,
         plateau_simulations=128,
+        sticky_plateau_simulations=False,
         initial_iteration=150,
         temperature_init=1.0,
         temperature_final=1.0,
@@ -152,6 +155,7 @@ def test_selfplay_simulations_escalate_after_200_unaccepted_iterations() -> None
         mcts_simulations=64,
         plateau_patience_iterations=200,
         plateau_simulations=128,
+        sticky_plateau_simulations=False,
         initial_iteration=150,
     )
     trainer.state = {"accepted_iteration": 150}
@@ -169,6 +173,98 @@ def test_selfplay_simulations_escalate_after_200_unaccepted_iterations() -> None
     trainer.state["accepted_iteration"] = 350
     assert trainer._selfplay_simulations(352) == 64
     assert events[-1][1]["reason"] == "incumbent_promoted"
+
+
+def test_sticky_plateau_simulations_do_not_drop_after_promotion() -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.args = SimpleNamespace(
+        mcts_simulations=32,
+        plateau_patience_iterations=200,
+        plateau_simulations=64,
+        sticky_plateau_simulations=True,
+        initial_iteration=150,
+    )
+    trainer.state = {"accepted_iteration": 150}
+    events = []
+    trainer._event = lambda name, **payload: events.append((name, payload))
+    trainer._save_state = lambda: None
+
+    assert trainer._selfplay_simulations(351) == 64
+    assert trainer.state["peak_mcts_simulations"] == 64
+
+    trainer.state["accepted_iteration"] = 350
+    assert trainer._selfplay_simulations(352) == 64
+    assert trainer.state["incumbent_stagnation_iterations"] == 1
+    assert len(events) == 1
+    assert events[-1][0] == "mcts_simulations_changed"
+    assert events[-1][1]["reason"] == "incumbent_plateau"
+
+
+def test_sticky_plateau_simulations_restore_legacy_run_high_watermark(
+    tmp_path,
+) -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.args = SimpleNamespace(
+        mcts_simulations=32,
+        plateau_patience_iterations=200,
+        plateau_simulations=64,
+        sticky_plateau_simulations=True,
+        initial_iteration=150,
+    )
+    trainer.state = {
+        "accepted_iteration": 1300,
+        "active_mcts_simulations": 32,
+    }
+    trainer.events_path = tmp_path / "events.jsonl"
+    trainer.events_path.write_text(
+        json.dumps(
+            {
+                "event": "mcts_simulations_changed",
+                "simulations": 64,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    events = []
+    trainer._event = lambda name, **payload: events.append((name, payload))
+    trainer._save_state = lambda: None
+
+    assert trainer._selfplay_simulations(1310) == 64
+    assert trainer.state["peak_mcts_simulations"] == 64
+    assert events[0][1]["reason"] == "plateau_budget_retained"
+    assert events[1][0] == "mcts_simulations_high_watermark_restored"
+
+
+def test_sticky_plateau_simulations_double_again_at_next_tier() -> None:
+    trainer = PortableLongTrainer.__new__(PortableLongTrainer)
+    trainer.args = SimpleNamespace(
+        mcts_simulations=32,
+        plateau_patience_iterations=100,
+        plateau_simulations=64,
+        plateau_max_simulations=128,
+        sticky_plateau_simulations=True,
+        initial_iteration=150,
+    )
+    trainer.state = {
+        "accepted_iteration": 1300,
+        "active_mcts_simulations": 64,
+        "peak_mcts_simulations": 64,
+        "mcts_simulation_tier_anchor_iteration": 1300,
+    }
+    events = []
+    trainer._event = lambda name, **payload: events.append((name, payload))
+    trainer._save_state = lambda: None
+
+    assert trainer._selfplay_simulations(1400) == 64
+    assert trainer.state["mcts_simulation_tier_stagnation_iterations"] == 99
+    assert trainer._selfplay_simulations(1401) == 128
+    assert trainer.state["peak_mcts_simulations"] == 128
+    assert trainer.state["mcts_simulation_tier_anchor_iteration"] == 1400
+    assert events[-1][1]["reason"] == "incumbent_plateau_next_tier"
+
+    assert trainer._selfplay_simulations(1501) == 128
+    assert trainer.state["peak_mcts_simulations"] == 128
 
 
 def test_disabled_cycle_anchor_never_reads_incumbent_history() -> None:
@@ -898,6 +994,53 @@ def test_resume_migrates_legacy_incumbent_gate_to_explicit_default(tmp_path) -> 
     assert trainer.state["config"]["portable_cpp_threads"] == 1
 
 
+def test_resume_can_enable_sticky_plateau_for_legacy_run(tmp_path) -> None:
+    args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--resume",
+            "--sticky-plateau-simulations",
+        ]
+    )
+    trainer = PortableLongTrainer(args)
+    trainer.checkpoint_dir.mkdir(parents=True)
+    trainer.current_checkpoint.write_bytes(b"model")
+    trainer.optimizer_checkpoint.write_bytes(b"optimizer")
+    legacy_config = _config_signature(args)
+    legacy_config.pop("sticky_plateau_simulations")
+    trainer.state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deadline_epoch": int(time.time()) + 3600,
+                "iteration": 50,
+                "stop_reason": None,
+                "config": legacy_config,
+                "latest_checkpoint_sha256": sha256_file(trainer.current_checkpoint),
+                "latest_optimizer_sha256": sha256_file(
+                    trainer.optimizer_checkpoint
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trainer.initialize()
+
+    assert trainer.state["config"]["sticky_plateau_simulations"] is True
+    events = [
+        json.loads(line)
+        for line in trainer.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        event.get("event") == "config_migrated"
+        and event.get("field") == "sticky_plateau_simulations"
+        and event.get("value") is True
+        for event in events
+    )
+
+
 def test_resume_allows_cuda_thermal_poll_cadence_update(tmp_path) -> None:
     original_args = build_parser().parse_args(
         [
@@ -950,6 +1093,123 @@ def test_resume_allows_cuda_thermal_poll_cadence_update(tmp_path) -> None:
         and event.get("field") == "cuda_thermal_poll_seconds"
         and event.get("previous_value") == pytest.approx(10.0)
         and event.get("value") == pytest.approx(2.0)
+        for event in events
+    )
+
+
+def test_resume_allows_explicit_plateau_patience_update(tmp_path) -> None:
+    original_args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--resume",
+            "--plateau-patience-iterations",
+            "200",
+            "--league-gate",
+            "--rollback-on-gate-fail",
+        ]
+    )
+    resumed_args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--resume",
+            "--plateau-patience-iterations",
+            "100",
+            "--league-gate",
+            "--rollback-on-gate-fail",
+        ]
+    )
+    trainer = PortableLongTrainer(resumed_args)
+    trainer.checkpoint_dir.mkdir(parents=True)
+    trainer.current_checkpoint.write_bytes(b"model")
+    trainer.optimizer_checkpoint.write_bytes(b"optimizer")
+    trainer.state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deadline_epoch": int(time.time()) + 3600,
+                "iteration": 50,
+                "stop_reason": None,
+                "config": _config_signature(original_args),
+                "latest_checkpoint_sha256": sha256_file(trainer.current_checkpoint),
+                "latest_optimizer_sha256": sha256_file(
+                    trainer.optimizer_checkpoint
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trainer.initialize()
+
+    assert trainer.state["config"]["plateau_patience_iterations"] == 100
+    events = [
+        json.loads(line)
+        for line in trainer.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        event.get("event") == "resume_config_updated"
+        and event.get("field") == "plateau_patience_iterations"
+        and event.get("previous_value") == 200
+        and event.get("value") == 100
+        for event in events
+    )
+
+
+def test_resume_allows_cuda_resume_temperature_update(tmp_path) -> None:
+    original_args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--resume",
+            "--cuda-resume-temp-c",
+            "78",
+        ]
+    )
+    resumed_args = build_parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--resume",
+            "--cuda-resume-temp-c",
+            "80",
+        ]
+    )
+    trainer = PortableLongTrainer(resumed_args)
+    trainer.checkpoint_dir.mkdir(parents=True)
+    trainer.current_checkpoint.write_bytes(b"model")
+    trainer.optimizer_checkpoint.write_bytes(b"optimizer")
+    trainer.state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deadline_epoch": int(time.time()) + 3600,
+                "iteration": 50,
+                "stop_reason": None,
+                "config": _config_signature(original_args),
+                "latest_checkpoint_sha256": sha256_file(trainer.current_checkpoint),
+                "latest_optimizer_sha256": sha256_file(
+                    trainer.optimizer_checkpoint
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trainer.initialize()
+
+    assert trainer.state["config"]["cuda_resume_temp_c"] == pytest.approx(80.0)
+    events = [
+        json.loads(line)
+        for line in trainer.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        event.get("event") == "resume_config_updated"
+        and event.get("field") == "cuda_resume_temp_c"
+        and event.get("previous_value") == pytest.approx(78.0)
+        and event.get("value") == pytest.approx(80.0)
+        and event.get("reason") == "runtime_thermal_threshold"
         for event in events
     )
 
